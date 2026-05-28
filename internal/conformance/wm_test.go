@@ -68,3 +68,7 @@ func TestHyprlandManagerConformance(t *testing.T) {
 func TestI3ManagerConformance(t *testing.T) {
 	conformance.RunManagerContract(t, wmAdapter{b: wm.NewI3()})
 }
+
+func TestX11ManagerConformance(t *testing.T) {
+	conformance.RunManagerContract(t, wmAdapter{b: wm.NewX11()})
+}
