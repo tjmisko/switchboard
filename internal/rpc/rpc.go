@@ -144,7 +144,7 @@ func (s *Server) focus(ctx context.Context, selector string) error {
 	if target.Hyprland == nil || target.Hyprland.Address == "" {
 		return fmt.Errorf("session has no hyprland address yet")
 	}
-	if err := hyprland.Dispatch(ctx, "focuswindow address:"+target.Hyprland.Address); err != nil {
+	if err := hyprland.FocusWindow(ctx, target.Hyprland.Address); err != nil {
 		return fmt.Errorf("hyprland focus: %w", err)
 	}
 	if target.Wezterm != nil {

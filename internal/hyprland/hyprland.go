@@ -80,6 +80,59 @@ func Dispatch(ctx context.Context, cmd string) error {
 	return nil
 }
 
+// FocusWindow focuses the window at addr without warping the cursor.
+//
+// Hyprland's `focuswindow` dispatcher warps the cursor to the center of the
+// target window when that window lives on another workspace (this is the
+// default `cursor:no_warps = false` behavior). For click-driven focus — a chip
+// click — that mouse jump is jarring. We want it to behave like clicking a
+// waybar workspace button, which switches workspace without moving the cursor.
+//
+// So we temporarily enable `cursor:no_warps` for the duration of this one
+// dispatch, batched into a single IPC request ([[BATCH]] runs the commands
+// sequentially in one round-trip) so the toggle is atomic and never leaks to
+// other, unrelated focus events. We restore the option to its prior value
+// rather than hardcoding false, so a user who globally disabled warps stays
+// disabled.
+func FocusWindow(ctx context.Context, addr string) error {
+	prev, err := noWarps(ctx)
+	if err != nil {
+		// If we can't read the option, fall back to a plain focus. The cursor
+		// may warp, but focus still works — better than failing the jump.
+		return Dispatch(ctx, "focuswindow address:"+addr)
+	}
+	cmd := fmt.Sprintf(
+		"[[BATCH]]keyword cursor:no_warps true ; dispatch focuswindow address:%s ; keyword cursor:no_warps %t",
+		addr, prev,
+	)
+	resp, err := request(ctx, cmd)
+	if err != nil {
+		return err
+	}
+	// A batch echoes "ok" once per sub-command. Any non-ok segment is a failure.
+	for _, part := range strings.Split(strings.TrimSpace(string(resp)), "\n") {
+		if part = strings.TrimSpace(part); part != "" && !strings.HasPrefix(part, "ok") {
+			return fmt.Errorf("focus window %s: %s", addr, part)
+		}
+	}
+	return nil
+}
+
+// noWarps reports the current effective value of the cursor:no_warps option.
+func noWarps(ctx context.Context) (bool, error) {
+	resp, err := request(ctx, "j/getoption cursor:no_warps")
+	if err != nil {
+		return false, err
+	}
+	var o struct {
+		Int int `json:"int"`
+	}
+	if err := json.Unmarshal(resp, &o); err != nil {
+		return false, fmt.Errorf("parse getoption cursor:no_warps: %w", err)
+	}
+	return o.Int != 0, nil
+}
+
 // Event is one line from socket2. Name is the event identifier
 // (openwindow/closewindow/...); Data is the raw comma-separated payload.
 type Event struct {
