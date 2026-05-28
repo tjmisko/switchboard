@@ -57,8 +57,9 @@ func Resolve(ctx context.Context, info proc.Info) state.Session {
 	client := findHyprClient(resolveCtx, pane.MuxPID, pane.WindowTitle)
 	if client != nil {
 		sess.Hyprland = &state.HyprlandInfo{
-			Address:   client.Address,
-			Workspace: client.Workspace.Name,
+			Address:     client.Address,
+			Workspace:   client.Workspace.Name,
+			WorkspaceID: client.Workspace.ID,
 		}
 	}
 	return sess
@@ -95,6 +96,7 @@ func Reconcile(ctx context.Context, sess *state.Session) {
 		}
 		sess.Hyprland.Address = client.Address
 		sess.Hyprland.Workspace = client.Workspace.Name
+		sess.Hyprland.WorkspaceID = client.Workspace.ID
 	}
 }
 

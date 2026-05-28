@@ -17,6 +17,7 @@
       "hyprland": {
         "address": "0x5640f1a2b3c0",
         "workspace": "4",
+        "workspace_id": 4,
         "monitor": "DP-1"
       },
       "claude": {

@@ -35,9 +35,10 @@ type WeztermInfo struct {
 }
 
 type HyprlandInfo struct {
-	Address   string `json:"address"`
-	Workspace string `json:"workspace"`
-	Monitor   string `json:"monitor"`
+	Address     string `json:"address"`
+	Workspace   string `json:"workspace"`
+	WorkspaceID int    `json:"workspace_id"`
+	Monitor     string `json:"monitor"`
 }
 
 type ClaudeInfo struct {
@@ -93,16 +94,44 @@ func (s *Store) snapshotLocked() Snapshot {
 	for _, sess := range s.sessions {
 		sessions = append(sessions, *sess)
 	}
-	// Sort by StartedAt, with PID as a deterministic tie-break. Equal timestamps
-	// would otherwise leave order to map iteration, making positional selectors
-	// (rpc.pickSession index, sessions[0]) nondeterministic across snapshots.
+	// Sort into chip order (lessChipOrder), which carries a PID tie-break for
+	// determinism: equal sort keys would otherwise leave order to map iteration,
+	// making positional selectors (rpc.pickSession index, sessions[0])
+	// nondeterministic across snapshots.
 	sort.Slice(sessions, func(i, j int) bool {
-		if sessions[i].StartedAt.Equal(sessions[j].StartedAt) {
-			return sessions[i].PID < sessions[j].PID
-		}
-		return sessions[i].StartedAt.Before(sessions[j].StartedAt)
+		return lessChipOrder(sessions[i], sessions[j])
 	})
 	return Snapshot{Sessions: sessions, UpdatedAt: time.Now()}
+}
+
+// lessChipOrder defines the left-to-right chip order on the bottom bar:
+// sessions with a resolved workspace come first, ordered by numeric workspace
+// ID (so chips follow workspace order); within a workspace, and among
+// sessions whose workspace is not yet resolved, oldest-started wins.
+// Unresolved-workspace sessions are pushed to the end.
+func lessChipOrder(a, b Session) bool {
+	aID, aResolved := workspaceID(a)
+	bID, bResolved := workspaceID(b)
+	if aResolved != bResolved {
+		return aResolved // resolved sessions sort before unresolved ones
+	}
+	if aResolved && aID != bID {
+		return aID < bID
+	}
+	if !a.StartedAt.Equal(b.StartedAt) {
+		return a.StartedAt.Before(b.StartedAt)
+	}
+	return a.PID < b.PID // deterministic tie-break (Phase 0.9)
+}
+
+// workspaceID returns the session's Hyprland workspace ID and whether it is
+// resolved. ID 0 is treated as unresolved (Hyprland workspaces are positive,
+// or negative for special workspaces).
+func workspaceID(s Session) (int, bool) {
+	if s.Hyprland == nil || s.Hyprland.WorkspaceID == 0 {
+		return 0, false
+	}
+	return s.Hyprland.WorkspaceID, true
 }
 
 // Subscribe returns a channel that receives every snapshot after a mutation.

@@ -61,6 +61,8 @@ func main() {
 			direction = args[1]
 		}
 		cmdCycle(c, direction)
+	case "attention":
+		cmdAttention(c)
 	case "hook":
 		if len(args) < 2 {
 			fail("hook requires an event name")
@@ -175,6 +177,49 @@ func cmdCycle(c *rpc.Client, direction string) {
 	cmdFocus(c, fmt.Sprintf("%d", snap.Sessions[target].PID))
 }
 
+// cmdAttention jumps to the first session that needs the user. Priority
+// mirrors the waybar chip colors: a session waiting on a permission prompt
+// (red) outranks an idle session (orange). It is a deliberate no-op when every
+// session is working (green) or unknown (grey) — there is nowhere worth
+// jumping. Bound to mod+Shift+a in Hyprland.
+func cmdAttention(c *rpc.Client) {
+	snap := mustList(c)
+	target := pickAttention(snap.Sessions)
+	if target == nil {
+		return
+	}
+	cmdFocus(c, fmt.Sprintf("%d", target.PID))
+}
+
+// pickAttention returns the highest-priority session needing attention:
+// permission outranks idle; working and unknown never qualify. Sessions are
+// assumed start-time ordered (as state.Snapshot guarantees), so the first
+// match within a tier is the oldest such session. Returns nil when nothing
+// needs attention.
+func pickAttention(sessions []state.Session) *state.Session {
+	var firstIdle *state.Session
+	for i := range sessions {
+		switch sessionStatus(sessions[i]) {
+		case "permission":
+			return &sessions[i]
+		case "idle":
+			if firstIdle == nil {
+				firstIdle = &sessions[i]
+			}
+		}
+	}
+	return firstIdle
+}
+
+// sessionStatus normalizes a missing or empty Claude status to "unknown",
+// matching switchboard-waybar's rendering.
+func sessionStatus(s state.Session) string {
+	if s.Claude == nil || s.Claude.Status == "" {
+		return "unknown"
+	}
+	return s.Claude.Status
+}
+
 // cmdHook is intended to be invoked from a Claude Code hook command. It
 // reads the hook's JSON payload from stdin, looks up its own getppid() to
 // identify which Claude process called the hook, and forwards an enrichment
@@ -245,6 +290,9 @@ commands:
   status                  one-line summary
   pick                    emit pid<TAB>label<TAB>ws<TAB>cwd lines for fzf
   cycle next|prev         focus the next/previous session, wrapping
+  attention               jump to the first session needing attention:
+                            first permission (red), else first idle (orange);
+                            no-op if all working (green) or unknown (grey)
   hook <event>            forward Claude Code hook enrichment (stdin = JSON)
   bottombar [sub]         manage the bottom waybar lifecycle:
                             watch      long-running; show/hide bar with sessions
