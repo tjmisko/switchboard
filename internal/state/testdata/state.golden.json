@@ -1,0 +1,37 @@
+{
+  "sessions": [
+    {
+      "pid": 4821,
+      "cwd": "/home/tjmisko/Projects/switchboard",
+      "tty": "/dev/pts/3",
+      "started_at": "2026-05-28T09:00:00Z",
+      "focused": true,
+      "wezterm": {
+        "mux_pid": 4790,
+        "mux_socket": "/run/user/1000/wezterm/gui-sock-4790",
+        "pane_id": 12,
+        "tab_id": 7,
+        "window_id": 3,
+        "window_title": "claude — switchboard"
+      },
+      "hyprland": {
+        "address": "0x5640f1a2b3c0",
+        "workspace": "4",
+        "monitor": "DP-1"
+      },
+      "claude": {
+        "session_id": "e0b4b21f-aaf6-4ab0-a8d6-2d595aba4065",
+        "transcript": "/home/tjmisko/.claude/projects/switchboard/e0b4b21f.jsonl",
+        "status": "working"
+      }
+    },
+    {
+      "pid": 5102,
+      "cwd": "/home/tjmisko/Tools/other",
+      "tty": "/dev/pts/9",
+      "started_at": "2026-05-28T09:05:00Z",
+      "focused": false
+    }
+  ],
+  "updated_at": "2026-05-28T09:05:30Z"
+}
