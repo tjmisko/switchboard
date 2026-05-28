@@ -3,13 +3,13 @@ package mapping
 import (
 	"testing"
 
-	"github.com/tjmisko/switchboard/internal/hyprland"
+	"github.com/tjmisko/switchboard/internal/wm"
 )
 
-// §3.2 matchUniqueClient — the wezterm<->WM join requires BOTH the mux pid and
+// §3.2 matchUniqueClient — the terminal<->WM join requires BOTH the mux pid and
 // the window title, and returns nil on zero or ambiguous matches.
 func TestMatchUniqueClient(t *testing.T) {
-	clients := []hyprland.Client{
+	clients := []wm.Window{
 		{Address: "0xA", PID: 10, Title: "A"},
 		{Address: "0xB", PID: 10, Title: "B"},
 		{Address: "0xC", PID: 20, Title: "A"},
@@ -30,7 +30,7 @@ func TestMatchUniqueClient(t *testing.T) {
 	}
 
 	// Ambiguous: two clients share pid+title → nil (retry next tick).
-	ambiguous := []hyprland.Client{
+	ambiguous := []wm.Window{
 		{Address: "0xA", PID: 10, Title: "A"},
 		{Address: "0xB", PID: 10, Title: "A"},
 	}

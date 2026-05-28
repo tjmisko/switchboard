@@ -16,10 +16,10 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/tjmisko/switchboard/internal/hyprland"
 	"github.com/tjmisko/switchboard/internal/proc"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/terminal"
+	"github.com/tjmisko/switchboard/internal/wm"
 )
 
 type Request struct {
@@ -42,10 +42,11 @@ type Server struct {
 	store      *state.Store
 	socketPath string
 	term       terminal.Locator
+	wm         wm.Manager
 }
 
-func New(store *state.Store, socketPath string, term terminal.Locator) *Server {
-	return &Server{store: store, socketPath: socketPath, term: term}
+func New(store *state.Store, socketPath string, term terminal.Locator, manager wm.Manager) *Server {
+	return &Server{store: store, socketPath: socketPath, term: term, wm: manager}
 }
 
 // Serve listens on the socket path and accepts connections until ctx is done.
@@ -145,8 +146,8 @@ func (s *Server) focus(ctx context.Context, selector string) error {
 	if target.Hyprland == nil || target.Hyprland.Address == "" {
 		return fmt.Errorf("session has no hyprland address yet")
 	}
-	if err := hyprland.FocusWindow(ctx, target.Hyprland.Address); err != nil {
-		return fmt.Errorf("hyprland focus: %w", err)
+	if err := s.wm.Focus(ctx, target.Hyprland.Address); err != nil {
+		return fmt.Errorf("wm focus: %w", err)
 	}
 	if target.Wezterm != nil {
 		ref := &terminal.PaneRef{MuxSocket: target.Wezterm.MuxSocket, PaneID: target.Wezterm.PaneID}

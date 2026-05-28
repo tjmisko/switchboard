@@ -13,22 +13,22 @@ import (
 	"context"
 	"time"
 
-	"github.com/tjmisko/switchboard/internal/hyprland"
 	"github.com/tjmisko/switchboard/internal/proc"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/terminal"
+	"github.com/tjmisko/switchboard/internal/wm"
 )
 
-// Resolver decorates sessions using injected seam backends. The terminal
-// locator is the Phase-1.2 seam; the WM join still calls Hyprland directly and
-// moves behind the wm.Manager seam in Phase 1.3.
+// Resolver decorates sessions using injected seam backends: the terminal
+// locator (Phase 1.2) and the window manager (Phase 1.3).
 type Resolver struct {
 	term terminal.Locator
+	wm   wm.Manager
 }
 
-// NewResolver builds a Resolver over the given terminal locator.
-func NewResolver(term terminal.Locator) *Resolver {
-	return &Resolver{term: term}
+// NewResolver builds a Resolver over the given terminal locator and WM manager.
+func NewResolver(term terminal.Locator, manager wm.Manager) *Resolver {
+	return &Resolver{term: term, wm: manager}
 }
 
 // Resolve maps the given claude process to a Session, filling in terminal and
@@ -57,12 +57,11 @@ func (r *Resolver) Resolve(ctx context.Context, info proc.Info) state.Session {
 		sess.CWD = pane.CWD
 	}
 
-	client := findHyprClient(resolveCtx, pane.Mux, pane.WindowTitle)
-	if client != nil {
+	if win := r.findWindow(resolveCtx, pane.Mux, pane.WindowTitle); win != nil {
 		sess.Hyprland = &state.HyprlandInfo{
-			Address:     client.Address,
-			Workspace:   client.Workspace.Name,
-			WorkspaceID: client.Workspace.ID,
+			Address:     win.Address,
+			Workspace:   win.Workspace,
+			WorkspaceID: win.WorkspaceID,
 		}
 	}
 	return sess
@@ -84,14 +83,13 @@ func (r *Resolver) Reconcile(ctx context.Context, sess *state.Session) {
 	}
 	sess.Wezterm = weztermInfo(pane)
 
-	client := findHyprClient(resolveCtx, pane.Mux, pane.WindowTitle)
-	if client != nil {
+	if win := r.findWindow(resolveCtx, pane.Mux, pane.WindowTitle); win != nil {
 		if sess.Hyprland == nil {
 			sess.Hyprland = &state.HyprlandInfo{}
 		}
-		sess.Hyprland.Address = client.Address
-		sess.Hyprland.Workspace = client.Workspace.Name
-		sess.Hyprland.WorkspaceID = client.Workspace.ID
+		sess.Hyprland.Address = win.Address
+		sess.Hyprland.Workspace = win.Workspace
+		sess.Hyprland.WorkspaceID = win.WorkspaceID
 	}
 }
 
@@ -106,21 +104,21 @@ func weztermInfo(pane *terminal.PaneRef) *state.WeztermInfo {
 	}
 }
 
-func findHyprClient(ctx context.Context, muxPID int, windowTitle string) *hyprland.Client {
-	clients, err := hyprland.Clients(ctx)
+func (r *Resolver) findWindow(ctx context.Context, muxPID int, windowTitle string) *wm.Window {
+	clients, err := r.wm.Clients(ctx)
 	if err != nil {
 		return nil
 	}
 	return matchUniqueClient(clients, muxPID, windowTitle)
 }
 
-// matchUniqueClient returns the single client matching BOTH the mux pid and the
+// matchUniqueClient returns the single window matching BOTH the mux pid and the
 // window title, or nil if zero or more than one match. An ambiguous match
 // returns nil rather than guessing — the next reconcile tick retries (the
 // "retry next tick" contract, decisions.md #4). Pure, so the join logic is
-// testable without a live Hyprland.
-func matchUniqueClient(clients []hyprland.Client, muxPID int, windowTitle string) *hyprland.Client {
-	var matches []*hyprland.Client
+// testable without a live WM.
+func matchUniqueClient(clients []wm.Window, muxPID int, windowTitle string) *wm.Window {
+	var matches []*wm.Window
 	for i := range clients {
 		c := &clients[i]
 		if c.PID != muxPID {
