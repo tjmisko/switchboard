@@ -28,6 +28,14 @@ func main() {
 		os.Exit(2)
 	}
 
+	// bottombar manages the bottom waybar's lifecycle and runs before the
+	// mandatory dial: its `watch` mode must tolerate a down daemon and
+	// reconnect on its own.
+	if args[0] == "bottombar" {
+		cmdBottombar(args[1:], *socketPath)
+		return
+	}
+
 	c, err := rpc.Dial(*socketPath)
 	if err != nil {
 		fail("connect daemon: %v", err)
@@ -238,6 +246,10 @@ commands:
   pick                    emit pid<TAB>label<TAB>ws<TAB>cwd lines for fzf
   cycle next|prev         focus the next/previous session, wrapping
   hook <event>            forward Claude Code hook enrichment (stdin = JSON)
+  bottombar [sub]         manage the bottom waybar lifecycle:
+                            watch      long-running; show/hide bar with sessions
+                            reconcile  one-shot; re-derive bar visibility (F8)
+                            stop       kill the bottom bar
 
 flags:
   --socket <path>         daemon socket (default: $XDG_RUNTIME_DIR/claude-tracker.sock)

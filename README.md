@@ -4,7 +4,7 @@ A discovery-first session tracker for Claude Code, designed for Hyprland + wezte
 
 Tells you, at a glance and in real time, how many Claude Code sessions you have running, where they live, and what each one is doing — without requiring you to pre-name, pre-tag, or otherwise register them. You just run `claude` somewhere; the tracker figures it out.
 
-The bottom waybar strip shows one rounded chip per session, color-coded by state (working / idle / waiting-on-permission), with the focused window's chip outlined.
+The bottom waybar strip shows one rounded chip per session, color-coded by state (working / idle / waiting-on-permission), with the focused window's chip outlined. The strip auto-hides when no sessions exist and reappears the moment one does — see [Auto-hiding the bottom bar](#auto-hiding-the-bottom-bar).
 
 ## Architecture
 
@@ -61,7 +61,7 @@ The tty match is load-bearing (the kernel can't lose it). Window-title match is 
 ```
 cmd/
   claude-tracker/       daemon — single epoll loop owning all signal sources
-  claude-tracker-ctl/   CLI — list / focus / cycle / pick / hook
+  claude-tracker-ctl/   CLI — list / focus / cycle / pick / hook / bottombar
   claude-waybar/        waybar exec module — one process per slot, emits JSON
 
 internal/
@@ -97,14 +97,43 @@ exec-once = systemctl --user start --no-block claude-tracker.service
 
 ## Integration points (this machine)
 
-### Waybar — one module per slot
+### Waybar — two bars, two processes
 
-`~/.config/waybar/config.jsonc` declares 10 `custom/claude-N` modules so each chip is a real GTK widget with its own CSS (border, border-radius, hover). Each runs `claude-waybar --slot N` and emits a JSON line per snapshot update; `class` carries the status + `focused` so `~/.config/waybar/style.css` paints the chip. Empty slots collapse to zero width.
+The top bar and the bottom claude strip run as **separate waybar processes** so the bottom one can be shown/hidden without touching the top. waybar's `--bar` flag does not filter a single array config (it loads every bar regardless), so the split is done with two config files:
+
+- `~/.config/waybar/config.jsonc` — the top bar only. Launched at boot by `exec-once = waybar` (the default config path).
+- `~/.config/waybar/claude.jsonc` — the bottom strip only. **Not** launched directly; its lifecycle is owned by `claude-tracker-ctl bottombar` (see below).
+
+`claude.jsonc` declares 10 `custom/claude-N` modules so each chip is a real GTK widget with its own CSS (border, border-radius, hover). Each runs `claude-waybar --slot N` and emits a JSON line per snapshot update; `class` carries the status + `focused` so `~/.config/waybar/style.css` paints the chip. Empty slots collapse to zero width.
 
 Click semantics:
 - left  — focus that slot's session (`claude-tracker-ctl focus N`)
 - right — open the rofi picker (`~/.config/scripts/claude-picker`)
 - scroll up/down — cycle prev/next
+
+### Auto-hiding the bottom bar
+
+The bottom strip obeys one invariant:
+
+```
+bottom bar runs  ⟺  (top bar visible)  AND  (≥1 claude session)
+```
+
+Visibility is **process existence**, not a SIGUSR1 toggle: `claude-tracker-ctl bottombar` literally starts and kills the `waybar -c claude.jsonc` process. There is no toggle state to drift, so the two bars never alternate or desync.
+
+Two inputs drive the invariant, each owned by a different actor:
+
+- **session count** — the daemon. `claude-tracker-ctl bottombar watch` subscribes to the daemon stream (plus a 3 s safety/self-heal ticker) and shows/kills the bottom bar as sessions come and go. Run once at startup:
+
+  ```
+  exec-once = claude-tracker-ctl bottombar watch
+  ```
+
+- **top-bar visibility** — the F8 master toggle in `~/.config/scripts/hypr-float-center`. That script touches/removes a marker file to hide/show the top bar, then calls `claude-tracker-ctl bottombar reconcile` so the bottom bar follows in lockstep. The script also excludes the bottom bar's pid (recorded at `$XDG_RUNTIME_DIR/claude-tracker/bottom-waybar.pid`) when it SIGUSR1s the top bar, so toggling the top never touches the bottom.
+
+The watcher kills the bottom bar by **process group**, so the 10 `claude-waybar` slot subprocesses die with it (no orphans), and reaps the resulting children so they never linger as zombies.
+
+Overridable via env: `CLAUDE_TRACKER_WAYBAR_MARKER` (default `/tmp/hypr-float-center/waybar-hidden`) and `CLAUDE_TRACKER_BOTTOM_CONFIG` (default `~/.config/waybar/claude.jsonc`).
 
 ### Hyprland keybindings
 
@@ -164,8 +193,8 @@ Working:
 - rofi picker, cycle keybindings
 - Claude Code hooks for status colors
 - systemd user service
+- bottom-bar auto-hide (`bottombar watch`/`reconcile`), split top/bottom waybar processes, F8 lockstep
 
 Not yet:
 - i3 port (would swap `internal/hyprland` for `internal/i3`; same RPC + same waybar binary)
-- Per-bar hide keybind (would require splitting waybar into two processes)
 - PID-pinned click selectors (today a click after a session-end race can target a neighbor; rare in practice)
