@@ -44,7 +44,7 @@ type HyprlandInfo struct {
 type ClaudeInfo struct {
 	SessionID  string `json:"session_id,omitempty"`
 	Transcript string `json:"transcript,omitempty"`
-	Status     string `json:"status"` // working|idle|permission|unknown
+	Status     string `json:"status"` // working|idle|permission (never "unknown")
 }
 
 type Snapshot struct {

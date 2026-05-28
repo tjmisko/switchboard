@@ -2,7 +2,7 @@
 // request per line, with JSON responses streamed back. Commands:
 //
 //	{"cmd":"list"}                              -> {"snapshot":{...}}
-//	{"cmd":"focus","selector":"active"|"<pid>"|"<index>"} -> {"ok":true}
+//	{"cmd":"focus","selector":"active"|"<pid>"|"<index>"|"pid:<n>"|"idx:<n>"} -> {"ok":true}
 //	{"cmd":"subscribe"}                          -> stream of {"snapshot":{...}}
 package rpc
 
@@ -10,17 +10,25 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/tjmisko/switchboard/internal/proc"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/terminal"
 	"github.com/tjmisko/switchboard/internal/wm"
 )
+
+// ErrNavigateUnsupported is returned by focus when the detected stack lacks a
+// terminal locator or a WM focus backend — Navigate degrades to Observe, so
+// there is nowhere to jump. Distinct from a transient "address not resolved
+// yet" so the client can present an actionable message.
+var ErrNavigateUnsupported = errors.New("navigate unsupported on this stack (Observe-only)")
 
 type Request struct {
 	Cmd      string `json:"cmd"`
@@ -135,6 +143,12 @@ func (s *Server) subscribe(ctx context.Context, conn net.Conn, enc *json.Encoder
 }
 
 func (s *Server) focus(ctx context.Context, selector string) error {
+	// Navigate requires both a terminal locator and a WM focus backend. On an
+	// Observe-only stack, fail with the typed error rather than the confusing
+	// "session has no hyprland address yet" (decisions.md #3 / Phase 1.5).
+	if s.wm.Name() == "none" || s.term.Name() == "none" {
+		return ErrNavigateUnsupported
+	}
 	snap := s.store.Snapshot()
 	if len(snap.Sessions) == 0 {
 		return fmt.Errorf("no sessions")
@@ -158,6 +172,16 @@ func (s *Server) focus(ctx context.Context, selector string) error {
 	return nil
 }
 
+// pickSession resolves a focus selector against the session slice:
+//
+//	"" / "active"  -> the focused session, else the first
+//	"pid:<n>"      -> the session with PID n (explicit; nil if none)
+//	"idx:<n>"      -> the session at index n (explicit; nil if out of range)
+//	"<n>"          -> back-compat heuristic: PID n if present, else index n
+//
+// The bare-number form is the Phase-0 ⚠ PID-vs-index collision (decisions.md
+// #3): selector "2" means PID 2 when such a session exists, else index 2. It is
+// kept for back-compat; the pid:/idx: prefixes are the unambiguous forms.
 func pickSession(sessions []state.Session, selector string) *state.Session {
 	switch selector {
 	case "", "active":
@@ -168,15 +192,39 @@ func pickSession(sessions []state.Session, selector string) *state.Session {
 		}
 		return &sessions[0]
 	}
+	if rest, ok := strings.CutPrefix(selector, "pid:"); ok {
+		if n, err := strconv.Atoi(rest); err == nil {
+			return byPID(sessions, n)
+		}
+		return nil
+	}
+	if rest, ok := strings.CutPrefix(selector, "idx:"); ok {
+		if n, err := strconv.Atoi(rest); err == nil {
+			return byIndex(sessions, n)
+		}
+		return nil
+	}
 	if n, err := strconv.Atoi(selector); err == nil {
-		for i := range sessions {
-			if sessions[i].PID == n {
-				return &sessions[i]
-			}
+		if s := byPID(sessions, n); s != nil {
+			return s
 		}
-		if n >= 0 && n < len(sessions) {
-			return &sessions[n]
+		return byIndex(sessions, n)
+	}
+	return nil
+}
+
+func byPID(sessions []state.Session, pid int) *state.Session {
+	for i := range sessions {
+		if sessions[i].PID == pid {
+			return &sessions[i]
 		}
+	}
+	return nil
+}
+
+func byIndex(sessions []state.Session, idx int) *state.Session {
+	if idx >= 0 && idx < len(sessions) {
+		return &sessions[idx]
 	}
 	return nil
 }

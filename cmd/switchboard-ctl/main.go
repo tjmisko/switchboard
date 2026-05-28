@@ -286,7 +286,8 @@ usage: switchboard-ctl [flags] <cmd> [args]
 
 commands:
   list                    show session list (human-friendly; --json for raw)
-  focus [selector]        focus session: "active" (default), <pid>, or <index>
+  focus [selector]        focus session: "active" (default), <pid>, <index>,
+                            or the unambiguous pid:<n> / idx:<n> forms
   status                  one-line summary
   pick                    emit pid<TAB>label<TAB>ws<TAB>cwd lines for fzf
   cycle next|prev         focus the next/previous session, wrapping
