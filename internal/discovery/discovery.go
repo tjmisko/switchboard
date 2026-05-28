@@ -27,13 +27,33 @@ func IsClaude(p proc.Info) bool {
 	return strings.Contains(p.Exe, "/claude/")
 }
 
+// procSource is the seam between the scanner and /proc. The default
+// implementation calls the proc package directly; tests inject a fake so the
+// seen-set state machine can be exercised without a live /proc.
+type procSource interface {
+	AllPIDs() ([]int, error)
+	Read(pid int) (proc.Info, error)
+}
+
+type realProcSource struct{}
+
+func (realProcSource) AllPIDs() ([]int, error)         { return proc.AllPIDs() }
+func (realProcSource) Read(pid int) (proc.Info, error) { return proc.Read(pid) }
+
 type Scanner struct {
 	mu   sync.Mutex
 	seen map[int]struct{}
+	src  procSource
 }
 
 func New() *Scanner {
-	return &Scanner{seen: make(map[int]struct{})}
+	return &Scanner{seen: make(map[int]struct{}), src: realProcSource{}}
+}
+
+// newWithSource builds a Scanner over an injected procSource. Test-only seam;
+// runtime callers use New, which wires the real /proc-backed source.
+func newWithSource(src procSource) *Scanner {
+	return &Scanner{seen: make(map[int]struct{}), src: src}
 }
 
 // Run polls /proc every interval and invokes onAppeared for any new claude
@@ -63,7 +83,7 @@ func (s *Scanner) Forget(pid int) {
 }
 
 func (s *Scanner) scanOnce(onAppeared func(proc.Info)) {
-	pids, err := proc.AllPIDs()
+	pids, err := s.src.AllPIDs()
 	if err != nil {
 		return
 	}
@@ -74,7 +94,7 @@ func (s *Scanner) scanOnce(onAppeared func(proc.Info)) {
 		if known {
 			continue
 		}
-		info, err := proc.Read(pid)
+		info, err := s.src.Read(pid)
 		if err != nil {
 			continue
 		}

@@ -189,7 +189,7 @@ func (s *Server) handleHook(req Request) {
 		return
 	}
 	s.store.Apply(func(m map[int]*state.Session) {
-		pid := findTrackedAncestor(m, req.PID)
+		pid := findTrackedAncestor(m, req.PID, proc.Read)
 		if pid == 0 {
 			return
 		}
@@ -206,15 +206,16 @@ func (s *Server) handleHook(req Request) {
 	})
 }
 
-// findTrackedAncestor walks up the /proc ppid chain starting at pid, returning
-// the first PID that's a tracked session. Bounded depth keeps us out of
-// trouble on weird /proc states.
-func findTrackedAncestor(m map[int]*state.Session, pid int) int {
+// findTrackedAncestor walks up the ppid chain starting at pid, returning the
+// first PID that's a tracked session. Bounded depth keeps us out of trouble on
+// weird process states. readProc is injected (defaults to proc.Read at the call
+// site) so the walk is testable without a live /proc.
+func findTrackedAncestor(m map[int]*state.Session, pid int, readProc func(int) (proc.Info, error)) int {
 	for depth := 0; pid > 1 && depth < 20; depth++ {
 		if _, ok := m[pid]; ok {
 			return pid
 		}
-		info, err := proc.Read(pid)
+		info, err := readProc(pid)
 		if err != nil || info.PPID == 0 {
 			return 0
 		}

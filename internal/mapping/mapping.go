@@ -103,6 +103,14 @@ func findHyprClient(ctx context.Context, muxPID int, windowTitle string) *hyprla
 	if err != nil {
 		return nil
 	}
+	return matchUniqueClient(clients, muxPID, windowTitle)
+}
+
+// matchUniqueClient returns the single client matching BOTH the mux pid and the
+// window title, or nil if zero or more than one match. An ambiguous match
+// returns nil rather than guessing — the next reconcile tick retries. Pure, so
+// the join logic is testable without a live Hyprland.
+func matchUniqueClient(clients []hyprland.Client, muxPID int, windowTitle string) *hyprland.Client {
 	var matches []*hyprland.Client
 	for i := range clients {
 		c := &clients[i]
@@ -117,7 +125,7 @@ func findHyprClient(ctx context.Context, muxPID int, windowTitle string) *hyprla
 	if len(matches) == 1 {
 		return matches[0]
 	}
-	return nil // ambiguous — let the next reconcile try again
+	return nil // zero or ambiguous — let the next reconcile try again
 }
 
 func decodeCWD(cwdURL string) string {

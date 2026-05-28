@@ -1,8 +1,10 @@
 package rpc
 
 import (
+	"errors"
 	"testing"
 
+	"github.com/tjmisko/switchboard/internal/proc"
 	"github.com/tjmisko/switchboard/internal/state"
 )
 
@@ -69,5 +71,84 @@ func TestPickSession(t *testing.T) {
 	noneFocused := []state.Session{{PID: 7}, {PID: 8}}
 	if got := pickSession(noneFocused, ""); got == nil || got.PID != 7 {
 		t.Errorf(`pickSession "" (none focused) = %v, want PID 7`, got)
+	}
+}
+
+// chainReader builds a readProc that maps each pid to its ppid; an unknown pid
+// returns ErrGone. It counts calls so the depth bound can be asserted.
+func chainReader(chain map[int]int, calls *int) func(int) (proc.Info, error) {
+	return func(pid int) (proc.Info, error) {
+		*calls++
+		ppid, ok := chain[pid]
+		if !ok {
+			return proc.Info{}, errors.New("gone")
+		}
+		return proc.Info{PID: pid, PPID: ppid}, nil
+	}
+}
+
+func tracked(pids ...int) map[int]*state.Session {
+	m := map[int]*state.Session{}
+	for _, p := range pids {
+		m[p] = &state.Session{PID: p}
+	}
+	return m
+}
+
+// §5.5 findTrackedAncestor — self-match returns immediately without reading.
+func TestFindTrackedAncestorSelfMatch(t *testing.T) {
+	read := func(int) (proc.Info, error) {
+		t.Fatal("readProc must not be called on a self-match")
+		return proc.Info{}, nil
+	}
+	if got := findTrackedAncestor(tracked(100), 100, read); got != 100 {
+		t.Errorf("self-match = %d, want 100", got)
+	}
+}
+
+// §5.5 findTrackedAncestor — walks the ppid chain to the first tracked ancestor.
+func TestFindTrackedAncestorWalksChain(t *testing.T) {
+	calls := 0
+	chain := map[int]int{102: 101, 101: 100, 100: 1}
+	if got := findTrackedAncestor(tracked(100), 102, chainReader(chain, &calls)); got != 100 {
+		t.Errorf("walk = %d, want 100", got)
+	}
+}
+
+// §5.5 ⚠ characterization: the walk inspects depths 0..19 only. A tracked
+// ancestor reachable only at depth 20 is NOT found, and readProc is called
+// exactly 20 times.
+func TestFindTrackedAncestorDepthBound(t *testing.T) {
+	chain := map[int]int{}
+	for p := 100; p < 200; p++ {
+		chain[p] = p + 1 // 100->101->...->199
+	}
+	calls := 0
+	// Only pid 120 (reachable at depth 20 from 100) is tracked.
+	if got := findTrackedAncestor(tracked(120), 100, chainReader(chain, &calls)); got != 0 {
+		t.Errorf("depth-20 ancestor = %d, want 0 (out of bound)", got)
+	}
+	if calls != 20 {
+		t.Errorf("readProc called %d times, want 20 (depths 0..19)", calls)
+	}
+
+	// The same ancestor one hop closer (depth 19) IS found.
+	calls = 0
+	if got := findTrackedAncestor(tracked(119), 100, chainReader(chain, &calls)); got != 119 {
+		t.Errorf("depth-19 ancestor = %d, want 119", got)
+	}
+}
+
+// §5.5 findTrackedAncestor — pid<=1, a read error, and ppid==0 all return 0.
+func TestFindTrackedAncestorTerminators(t *testing.T) {
+	calls := 0
+	if got := findTrackedAncestor(tracked(100), 1, chainReader(nil, &calls)); got != 0 {
+		t.Errorf("pid<=1 = %d, want 0", got)
+	}
+	if got := findTrackedAncestor(tracked(100), 50, chainReader(map[int]int{}, &calls)); got != 0 {
+		t.Errorf("read error = %d, want 0", got)
+	}
+	if got := findTrackedAncestor(tracked(100), 50, chainReader(map[int]int{50: 0}, &calls)); got != 0 {
+		t.Errorf("ppid==0 = %d, want 0", got)
 	}
 }
