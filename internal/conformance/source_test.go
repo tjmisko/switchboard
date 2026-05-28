@@ -10,48 +10,42 @@ import (
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/conformance"
+	"github.com/tjmisko/switchboard/internal/osproc"
 	"github.com/tjmisko/switchboard/internal/proc"
-	"github.com/tjmisko/switchboard/internal/procwatch"
 	"github.com/tjmisko/switchboard/internal/testsupport"
 )
 
-// osprocSource is the thin adapter wrapping the existing Linux /proc + pidfd
-// concretes behind the neutral conformance.Source interface. Phase 1's
-// internal/osproc linux backend replaces it and reuses RunSourceContract.
-type osprocSource struct{ w *procwatch.Watcher }
+// osprocAdapter wraps the Phase-1 internal/osproc Source behind the neutral
+// conformance.Source interface (the only difference is the neutral struct type).
+// The sway/x11/tmux/macOS backends adopt this same contract in later phases.
+type osprocAdapter struct{ s osproc.Source }
 
-func newOsprocSource() *osprocSource { return &osprocSource{w: procwatch.New()} }
-
-func toNeutral(p proc.Info) conformance.ProcInfo {
+func toNeutral(p osproc.Info) conformance.ProcInfo {
 	return conformance.ProcInfo{PID: p.PID, PPID: p.PPID, Comm: p.Comm, Exe: p.Exe, CWD: p.CWD, TTY: p.TTY}
 }
 
-func (s *osprocSource) Enumerate() ([]conformance.ProcInfo, error) {
-	pids, err := proc.AllPIDs()
+func (a osprocAdapter) Enumerate() ([]conformance.ProcInfo, error) {
+	infos, err := a.s.Enumerate()
 	if err != nil {
 		return nil, err
 	}
-	out := make([]conformance.ProcInfo, 0, len(pids))
-	for _, pid := range pids {
-		info, err := proc.Read(pid)
-		if err != nil {
-			continue
-		}
+	out := make([]conformance.ProcInfo, 0, len(infos))
+	for _, info := range infos {
 		out = append(out, toNeutral(info))
 	}
 	return out, nil
 }
 
-func (s *osprocSource) Read(pid int) (conformance.ProcInfo, error) {
-	info, err := proc.Read(pid)
+func (a osprocAdapter) Read(pid int) (conformance.ProcInfo, error) {
+	info, err := a.s.Read(pid)
 	return toNeutral(info), err
 }
 
-func (s *osprocSource) Watch(ctx context.Context, pid int, onDeath func()) error {
-	return s.w.Watch(ctx, pid, onDeath)
+func (a osprocAdapter) Watch(ctx context.Context, pid int, onDeath func()) error {
+	return a.s.Watch(ctx, pid, onDeath)
 }
 
-func (s *osprocSource) Stop(pid int) { s.w.Stop(pid) }
+func (a osprocAdapter) Stop(pid int) { a.s.Stop(pid) }
 
 // childRegistry tracks spawned testsupport children by pid so the neutral
 // KillChild hook can kill AND reap (reaping is what makes a dead pid read as
@@ -82,8 +76,8 @@ func TestOsprocSourceConformance(t *testing.T) {
 	reg := &childRegistry{m: map[int]*testsupport.Child{}}
 
 	conformance.RunSourceContract(t, conformance.SourceFixture{
-		Source: newOsprocSource(),
-		IsGone: func(err error) bool { return errors.Is(err, proc.ErrGone) },
+		Source: osprocAdapter{s: osproc.New()},
+		IsGone: func(err error) bool { return errors.Is(err, osproc.ErrGone) },
 		SpawnTTYChild: func(t *testing.T) int {
 			return reg.add(testsupport.SpawnTTYChild(t, 60*time.Second))
 		},

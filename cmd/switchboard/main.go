@@ -19,8 +19,8 @@ import (
 	"github.com/tjmisko/switchboard/internal/discovery"
 	"github.com/tjmisko/switchboard/internal/hyprland"
 	"github.com/tjmisko/switchboard/internal/mapping"
+	"github.com/tjmisko/switchboard/internal/osproc"
 	"github.com/tjmisko/switchboard/internal/proc"
-	"github.com/tjmisko/switchboard/internal/procwatch"
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
 )
@@ -41,7 +41,7 @@ func main() {
 	}
 	dropStaleSessions(store)
 
-	watcher := procwatch.New()
+	procSrc := osproc.New()
 	scanner := discovery.New()
 
 	onClaudeAppeared := func(info proc.Info) {
@@ -49,7 +49,7 @@ func main() {
 		sess := mapping.Resolve(ctx, info)
 		store.Apply(func(m map[int]*state.Session) { m[sess.PID] = &sess })
 
-		if err := watcher.Watch(ctx, info.PID, func() {
+		if err := procSrc.Watch(ctx, info.PID, func() {
 			log.Printf("claude pid=%d died", info.PID)
 			store.Apply(func(m map[int]*state.Session) { delete(m, info.PID) })
 			scanner.Forget(info.PID)
