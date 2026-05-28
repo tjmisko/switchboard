@@ -14,7 +14,7 @@ The bottom waybar strip shows one rounded chip per session, color-coded by state
                   │                                         │
   /proc scan ───►│  discovery (1 Hz): comm == "claude"     │
                   │                                         │
-  pidfd_open ───►│  procwatch: EPOLLIN → drop session       │
+  pidfd_open ───►│  procwatch: POLLIN → drop session        │
                   │                                         │
   socket2.sock ─►│  hyprland: window lifecycle + focus      │
                   │                                         │
@@ -60,7 +60,7 @@ The tty match is load-bearing (the kernel can't lose it). Window-title match is 
 
 ```
 cmd/
-  claude-tracker/       daemon — single epoll loop owning all signal sources
+  claude-tracker/       daemon — goroutines fan signal sources into one store
   claude-tracker-ctl/   CLI — list / focus / cycle / pick / hook / bottombar
   claude-waybar/        waybar exec module — one process per slot, emits JSON
 
