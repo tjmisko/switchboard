@@ -1,143 +1,182 @@
 # Switchboard
 
-A discovery-first session tracker for Claude Code, designed for Hyprland + wezterm.
+**See all your Claude Code sessions at a glance, and jump between them.**
 
-Tells you, at a glance and in real time, how many Claude Code sessions you have running, where they live, and what each one is doing — without requiring you to pre-name, pre-tag, or otherwise register them. You just run `claude` somewhere; the tracker figures it out.
+You run `claude` in a few different projects and lose track of which is working,
+which is waiting on you, and where each one lives. Switchboard is a small daemon
+that discovers every `claude` process on your machine — no pre-naming, no
+tagging, no registration — and tells you, in real time, how many are running,
+their working directories, and what each one is doing.
 
-The bottom waybar strip shows one rounded chip per session, color-coded by state (working / idle / waiting-on-permission), with the focused window's chip outlined. The strip auto-hides when no sessions exist and reappears the moment one does — see [Auto-hiding the bottom bar](#auto-hiding-the-bottom-bar).
+It installs as a single binary, **detects your environment at runtime**, and
+degrades gracefully: it works on any Linux box with zero desktop configuration,
+and lights up click-to-focus when it recognizes your window manager and
+terminal.
 
-## Architecture
+## Capability tiers
+
+Everything hangs on two tiers. Switchboard never hard-fails on a missing
+integration — it just offers what the environment supports.
+
+| Tier | What you get | Needs | Availability |
+|------|--------------|-------|--------------|
+| **Observe** | live count, working directory, and per-session status (working / idle / waiting-on-permission) | nothing but the OS process layer | **always** — the floor |
+| **Navigate** | click or keybind to focus a specific session's window + pane | a supported window manager **and** terminal | when both are detected; otherwise degrades to Observe |
+
+`state.json` (the [stable public contract](docs/state-schema.md)) is emitted in
+every tier, so any bar or script can render your sessions. The headline is the
+Observe tier: **runs anywhere, zero desktop config, any bar can render it.**
+
+### Detected backends
+
+One binary; it probes the environment and picks backends live (build tags are
+used only for the OS syscall layer).
+
+| Seam | Backends | Detection |
+|------|----------|-----------|
+| **OS process** (Observe floor) | Linux `/proc` + `pidfd` · macOS *(planned)* | per-OS at build |
+| **Window manager** (Navigate) | Hyprland · sway · i3 · X11/EWMH · `none` | `HYPRLAND_INSTANCE_SIGNATURE` → `SWAYSOCK` → `I3SOCK` → `DISPLAY` |
+| **Terminal** (Navigate) | wezterm · tmux · `none` | tmux server socket · wezterm gui sockets (composes when nested) |
+
+The daemon logs its chosen stack at startup and records it in the
+`capabilities` block of `state.json`.
+
+## Quickstart (Observe tier, one command after install)
+
+```bash
+go install github.com/tjmisko/switchboard/cmd/...@latest
+
+# run the daemon (foreground; see the systemd unit below for a managed service)
+switchboard &
+
+# watch your sessions live — in any terminal, even over SSH
+claude-tui
+```
+
+`claude-tui` is the reference renderer: a zero-dependency live list of every
+session with its cwd, status, and (if resolved) workspace. No window manager,
+bar, or terminal integration required.
 
 ```
-                  ┌────────────────────────────────────────┐
-                  │           switchboard (daemon)       │
-                  │                                         │
-  /proc scan ───►│  discovery (1 Hz): comm == "claude"     │
-                  │                                         │
-  pidfd_open ───►│  procwatch: POLLIN → drop session        │
-                  │                                         │
-  socket2.sock ─►│  hyprland: window lifecycle + focus      │
-                  │                                         │
-  claude hooks ─►│  RPC "hook" cmd: enrich Claude.Status    │
-                  │                                         │
-                  │  → ~/.cache/switchboard/state.json    │
-                  │  → $XDG_RUNTIME_DIR/switchboard.sock  │
-                  └────────────────────────────────────────┘
-                              │              │
-                              ▼              ▼
-                       switchboard-waybar    switchboard-ctl
-                       (one process     (one-shot CLI for
-                       per slot 0..9)   picker / cycle / focus)
+switchboard · 3 sessions · navigate · wm=hyprland term=wezterm
+
+  * ● working     ~/Projects/switchboard                   pid 4821  ws 4
+    ● idle        ~/Tools/other                            pid 5102  ws 2
+    ○ unknown     ~/scratch                                pid 5390
 ```
 
-**Discovery is the source of truth.** Hooks are pure enrichment — if `~/.claude/settings.json` lost its hooks tomorrow, the tracker would still know every session exists, where its wezterm pane lives, and which Hyprland window owns it. The only thing it would lose is the working/idle/permission status colors.
+Prefer your own UI? Read `~/.cache/switchboard/state.json` directly — see the
+[schema](docs/state-schema.md) and [bar recipes](docs/bars/README.md) for
+polybar / eww / i3blocks.
 
-**Death is observed, never inferred.** Each tracked PID has a `pidfd_open(2)` watching it; `POLLIN` fires the instant the kernel marks the process a zombie, regardless of how it died (Ctrl+C, `/exit`, kill, OOM, parent shell death). The wezterm pane keeps living; the chip just disappears.
-
-## Mapping pipeline
-
-For every discovered claude PID, the daemon assembles:
+## How it works
 
 ```
-claude PID
-  ├── /proc/<pid>/comm           "claude"          (filter)
-  ├── /proc/<pid>/cwd            project dir
-  ├── /proc/<pid>/fd/0..2        → "/dev/pts/N"
-  └── pidfd_open                 death signal
-
-mux_pid + tty_name
-  └── wezterm cli --socket=… list  (per-mux walk under $XDG_RUNTIME_DIR/wezterm/)
-      → pane_id, window_id, window_title
-
-mux_pid + window_title
-  └── hyprctl clients -j          (match by pid AND title)
-      → hyprland address, workspace
+                  ┌──────────────────────────────────────────┐
+                  │            switchboard (daemon)            │
+  OS process  ───►│  discovery: comm == "claude"  (Observe)    │
+   layer          │  death watch: pidfd/kqueue → drop session  │
+                  │                                            │
+  WM seam     ───►│  window lifecycle + focus  (Navigate)      │
+  terminal    ───►│  pane locate + focus       (Navigate)      │
+  claude hooks ──►│  RPC "hook": enrich status                 │
+                  │                                            │
+                  │  → ~/.cache/switchboard/state.json         │
+                  │  → $XDG_RUNTIME_DIR/switchboard.sock (RPC)  │
+                  └──────────────────────────────────────────┘
+                        │            │             │
+                        ▼            ▼             ▼
+                   claude-tui   switchboard-ctl   any bar
+                  (reference)   (focus/cycle/…)  (reads state.json)
 ```
 
-The tty match is load-bearing (the kernel can't lose it). Window-title match is the weakest link — relies on wezterm pushing its title to the WM, which it does — and falls back gracefully on collision.
+Two load-bearing invariants:
 
-## Components
+- **Discovery is the source of truth.** Hooks are pure enrichment — if your
+  `~/.claude/settings.json` lost its hooks tomorrow, Switchboard would still
+  know every session exists and (on a Navigate stack) which window owns it. It
+  would only lose the working/idle/permission status.
+- **Death is observed, never inferred.** Each tracked PID has a kernel death
+  handle (`pidfd_open(2)` on Linux); the session disappears the instant the
+  process dies, however it died (Ctrl+C, `/exit`, kill, OOM, shell hangup).
+
+### Mapping (Navigate)
+
+The join from a `claude` PID to a focusable window is anchored on the
+**controlling tty**, which the kernel can't lose:
+
+```
+claude PID ──/proc──► cwd, tty, pidfd death signal
+   tty      ──terminal seam──► pane (mux, pane id, window title)
+   mux+title──WM seam──► window address, workspace   (opaque, backend-owned ref)
+```
+
+The tty match is bulletproof; the `(mux, title)` join to the WM window is
+best-effort and returns nothing rather than guessing on a collision (it retries
+next tick). A session that can't be mapped stays in the Observe tier.
+
+## Layout
 
 ```
 cmd/
-  switchboard/       daemon — goroutines fan signal sources into one store
-  switchboard-ctl/   CLI — list / focus / cycle / pick / hook / bottombar
-  switchboard-waybar/        waybar exec module — one process per slot, emits JSON
+  switchboard/        daemon — fans the signal sources into one store
+  switchboard-ctl/    CLI — list / focus / cycle / pick / hook / bottombar
+  claude-tui/         reference TUI renderer (subscribe → live list)
+  switchboard-waybar/ waybar exec module — one process per slot (Hyprland extra)
 
 internal/
-  proc/                 /proc reader (comm, cwd, ppid, tty)
-  discovery/            1 Hz scan filter
-  procwatch/            pidfd_open + POLLIN per PID
-  hyprland/             clients + dispatch + socket2 stream
-  wezterm/              multi-mux cli list + activate-pane
-  mapping/              orchestrates proc → pane → addr
-  state/                in-memory store + atomic state.json mirror
-  rpc/                  Unix socket: list / focus / cycle / pick / subscribe / hook
-
-systemd/
-  switchboard.service  user service, Restart=always
+  osproc/      Seam 1 — OS process layer (enumerate + death watch; per-OS)
+  terminal/    Seam 2 — terminal locator (wezterm, tmux, none, chain)
+  wm/          Seam 3 — window manager (hyprland, sway/i3, x11, none)
+  detect/      runtime backend selection + capability reporting
+  proc/        Linux /proc reader (used by osproc_linux)
+  discovery/   1 Hz claude scan filter
+  hyprland/    Hyprland IPC client (wrapped by wm/hyprland)
+  wezterm/     wezterm multi-mux cli client (wrapped by terminal/wezterm)
+  mapping/     orchestrates proc → pane → window
+  state/       in-memory store + atomic state.json mirror
+  rpc/         Unix socket: list / focus / subscribe / hook
+  conformance/ backend-agnostic contract suites reused by every backend
+  testsupport/ fixtures (fake conn, fake /proc, real-child death helpers)
 ```
 
-## Install
+The portability design and phase plan live in
+[`docs/portability-plan.md`](docs/portability-plan.md).
+
+## `switchboard-ctl`
 
 ```bash
-go install ./...
+switchboard-ctl list                # human-friendly snapshot
+switchboard-ctl --json list         # raw JSON
+switchboard-ctl status              # one-line count
+switchboard-ctl focus active        # jump to the focused session
+switchboard-ctl focus pid:<n>       # jump to a specific PID (unambiguous)
+switchboard-ctl focus idx:<n>       # jump to the Nth session (unambiguous)
+switchboard-ctl focus <n>           # PID n if present, else index n (back-compat)
+switchboard-ctl cycle next|prev     # focus next/prev session, wrapping
+switchboard-ctl attention           # jump to first permission, else first idle
+switchboard-ctl pick                # pid<TAB>label<TAB>ws<TAB>cwd lines (for fzf)
+```
+
+On an Observe-only stack, `focus` returns a clean "navigate unsupported"
+message instead of failing obscurely.
+
+## Run as a service
+
+```bash
 mkdir -p ~/.config/systemd/user
 cp systemd/switchboard.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now switchboard.service
 ```
 
-Then in `~/.config/hypr/hyprland.conf`, before any `exec-once` that needs Hyprland env in systemd-user-land:
+Force a backend (e.g. to test degradation) with the daemon flags
+`-wm auto|hyprland|sway|i3|x11|none` and `-terminal auto|wezterm|tmux|none`.
 
-```
-exec-once = systemctl --user import-environment HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY XDG_CURRENT_DESKTOP DISPLAY
-exec-once = systemctl --user start --no-block switchboard.service
-```
+## Claude Code hooks (optional status enrichment)
 
-## Integration points (this machine)
-
-### Waybar — two bars, two processes
-
-The top bar and the bottom claude strip run as **separate waybar processes** so the bottom one can be shown/hidden without touching the top. waybar's `--bar` flag does not filter a single array config (it loads every bar regardless), so the split is done with two config files:
-
-- `~/.config/waybar/config.jsonc` — the top bar only. Launched at boot by `exec-once = waybar` (the default config path).
-- `~/.config/waybar/claude.jsonc` — the bottom strip only. **Not** launched directly; its lifecycle is owned by `switchboard-ctl bottombar` (see below).
-
-`claude.jsonc` declares 10 `custom/claude-N` modules so each chip is a real GTK widget with its own CSS (border, border-radius, hover). Each runs `switchboard-waybar --slot N` and emits a JSON line per snapshot update; `class` carries the status + `focused` so `~/.config/waybar/style.css` paints the chip. Empty slots collapse to zero width.
-
-Click semantics:
-- left  — focus that slot's session (`switchboard-ctl focus N`)
-- right — open the rofi picker (`~/.config/scripts/claude-picker`)
-- scroll up/down — cycle prev/next
-
-### Auto-hiding the bottom bar
-
-The bottom strip obeys one invariant:
-
-```
-bottom bar runs  ⟺  (top bar visible)  AND  (≥1 claude session)
-```
-
-Visibility is **process existence**, not a SIGUSR1 toggle: `switchboard-ctl bottombar` literally starts and kills the `waybar -c claude.jsonc` process. There is no toggle state to drift, so the two bars never alternate or desync.
-
-Two inputs drive the invariant, each owned by a different actor:
-
-- **session count** — the daemon. `switchboard-ctl bottombar watch` subscribes to the daemon stream (plus a 3 s safety/self-heal ticker) and shows/kills the bottom bar as sessions come and go. Run once at startup:
-
-  ```
-  exec-once = switchboard-ctl bottombar watch
-  ```
-
-- **top-bar visibility** — the F8 master toggle in `~/.config/scripts/hypr-float-center`. That script touches/removes a marker file to hide/show the top bar, then calls `switchboard-ctl bottombar reconcile` so the bottom bar follows in lockstep. The script also excludes the bottom bar's pid (recorded at `$XDG_RUNTIME_DIR/switchboard/bottom-waybar.pid`) when it SIGUSR1s the top bar, so toggling the top never touches the bottom.
-
-The watcher kills the bottom bar by **process group**, so the 10 `switchboard-waybar` slot subprocesses die with it (no orphans), and reaps the resulting children so they never linger as zombies.
-
-Overridable via env: `SWITCHBOARD_WAYBAR_MARKER` (default `/tmp/hypr-float-center/waybar-hidden`) and `SWITCHBOARD_BOTTOM_CONFIG` (default `~/.config/waybar/claude.jsonc`).
-
-### Claude Code hooks (optional enrichment)
-
-In `~/.claude/settings.json`:
+Status colors come from Claude Code hooks. Without them, sessions still appear
+(Observe) but show `unknown` status. In `~/.claude/settings.json`:
 
 ```json
 "hooks": {
@@ -149,43 +188,72 @@ In `~/.claude/settings.json`:
 }
 ```
 
-The forwarder is fire-and-forget. Hook failures cannot corrupt state — they just leave a session at its previous status.
-
-## Useful commands
-
-```bash
-switchboard-ctl list                # human-friendly snapshot
-switchboard-ctl --json list         # raw JSON
-switchboard-ctl status              # one-line count
-switchboard-ctl focus active        # jump to currently-focused session
-switchboard-ctl focus <pid>         # jump to specific session
-switchboard-ctl focus <N>           # jump to Nth session (by start time)
-switchboard-ctl cycle next|prev     # focus next/prev session, wrapping
-switchboard-ctl attention           # jump to first permission, else first idle
-switchboard-ctl pick                # pid<TAB>label<TAB>ws<TAB>cwd lines
-```
-
-Live state mirror at `~/.cache/switchboard/state.json` (atomic-rename writes); useful for ad-hoc scripts.
+The forwarder is fire-and-forget; a broken hook can never corrupt state or
+block Claude Code.
 
 ## Requirements
 
-- Linux with `pidfd_open(2)` (kernel 5.3+)
-- `wezterm` and `hyprctl` on PATH
-- Go 1.25 for build
-- `rofi` (for picker), `jq` (for picker)
-- A Nerd Font is *not* required (CSS chips replaced the powerline-glyph approach)
+- **Observe:** Linux with `pidfd_open(2)` (kernel 5.3+). Go 1.25 to build.
+- **Navigate:** a supported WM (Hyprland / sway / i3 / X11) **and** terminal
+  (wezterm / tmux) on `PATH`.
+- macOS support (Observe tier) is planned (see the plan).
 
 ## Status / roadmap
 
-Working:
-- `/proc` discovery, pidfd death detection
-- wezterm multi-mux + Hyprland socket2 mapping
-- waybar 10-slot strip with CSS borders
-- rofi picker, cycle keybindings
-- Claude Code hooks for status colors
-- systemd user service
-- bottom-bar auto-hide (`bottombar watch`/`reconcile`), split top/bottom waybar processes, F8 lockstep
+Done: runtime-detecting `osproc` / `terminal` / `wm` seams behind a reusable
+conformance contract; Hyprland + sway/i3 + X11/EWMH WM backends; wezterm + tmux
+terminal backends with per-session locator chaining; capability reporting;
+`claude-tui` reference renderer; the Hyprland + waybar two-bar appliance
+(appendix).
 
-Not yet:
-- i3 port (would swap `internal/hyprland` for `internal/i3`; same RPC + same waybar binary)
-- PID-pinned click selectors (today a click after a session-end race can target a neighbor; rare in practice)
+Next: macOS OS backend (`libproc` + `kqueue`); verified polybar/eww recipes;
+the tmux→WM-window focus bridge.
+
+---
+
+## Appendix — the Hyprland + waybar appliance
+
+The original Switchboard was a Hyprland + wezterm + waybar appliance. That
+integration still ships as a Hyprland-specific extra; the portable core above
+does not depend on it.
+
+### Waybar — two bars, two processes
+
+The top bar and the bottom claude strip run as **separate waybar processes** so
+the bottom one can be shown/hidden without touching the top. The split is done
+with two config files:
+
+- `~/.config/waybar/config.jsonc` — the top bar only (launched by `exec-once = waybar`).
+- `~/.config/waybar/claude.jsonc` — the bottom strip only; **not** launched
+  directly. Its lifecycle is owned by `switchboard-ctl bottombar`.
+
+`claude.jsonc` declares 10 `custom/claude-N` modules so each chip is a real GTK
+widget with its own CSS. Each runs `switchboard-waybar --slot N` and emits a
+JSON line per snapshot; `class` carries status + `focused` so `style.css` paints
+the chip. Click = focus that slot; right-click = rofi picker; scroll = cycle.
+
+Hyprland startup wiring:
+
+```
+exec-once = systemctl --user import-environment HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY XDG_CURRENT_DESKTOP DISPLAY
+exec-once = systemctl --user start --no-block switchboard.service
+exec-once = switchboard-ctl bottombar watch
+```
+
+### Auto-hiding the bottom bar
+
+```
+bottom bar runs  ⟺  (top bar visible)  AND  (≥1 claude session)
+```
+
+Visibility is **process existence**, not a toggle: `switchboard-ctl bottombar`
+literally starts and kills the `waybar -c claude.jsonc` process, so the two bars
+never desync. The session-count input comes from the daemon stream (`bottombar
+watch`, plus a 3 s self-heal ticker); the top-bar-visibility input comes from
+the F8 master toggle, which touches a marker file and calls `bottombar
+reconcile` so the bottom bar follows in lockstep. The watcher kills by process
+group (no orphan slot subprocesses) and reaps them (no zombies).
+
+Overridable via `SWITCHBOARD_WAYBAR_MARKER` and `SWITCHBOARD_BOTTOM_CONFIG`.
+This auto-hide logic is deeply Hyprland-specific and stays an opt-in extra, not
+part of the portable core.

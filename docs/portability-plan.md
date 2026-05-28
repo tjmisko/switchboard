@@ -162,10 +162,10 @@ The daemon's `-wm` flag forces any single backend.
 ### Phase 5 — UI portability & docs  (the advertising payload)
 > Pre: Phases 1–4 as far as shipped. Can start the docs subset right after Phase 1.
 
-- [ ] **5.1 `state.json` contract doc** (done in 0.1, finalize here with examples per tier).
-- [ ] **5.2 Reference TUI renderer.** `cmd/claude-tui`: reads RPC `subscribe`, draws a live list (count, cwd, status). Zero desktop deps — the demo that works in any terminal, even over SSH. DoD: `claude-tui` shows live sessions with no WM/bar.
-- [ ] **5.3 Bar recipes.** `docs/bars/` with copy-paste polybar, eww, i3blocks, waybar configs that consume the same `status`/`pick` commands. DoD: at least polybar + eww recipes verified.
-- [ ] **5.4 Install story.** Single `go install`; runtime detection means no per-WM build. Update README: capability matrix table, "works with X" badges, quickstart that reaches Observe tier in one command. DoD: README leads with the portable pitch; per-WM setup demoted to an appendix.
+- [x] **5.1 `state.json` contract doc** (done in 0.1, finalize here with examples per tier). *(Done: per-tier Observe/Navigate examples added to `docs/state-schema.md`.)*
+- [x] **5.2 Reference TUI renderer.** `cmd/claude-tui`: reads RPC `subscribe`, draws a live list (count, cwd, status). Zero desktop deps — the demo that works in any terminal, even over SSH. DoD: `claude-tui` shows live sessions with no WM/bar. *(Done: dependency-free ANSI alt-screen, reconnect, `-once` plain frame; pure renderer unit-tested; verified live against the daemon.)*
+- [ ] **5.3 Bar recipes.** `docs/bars/` with copy-paste polybar, eww, i3blocks, waybar configs that consume the same `status`/`pick` commands. DoD: at least polybar + eww recipes verified. *(Partial: `docs/bars/README.md` provides polybar/eww/i3blocks recipes reading the `state.json` contract, **clearly marked unverified** — polybar/eww aren't installed on the dev box. The waybar path is the verified one. End-to-end polybar/eww verification is the remaining DoD.)*
+- [x] **5.4 Install story.** Single `go install`; runtime detection means no per-WM build. Update README: capability matrix table, "works with X" badges, quickstart that reaches Observe tier in one command. DoD: README leads with the portable pitch; per-WM setup demoted to an appendix. *(Done: README leads with the pitch + capability-tier + backend matrices + one-command `claude-tui` quickstart; the Hyprland/waybar appliance is now an appendix.)*
 
 ---
 
