@@ -1,0 +1,17 @@
+[Unit]
+Description=Claude Code session tracker daemon
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/go/bin/claude-tracker
+Restart=always
+RestartSec=2
+# Hyprland exports these into the user systemd environment via
+# `systemctl --user import-environment` in the Hyprland startup script.
+PassEnvironment=HYPRLAND_INSTANCE_SIGNATURE XDG_RUNTIME_DIR XDG_CACHE_HOME
+NoNewPrivileges=true
+
+[Install]
+WantedBy=graphical-session.target

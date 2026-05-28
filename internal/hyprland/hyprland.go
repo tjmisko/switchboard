@@ -1,0 +1,165 @@
+// Package hyprland talks to Hyprland's two IPC sockets: the request socket
+// (commands like `clients`, `dispatch`) and socket2 (an async event stream).
+//
+// Event payloads are documented at https://wiki.hypr.land/IPC/. We only care
+// about a small subset (openwindow, closewindow, movewindowv2, activewindowv2,
+// windowtitlev2) — anything else is dropped at parse time.
+package hyprland
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+// Client is one entry from `hyprctl clients -j`.
+type Client struct {
+	Address   string    `json:"address"` // "0x..."
+	PID       int       `json:"pid"`
+	Class     string    `json:"class"`
+	Title     string    `json:"title"`
+	Workspace Workspace `json:"workspace"`
+	Monitor   int       `json:"monitor"`
+	Mapped    bool      `json:"mapped"`
+}
+
+type Workspace struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+}
+
+// Clients runs `hyprctl clients -j` over the request socket and parses the
+// JSON. We bypass the hyprctl binary to keep latency low and avoid spawning.
+func Clients(ctx context.Context) ([]Client, error) {
+	resp, err := request(ctx, "j/clients")
+	if err != nil {
+		return nil, err
+	}
+	var out []Client
+	if err := json.Unmarshal(resp, &out); err != nil {
+		return nil, fmt.Errorf("parse clients: %w", err)
+	}
+	return out, nil
+}
+
+// ActiveWindowAddress returns the address of the currently focused window, or
+// "" if nothing is focused. Used at startup to set the initial Focused flag
+// without waiting for the user to switch windows.
+func ActiveWindowAddress(ctx context.Context) (string, error) {
+	resp, err := request(ctx, "j/activewindow")
+	if err != nil {
+		return "", err
+	}
+	var aw struct {
+		Address string `json:"address"`
+	}
+	if err := json.Unmarshal(resp, &aw); err != nil {
+		return "", fmt.Errorf("parse activewindow: %w", err)
+	}
+	return aw.Address, nil
+}
+
+// Dispatch sends a `dispatch` command (e.g. "focuswindow address:0x...") and
+// returns the raw response bytes. Hyprland responds with "ok" on success.
+func Dispatch(ctx context.Context, cmd string) error {
+	resp, err := request(ctx, "/dispatch "+cmd)
+	if err != nil {
+		return err
+	}
+	if !strings.HasPrefix(string(resp), "ok") {
+		return fmt.Errorf("dispatch %q: %s", cmd, strings.TrimSpace(string(resp)))
+	}
+	return nil
+}
+
+// Event is one line from socket2. Name is the event identifier
+// (openwindow/closewindow/...); Data is the raw comma-separated payload.
+type Event struct {
+	Name string
+	Data string
+}
+
+// Subscribe opens socket2 and streams events into the returned channel.
+// Closes the channel when the context is cancelled or the socket dies.
+func Subscribe(ctx context.Context) (<-chan Event, error) {
+	sock, err := socket2Path()
+	if err != nil {
+		return nil, err
+	}
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		return nil, err
+	}
+	ch := make(chan Event, 32)
+	go func() {
+		defer close(ch)
+		defer conn.Close()
+		go func() {
+			<-ctx.Done()
+			conn.Close()
+		}()
+		scanner := bufio.NewScanner(conn)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			line := scanner.Text()
+			name, data, ok := strings.Cut(line, ">>")
+			if !ok {
+				continue
+			}
+			select {
+			case ch <- Event{Name: name, Data: data}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return ch, nil
+}
+
+// request sends one command to the Hyprland request socket and reads the
+// response until EOF. The protocol is text: the client writes the command and
+// the server writes the response, then closes the connection.
+func request(ctx context.Context, cmd string) ([]byte, error) {
+	sock, err := requestSocketPath()
+	if err != nil {
+		return nil, err
+	}
+	d := net.Dialer{Timeout: 2 * time.Second}
+	conn, err := d.DialContext(ctx, "unix", sock)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	if dl, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(dl)
+	} else {
+		conn.SetDeadline(time.Now().Add(2 * time.Second))
+	}
+	if _, err := conn.Write([]byte(cmd)); err != nil {
+		return nil, err
+	}
+	return io.ReadAll(conn)
+}
+
+func requestSocketPath() (string, error) { return socketPath(".socket.sock") }
+func socket2Path() (string, error)       { return socketPath(".socket2.sock") }
+
+func socketPath(name string) (string, error) {
+	sig := os.Getenv("HYPRLAND_INSTANCE_SIGNATURE")
+	if sig == "" {
+		return "", errors.New("HYPRLAND_INSTANCE_SIGNATURE not set; not running under Hyprland?")
+	}
+	xdg := os.Getenv("XDG_RUNTIME_DIR")
+	if xdg == "" {
+		return "", errors.New("XDG_RUNTIME_DIR not set")
+	}
+	return filepath.Join(xdg, "hypr", sig, name), nil
+}
