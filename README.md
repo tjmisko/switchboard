@@ -139,6 +139,7 @@ Overridable via env: `SWITCHBOARD_WAYBAR_MARKER` (default `/tmp/hypr-float-cente
 
 ```
 bind = $mainMod, A, exec, ~/.config/scripts/claude-picker
+bind = $mainMod SHIFT, A, exec, switchboard-ctl attention
 bind = $mainMod $altMod, Up,    exec, switchboard-ctl cycle next
 bind = $mainMod $altMod, Down,  exec, switchboard-ctl cycle prev
 bind = $mainMod $altMod, Right, exec, switchboard-ctl cycle next
@@ -171,6 +172,7 @@ switchboard-ctl focus active        # jump to currently-focused session
 switchboard-ctl focus <pid>         # jump to specific session
 switchboard-ctl focus <N>           # jump to Nth session (by start time)
 switchboard-ctl cycle next|prev     # focus next/prev session, wrapping
+switchboard-ctl attention           # jump to first permission, else first idle
 switchboard-ctl pick                # pid<TAB>label<TAB>ws<TAB>cwd lines
 ```
 
