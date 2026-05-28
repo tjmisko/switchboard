@@ -8,6 +8,8 @@
 package detect
 
 import (
+	"os"
+
 	"github.com/tjmisko/switchboard/internal/osproc"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/terminal"
@@ -27,7 +29,7 @@ type Stack struct {
 // environment; "none" forces the Observe-only backend; a named backend forces
 // that one regardless of availability (useful for testing degradation).
 type Options struct {
-	WM       string // "auto" | "hyprland" | "none"
+	WM       string // "auto" | "hyprland" | "sway" | "i3" | "x11" | "none"
 	Terminal string // "auto" | "wezterm" | "none"
 }
 
@@ -44,13 +46,41 @@ func detectWM(force string) wm.Manager {
 	switch force {
 	case "hyprland":
 		return wm.NewHyprland()
+	case "sway", "i3":
+		return wm.NewI3()
+	case "x11":
+		return wm.NewX11()
 	case "none":
 		return wm.NewNone()
 	}
-	if h := wm.NewHyprland(); h.Available() {
-		return h
+	return detectWMAuto()
+}
+
+// detectWMAuto selects the WM backend by environment precedence:
+//
+//	Hyprland  (HYPRLAND_INSTANCE_SIGNATURE)
+//	sway      (SWAYSOCK)
+//	i3        (I3SOCK)
+//	X11/EWMH  (DISPLAY)
+//	none
+//
+// A native Wayland compositor or i3's own IPC wins over generic X11/EWMH: under
+// sway or i3, DISPLAY is also set (XWayland), but the richer native IPC — with
+// pids (sway) and a precise event stream — is preferred. X11/EWMH is the
+// fallback for any other DISPLAY-backed WM.
+func detectWMAuto() wm.Manager {
+	switch {
+	case os.Getenv("HYPRLAND_INSTANCE_SIGNATURE") != "":
+		return wm.NewHyprland()
+	case os.Getenv("SWAYSOCK") != "":
+		return wm.NewI3()
+	case os.Getenv("I3SOCK") != "":
+		return wm.NewI3()
+	case os.Getenv("DISPLAY") != "":
+		return wm.NewX11()
+	default:
+		return wm.NewNone()
 	}
-	return wm.NewNone()
 }
 
 func detectTerminal(force string) terminal.Locator {
