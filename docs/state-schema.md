@@ -125,11 +125,13 @@ Present once a Claude Code hook has fired for the session.
 | `Stop`, `SessionStart` | `idle` |
 | (any other / unknown) | unchanged (empty mapping; status not modified) |
 
-## The future `capabilities` block (reserved — Phase 1.4)
+## The `capabilities` block (Phase 1.4)
 
-Not yet emitted. Phase 1.4 adds a top-level `capabilities` object reporting the
-detected backend stack and which tier is active, so a renderer can decide
-whether to show "jump to" affordances:
+Emitted since Phase 1.4. A top-level `capabilities` object reports the detected
+backend stack and which tier is active, so a renderer can decide whether to show
+"jump to" affordances. It is **omitted entirely** (never `null`) by a daemon
+that has not set it — consumers must tolerate its absence for forward/backward
+compatibility:
 
 ```jsonc
 {

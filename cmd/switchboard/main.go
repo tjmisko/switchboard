@@ -15,13 +15,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/detect"
 	"github.com/tjmisko/switchboard/internal/discovery"
 	"github.com/tjmisko/switchboard/internal/mapping"
-	"github.com/tjmisko/switchboard/internal/osproc"
 	"github.com/tjmisko/switchboard/internal/proc"
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
-	"github.com/tjmisko/switchboard/internal/terminal"
 	"github.com/tjmisko/switchboard/internal/wm"
 )
 
@@ -30,21 +29,29 @@ func main() {
 	socketPath := flag.String("socket", defaultSocketPath(), "path to RPC unix socket")
 	scanInterval := flag.Duration("scan-interval", 1*time.Second, "/proc scan interval")
 	reconcileInterval := flag.Duration("reconcile-interval", 5*time.Second, "full reconcile interval")
+	wmFlag := flag.String("wm", "auto", "WM backend: auto|hyprland|none")
+	terminalFlag := flag.String("terminal", "auto", "terminal backend: auto|wezterm|none")
 	flag.Parse()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	stack := detect.Detect(detect.Options{WM: *wmFlag, Terminal: *terminalFlag})
+	caps := stack.Capabilities()
+	log.Printf("backends: wm=%s terminal=%s observe=%t navigate=%t",
+		caps.WM, caps.Terminal, caps.Observe, caps.Navigate)
+
 	store := state.New(*statePath)
+	store.SetCapabilities(caps)
 	if err := store.Load(); err != nil {
 		log.Printf("hydrate: %v (continuing)", err)
 	}
 	dropStaleSessions(store)
 
-	procSrc := osproc.New()
+	procSrc := stack.OSProc
+	term := stack.Terminal
+	manager := stack.WM
 	scanner := discovery.New()
-	term := terminal.NewWezterm()
-	manager := wm.NewHyprland()
 	resolver := mapping.NewResolver(term, manager)
 
 	onClaudeAppeared := func(info proc.Info) {
