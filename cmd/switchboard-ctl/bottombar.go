@@ -14,7 +14,7 @@ package main
 //
 //	top visible : the F8 master toggle, recorded as the presence/absence of a
 //	              marker file (absent => visible). Owned by hypr-float-center.
-//	sessions    : the claude-tracker daemon's session count.
+//	sessions    : the switchboard daemon's session count.
 //
 // `bottombar watch` reacts to session changes (subscribe stream + safety
 // ticker). `bottombar reconcile` is the one-shot the F8 script calls after it
@@ -31,7 +31,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/tjmisko/claude-tracker/internal/rpc"
+	"github.com/tjmisko/switchboard/internal/rpc"
 	"golang.org/x/sys/unix"
 )
 
@@ -48,10 +48,10 @@ func bottomBarConfigDefault(socketPath string) bottomBarConfig {
 	home, _ := os.UserHomeDir()
 	return bottomBarConfig{
 		socketPath:   socketPath,
-		marker:       envOr("CLAUDE_TRACKER_WAYBAR_MARKER", "/tmp/hypr-float-center/waybar-hidden"),
-		pidFile:      filepath.Join(run, "claude-tracker", "bottom-waybar.pid"),
-		lockFile:     filepath.Join(run, "claude-tracker", "bottombar.lock"),
-		waybarConfig: envOr("CLAUDE_TRACKER_BOTTOM_CONFIG", filepath.Join(home, ".config", "waybar", "claude.jsonc")),
+		marker:       envOr("SWITCHBOARD_WAYBAR_MARKER", "/tmp/hypr-float-center/waybar-hidden"),
+		pidFile:      filepath.Join(run, "switchboard", "bottom-waybar.pid"),
+		lockFile:     filepath.Join(run, "switchboard", "bottombar.lock"),
+		waybarConfig: envOr("SWITCHBOARD_BOTTOM_CONFIG", filepath.Join(home, ".config", "waybar", "claude.jsonc")),
 	}
 }
 
@@ -217,7 +217,7 @@ func ensureStopped(cfg bottomBarConfig) {
 	if pid := bottomPID(cfg); pid > 0 {
 		// Negative pid targets the whole process group. The bottom waybar is a
 		// session/group leader (Setsid below), so this also reaps the
-		// claude-waybar slot subprocesses — no orphans writing to a dead pipe.
+		// switchboard-waybar slot subprocesses — no orphans writing to a dead pipe.
 		if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil {
 			_ = syscall.Kill(pid, syscall.SIGTERM)
 		}
