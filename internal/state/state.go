@@ -35,9 +35,10 @@ type WeztermInfo struct {
 }
 
 type HyprlandInfo struct {
-	Address   string `json:"address"`
-	Workspace string `json:"workspace"`
-	Monitor   string `json:"monitor"`
+	Address     string `json:"address"`
+	Workspace   string `json:"workspace"`
+	WorkspaceID int    `json:"workspace_id"`
+	Monitor     string `json:"monitor"`
 }
 
 type ClaudeInfo struct {
@@ -94,9 +95,36 @@ func (s *Store) snapshotLocked() Snapshot {
 		sessions = append(sessions, *sess)
 	}
 	sort.Slice(sessions, func(i, j int) bool {
-		return sessions[i].StartedAt.Before(sessions[j].StartedAt)
+		return lessChipOrder(sessions[i], sessions[j])
 	})
 	return Snapshot{Sessions: sessions, UpdatedAt: time.Now()}
+}
+
+// lessChipOrder defines the left-to-right chip order on the bottom bar:
+// sessions with a resolved workspace come first, ordered by numeric workspace
+// ID (so chips follow workspace order); within a workspace, and among
+// sessions whose workspace is not yet resolved, oldest-started wins.
+// Unresolved-workspace sessions are pushed to the end.
+func lessChipOrder(a, b Session) bool {
+	aID, aResolved := workspaceID(a)
+	bID, bResolved := workspaceID(b)
+	if aResolved != bResolved {
+		return aResolved // resolved sessions sort before unresolved ones
+	}
+	if aResolved && aID != bID {
+		return aID < bID
+	}
+	return a.StartedAt.Before(b.StartedAt)
+}
+
+// workspaceID returns the session's Hyprland workspace ID and whether it is
+// resolved. ID 0 is treated as unresolved (Hyprland workspaces are positive,
+// or negative for special workspaces).
+func workspaceID(s Session) (int, bool) {
+	if s.Hyprland == nil || s.Hyprland.WorkspaceID == 0 {
+		return 0, false
+	}
+	return s.Hyprland.WorkspaceID, true
 }
 
 // Subscribe returns a channel that receives every snapshot after a mutation.
