@@ -30,7 +30,7 @@ type Stack struct {
 // that one regardless of availability (useful for testing degradation).
 type Options struct {
 	WM       string // "auto" | "hyprland" | "sway" | "i3" | "x11" | "none"
-	Terminal string // "auto" | "wezterm" | "none"
+	Terminal string // "auto" | "wezterm" | "tmux" | "none"
 }
 
 // Detect selects the backend stack for the current environment.
@@ -87,13 +87,29 @@ func detectTerminal(force string) terminal.Locator {
 	switch force {
 	case "wezterm":
 		return terminal.NewWezterm()
+	case "tmux":
+		return terminal.NewTmux()
 	case "none":
 		return terminal.NewNone()
 	}
-	if w := terminal.NewWezterm(); w.Available() {
-		return w
+	// auto: compose the available backends innermost-first (tmux owns the pane a
+	// claude actually runs in; wezterm is the outer window). Per-session nesting
+	// means the right backend varies by tty, so the chain tries each in order.
+	var locs []terminal.Locator
+	if tx := terminal.NewTmux(); tx.Available() {
+		locs = append(locs, tx)
 	}
-	return terminal.NewNone()
+	if wz := terminal.NewWezterm(); wz.Available() {
+		locs = append(locs, wz)
+	}
+	switch len(locs) {
+	case 0:
+		return terminal.NewNone()
+	case 1:
+		return locs[0]
+	default:
+		return terminal.NewChain(locs...)
+	}
 }
 
 // Capabilities summarizes the stack for the state.json capabilities block.

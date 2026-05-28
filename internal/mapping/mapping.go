@@ -52,16 +52,23 @@ func (r *Resolver) Resolve(ctx context.Context, info proc.Info) state.Session {
 	if err != nil || pane == nil {
 		return sess
 	}
-	sess.Wezterm = weztermInfo(pane)
+	if pane.Backend == "wezterm" {
+		sess.Wezterm = weztermInfo(pane)
+	}
 	if sess.CWD == "" {
 		sess.CWD = pane.CWD
 	}
 
-	if win := r.findWindow(resolveCtx, pane.Mux, pane.WindowTitle); win != nil {
-		sess.Hyprland = &state.HyprlandInfo{
-			Address:     win.Address,
-			Workspace:   win.Workspace,
-			WorkspaceID: win.WorkspaceID,
+	// The WM join keys on the terminal's mux pid; backends that don't expose one
+	// (e.g. tmux, whose pane pid is the in-pane process) leave Mux 0 and the
+	// session stays Observe-only on the WM axis.
+	if pane.Mux != 0 {
+		if win := r.findWindow(resolveCtx, pane.Mux, pane.WindowTitle); win != nil {
+			sess.Hyprland = &state.HyprlandInfo{
+				Address:     win.Address,
+				Workspace:   win.Workspace,
+				WorkspaceID: win.WorkspaceID,
+			}
 		}
 	}
 	return sess
@@ -81,15 +88,19 @@ func (r *Resolver) Reconcile(ctx context.Context, sess *state.Session) {
 	if err != nil || pane == nil {
 		return
 	}
-	sess.Wezterm = weztermInfo(pane)
+	if pane.Backend == "wezterm" {
+		sess.Wezterm = weztermInfo(pane)
+	}
 
-	if win := r.findWindow(resolveCtx, pane.Mux, pane.WindowTitle); win != nil {
-		if sess.Hyprland == nil {
-			sess.Hyprland = &state.HyprlandInfo{}
+	if pane.Mux != 0 {
+		if win := r.findWindow(resolveCtx, pane.Mux, pane.WindowTitle); win != nil {
+			if sess.Hyprland == nil {
+				sess.Hyprland = &state.HyprlandInfo{}
+			}
+			sess.Hyprland.Address = win.Address
+			sess.Hyprland.Workspace = win.Workspace
+			sess.Hyprland.WorkspaceID = win.WorkspaceID
 		}
-		sess.Hyprland.Address = win.Address
-		sess.Hyprland.Workspace = win.Workspace
-		sess.Hyprland.WorkspaceID = win.WorkspaceID
 	}
 }
 

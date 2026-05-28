@@ -17,8 +17,14 @@ import (
 // PaneRef is the neutral pane record. It carries the mux-scoped identity the
 // WM join and the focus dispatch both need; (Mux, PaneID) is the stable
 // identity (PaneID is unique only within its mux).
+//
+// Backend names the locator that produced the ref so a Chain can route Activate
+// back to it. Handle is an opaque, backend-specific focus token (tmux uses it
+// for the pane target; wezterm focuses via MuxSocket+PaneID instead).
 type PaneRef struct {
-	Mux         int    // multiplexer process id owning the pane
+	Backend     string // locator that produced this ref ("wezterm", "tmux", …)
+	Handle      string // opaque per-backend focus token (e.g. tmux pane id "%3")
+	Mux         int    // multiplexer process id owning the pane (0 when N/A)
 	MuxSocket   string // control socket of that mux
 	PaneID      int    // pane id within the mux's namespace
 	TabID       int

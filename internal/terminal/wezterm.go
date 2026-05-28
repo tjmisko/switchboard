@@ -32,6 +32,7 @@ func (weztermLocator) Locate(ctx context.Context, tty string) (*PaneRef, error) 
 		return nil, nil
 	}
 	return &PaneRef{
+		Backend:     "wezterm",
 		Mux:         p.MuxPID,
 		MuxSocket:   p.MuxSocket,
 		PaneID:      p.PaneID,

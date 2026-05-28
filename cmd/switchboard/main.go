@@ -30,7 +30,7 @@ func main() {
 	scanInterval := flag.Duration("scan-interval", 1*time.Second, "/proc scan interval")
 	reconcileInterval := flag.Duration("reconcile-interval", 5*time.Second, "full reconcile interval")
 	wmFlag := flag.String("wm", "auto", "WM backend: auto|hyprland|sway|i3|x11|none")
-	terminalFlag := flag.String("terminal", "auto", "terminal backend: auto|wezterm|none")
+	terminalFlag := flag.String("terminal", "auto", "terminal backend: auto|wezterm|tmux|none")
 	flag.Parse()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
