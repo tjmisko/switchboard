@@ -74,8 +74,8 @@ func runOnce(socketPath string, slot int) {
 }
 
 // renderSlot emits JSON for the Nth session. The class array carries the
-// status and a "focused" flag so waybar CSS can paint the chip. Empty slots
-// get class=["empty"] so the CSS can collapse them.
+// status, a "focused" flag, and a "suspended" flag so waybar CSS can paint the
+// chip. Empty slots get class=["empty"] so the CSS can collapse them.
 func renderSlot(snap state.Snapshot, slot int) waybarOutput {
 	if slot >= len(snap.Sessions) {
 		return waybarOutput{Text: "", Class: []string{"empty"}}
@@ -84,6 +84,9 @@ func renderSlot(snap state.Snapshot, slot int) waybarOutput {
 	classes := []string{sessionStatus(s)}
 	if s.Focused {
 		classes = append(classes, "focused")
+	}
+	if s.Suspended {
+		classes = append(classes, "suspended")
 	}
 	return waybarOutput{
 		Text:    shortName(s),
@@ -128,6 +131,9 @@ func sessionTooltip(s state.Session) string {
 		ws = s.Hyprland.Workspace
 	}
 	status := sessionStatus(s)
+	if s.Suspended {
+		status += ", suspended"
+	}
 	return fmt.Sprintf("%s [%s] — ws %s — %s (pid %d)", name, status, ws, s.CWD, s.PID)
 }
 

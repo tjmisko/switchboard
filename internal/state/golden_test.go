@@ -27,6 +27,7 @@ func canonicalSnapshot() Snapshot {
 				TTY:       "/dev/pts/3",
 				StartedAt: time.Date(2026, 5, 28, 9, 0, 0, 0, time.UTC),
 				Focused:   true,
+				Suspended: true,
 				Wezterm: &WeztermInfo{
 					MuxPID:      4790,
 					MuxSocket:   "/run/user/1000/wezterm/gui-sock-4790",

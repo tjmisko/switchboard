@@ -180,6 +180,13 @@ func renderSnapshot(snap state.Snapshot, home string, color bool) string {
 	for _, s := range snap.Sessions {
 		status := sessionStatus(s)
 		glyph, gcol := statusStyle(status)
+		label := c(gcol, fmt.Sprintf("%-11s", status))
+		// A suspended (Ctrl-Z'd) process is greyed out wholesale: pause glyph,
+		// grey label, grey cwd — its real status is stale until it resumes.
+		if s.Suspended {
+			glyph, gcol = "⏸", colGrey
+			label = c(colGrey, fmt.Sprintf("%-11s", "suspended"))
+		}
 		focus := " "
 		if s.Focused {
 			focus = c(colBold, "*")
@@ -188,8 +195,14 @@ func renderSnapshot(snap state.Snapshot, home string, color bool) string {
 		if s.Hyprland != nil && s.Hyprland.Workspace != "" {
 			ws = "  ws " + s.Hyprland.Workspace
 		}
-		fmt.Fprintf(&b, "%s %s %-11s %-40s %s%s\r\n",
-			focus, c(gcol, glyph), status, abbrevHome(s.CWD, home),
+		// Pad before coloring: ANSI escapes are zero-width on screen but count
+		// against %-40s, so wrapping a pre-padded string keeps columns aligned.
+		cwd := fmt.Sprintf("%-40s", abbrevHome(s.CWD, home))
+		if s.Suspended {
+			cwd = c(colGrey, cwd)
+		}
+		fmt.Fprintf(&b, "%s %s %s %s %s%s\r\n",
+			focus, c(gcol, glyph), label, cwd,
 			c(colGrey, fmt.Sprintf("pid %d", s.PID)), c(colGrey, ws))
 	}
 	return b.String()
