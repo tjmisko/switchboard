@@ -143,10 +143,10 @@ func (s *Server) subscribe(ctx context.Context, conn net.Conn, enc *json.Encoder
 }
 
 func (s *Server) focus(ctx context.Context, selector string) error {
-	// Navigate requires both a terminal locator and a WM focus backend. On an
-	// Observe-only stack, fail with the typed error rather than the confusing
-	// "session has no hyprland address yet" (decisions.md #3 / Phase 1.5).
-	if s.wm.Name() == "none" || s.term.Name() == "none" {
+	// Navigate needs at least one actuator. With neither a WM nor a terminal
+	// backend the stack is Observe-only: fail with the typed error rather than
+	// the confusing "session has no hyprland address yet" (decisions.md #3).
+	if s.wm.Name() == "none" && s.term.Name() == "none" {
 		return ErrNavigateUnsupported
 	}
 	snap := s.store.Snapshot()
@@ -157,17 +157,28 @@ func (s *Server) focus(ctx context.Context, selector string) error {
 	if target == nil {
 		return fmt.Errorf("no session matches %q", selector)
 	}
-	if target.Hyprland == nil || target.Hyprland.Address == "" {
-		return fmt.Errorf("session has no hyprland address yet")
-	}
-	if err := s.wm.Focus(ctx, target.Hyprland.Address); err != nil {
-		return fmt.Errorf("wm focus: %w", err)
-	}
-	if target.Wezterm != nil {
-		ref := &terminal.PaneRef{MuxSocket: target.Wezterm.MuxSocket, PaneID: target.Wezterm.PaneID}
-		if err := s.term.Activate(ctx, ref); err != nil {
-			return fmt.Errorf("terminal activate: %w", err)
+
+	// Best-effort, backend-agnostic: raise the WM window if we have its ref, and
+	// focus the terminal pane by re-locating it from the (always-present) tty —
+	// so this works for wezterm and tmux without persisting backend-specific
+	// pane fields. At least one step must act, else there's nothing to focus.
+	acted := false
+	if target.Hyprland != nil && target.Hyprland.Address != "" {
+		if err := s.wm.Focus(ctx, target.Hyprland.Address); err != nil {
+			return fmt.Errorf("wm focus: %w", err)
 		}
+		acted = true
+	}
+	if target.TTY != "" {
+		if pane, err := s.term.Locate(ctx, target.TTY); err == nil && pane != nil {
+			if err := s.term.Activate(ctx, pane); err != nil {
+				return fmt.Errorf("terminal activate: %w", err)
+			}
+			acted = true
+		}
+	}
+	if !acted {
+		return fmt.Errorf("session %d has no window or pane to focus yet", target.PID)
 	}
 	return nil
 }
