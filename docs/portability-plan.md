@@ -154,6 +154,12 @@ The daemon's `-wm` flag forces any single backend.
 
 ### Phase 4 — macOS OS backend
 > Pre: Phase 1 merged. Opens the second platform.
+>
+> **Detailed, implementation-ready plan: [`docs/phase4/`](phase4/README.md)** —
+> Phase 4 is the one phase that cannot be built or verified from the Linux dev
+> box (cgo `libproc` + a macOS CI runner). The `docs/phase4/` docs spell out the
+> enumerate/death-watch/CI/Navigate/discovery work, the decisions required, and
+> the recommended sequencing. Tracked in the Phase-4 GitHub issue.
 
 - [ ] **4.1 darwin enumerate.** `osproc_darwin.go`: `proc_listallpids`/`KERN_PROC_ALL` + `proc_pidpath` (exe) + `proc_pidinfo`/`VNODE` for cwd; tty via `proc_pidinfo`. DoD: `Enumerate()` returns claude procs with cwd+tty on macOS.
 - [ ] **4.2 darwin death watch.** kqueue `EVFILT_PROC` + `NOTE_EXIT`, one kevent per pid (mirror the pidfd-per-pid model). DoD: killing a claude proc fires `onDeath` once, promptly.
