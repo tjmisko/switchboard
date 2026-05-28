@@ -20,6 +20,7 @@ func TestParsePPID(t *testing.T) {
 		{"whitespace around value", "Name:\tx\nPPid:\t  99  \nTracerPid:\t0\n", 99},
 		{"missing ppid line", "Name:\tx\nState:\tS\n", 0},
 		{"non-numeric value", "PPid:\tabc\n", 0},
+		{"empty input", "", 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

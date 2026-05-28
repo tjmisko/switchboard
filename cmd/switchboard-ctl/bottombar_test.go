@@ -8,9 +8,32 @@ import (
 	"github.com/tjmisko/switchboard/internal/testsupport"
 )
 
-// §10.2 topVisible / bottomPID / envOr — seed cases (0.4 expands; 0.3 extracts
-// the pure shouldRun core). Uses the harness's temp-file builders for the
-// master-visibility marker and the stale pidfile.
+// §10.1 shouldRun — the bottom-bar invariant's pure core. All four F8
+// truth-table cases.
+func TestShouldRun(t *testing.T) {
+	tests := []struct {
+		name       string
+		topVisible bool
+		count      int
+		want       bool
+	}{
+		{"top hidden, no sessions", false, 0, false},
+		{"top hidden, sessions present", false, 3, false},
+		{"top visible, no sessions", true, 0, false},
+		{"top visible, sessions present", true, 1, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldRun(tt.topVisible, tt.count); got != tt.want {
+				t.Errorf("shouldRun(%v, %d) = %v, want %v", tt.topVisible, tt.count, got, tt.want)
+			}
+		})
+	}
+}
+
+// §10.2 topVisible / bottomPID / envOr — seed cases (0.4 expands). Uses the
+// harness's temp-file builders for the master-visibility marker and the stale
+// pidfile.
 func TestTopVisible(t *testing.T) {
 	dir := t.TempDir()
 	cfg := bottomBarConfig{marker: filepath.Join(dir, "waybar-hidden")}

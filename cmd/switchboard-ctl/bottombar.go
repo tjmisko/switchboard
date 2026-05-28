@@ -82,6 +82,14 @@ func cmdBottombar(args []string, socketPath string) {
 	}
 }
 
+// shouldRun is the bottom-bar invariant, distilled to a pure decision: the
+// bottom bar runs iff the top bar is visible AND at least one claude session
+// exists. Both reconcile paths route their final start/stop decision through
+// it, so the F8 truth table has exactly one source of truth.
+func shouldRun(topVisible bool, count int) bool {
+	return topVisible && count > 0
+}
+
 // reconcile brings the bottom bar in line with the invariant, dialing the
 // daemon for the current session count. Safe to call concurrently — it holds
 // the flock for the duration.
@@ -89,7 +97,8 @@ func reconcile(cfg bottomBarConfig) {
 	unlock := mustFlock(cfg.lockFile)
 	defer unlock()
 
-	if !topVisible(cfg) {
+	visible := topVisible(cfg)
+	if !visible {
 		// Master toggle is off: the bottom bar must not exist regardless of
 		// session count. We can decide this without the daemon.
 		ensureStopped(cfg)
@@ -101,7 +110,7 @@ func reconcile(cfg bottomBarConfig) {
 		// bottom bar in whatever state it is. Better than flapping.
 		return
 	}
-	apply(cfg, count)
+	setBottom(cfg, shouldRun(visible, count))
 }
 
 // reconcileWith is reconcile when the caller already knows the session count
@@ -109,15 +118,11 @@ func reconcile(cfg bottomBarConfig) {
 func reconcileWith(cfg bottomBarConfig, count int) {
 	unlock := mustFlock(cfg.lockFile)
 	defer unlock()
-	if !topVisible(cfg) {
-		ensureStopped(cfg)
-		return
-	}
-	apply(cfg, count)
+	setBottom(cfg, shouldRun(topVisible(cfg), count))
 }
 
-func apply(cfg bottomBarConfig, count int) {
-	if count > 0 {
+func setBottom(cfg bottomBarConfig, run bool) {
+	if run {
 		ensureStarted(cfg)
 	} else {
 		ensureStopped(cfg)

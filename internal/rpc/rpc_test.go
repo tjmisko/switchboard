@@ -60,6 +60,10 @@ func TestPickSession(t *testing.T) {
 	if got := pickSession(sessions, "99"); got != nil {
 		t.Errorf(`pickSession "99" = %v, want nil (no PID, out of range)`, got)
 	}
+	// Negative numeric selector parses but matches no PID and is below index 0.
+	if got := pickSession(sessions, "-1"); got != nil {
+		t.Errorf(`pickSession "-1" = %v, want nil`, got)
+	}
 
 	// "active"/"" with none focused falls back to sessions[0].
 	noneFocused := []state.Session{{PID: 7}, {PID: 8}}
