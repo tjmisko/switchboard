@@ -101,6 +101,7 @@ fields always present when the block exists.
 |-------|-----------|---------|
 | `address` | string | Hyprland window address, e.g. `0x5640f1a2b3c0`. ⚠ **Always `0x`-prefixed here**, even though Hyprland's socket2 event stream emits it without the prefix; the daemon normalizes at the event boundary. Treat as an **opaque** window ref — future WM backends store sway `con_id` / X11 window ids in this slot. |
 | `workspace` | string | Workspace name the window is on. |
+| `workspace_id` | integer | Numeric Hyprland workspace id. Drives the bottom-bar chip ordering (chips follow workspace order). `0` means unresolved (Hyprland workspace ids are positive, or negative for special workspaces). |
 | `monitor` | string | Monitor name. ⚠ Currently **never populated** (always `""`); reserved. See `docs/decisions.md`. |
 
 ### `claude` (`ClaudeInfo`) — stable

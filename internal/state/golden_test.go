@@ -36,9 +36,10 @@ func canonicalSnapshot() Snapshot {
 					WindowTitle: "claude — switchboard",
 				},
 				Hyprland: &HyprlandInfo{
-					Address:   "0x5640f1a2b3c0",
-					Workspace: "4",
-					Monitor:   "DP-1",
+					Address:     "0x5640f1a2b3c0",
+					Workspace:   "4",
+					WorkspaceID: 4,
+					Monitor:     "DP-1",
 				},
 				Claude: &ClaudeInfo{
 					SessionID:  "e0b4b21f-aaf6-4ab0-a8d6-2d595aba4065",

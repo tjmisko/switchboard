@@ -94,6 +94,10 @@ func (s *Store) snapshotLocked() Snapshot {
 	for _, sess := range s.sessions {
 		sessions = append(sessions, *sess)
 	}
+	// Sort into chip order (lessChipOrder), which carries a PID tie-break for
+	// determinism: equal sort keys would otherwise leave order to map iteration,
+	// making positional selectors (rpc.pickSession index, sessions[0])
+	// nondeterministic across snapshots.
 	sort.Slice(sessions, func(i, j int) bool {
 		return lessChipOrder(sessions[i], sessions[j])
 	})
@@ -114,7 +118,10 @@ func lessChipOrder(a, b Session) bool {
 	if aResolved && aID != bID {
 		return aID < bID
 	}
-	return a.StartedAt.Before(b.StartedAt)
+	if !a.StartedAt.Equal(b.StartedAt) {
+		return a.StartedAt.Before(b.StartedAt)
+	}
+	return a.PID < b.PID // deterministic tie-break (Phase 0.9)
 }
 
 // workspaceID returns the session's Hyprland workspace ID and whether it is

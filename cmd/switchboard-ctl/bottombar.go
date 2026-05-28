@@ -41,6 +41,25 @@ type bottomBarConfig struct {
 	pidFile      string
 	lockFile     string
 	waybarConfig string
+
+	ops bottomBarOps
+}
+
+// bottomBarOps are the effectful lifecycle operations, injectable so the
+// reconcile/start/stop orchestration is testable without launching a real
+// waybar. defaultOps wires the production behavior; tests substitute a stub.
+type bottomBarOps struct {
+	isRunning func(bottomBarConfig) bool // is the bottom bar currently up?
+	start     func(bottomBarConfig) error
+	stop      func(bottomBarConfig)
+}
+
+func defaultOps() bottomBarOps {
+	return bottomBarOps{
+		isRunning: func(c bottomBarConfig) bool { return bottomPID(c) > 0 },
+		start:     startBottom,
+		stop:      stopBottom,
+	}
 }
 
 func bottomBarConfigDefault(socketPath string) bottomBarConfig {
@@ -52,6 +71,7 @@ func bottomBarConfigDefault(socketPath string) bottomBarConfig {
 		pidFile:      filepath.Join(run, "switchboard", "bottom-waybar.pid"),
 		lockFile:     filepath.Join(run, "switchboard", "bottombar.lock"),
 		waybarConfig: envOr("SWITCHBOARD_BOTTOM_CONFIG", filepath.Join(home, ".config", "waybar", "claude.jsonc")),
+		ops:          defaultOps(),
 	}
 }
 
@@ -82,6 +102,14 @@ func cmdBottombar(args []string, socketPath string) {
 	}
 }
 
+// shouldRun is the bottom-bar invariant, distilled to a pure decision: the
+// bottom bar runs iff the top bar is visible AND at least one claude session
+// exists. Both reconcile paths route their final start/stop decision through
+// it, so the F8 truth table has exactly one source of truth.
+func shouldRun(topVisible bool, count int) bool {
+	return topVisible && count > 0
+}
+
 // reconcile brings the bottom bar in line with the invariant, dialing the
 // daemon for the current session count. Safe to call concurrently — it holds
 // the flock for the duration.
@@ -89,7 +117,8 @@ func reconcile(cfg bottomBarConfig) {
 	unlock := mustFlock(cfg.lockFile)
 	defer unlock()
 
-	if !topVisible(cfg) {
+	visible := topVisible(cfg)
+	if !visible {
 		// Master toggle is off: the bottom bar must not exist regardless of
 		// session count. We can decide this without the daemon.
 		ensureStopped(cfg)
@@ -101,7 +130,7 @@ func reconcile(cfg bottomBarConfig) {
 		// bottom bar in whatever state it is. Better than flapping.
 		return
 	}
-	apply(cfg, count)
+	setBottom(cfg, shouldRun(visible, count))
 }
 
 // reconcileWith is reconcile when the caller already knows the session count
@@ -109,15 +138,11 @@ func reconcile(cfg bottomBarConfig) {
 func reconcileWith(cfg bottomBarConfig, count int) {
 	unlock := mustFlock(cfg.lockFile)
 	defer unlock()
-	if !topVisible(cfg) {
-		ensureStopped(cfg)
-		return
-	}
-	apply(cfg, count)
+	setBottom(cfg, shouldRun(topVisible(cfg), count))
 }
 
-func apply(cfg bottomBarConfig, count int) {
-	if count > 0 {
+func setBottom(cfg bottomBarConfig, run bool) {
+	if run {
 		ensureStarted(cfg)
 	} else {
 		ensureStopped(cfg)
@@ -203,17 +228,23 @@ func sessionCount(socketPath string) (int, bool) {
 
 // ensureStarted launches the bottom waybar if it is not already running.
 func ensureStarted(cfg bottomBarConfig) {
-	if bottomPID(cfg) > 0 {
+	if cfg.ops.isRunning(cfg) {
 		return
 	}
-	if err := startBottom(cfg); err != nil {
+	if err := cfg.ops.start(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "bottombar: start: %v\n", err)
 	}
 }
 
-// ensureStopped kills the bottom waybar (and its module subprocesses) if it is
+// ensureStopped stops the bottom waybar (and its module subprocesses) if it is
 // running, and clears the pidfile.
 func ensureStopped(cfg bottomBarConfig) {
+	cfg.ops.stop(cfg)
+}
+
+// stopBottom is the production stop: kill the bottom waybar's process group and
+// clear the pidfile. It is the default bottomBarOps.stop.
+func stopBottom(cfg bottomBarConfig) {
 	if pid := bottomPID(cfg); pid > 0 {
 		// Negative pid targets the whole process group. The bottom waybar is a
 		// session/group leader (Setsid below), so this also reaps the
