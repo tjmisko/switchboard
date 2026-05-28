@@ -23,6 +23,7 @@ import (
 	"github.com/tjmisko/switchboard/internal/proc"
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
+	"github.com/tjmisko/switchboard/internal/terminal"
 )
 
 func main() {
@@ -43,10 +44,12 @@ func main() {
 
 	procSrc := osproc.New()
 	scanner := discovery.New()
+	term := terminal.NewWezterm()
+	resolver := mapping.NewResolver(term)
 
 	onClaudeAppeared := func(info proc.Info) {
 		log.Printf("claude pid=%d cwd=%s tty=%s discovered", info.PID, info.CWD, info.TTY)
-		sess := mapping.Resolve(ctx, info)
+		sess := resolver.Resolve(ctx, info)
 		store.Apply(func(m map[int]*state.Session) { m[sess.PID] = &sess })
 
 		if err := procSrc.Watch(ctx, info.PID, func() {
@@ -63,10 +66,10 @@ func main() {
 			log.Printf("scanner: %v", err)
 		}
 	}()
-	go runHyprlandLoop(ctx, store)
-	go runReconciler(ctx, store, *reconcileInterval)
+	go runHyprlandLoop(ctx, store, resolver)
+	go runReconciler(ctx, store, resolver, *reconcileInterval)
 
-	server := rpc.New(store, *socketPath)
+	server := rpc.New(store, *socketPath, term)
 	if err := os.MkdirAll(filepath.Dir(*socketPath), 0o755); err != nil {
 		log.Fatalf("mkdir socket dir: %v", err)
 	}
@@ -90,7 +93,7 @@ func dropStaleSessions(store *state.Store) {
 	})
 }
 
-func runHyprlandLoop(ctx context.Context, store *state.Store) {
+func runHyprlandLoop(ctx context.Context, store *state.Store, resolver *mapping.Resolver) {
 	for ctx.Err() == nil {
 		events, err := hyprland.Subscribe(ctx)
 		if err != nil {
@@ -103,13 +106,13 @@ func runHyprlandLoop(ctx context.Context, store *state.Store) {
 			}
 		}
 		for evt := range events {
-			handleHyprlandEvent(ctx, store, evt)
+			handleHyprlandEvent(ctx, store, resolver, evt)
 		}
 		// channel closed (socket EOF or ctx cancel) — loop will retry
 	}
 }
 
-func handleHyprlandEvent(ctx context.Context, store *state.Store, evt hyprland.Event) {
+func handleHyprlandEvent(ctx context.Context, store *state.Store, resolver *mapping.Resolver, evt hyprland.Event) {
 	switch evt.Name {
 	case "closewindow":
 		// closed window address — drop any session living in it. Covers the
@@ -138,7 +141,7 @@ func handleHyprlandEvent(ctx context.Context, store *state.Store, evt hyprland.E
 		// match. Cheap: just iterate live sessions and re-resolve.
 		store.Apply(func(m map[int]*state.Session) {
 			for _, sess := range m {
-				mapping.Reconcile(ctx, sess)
+				resolver.Reconcile(ctx, sess)
 			}
 		})
 	}
@@ -150,25 +153,25 @@ func handleHyprlandEvent(ctx context.Context, store *state.Store, evt hyprland.E
 // Catches anything missed by event-driven updates (e.g. a session whose
 // mapping was incomplete when first created, the initial focus state, or a
 // hyprctl race).
-func runReconciler(ctx context.Context, store *state.Store, interval time.Duration) {
+func runReconciler(ctx context.Context, store *state.Store, resolver *mapping.Resolver, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
-	reconcileOnce(ctx, store)
+	reconcileOnce(ctx, store, resolver)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			reconcileOnce(ctx, store)
+			reconcileOnce(ctx, store, resolver)
 		}
 	}
 }
 
-func reconcileOnce(ctx context.Context, store *state.Store) {
+func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Resolver) {
 	active, _ := hyprland.ActiveWindowAddress(ctx)
 	store.Apply(func(m map[int]*state.Session) {
 		for _, sess := range m {
-			mapping.Reconcile(ctx, sess)
+			resolver.Reconcile(ctx, sess)
 			if sess.Hyprland != nil {
 				sess.Focused = sess.Hyprland.Address == active
 			}

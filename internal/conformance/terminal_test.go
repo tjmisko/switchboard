@@ -5,37 +5,32 @@ import (
 	"testing"
 
 	"github.com/tjmisko/switchboard/internal/conformance"
+	"github.com/tjmisko/switchboard/internal/terminal"
 	"github.com/tjmisko/switchboard/internal/wezterm"
 )
 
-// weztermLocator is the thin adapter wrapping the existing wezterm concretes
-// behind the neutral conformance.Locator interface. Phase 1's internal/terminal
-// wezterm backend replaces it and reuses RunLocatorContract; the tmux backend
-// adopts the same contract in Phase 3.
-type weztermLocator struct{}
+// terminalLocator wraps the Phase-1 internal/terminal wezterm backend behind
+// the neutral conformance.Locator. The tmux backend adopts the same contract in
+// Phase 3. SomeTTY is a live-fixture helper (not part of the production
+// Locator), so it reaches into the underlying wezterm driver to enumerate panes.
+type terminalLocator struct{ l terminal.Locator }
 
-func (weztermLocator) Available() bool {
-	ms, err := wezterm.Muxes()
-	return err == nil && len(ms) > 0
-}
+func (a terminalLocator) Available() bool { return a.l.Available() }
 
-func (weztermLocator) Locate(ctx context.Context, tty string) (*conformance.Pane, error) {
-	p, err := wezterm.FindByTTY(ctx, tty)
-	if err != nil {
+func (a terminalLocator) Locate(ctx context.Context, tty string) (*conformance.Pane, error) {
+	p, err := a.l.Locate(ctx, tty)
+	if err != nil || p == nil {
 		return nil, err
 	}
-	if p == nil {
-		return nil, nil
-	}
 	return &conformance.Pane{
-		Mux:         p.MuxPID,
+		Mux:         p.Mux,
 		PaneID:      p.PaneID,
-		TTY:         p.TTYName,
+		TTY:         p.TTY,
 		WindowTitle: p.WindowTitle,
 	}, nil
 }
 
-func (weztermLocator) SomeTTY(ctx context.Context) (string, bool) {
+func (terminalLocator) SomeTTY(ctx context.Context) (string, bool) {
 	panes, err := wezterm.List(ctx)
 	if err != nil {
 		return "", false
@@ -49,5 +44,5 @@ func (weztermLocator) SomeTTY(ctx context.Context) (string, bool) {
 }
 
 func TestWeztermLocatorConformance(t *testing.T) {
-	conformance.RunLocatorContract(t, weztermLocator{})
+	conformance.RunLocatorContract(t, terminalLocator{l: terminal.NewWezterm()})
 }

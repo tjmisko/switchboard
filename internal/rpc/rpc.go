@@ -19,7 +19,7 @@ import (
 	"github.com/tjmisko/switchboard/internal/hyprland"
 	"github.com/tjmisko/switchboard/internal/proc"
 	"github.com/tjmisko/switchboard/internal/state"
-	"github.com/tjmisko/switchboard/internal/wezterm"
+	"github.com/tjmisko/switchboard/internal/terminal"
 )
 
 type Request struct {
@@ -41,10 +41,11 @@ type Response struct {
 type Server struct {
 	store      *state.Store
 	socketPath string
+	term       terminal.Locator
 }
 
-func New(store *state.Store, socketPath string) *Server {
-	return &Server{store: store, socketPath: socketPath}
+func New(store *state.Store, socketPath string, term terminal.Locator) *Server {
+	return &Server{store: store, socketPath: socketPath, term: term}
 }
 
 // Serve listens on the socket path and accepts connections until ctx is done.
@@ -148,8 +149,9 @@ func (s *Server) focus(ctx context.Context, selector string) error {
 		return fmt.Errorf("hyprland focus: %w", err)
 	}
 	if target.Wezterm != nil {
-		if err := wezterm.ActivatePane(ctx, target.Wezterm.MuxSocket, target.Wezterm.PaneID); err != nil {
-			return fmt.Errorf("wezterm activate: %w", err)
+		ref := &terminal.PaneRef{MuxSocket: target.Wezterm.MuxSocket, PaneID: target.Wezterm.PaneID}
+		if err := s.term.Activate(ctx, ref); err != nil {
+			return fmt.Errorf("terminal activate: %w", err)
 		}
 	}
 	return nil
