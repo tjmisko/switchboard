@@ -1,6 +1,6 @@
-# claude-tracker — Portability Plan
+# Switchboard — Portability Plan
 
-> Goal: turn claude-tracker from a Hyprland+wezterm+waybar appliance into a
+> Goal: turn Switchboard from a Hyprland+wezterm+waybar appliance into a
 > portable, runtime-detecting "see all your Claude Code sessions at a glance and
 > jump between them" tool that installs as a single binary and works across
 > Linux WMs/terminals/bars and macOS.
@@ -44,7 +44,7 @@ any bar can render it.*
 - **Abstraction:** `Clients() → []Window{address, pid, title, workspace}`; `Focus(ref)`; `Subscribe() → <-chan Event{focus-changed, window-closed, layout-changed}`. Address type becomes opaque (Hyprland `0x…`, sway `con_id`, X11 window id).
 - **Backends:** `hyprland` (existing), `sway/i3` (i3 IPC binary protocol over `$SWAYSOCK`/`$I3SOCK`; `get_tree` for clients, `[con_id=…] focus`, `SUBSCRIBE ["window"]` events), `x11` (EWMH: `_NET_CLIENT_LIST`, `_NET_WM_PID`, `_NET_ACTIVE_WINDOW`; focus via `_NET_ACTIVE_WINDOW` ClientMessage; events via root `PropertyNotify`), `none` (Observe only).
 
-### Seam 4 — UI  `cmd/claude-waybar`, `cmd/claude-tracker-ctl bottombar`
+### Seam 4 — UI  `cmd/switchboard-waybar`, `cmd/switchboard-ctl bottombar`
 - **Today:** waybar custom-module JSON + CSS + two-process split + Hyprland-specific bottombar lifecycle.
 - **Abstraction:** already decoupled — consumes only RPC `subscribe` + `state.json`. The bottombar auto-hide logic is Hyprland-coupled and stays an opt-in extra.
 - **Backends:** waybar (existing); document the contract so polybar/eww/i3blocks/TUI are drop-ins. Ship one reference renderer (standalone TUI) that needs no desktop.

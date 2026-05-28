@@ -1,4 +1,4 @@
-# claude-tracker
+# Switchboard
 
 A discovery-first session tracker for Claude Code, designed for Hyprland + wezterm.
 
@@ -10,7 +10,7 @@ The bottom waybar strip shows one rounded chip per session, color-coded by state
 
 ```
                   ┌────────────────────────────────────────┐
-                  │           claude-tracker (daemon)       │
+                  │           switchboard (daemon)       │
                   │                                         │
   /proc scan ───►│  discovery (1 Hz): comm == "claude"     │
                   │                                         │
@@ -20,12 +20,12 @@ The bottom waybar strip shows one rounded chip per session, color-coded by state
                   │                                         │
   claude hooks ─►│  RPC "hook" cmd: enrich Claude.Status    │
                   │                                         │
-                  │  → ~/.cache/claude-tracker/state.json    │
-                  │  → $XDG_RUNTIME_DIR/claude-tracker.sock  │
+                  │  → ~/.cache/switchboard/state.json    │
+                  │  → $XDG_RUNTIME_DIR/switchboard.sock  │
                   └────────────────────────────────────────┘
                               │              │
                               ▼              ▼
-                       claude-waybar    claude-tracker-ctl
+                       switchboard-waybar    switchboard-ctl
                        (one process     (one-shot CLI for
                        per slot 0..9)   picker / cycle / focus)
 ```
@@ -60,9 +60,9 @@ The tty match is load-bearing (the kernel can't lose it). Window-title match is 
 
 ```
 cmd/
-  claude-tracker/       daemon — goroutines fan signal sources into one store
-  claude-tracker-ctl/   CLI — list / focus / cycle / pick / hook / bottombar
-  claude-waybar/        waybar exec module — one process per slot, emits JSON
+  switchboard/       daemon — goroutines fan signal sources into one store
+  switchboard-ctl/   CLI — list / focus / cycle / pick / hook / bottombar
+  switchboard-waybar/        waybar exec module — one process per slot, emits JSON
 
 internal/
   proc/                 /proc reader (comm, cwd, ppid, tty)
@@ -75,7 +75,7 @@ internal/
   rpc/                  Unix socket: list / focus / cycle / pick / subscribe / hook
 
 systemd/
-  claude-tracker.service  user service, Restart=always
+  switchboard.service  user service, Restart=always
 ```
 
 ## Install
@@ -83,16 +83,16 @@ systemd/
 ```bash
 go install ./...
 mkdir -p ~/.config/systemd/user
-cp systemd/claude-tracker.service ~/.config/systemd/user/
+cp systemd/switchboard.service ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now claude-tracker.service
+systemctl --user enable --now switchboard.service
 ```
 
 Then in `~/.config/hypr/hyprland.conf`, before any `exec-once` that needs Hyprland env in systemd-user-land:
 
 ```
 exec-once = systemctl --user import-environment HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY XDG_CURRENT_DESKTOP DISPLAY
-exec-once = systemctl --user start --no-block claude-tracker.service
+exec-once = systemctl --user start --no-block switchboard.service
 ```
 
 ## Integration points (this machine)
@@ -102,12 +102,12 @@ exec-once = systemctl --user start --no-block claude-tracker.service
 The top bar and the bottom claude strip run as **separate waybar processes** so the bottom one can be shown/hidden without touching the top. waybar's `--bar` flag does not filter a single array config (it loads every bar regardless), so the split is done with two config files:
 
 - `~/.config/waybar/config.jsonc` — the top bar only. Launched at boot by `exec-once = waybar` (the default config path).
-- `~/.config/waybar/claude.jsonc` — the bottom strip only. **Not** launched directly; its lifecycle is owned by `claude-tracker-ctl bottombar` (see below).
+- `~/.config/waybar/claude.jsonc` — the bottom strip only. **Not** launched directly; its lifecycle is owned by `switchboard-ctl bottombar` (see below).
 
-`claude.jsonc` declares 10 `custom/claude-N` modules so each chip is a real GTK widget with its own CSS (border, border-radius, hover). Each runs `claude-waybar --slot N` and emits a JSON line per snapshot update; `class` carries the status + `focused` so `~/.config/waybar/style.css` paints the chip. Empty slots collapse to zero width.
+`claude.jsonc` declares 10 `custom/claude-N` modules so each chip is a real GTK widget with its own CSS (border, border-radius, hover). Each runs `switchboard-waybar --slot N` and emits a JSON line per snapshot update; `class` carries the status + `focused` so `~/.config/waybar/style.css` paints the chip. Empty slots collapse to zero width.
 
 Click semantics:
-- left  — focus that slot's session (`claude-tracker-ctl focus N`)
+- left  — focus that slot's session (`switchboard-ctl focus N`)
 - right — open the rofi picker (`~/.config/scripts/claude-picker`)
 - scroll up/down — cycle prev/next
 
@@ -119,30 +119,30 @@ The bottom strip obeys one invariant:
 bottom bar runs  ⟺  (top bar visible)  AND  (≥1 claude session)
 ```
 
-Visibility is **process existence**, not a SIGUSR1 toggle: `claude-tracker-ctl bottombar` literally starts and kills the `waybar -c claude.jsonc` process. There is no toggle state to drift, so the two bars never alternate or desync.
+Visibility is **process existence**, not a SIGUSR1 toggle: `switchboard-ctl bottombar` literally starts and kills the `waybar -c claude.jsonc` process. There is no toggle state to drift, so the two bars never alternate or desync.
 
 Two inputs drive the invariant, each owned by a different actor:
 
-- **session count** — the daemon. `claude-tracker-ctl bottombar watch` subscribes to the daemon stream (plus a 3 s safety/self-heal ticker) and shows/kills the bottom bar as sessions come and go. Run once at startup:
+- **session count** — the daemon. `switchboard-ctl bottombar watch` subscribes to the daemon stream (plus a 3 s safety/self-heal ticker) and shows/kills the bottom bar as sessions come and go. Run once at startup:
 
   ```
-  exec-once = claude-tracker-ctl bottombar watch
+  exec-once = switchboard-ctl bottombar watch
   ```
 
-- **top-bar visibility** — the F8 master toggle in `~/.config/scripts/hypr-float-center`. That script touches/removes a marker file to hide/show the top bar, then calls `claude-tracker-ctl bottombar reconcile` so the bottom bar follows in lockstep. The script also excludes the bottom bar's pid (recorded at `$XDG_RUNTIME_DIR/claude-tracker/bottom-waybar.pid`) when it SIGUSR1s the top bar, so toggling the top never touches the bottom.
+- **top-bar visibility** — the F8 master toggle in `~/.config/scripts/hypr-float-center`. That script touches/removes a marker file to hide/show the top bar, then calls `switchboard-ctl bottombar reconcile` so the bottom bar follows in lockstep. The script also excludes the bottom bar's pid (recorded at `$XDG_RUNTIME_DIR/switchboard/bottom-waybar.pid`) when it SIGUSR1s the top bar, so toggling the top never touches the bottom.
 
-The watcher kills the bottom bar by **process group**, so the 10 `claude-waybar` slot subprocesses die with it (no orphans), and reaps the resulting children so they never linger as zombies.
+The watcher kills the bottom bar by **process group**, so the 10 `switchboard-waybar` slot subprocesses die with it (no orphans), and reaps the resulting children so they never linger as zombies.
 
-Overridable via env: `CLAUDE_TRACKER_WAYBAR_MARKER` (default `/tmp/hypr-float-center/waybar-hidden`) and `CLAUDE_TRACKER_BOTTOM_CONFIG` (default `~/.config/waybar/claude.jsonc`).
+Overridable via env: `SWITCHBOARD_WAYBAR_MARKER` (default `/tmp/hypr-float-center/waybar-hidden`) and `SWITCHBOARD_BOTTOM_CONFIG` (default `~/.config/waybar/claude.jsonc`).
 
 ### Hyprland keybindings
 
 ```
 bind = $mainMod, A, exec, ~/.config/scripts/claude-picker
-bind = $mainMod $altMod, Up,    exec, claude-tracker-ctl cycle next
-bind = $mainMod $altMod, Down,  exec, claude-tracker-ctl cycle prev
-bind = $mainMod $altMod, Right, exec, claude-tracker-ctl cycle next
-bind = $mainMod $altMod, Left,  exec, claude-tracker-ctl cycle prev
+bind = $mainMod $altMod, Up,    exec, switchboard-ctl cycle next
+bind = $mainMod $altMod, Down,  exec, switchboard-ctl cycle prev
+bind = $mainMod $altMod, Right, exec, switchboard-ctl cycle next
+bind = $mainMod $altMod, Left,  exec, switchboard-ctl cycle prev
 ```
 
 ### Claude Code hooks (optional enrichment)
@@ -151,11 +151,11 @@ In `~/.claude/settings.json`:
 
 ```json
 "hooks": {
-  "SessionStart":      [{ "hooks": [{ "type": "command", "command": "claude-tracker-ctl hook SessionStart",      "timeout": 2 }] }],
-  "UserPromptSubmit":  [{ "hooks": [{ "type": "command", "command": "claude-tracker-ctl hook UserPromptSubmit",  "timeout": 2 }] }],
-  "PostToolUse":       [{ "hooks": [{ "type": "command", "command": "claude-tracker-ctl hook PostToolUse",       "timeout": 2 }] }],
-  "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "claude-tracker-ctl hook PermissionRequest", "timeout": 2 }] }],
-  "Stop":              [{ "hooks": [{ "type": "command", "command": "claude-tracker-ctl hook Stop",              "timeout": 2 }] }]
+  "SessionStart":      [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook SessionStart",      "timeout": 2 }] }],
+  "UserPromptSubmit":  [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook UserPromptSubmit",  "timeout": 2 }] }],
+  "PostToolUse":       [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook PostToolUse",       "timeout": 2 }] }],
+  "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook PermissionRequest", "timeout": 2 }] }],
+  "Stop":              [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook Stop",              "timeout": 2 }] }]
 }
 ```
 
@@ -164,17 +164,17 @@ The forwarder is fire-and-forget. Hook failures cannot corrupt state — they ju
 ## Useful commands
 
 ```bash
-claude-tracker-ctl list                # human-friendly snapshot
-claude-tracker-ctl --json list         # raw JSON
-claude-tracker-ctl status              # one-line count
-claude-tracker-ctl focus active        # jump to currently-focused session
-claude-tracker-ctl focus <pid>         # jump to specific session
-claude-tracker-ctl focus <N>           # jump to Nth session (by start time)
-claude-tracker-ctl cycle next|prev     # focus next/prev session, wrapping
-claude-tracker-ctl pick                # pid<TAB>label<TAB>ws<TAB>cwd lines
+switchboard-ctl list                # human-friendly snapshot
+switchboard-ctl --json list         # raw JSON
+switchboard-ctl status              # one-line count
+switchboard-ctl focus active        # jump to currently-focused session
+switchboard-ctl focus <pid>         # jump to specific session
+switchboard-ctl focus <N>           # jump to Nth session (by start time)
+switchboard-ctl cycle next|prev     # focus next/prev session, wrapping
+switchboard-ctl pick                # pid<TAB>label<TAB>ws<TAB>cwd lines
 ```
 
-Live state mirror at `~/.cache/claude-tracker/state.json` (atomic-rename writes); useful for ad-hoc scripts.
+Live state mirror at `~/.cache/switchboard/state.json` (atomic-rename writes); useful for ad-hoc scripts.
 
 ## Requirements
 

@@ -1,4 +1,4 @@
-// Command claude-tracker-ctl is the user-facing CLI client. It talks to the
+// Command switchboard-ctl is the user-facing CLI client. It talks to the
 // daemon over its Unix socket and prints either human-friendly text or raw
 // JSON.
 package main
@@ -12,8 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/tjmisko/claude-tracker/internal/rpc"
-	"github.com/tjmisko/claude-tracker/internal/state"
+	"github.com/tjmisko/switchboard/internal/rpc"
+	"github.com/tjmisko/switchboard/internal/state"
 )
 
 func main() {
@@ -237,7 +237,7 @@ func mustList(c *rpc.Client) state.Snapshot {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, strings.TrimSpace(`
-usage: claude-tracker-ctl [flags] <cmd> [args]
+usage: switchboard-ctl [flags] <cmd> [args]
 
 commands:
   list                    show session list (human-friendly; --json for raw)
@@ -252,19 +252,19 @@ commands:
                             stop       kill the bottom bar
 
 flags:
-  --socket <path>         daemon socket (default: $XDG_RUNTIME_DIR/claude-tracker.sock)
+  --socket <path>         daemon socket (default: $XDG_RUNTIME_DIR/switchboard.sock)
   --json                  json output for list
 `))
 }
 
 func fail(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "claude-tracker-ctl: "+format+"\n", args...)
+	fmt.Fprintf(os.Stderr, "switchboard-ctl: "+format+"\n", args...)
 	os.Exit(1)
 }
 
 func defaultSocketPath() string {
 	if x := os.Getenv("XDG_RUNTIME_DIR"); x != "" {
-		return filepath.Join(x, "claude-tracker.sock")
+		return filepath.Join(x, "switchboard.sock")
 	}
-	return fmt.Sprintf("/tmp/claude-tracker-%d.sock", os.Getuid())
+	return fmt.Sprintf("/tmp/switchboard-%d.sock", os.Getuid())
 }

@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tjmisko/claude-tracker/internal/proc"
+	"github.com/tjmisko/switchboard/internal/proc"
 )
 
 // IsClaude returns true if the given /proc snapshot looks like a Claude Code

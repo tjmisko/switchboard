@@ -1,11 +1,11 @@
 [Unit]
-Description=Claude Code session tracker daemon
+Description=Switchboard — Claude Code session tracker daemon
 PartOf=graphical-session.target
 After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/go/bin/claude-tracker
+ExecStart=%h/go/bin/switchboard
 Restart=always
 RestartSec=2
 # Hyprland exports these into the user systemd environment via

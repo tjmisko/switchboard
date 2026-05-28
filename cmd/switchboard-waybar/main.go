@@ -1,4 +1,4 @@
-// Command claude-waybar subscribes to the daemon and emits waybar JSON. It
+// Command switchboard-waybar subscribes to the daemon and emits waybar JSON. It
 // runs in one of two modes:
 //
 //	(no flag)        aggregate mode — emits a single chip-set in one module
@@ -19,8 +19,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tjmisko/claude-tracker/internal/rpc"
-	"github.com/tjmisko/claude-tracker/internal/state"
+	"github.com/tjmisko/switchboard/internal/rpc"
+	"github.com/tjmisko/switchboard/internal/state"
 )
 
 type waybarOutput struct {
@@ -42,7 +42,7 @@ func main() {
 		if *slot >= 0 {
 			emit(waybarOutput{Text: "", Class: []string{"empty"}})
 		} else {
-			emit(waybarOutput{Text: "✕", Tooltip: "claude-tracker not running", Class: []string{"tracker-down"}})
+			emit(waybarOutput{Text: "✕", Tooltip: "switchboard not running", Class: []string{"tracker-down"}})
 		}
 		time.Sleep(2 * time.Second)
 	}
@@ -94,7 +94,7 @@ func renderSlot(snap state.Snapshot, slot int) waybarOutput {
 }
 
 // renderAggregate is the original single-module mode. Kept for ad-hoc
-// inspection (`claude-waybar | jq .`) but not driven by the live bar.
+// inspection (`switchboard-waybar | jq .`) but not driven by the live bar.
 func renderAggregate(snap state.Snapshot) waybarOutput {
 	if len(snap.Sessions) == 0 {
 		return waybarOutput{Text: "", Tooltip: "no claude sessions", Class: []string{"empty"}}
@@ -157,7 +157,7 @@ func emit(o waybarOutput) {
 
 func defaultSocketPath() string {
 	if x := os.Getenv("XDG_RUNTIME_DIR"); x != "" {
-		return filepath.Join(x, "claude-tracker.sock")
+		return filepath.Join(x, "switchboard.sock")
 	}
-	return fmt.Sprintf("/tmp/claude-tracker-%d.sock", os.Getuid())
+	return fmt.Sprintf("/tmp/switchboard-%d.sock", os.Getuid())
 }

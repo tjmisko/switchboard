@@ -1,4 +1,4 @@
-// Command claude-tracker is the daemon. It runs one long-lived process per
+// Command switchboard is the daemon. It runs one long-lived process per
 // user session, watches /proc for claude binaries, owns pidfds for instant
 // death detection, listens to Hyprland's socket2 for window lifecycle, and
 // serves an RPC socket for waybar + ctl.
@@ -16,13 +16,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/tjmisko/claude-tracker/internal/discovery"
-	"github.com/tjmisko/claude-tracker/internal/hyprland"
-	"github.com/tjmisko/claude-tracker/internal/mapping"
-	"github.com/tjmisko/claude-tracker/internal/proc"
-	"github.com/tjmisko/claude-tracker/internal/procwatch"
-	"github.com/tjmisko/claude-tracker/internal/rpc"
-	"github.com/tjmisko/claude-tracker/internal/state"
+	"github.com/tjmisko/switchboard/internal/discovery"
+	"github.com/tjmisko/switchboard/internal/hyprland"
+	"github.com/tjmisko/switchboard/internal/mapping"
+	"github.com/tjmisko/switchboard/internal/proc"
+	"github.com/tjmisko/switchboard/internal/procwatch"
+	"github.com/tjmisko/switchboard/internal/rpc"
+	"github.com/tjmisko/switchboard/internal/state"
 )
 
 func main() {
@@ -70,7 +70,7 @@ func main() {
 	if err := os.MkdirAll(filepath.Dir(*socketPath), 0o755); err != nil {
 		log.Fatalf("mkdir socket dir: %v", err)
 	}
-	log.Printf("claude-tracker listening on %s", *socketPath)
+	log.Printf("switchboard listening on %s", *socketPath)
 	if err := server.Serve(ctx); err != nil {
 		log.Fatalf("rpc: %v", err)
 	}
@@ -178,14 +178,14 @@ func reconcileOnce(ctx context.Context, store *state.Store) {
 
 func defaultStatePath() string {
 	if x := os.Getenv("XDG_CACHE_HOME"); x != "" {
-		return filepath.Join(x, "claude-tracker", "state.json")
+		return filepath.Join(x, "switchboard", "state.json")
 	}
-	return filepath.Join(os.Getenv("HOME"), ".cache", "claude-tracker", "state.json")
+	return filepath.Join(os.Getenv("HOME"), ".cache", "switchboard", "state.json")
 }
 
 func defaultSocketPath() string {
 	if x := os.Getenv("XDG_RUNTIME_DIR"); x != "" {
-		return filepath.Join(x, "claude-tracker.sock")
+		return filepath.Join(x, "switchboard.sock")
 	}
-	return fmt.Sprintf("/tmp/claude-tracker-%d.sock", os.Getuid())
+	return fmt.Sprintf("/tmp/switchboard-%d.sock", os.Getuid())
 }

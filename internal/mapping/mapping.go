@@ -15,10 +15,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tjmisko/claude-tracker/internal/hyprland"
-	"github.com/tjmisko/claude-tracker/internal/proc"
-	"github.com/tjmisko/claude-tracker/internal/state"
-	"github.com/tjmisko/claude-tracker/internal/wezterm"
+	"github.com/tjmisko/switchboard/internal/hyprland"
+	"github.com/tjmisko/switchboard/internal/proc"
+	"github.com/tjmisko/switchboard/internal/state"
+	"github.com/tjmisko/switchboard/internal/wezterm"
 )
 
 // Resolve maps the given claude process to a Session, filling in wezterm and

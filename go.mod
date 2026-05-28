@@ -1,4 +1,4 @@
-module github.com/tjmisko/claude-tracker
+module github.com/tjmisko/switchboard
 
 go 1.25
 
