@@ -135,17 +135,6 @@ The watcher kills the bottom bar by **process group**, so the 10 `switchboard-wa
 
 Overridable via env: `SWITCHBOARD_WAYBAR_MARKER` (default `/tmp/hypr-float-center/waybar-hidden`) and `SWITCHBOARD_BOTTOM_CONFIG` (default `~/.config/waybar/claude.jsonc`).
 
-### Hyprland keybindings
-
-```
-bind = $mainMod, A, exec, ~/.config/scripts/claude-picker
-bind = $mainMod SHIFT, A, exec, switchboard-ctl attention
-bind = $mainMod $altMod, Up,    exec, switchboard-ctl cycle next
-bind = $mainMod $altMod, Down,  exec, switchboard-ctl cycle prev
-bind = $mainMod $altMod, Right, exec, switchboard-ctl cycle next
-bind = $mainMod $altMod, Left,  exec, switchboard-ctl cycle prev
-```
-
 ### Claude Code hooks (optional enrichment)
 
 In `~/.claude/settings.json`:
