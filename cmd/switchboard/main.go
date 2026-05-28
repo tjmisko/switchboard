@@ -29,7 +29,7 @@ func main() {
 	socketPath := flag.String("socket", defaultSocketPath(), "path to RPC unix socket")
 	scanInterval := flag.Duration("scan-interval", 1*time.Second, "/proc scan interval")
 	reconcileInterval := flag.Duration("reconcile-interval", 5*time.Second, "full reconcile interval")
-	wmFlag := flag.String("wm", "auto", "WM backend: auto|hyprland|none")
+	wmFlag := flag.String("wm", "auto", "WM backend: auto|hyprland|sway|i3|x11|none")
 	terminalFlag := flag.String("terminal", "auto", "terminal backend: auto|wezterm|none")
 	flag.Parse()
 

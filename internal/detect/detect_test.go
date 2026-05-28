@@ -50,3 +50,47 @@ func TestPartialStackCannotNavigate(t *testing.T) {
 		t.Error("Navigate = true with terminal=none, want false")
 	}
 }
+
+// Forcing x11 / none selects that backend regardless of environment (these two
+// derive their Name without reading env, so the assertion is deterministic).
+func TestForceX11AndNone(t *testing.T) {
+	if got := detectWM("x11").Name(); got != "x11" {
+		t.Errorf("force x11 = %q, want x11", got)
+	}
+	if got := detectWM("none").Name(); got != "none" {
+		t.Errorf("force none = %q, want none", got)
+	}
+}
+
+// §2.3 auto-detection precedence: a native Wayland compositor or i3's own IPC
+// wins over X11/XWayland; X11 is the DISPLAY-only fallback; nothing → none.
+func TestWMDetectionPrecedence(t *testing.T) {
+	const (
+		hypr = "HYPRLAND_INSTANCE_SIGNATURE"
+		sway = "SWAYSOCK"
+		i3   = "I3SOCK"
+		disp = "DISPLAY"
+	)
+	// set applies env for the case (empty value clears, matching != "" probes).
+	tests := []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{"hyprland wins over everything", map[string]string{hypr: "sig", sway: "/s", i3: "/i", disp: ":0"}, "hyprland"},
+		{"sway over x11", map[string]string{hypr: "", sway: "/run/sway.sock", i3: "", disp: ":0"}, "sway"},
+		{"i3 over x11", map[string]string{hypr: "", sway: "", i3: "/run/i3.sock", disp: ":0"}, "i3"},
+		{"x11 fallback", map[string]string{hypr: "", sway: "", i3: "", disp: ":0"}, "x11"},
+		{"nothing -> none", map[string]string{hypr: "", sway: "", i3: "", disp: ""}, "none"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, k := range []string{hypr, sway, i3, disp} {
+				t.Setenv(k, tt.env[k])
+			}
+			if got := detectWMAuto().Name(); got != tt.want {
+				t.Errorf("auto WM = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

@@ -127,9 +127,23 @@ Check off as completed. Keep a running `DONE.md` log of merged milestones.
 ### Phase 2 — WM backends  (biggest reach)
 > Pre: Phase 1 merged. Each backend is independently shippable.
 
-- [ ] **2.1 sway/i3 backend.** `wm/i3.go`: i3 IPC over `$SWAYSOCK`/`$I3SOCK`, magic-string binary framing. `get_tree`→windows (pid, name, workspace, con_id), `RUN_COMMAND [con_id=…] focus`, `SUBSCRIBE ["window","workspace"]`→events. Detection: `SWAYSOCK`/`I3SOCK` present. DoD: on a sway session, `list` shows correct workspaces; `focus` jumps; closing a window drops the chip; focus changes flip `Focused`.
-- [ ] **2.2 X11/EWMH backend.** `wm/x11.go`: connect via Xlib/xcb (cgo) or a pure-Go X client. `_NET_CLIENT_LIST` + `_NET_WM_PID` + `_WM_NAME`; focus via `_NET_ACTIVE_WINDOW` ClientMessage; events via root-window `PropertyNotify` on `_NET_ACTIVE_WINDOW`/`_NET_CLIENT_LIST`. Detection: `DISPLAY` set and not Wayland. Decide cgo vs pure-Go (affects cross-compile — see Risks). DoD: under a stacking/tiling X11 WM, list+focus+focus-events work.
-- [ ] **2.3 Detection precedence.** Define order when multiple are present (Wayland compositor wins over X11 when both signal). DoD: documented and unit-tested precedence table.
+- [x] **2.1 sway/i3 backend.** `wm/i3.go`: i3 IPC over `$SWAYSOCK`/`$I3SOCK`, magic-string binary framing. `get_tree`→windows (pid, name, workspace, con_id), `RUN_COMMAND [con_id=…] focus`, `SUBSCRIBE ["window","workspace"]`→events. Detection: `SWAYSOCK`/`I3SOCK` present. DoD: on a sway session, `list` shows correct workspaces; `focus` jumps; closing a window drops the chip; focus changes flip `Focused`. *(Done: pure-Go (native byte order), con_id is the opaque ref, neutral event translation. Pure parsers unit-tested + RunManagerContract. **Live DoD pending a real sway/i3 session** — unverifiable on the Hyprland dev box. **Limitation:** i3's `get_tree` omits `pid` (only sway has it), so under pure i3 the terminal↔window join can't resolve and sessions stay Observe-only.)*
+- [x] **2.2 X11/EWMH backend.** `wm/x11.go`: connect via Xlib/xcb (cgo) or a pure-Go X client. `_NET_CLIENT_LIST` + `_NET_WM_PID` + `_WM_NAME`; focus via `_NET_ACTIVE_WINDOW` ClientMessage; events via root-window `PropertyNotify` on `_NET_ACTIVE_WINDOW`/`_NET_CLIENT_LIST`. Detection: `DISPLAY` set and not Wayland. Decide cgo vs pure-Go (affects cross-compile — see Risks). DoD: under a stacking/tiling X11 WM, list+focus+focus-events work. *(Done: **pure-Go via `github.com/jezek/xgb`** — the locked lean; cross-compiles to darwin. Window id is the opaque ref; X11 emits focus/layout events, not window-closed. Read path (connect, atom intern, `Clients`, `ActiveWindow`) **verified live against XWayland**; **full focus + populated-client-list DoD pending a real X11 WM**.)*
+- [x] **2.3 Detection precedence.** Define order when multiple are present (Wayland compositor wins over X11 when both signal). DoD: documented and unit-tested precedence table. *(Done in `internal/detect`, `TestWMDetectionPrecedence`.)*
+
+**WM auto-detection precedence** (`internal/detect.detectWMAuto`): first match wins.
+
+| Order | Backend | Signal | Notes |
+|-------|---------|--------|-------|
+| 1 | `hyprland` | `HYPRLAND_INSTANCE_SIGNATURE` | native Wayland compositor |
+| 2 | `sway` | `SWAYSOCK` | native Wayland compositor (i3-IPC) |
+| 3 | `i3` | `I3SOCK` | X11, but its own IPC beats generic EWMH |
+| 4 | `x11` | `DISPLAY` | EWMH fallback for any other X11 WM |
+| 5 | `none` | — | Observe-only |
+
+A native Wayland/i3 IPC wins over X11/EWMH because under sway or i3 `DISPLAY` is
+also set (XWayland); the native IPC is richer (pids on sway, precise events).
+The daemon's `-wm` flag forces any single backend.
 
 ### Phase 3 — terminal backends
 > Pre: Phase 1 merged.
