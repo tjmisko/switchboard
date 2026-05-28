@@ -18,22 +18,28 @@ type Child struct {
 	once sync.Once
 }
 
-// SpawnSleep starts `sleep <seconds>` and returns it. The caller drives its
-// death explicitly via Kill; t.Cleanup reaps it otherwise. Pass a duration
-// longer than the test's window so the child only dies when the test kills it.
+// SpawnSleep starts `sleep <seconds>` and returns it. Its std streams are left
+// nil, so os/exec wires them to /dev/null — the child has no controlling tty
+// (the "non-interactive child / empty tty" case). The caller drives its death
+// explicitly via Kill; t.Cleanup reaps it otherwise. Pass a duration longer
+// than the test's window so the child only dies when the test kills it.
 func SpawnSleep(t testing.TB, d time.Duration) *Child {
 	t.Helper()
-	secs := int(d.Seconds())
-	if secs < 1 {
-		secs = 1
-	}
-	cmd := exec.Command("sleep", strconv.Itoa(secs))
+	cmd := exec.Command("sleep", strconv.Itoa(sleepSeconds(d)))
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("spawn sleep: %v", err)
 	}
 	c := &Child{PID: cmd.Process.Pid, cmd: cmd}
 	t.Cleanup(func() { c.Kill(t) })
 	return c
+}
+
+func sleepSeconds(d time.Duration) int {
+	secs := int(d.Seconds())
+	if secs < 1 {
+		return 1
+	}
+	return secs
 }
 
 // Kill sends SIGKILL and reaps the child. Idempotent and safe to call from
