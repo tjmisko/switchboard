@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (linux/${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go build ./...
+      - run: go test -race ./...
+
+  darwin-build:
+    # Stub (non-blocking). The OS process layer (/proc + pidfd_open) is
+    # Linux-only and not yet behind build tags, so `go build ./...` is expected
+    # to fail on macOS until Phase 1.1 moves it behind osproc_linux.go and
+    # Phase 4 adds the darwin backend (libproc + kqueue). This slot exists now so
+    # the matrix is visible; it must not block the required checks. The darwin
+    # test job lands in Phase 4.
+    name: darwin build (stub, non-blocking)
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go build ./...
