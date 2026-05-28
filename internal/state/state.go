@@ -19,6 +19,10 @@ type Session struct {
 	TTY       string    `json:"tty"`
 	StartedAt time.Time `json:"started_at"`
 	Focused   bool      `json:"focused"`
+	// Suspended is true when the claude process is job-control-stopped (Ctrl-Z /
+	// SIGSTOP). Renderers grey such chips out. Omitted when false so the common
+	// case stays off the wire.
+	Suspended bool `json:"suspended,omitempty"`
 
 	Wezterm  *WeztermInfo  `json:"wezterm,omitempty"`
 	Hyprland *HyprlandInfo `json:"hyprland,omitempty"`

@@ -10,12 +10,13 @@ import (
 )
 
 type Info struct {
-	PID  int
-	PPID int
-	Comm string
-	Exe  string
-	CWD  string
-	TTY  string // e.g. "/dev/pts/2" or "" if not a tty-attached process
+	PID   int
+	PPID  int
+	Comm  string
+	Exe   string
+	CWD   string
+	TTY   string // e.g. "/dev/pts/2" or "" if not a tty-attached process
+	State string // single-char run state from /proc/<pid>/status (R/S/D/T/t/Z/...)
 }
 
 // Read collects /proc/<pid>/{comm,exe,cwd,status,fd/0..2}. Returns ErrGone if
@@ -41,9 +42,29 @@ func Read(pid int) (Info, error) {
 		return out, wrapGone(err)
 	}
 	out.PPID = parsePPID(status)
+	out.State = parseState(status)
 
 	out.TTY = readTTY(pid)
 	return out, nil
+}
+
+// State reads only /proc/<pid>/status and returns the single-char run-state
+// code ("R", "S", "T", ...). Lighter than Read for the reconcile hot path,
+// which re-checks suspension on every live session each tick. Returns ErrGone
+// if the process vanished.
+func State(pid int) (string, error) {
+	status, err := readSmallFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		return "", wrapGone(err)
+	}
+	return parseState(status), nil
+}
+
+// Suspended reports whether a run-state code denotes a job-control-stopped
+// process — i.e. one paused by SIGSTOP/SIGTSTP (Ctrl-Z). "t" (tracing stop,
+// e.g. under a debugger) is deliberately excluded.
+func Suspended(state string) bool {
+	return state == "T"
 }
 
 // readTTY tries /proc/<pid>/fd/{0,1,2} for a /dev/pts/N link. Interactive TUIs
@@ -109,4 +130,20 @@ func parsePPID(status string) int {
 		}
 	}
 	return 0
+}
+
+// parseState extracts the single-char run-state code from the status "State:"
+// line, e.g. "State:\tT (stopped)" → "T". Returns "" if the line is absent or
+// malformed.
+func parseState(status string) string {
+	for line := range strings.SplitSeq(status, "\n") {
+		if rest, ok := strings.CutPrefix(line, "State:"); ok {
+			fields := strings.Fields(rest)
+			if len(fields) == 0 {
+				return ""
+			}
+			return fields[0]
+		}
+	}
+	return ""
 }

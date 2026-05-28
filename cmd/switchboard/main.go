@@ -182,6 +182,12 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 			if sess.Hyprland != nil {
 				sess.Focused = sess.Hyprland.Address == active
 			}
+			// Refresh job-control suspension (Ctrl-Z). On ErrGone the procwatch
+			// death callback will drop the session shortly; leave the last-known
+			// value until then rather than flapping.
+			if st, err := proc.State(sess.PID); err == nil {
+				sess.Suspended = proc.Suspended(st)
+			}
 		}
 	})
 }

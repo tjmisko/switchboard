@@ -6,6 +6,7 @@
       "tty": "/dev/pts/3",
       "started_at": "2026-05-28T09:00:00Z",
       "focused": true,
+      "suspended": true,
       "wezterm": {
         "mux_pid": 4790,
         "mux_socket": "/run/user/1000/wezterm/gui-sock-4790",

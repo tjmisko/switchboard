@@ -47,6 +47,33 @@ func TestRenderSnapshotListsSessions(t *testing.T) {
 	}
 }
 
+func TestRenderSnapshotGreysSuspended(t *testing.T) {
+	snap := state.Snapshot{
+		Sessions: []state.Session{
+			{
+				PID: 4821, CWD: "/home/u/proj", Suspended: true,
+				Claude: &state.ClaudeInfo{Status: "working"},
+			},
+		},
+	}
+
+	// Plain (no color): suspended sessions read "suspended", not their stale
+	// underlying status.
+	plain := renderSnapshot(snap, "/home/u", false)
+	if !strings.Contains(plain, "suspended") {
+		t.Errorf("plain frame missing 'suspended' label:\n%s", plain)
+	}
+	if strings.Contains(plain, "working") {
+		t.Errorf("suspended session should not show its stale 'working' status:\n%s", plain)
+	}
+
+	// Colored: the line is painted grey (the suspended treatment).
+	colored := renderSnapshot(snap, "/home/u", true)
+	if !strings.Contains(colored, colGrey) {
+		t.Errorf("colored suspended frame missing grey escape:\n%q", colored)
+	}
+}
+
 func TestRenderSnapshotEmptyAndNoCaps(t *testing.T) {
 	got := renderSnapshot(state.Snapshot{UpdatedAt: time.Now()}, "/home/u", false)
 	if !strings.Contains(got, "0 sessions") {

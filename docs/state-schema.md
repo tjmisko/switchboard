@@ -51,8 +51,9 @@ should key on `pid`.
 
 ## `Session`
 
-The session record. Five fields are always present; three nested blocks are
-optional and omitted entirely when their data has not been resolved yet.
+The session record. Five fields are always present; `suspended` appears only
+when true; three nested blocks are optional and omitted entirely when their
+data has not been resolved yet.
 
 ```jsonc
 {
@@ -61,6 +62,7 @@ optional and omitted entirely when their data has not been resolved yet.
   "tty": "/dev/pts/3",
   "started_at": "2026-05-28T09:00:00Z",
   "focused": true,
+  "suspended": true,         // omitted when false
   "wezterm":  { /* WeztermInfo,  optional */ },
   "hyprland": { /* HyprlandInfo, optional */ },
   "claude":   { /* ClaudeInfo,   optional */ }
@@ -74,6 +76,7 @@ optional and omitted entirely when their data has not been resolved yet.
 | `tty` | string | always | stable | Controlling pseudo-terminal, e.g. `/dev/pts/3`. **OS-specific literal** (macOS will report `/dev/ttysNNN`); consumers should treat it as an opaque join key, never parse the prefix. May be `""` for a non-tty-attached process — such a session cannot be mapped to a terminal/window (Observe-only). |
 | `started_at` | RFC 3339 timestamp | always | stable | When Switchboard first observed the session (wall clock at discovery), **not** the process's real start time. |
 | `focused` | boolean | always | stable | Whether this session's window is the active window in the WM. Best-effort; `false` for any session without a resolved WM address. |
+| `suspended` | boolean | omitted when false | stable | Whether the `claude` process is job-control-stopped — paused by `SIGTSTP`/`SIGSTOP` (Ctrl-Z). Derived from the `State:` field of `/proc/<pid>/status` (`T`); refreshed each reconcile tick (~5 s). Renderers grey such chips out, since the `claude.status` is stale while paused. `t` (tracing stop, e.g. under a debugger) does **not** count. Linux-only signal today; absent on backends that can't read process run-state. |
 | `wezterm` | object \| absent | optional | provisional | Terminal-locator data. Present once the tty is matched to a **wezterm** pane. Other terminal backends (e.g. tmux) do **not** populate it — those sessions are still observed via `/proc`, and focus re-locates the pane by tty at request time. Field set is terminal-backend-specific and may generalize when the seam grows a neutral terminal block. |
 | `hyprland` | object \| absent | optional | provisional | Window-manager data. Present once the pane is matched to a WM window. WM-backend-specific; will generalize behind a neutral window block as other WM backends land. |
 | `claude` | object \| absent | optional | stable | Claude-side enrichment fed by hooks. Present once at least one hook fires for the session. |

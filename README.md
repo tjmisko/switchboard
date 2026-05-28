@@ -229,8 +229,18 @@ with two config files:
 
 `claude.jsonc` declares 10 `custom/claude-N` modules so each chip is a real GTK
 widget with its own CSS. Each runs `switchboard-waybar --slot N` and emits a
-JSON line per snapshot; `class` carries status + `focused` so `style.css` paints
-the chip. Click = focus that slot; right-click = rofi picker; scroll = cycle.
+JSON line per snapshot; `class` carries status + `focused` + `suspended` so
+`style.css` paints the chip. Click = focus that slot; right-click = rofi picker;
+scroll = cycle.
+
+A chip whose `claude` process is job-control-stopped (Ctrl-Z) gains the
+`suspended` class on top of its status class. Grey it out in `style.css`:
+
+```css
+#custom-claude-0.suspended, #custom-claude-1.suspended, /* … through -9 */ {
+  opacity: 0.4;
+}
+```
 
 Hyprland startup wiring:
 
