@@ -66,24 +66,25 @@ func TestSnapshotSortsByStartedAt(t *testing.T) {
 	}
 }
 
-// §4.2 ⚠ characterization: equal StartedAt has no tie-break, so relative order
-// is unspecified. We pin only that both sessions survive the snapshot; 0.9 adds
-// a PID tie-break and tightens this to assert deterministic order.
-func TestSnapshotEqualStartedAtKeepsBothUnordered(t *testing.T) {
+// §4.2 — equal StartedAt is broken by an ascending-PID tie-break, so order is
+// deterministic across snapshots (fixed in 0.9; was previously unspecified —
+// see docs/decisions.md). The positional focus selector relies on this.
+func TestSnapshotEqualStartedAtSortsByPID(t *testing.T) {
 	same := time.Unix(500, 0)
 	store := state.New("")
 	store.Apply(func(m map[int]*state.Session) {
-		m[10] = &state.Session{PID: 10, StartedAt: same}
 		m[20] = &state.Session{PID: 20, StartedAt: same}
+		m[10] = &state.Session{PID: 10, StartedAt: same}
+		m[30] = &state.Session{PID: 30, StartedAt: same}
 	})
 
 	snap := store.Snapshot()
-	if len(snap.Sessions) != 2 {
-		t.Fatalf("got %d sessions, want 2", len(snap.Sessions))
-	}
-	seen := map[int]bool{snap.Sessions[0].PID: true, snap.Sessions[1].PID: true}
-	if !seen[10] || !seen[20] {
-		t.Errorf("both PIDs should be present regardless of order, got %+v", snap.Sessions)
+	got := []int{snap.Sessions[0].PID, snap.Sessions[1].PID, snap.Sessions[2].PID}
+	want := []int{10, 20, 30}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("equal-StartedAt order = %v, want ascending PID %v", got, want)
+		}
 	}
 }
 

@@ -93,7 +93,13 @@ func (s *Store) snapshotLocked() Snapshot {
 	for _, sess := range s.sessions {
 		sessions = append(sessions, *sess)
 	}
+	// Sort by StartedAt, with PID as a deterministic tie-break. Equal timestamps
+	// would otherwise leave order to map iteration, making positional selectors
+	// (rpc.pickSession index, sessions[0]) nondeterministic across snapshots.
 	sort.Slice(sessions, func(i, j int) bool {
+		if sessions[i].StartedAt.Equal(sessions[j].StartedAt) {
+			return sessions[i].PID < sessions[j].PID
+		}
 		return sessions[i].StartedAt.Before(sessions[j].StartedAt)
 	})
 	return Snapshot{Sessions: sessions, UpdatedAt: time.Now()}
