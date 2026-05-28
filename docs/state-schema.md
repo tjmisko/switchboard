@@ -150,6 +150,55 @@ Consumers must tolerate its **absence** (pre-1.4 daemons, or to stay
 forward-compatible). When present, `observe` is always `true`; `navigate` is
 `true` only when both a terminal locator and a WM focus backend are available.
 
+## Examples per tier
+
+**Observe tier** (no WM/terminal backend detected — e.g. a headless box or an
+unsupported desktop). Sessions still carry `pid`/`cwd`/`tty`/`status`; the
+`wezterm`/`hyprland` blocks are absent and `capabilities.navigate` is `false`:
+
+```json
+{
+  "sessions": [
+    {
+      "pid": 4821,
+      "cwd": "/home/u/Projects/switchboard",
+      "tty": "/dev/pts/3",
+      "started_at": "2026-05-28T09:00:00Z",
+      "focused": false,
+      "claude": { "status": "working" }
+    }
+  ],
+  "updated_at": "2026-05-28T09:05:30Z",
+  "capabilities": { "observe": true, "navigate": false, "wm": "none", "terminal": "none" }
+}
+```
+
+**Navigate tier** (a WM focus backend and a terminal locator are both present).
+The optional blocks are filled and `capabilities.navigate` is `true`:
+
+```json
+{
+  "sessions": [
+    {
+      "pid": 4821,
+      "cwd": "/home/u/Projects/switchboard",
+      "tty": "/dev/pts/3",
+      "started_at": "2026-05-28T09:00:00Z",
+      "focused": true,
+      "wezterm":  { "mux_pid": 4790, "mux_socket": "/run/user/1000/wezterm/gui-sock-4790", "pane_id": 12, "tab_id": 7, "window_id": 3, "window_title": "claude — switchboard" },
+      "hyprland": { "address": "0x5640f1a2b3c0", "workspace": "4", "workspace_id": 4, "monitor": "" },
+      "claude":   { "status": "working" }
+    }
+  ],
+  "updated_at": "2026-05-28T09:05:30Z",
+  "capabilities": { "observe": true, "navigate": true, "wm": "hyprland", "terminal": "wezterm" }
+}
+```
+
+A tmux-hosted session reaches the Navigate tier with `terminal` reported as
+`"tmux"` (or a chain like `"tmux+wezterm"`) and **no** `wezterm` block — focus
+re-locates the pane by `tty` at request time.
+
 ## Stability rules / versioning
 
 - **Stable fields** (`pid`, `cwd`, `tty`, `started_at`, `focused`, all of
