@@ -7,6 +7,24 @@ import (
 	"github.com/tjmisko/switchboard/internal/wezterm"
 )
 
+// §8.1 Muxes — returns nil (no error) when XDG_RUNTIME_DIR is unset or the
+// wezterm dir does not exist.
+func TestMuxesNilWhenNoRuntimeDir(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	muxes, err := wezterm.Muxes()
+	if err != nil || muxes != nil {
+		t.Errorf("Muxes with no XDG_RUNTIME_DIR = (%+v, %v), want (nil, nil)", muxes, err)
+	}
+}
+
+func TestMuxesNilWhenWeztermDirMissing(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir()) // exists, but has no wezterm/ subdir
+	muxes, err := wezterm.Muxes()
+	if err != nil || muxes != nil {
+		t.Errorf("Muxes with missing wezterm dir = (%+v, %v), want (nil, nil)", muxes, err)
+	}
+}
+
 // §8.1 Muxes — keeps only gui-sock-<pid> entries whose owning pid is alive,
 // skipping the dead socket, the non-numeric suffix, and the unrelated file.
 // Driven by the harness's fake $XDG_RUNTIME_DIR/wezterm layout.

@@ -43,3 +43,35 @@ func TestLoadHydratesFromGolden(t *testing.T) {
 		t.Errorf("session 4821 should be focused per golden")
 	}
 }
+
+// §4.5 Load — no-op (nil) on empty path and on a missing file.
+func TestLoadNoOpOnEmptyPathAndMissingFile(t *testing.T) {
+	if err := state.New("").Load(); err != nil {
+		t.Errorf("Load with empty path = %v, want nil", err)
+	}
+
+	missing := filepath.Join(t.TempDir(), "does-not-exist.json")
+	store := state.New(missing)
+	if err := store.Load(); err != nil {
+		t.Errorf("Load of missing file = %v, want nil", err)
+	}
+	if n := len(store.Snapshot().Sessions); n != 0 {
+		t.Errorf("missing-file Load hydrated %d sessions, want 0", n)
+	}
+}
+
+// §4.5 ⚠ characterization: a corrupt mirror returns an error and hydrates
+// nothing — previously-persisted sessions are not restored (the daemon logs and
+// rebuilds from the live scan).
+func TestLoadCorruptReturnsErrorAndHydratesNothing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	testsupport.WriteFile(t, path, "{ this is not valid json ]")
+
+	store := state.New(path)
+	if err := store.Load(); err == nil {
+		t.Error("Load of corrupt JSON = nil, want error")
+	}
+	if n := len(store.Snapshot().Sessions); n != 0 {
+		t.Errorf("corrupt-file Load hydrated %d sessions, want 0", n)
+	}
+}

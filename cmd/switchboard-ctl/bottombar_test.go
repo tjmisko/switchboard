@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -69,5 +70,19 @@ func TestEnvOr(t *testing.T) {
 	}
 	if got := envOr("SWITCHBOARD_TEST_ENVOR_MISSING", "fallback"); got != "fallback" {
 		t.Errorf("envOr (unset) = %q, want fallback", got)
+	}
+}
+
+func TestRuntimeDir(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+	if got := runtimeDir(); got != "/run/user/1000" {
+		t.Errorf("runtimeDir (set) = %q, want /run/user/1000", got)
+	}
+
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	got := runtimeDir()
+	want := fmt.Sprintf("/tmp/run-%d", os.Getuid())
+	if got != want {
+		t.Errorf("runtimeDir (unset) = %q, want %q", got, want)
 	}
 }

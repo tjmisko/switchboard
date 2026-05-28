@@ -106,22 +106,31 @@ func Subscribe(ctx context.Context) (<-chan Event, error) {
 			<-ctx.Done()
 			conn.Close()
 		}()
-		scanner := bufio.NewScanner(conn)
-		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		for scanner.Scan() {
-			line := scanner.Text()
-			name, data, ok := strings.Cut(line, ">>")
-			if !ok {
-				continue
-			}
-			select {
-			case ch <- Event{Name: name, Data: data}:
-			case <-ctx.Done():
-				return
-			}
-		}
+		parseEvents(ctx, conn, ch)
 	}()
 	return ch, nil
+}
+
+// parseEvents reads socket2 lines from r, splits each on the first ">>" into an
+// Event, and forwards them to ch until r reaches EOF/error or ctx is cancelled
+// (observed on the send). Lines without a ">>" delimiter are dropped. The token
+// buffer is capped at 1 MiB. It does not close ch — the caller owns that, and
+// is responsible for closing r (e.g. on ctx-cancel) to unblock a pending Read.
+func parseEvents(ctx context.Context, r io.Reader, ch chan<- Event) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		name, data, ok := strings.Cut(line, ">>")
+		if !ok {
+			continue
+		}
+		select {
+		case ch <- Event{Name: name, Data: data}:
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // request sends one command to the Hyprland request socket and reads the
