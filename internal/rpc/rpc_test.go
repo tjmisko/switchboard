@@ -1,12 +1,31 @@
 package rpc
 
 import (
+	"context"
 	"errors"
 	"testing"
 
 	"github.com/tjmisko/switchboard/internal/proc"
 	"github.com/tjmisko/switchboard/internal/state"
+	"github.com/tjmisko/switchboard/internal/terminal"
+	"github.com/tjmisko/switchboard/internal/wm"
 )
+
+// §1.5 graceful degradation: on an Observe-only stack (wm or terminal is the
+// none backend) focus returns the typed ErrNavigateUnsupported up front, rather
+// than the confusing "session has no hyprland address yet" — even when sessions
+// exist and one is fully resolved.
+func TestFocusNavigateUnsupportedOnObserveOnlyStack(t *testing.T) {
+	store := state.New("")
+	store.Apply(func(m map[int]*state.Session) {
+		m[42] = &state.Session{PID: 42, Hyprland: &state.HyprlandInfo{Address: "0xabc"}}
+	})
+	s := New(store, "", terminal.NewNone(), wm.NewNone())
+
+	if err := s.focus(context.Background(), "active"); !errors.Is(err, ErrNavigateUnsupported) {
+		t.Errorf("focus on Observe-only stack err = %v, want ErrNavigateUnsupported", err)
+	}
+}
 
 // §5.1 statusFromHookEvent — full mapping table including the ⚠ never-emit
 // "unknown" contract.
@@ -36,8 +55,10 @@ func TestStatusFromHookEvent(t *testing.T) {
 	}
 }
 
-// §5.2 pickSession — seed cases over a pure slice, including the ⚠ PID-vs-index
-// collision (selector "2" resolves to PID 2 when present, else index 2).
+// §5.2 pickSession — seed cases over a pure slice. The bare-number form keeps
+// the ⚠ PID-vs-index collision for back-compat (decisions.md #3: "2" resolves
+// to PID 2 when present, else index 2); the pid:/idx: prefixes added in Phase
+// 1.5 are the unambiguous forms.
 func TestPickSession(t *testing.T) {
 	sessions := []state.Session{
 		{PID: 100},
@@ -48,7 +69,7 @@ func TestPickSession(t *testing.T) {
 	if got := pickSession(sessions, "active"); got == nil || got.PID != 2 {
 		t.Errorf(`pickSession "active" = %v, want focused PID 2`, got)
 	}
-	// "2" matches PID 2 (index 1), NOT index 2 (PID 300) — the collision.
+	// "2" matches PID 2 (index 1), NOT index 2 (PID 300) — the back-compat collision.
 	if got := pickSession(sessions, "2"); got == nil || got.PID != 2 {
 		t.Errorf(`pickSession "2" = %v, want PID 2 (not index 2)`, got)
 	}
@@ -65,6 +86,34 @@ func TestPickSession(t *testing.T) {
 	// Negative numeric selector parses but matches no PID and is below index 0.
 	if got := pickSession(sessions, "-1"); got != nil {
 		t.Errorf(`pickSession "-1" = %v, want nil`, got)
+	}
+
+	// Explicit pid: selector resolves only by PID, never by index.
+	if got := pickSession(sessions, "pid:300"); got == nil || got.PID != 300 {
+		t.Errorf(`pickSession "pid:300" = %v, want PID 300`, got)
+	}
+	// "pid:2" is unambiguous — PID 2, same as the bare heuristic here.
+	if got := pickSession(sessions, "pid:2"); got == nil || got.PID != 2 {
+		t.Errorf(`pickSession "pid:2" = %v, want PID 2`, got)
+	}
+	// A pid: with no matching session is nil, even though that number is a valid
+	// index — the prefix disables the index fallback.
+	if got := pickSession(sessions, "pid:0"); got != nil {
+		t.Errorf(`pickSession "pid:0" = %v, want nil (no PID 0; index fallback disabled)`, got)
+	}
+	if got := pickSession(sessions, "pid:bad"); got != nil {
+		t.Errorf(`pickSession "pid:bad" = %v, want nil`, got)
+	}
+	// Explicit idx: selector resolves only by position. "idx:2" is PID 300 —
+	// the very session the bare-"2" heuristic shadows behind PID 2.
+	if got := pickSession(sessions, "idx:2"); got == nil || got.PID != 300 {
+		t.Errorf(`pickSession "idx:2" = %v, want index 2 (PID 300)`, got)
+	}
+	if got := pickSession(sessions, "idx:0"); got == nil || got.PID != 100 {
+		t.Errorf(`pickSession "idx:0" = %v, want index 0 (PID 100)`, got)
+	}
+	if got := pickSession(sessions, "idx:99"); got != nil {
+		t.Errorf(`pickSession "idx:99" = %v, want nil (out of range)`, got)
 	}
 
 	// "active"/"" with none focused falls back to sessions[0].

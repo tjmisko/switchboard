@@ -44,12 +44,25 @@ type HyprlandInfo struct {
 type ClaudeInfo struct {
 	SessionID  string `json:"session_id,omitempty"`
 	Transcript string `json:"transcript,omitempty"`
-	Status     string `json:"status"` // working|idle|permission|unknown
+	Status     string `json:"status"` // working|idle|permission (never "unknown")
 }
 
 type Snapshot struct {
-	Sessions  []Session `json:"sessions"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Sessions     []Session     `json:"sessions"`
+	UpdatedAt    time.Time     `json:"updated_at"`
+	Capabilities *Capabilities `json:"capabilities,omitempty"`
+}
+
+// Capabilities reports the detected backend stack and which tier is active, so
+// a renderer can decide whether to show "jump to" affordances. Observe is the
+// always-available floor; Navigate is true only when both a terminal locator
+// and a WM focus backend are present. Omitted entirely (never null) when the
+// daemon has not set it; consumers tolerate its absence.
+type Capabilities struct {
+	Observe  bool   `json:"observe"`
+	Navigate bool   `json:"navigate"`
+	WM       string `json:"wm"`
+	Terminal string `json:"terminal"`
 }
 
 type Store struct {
@@ -57,6 +70,7 @@ type Store struct {
 	mu          sync.RWMutex
 	sessions    map[int]*Session
 	subscribers map[chan Snapshot]struct{}
+	caps        *Capabilities
 }
 
 func New(statePath string) *Store {
@@ -65,6 +79,14 @@ func New(statePath string) *Store {
 		sessions:    make(map[int]*Session),
 		subscribers: make(map[chan Snapshot]struct{}),
 	}
+}
+
+// SetCapabilities records the detected backend stack. It is included in every
+// subsequent snapshot. Set once at daemon startup, before serving.
+func (s *Store) SetCapabilities(c Capabilities) {
+	s.mu.Lock()
+	s.caps = &c
+	s.mu.Unlock()
 }
 
 // Apply mutates the store under lock, then notifies subscribers and persists.
@@ -101,7 +123,7 @@ func (s *Store) snapshotLocked() Snapshot {
 	sort.Slice(sessions, func(i, j int) bool {
 		return lessChipOrder(sessions[i], sessions[j])
 	})
-	return Snapshot{Sessions: sessions, UpdatedAt: time.Now()}
+	return Snapshot{Sessions: sessions, UpdatedAt: time.Now(), Capabilities: s.caps}
 }
 
 // lessChipOrder defines the left-to-right chip order on the bottom bar:

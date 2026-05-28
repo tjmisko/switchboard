@@ -12,17 +12,16 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/detect"
 	"github.com/tjmisko/switchboard/internal/discovery"
-	"github.com/tjmisko/switchboard/internal/hyprland"
 	"github.com/tjmisko/switchboard/internal/mapping"
 	"github.com/tjmisko/switchboard/internal/proc"
-	"github.com/tjmisko/switchboard/internal/procwatch"
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
+	"github.com/tjmisko/switchboard/internal/wm"
 )
 
 func main() {
@@ -30,26 +29,37 @@ func main() {
 	socketPath := flag.String("socket", defaultSocketPath(), "path to RPC unix socket")
 	scanInterval := flag.Duration("scan-interval", 1*time.Second, "/proc scan interval")
 	reconcileInterval := flag.Duration("reconcile-interval", 5*time.Second, "full reconcile interval")
+	wmFlag := flag.String("wm", "auto", "WM backend: auto|hyprland|none")
+	terminalFlag := flag.String("terminal", "auto", "terminal backend: auto|wezterm|none")
 	flag.Parse()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	stack := detect.Detect(detect.Options{WM: *wmFlag, Terminal: *terminalFlag})
+	caps := stack.Capabilities()
+	log.Printf("backends: wm=%s terminal=%s observe=%t navigate=%t",
+		caps.WM, caps.Terminal, caps.Observe, caps.Navigate)
+
 	store := state.New(*statePath)
+	store.SetCapabilities(caps)
 	if err := store.Load(); err != nil {
 		log.Printf("hydrate: %v (continuing)", err)
 	}
 	dropStaleSessions(store)
 
-	watcher := procwatch.New()
+	procSrc := stack.OSProc
+	term := stack.Terminal
+	manager := stack.WM
 	scanner := discovery.New()
+	resolver := mapping.NewResolver(term, manager)
 
 	onClaudeAppeared := func(info proc.Info) {
 		log.Printf("claude pid=%d cwd=%s tty=%s discovered", info.PID, info.CWD, info.TTY)
-		sess := mapping.Resolve(ctx, info)
+		sess := resolver.Resolve(ctx, info)
 		store.Apply(func(m map[int]*state.Session) { m[sess.PID] = &sess })
 
-		if err := watcher.Watch(ctx, info.PID, func() {
+		if err := procSrc.Watch(ctx, info.PID, func() {
 			log.Printf("claude pid=%d died", info.PID)
 			store.Apply(func(m map[int]*state.Session) { delete(m, info.PID) })
 			scanner.Forget(info.PID)
@@ -63,10 +73,10 @@ func main() {
 			log.Printf("scanner: %v", err)
 		}
 	}()
-	go runHyprlandLoop(ctx, store)
-	go runReconciler(ctx, store, *reconcileInterval)
+	go runWMLoop(ctx, store, resolver, manager)
+	go runReconciler(ctx, store, resolver, manager, *reconcileInterval)
 
-	server := rpc.New(store, *socketPath)
+	server := rpc.New(store, *socketPath, term, manager)
 	if err := os.MkdirAll(filepath.Dir(*socketPath), 0o755); err != nil {
 		log.Fatalf("mkdir socket dir: %v", err)
 	}
@@ -90,11 +100,11 @@ func dropStaleSessions(store *state.Store) {
 	})
 }
 
-func runHyprlandLoop(ctx context.Context, store *state.Store) {
+func runWMLoop(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager) {
 	for ctx.Err() == nil {
-		events, err := hyprland.Subscribe(ctx)
+		events, err := manager.Subscribe(ctx)
 		if err != nil {
-			log.Printf("hyprland subscribe: %v (retrying in 2s)", err)
+			log.Printf("wm subscribe: %v (retrying in 2s)", err)
 			select {
 			case <-ctx.Done():
 				return
@@ -103,46 +113,46 @@ func runHyprlandLoop(ctx context.Context, store *state.Store) {
 			}
 		}
 		for evt := range events {
-			handleHyprlandEvent(ctx, store, evt)
+			handleWMEvent(ctx, store, resolver, evt)
 		}
-		// channel closed (socket EOF or ctx cancel) — loop will retry
+		// channel closed (connection EOF or ctx cancel) — loop will retry
 	}
 }
 
-func handleHyprlandEvent(ctx context.Context, store *state.Store, evt hyprland.Event) {
-	switch evt.Name {
-	case "closewindow":
-		// closed window address — drop any session living in it. Covers the
-		// "user closed the terminal while claude was running" case.
-		addr := "0x" + evt.Data
+// handleWMEvent reacts to a neutral window event. Addresses arrive already
+// normalized to Clients() form (the wm seam owns the Hyprland 0x quirk), so the
+// daemon compares them directly against sess.Hyprland.Address.
+func handleWMEvent(ctx context.Context, store *state.Store, resolver *mapping.Resolver, evt wm.Event) {
+	switch evt.Kind {
+	case wm.EventWindowClosed:
+		// Drop any session living in the closed window. Covers the "user closed
+		// the terminal while claude was running" case.
 		store.Apply(func(m map[int]*state.Session) {
 			for pid, sess := range m {
-				if sess.Hyprland != nil && sess.Hyprland.Address == addr {
+				if sess.Hyprland != nil && sess.Hyprland.Address == evt.Address {
 					delete(m, pid)
 				}
 			}
 		})
-	case "activewindowv2":
-		addr := "0x" + evt.Data
+	case wm.EventFocusChanged:
 		store.Apply(func(m map[int]*state.Session) {
 			for _, sess := range m {
 				if sess.Hyprland == nil {
 					sess.Focused = false
 					continue
 				}
-				sess.Focused = sess.Hyprland.Address == addr
+				sess.Focused = sess.Hyprland.Address == evt.Address
 			}
 		})
-	case "movewindowv2", "windowtitlev2", "openwindow":
-		// Something changed — kick a reconcile on any session that might
-		// match. Cheap: just iterate live sessions and re-resolve.
+	case wm.EventLayoutChanged:
+		// Something changed — kick a reconcile on any session that might match.
+		// Cheap: just iterate live sessions and re-resolve.
 		store.Apply(func(m map[int]*state.Session) {
 			for _, sess := range m {
-				mapping.Reconcile(ctx, sess)
+				resolver.Reconcile(ctx, sess)
 			}
 		})
 	}
-	_ = strings.TrimSpace // keep import alive if we strip handlers later
 }
 
 // runReconciler periodically re-resolves every session's wezterm + hyprland
@@ -150,25 +160,25 @@ func handleHyprlandEvent(ctx context.Context, store *state.Store, evt hyprland.E
 // Catches anything missed by event-driven updates (e.g. a session whose
 // mapping was incomplete when first created, the initial focus state, or a
 // hyprctl race).
-func runReconciler(ctx context.Context, store *state.Store, interval time.Duration) {
+func runReconciler(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
-	reconcileOnce(ctx, store)
+	reconcileOnce(ctx, store, resolver, manager)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			reconcileOnce(ctx, store)
+			reconcileOnce(ctx, store, resolver, manager)
 		}
 	}
 }
 
-func reconcileOnce(ctx context.Context, store *state.Store) {
-	active, _ := hyprland.ActiveWindowAddress(ctx)
+func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager) {
+	active, _ := manager.ActiveWindow(ctx)
 	store.Apply(func(m map[int]*state.Session) {
 		for _, sess := range m {
-			mapping.Reconcile(ctx, sess)
+			resolver.Reconcile(ctx, sess)
 			if sess.Hyprland != nil {
 				sess.Focused = sess.Hyprland.Address == active
 			}

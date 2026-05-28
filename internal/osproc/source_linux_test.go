@@ -1,25 +1,29 @@
-package procwatch_test
+//go:build linux
+
+package osproc
 
 import (
 	"context"
 	"testing"
 	"time"
 
-	"github.com/tjmisko/switchboard/internal/procwatch"
 	"github.com/tjmisko/switchboard/internal/testsupport"
 )
 
-// §9 procwatch death semantics, exercised against real short-lived children.
+// §9 death semantics, exercised against real short-lived children. These were
+// internal/procwatch's tests; the pidfd machinery moved into the linux Source
+// in Phase 1.1, so they now drive *linuxSource directly.
 //
 // Two behaviors are documented gaps, not assertions (see docs/decisions.md):
 //   - EINTR mid-poll must not fire onDeath (the loop continues). It cannot be
 //     triggered deterministically from a test, so it is covered by inspection.
-//   - ⚠ a POLLERR revent without POLLIN can spin without ever firing onDeath.
-//     Known gap, intentionally unfixed in Phase 0.
+//   - The Phase-0 ⚠ POLLERR-without-POLLIN spin (decisions.md #11) is now FIXED:
+//     POLLERR/POLLHUP/POLLNVAL are treated as death. Hard to trigger from a
+//     test (pidfd delivers POLLIN on exit), so it is covered by inspection.
 
-// watching reports whether w currently watches pid.
-func watching(w *procwatch.Watcher, pid int) bool {
-	for _, p := range w.Watched() {
+// watching reports whether s currently watches pid.
+func watching(s *linuxSource, pid int) bool {
+	for _, p := range s.Watched() {
 		if p == pid {
 			return true
 		}
@@ -30,19 +34,19 @@ func watching(w *procwatch.Watcher, pid int) bool {
 // waitWatchedEmpty waits (briefly) for the watched set to drain — the proxy for
 // "the per-pid goroutine returned and cleaned up", i.e. no leak. The poll tick
 // is 1s, so allow generous slack.
-func waitWatchedEmpty(t *testing.T, w *procwatch.Watcher) {
+func waitWatchedEmpty(t *testing.T, s *linuxSource) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if len(w.Watched()) == 0 {
+		if len(s.Watched()) == 0 {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("watched set did not drain (goroutine leak?): %v", w.Watched())
+	t.Fatalf("watched set did not drain (goroutine leak?): %v", s.Watched())
 }
 
-// onDeath fires exactly once when a watched child is killed, and the watcher
+// onDeath fires exactly once when a watched child is killed, and the source
 // cleans itself up afterward.
 func TestWatchFiresOnDeathExactlyOnce(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -51,8 +55,8 @@ func TestWatchFiresOnDeathExactlyOnce(t *testing.T) {
 	child := testsupport.SpawnSleep(t, 60*time.Second)
 
 	fired := make(chan struct{}, 4)
-	w := procwatch.New()
-	if err := w.Watch(ctx, child.PID, func() { fired <- struct{}{} }); err != nil {
+	s := newLinuxSource()
+	if err := s.Watch(ctx, child.PID, func() { fired <- struct{}{} }); err != nil {
 		t.Fatalf("Watch: %v", err)
 	}
 
@@ -70,7 +74,7 @@ func TestWatchFiresOnDeathExactlyOnce(t *testing.T) {
 	}
 
 	// §9 Watched() excludes the exited PID; the goroutine cleaned up (no leak).
-	waitWatchedEmpty(t, w)
+	waitWatchedEmpty(t, s)
 }
 
 // A duplicate Watch for the same pid is a no-op: no second fd, no second
@@ -82,14 +86,14 @@ func TestDuplicateWatchIsNoOp(t *testing.T) {
 	child := testsupport.SpawnSleep(t, 60*time.Second)
 
 	fired := make(chan struct{}, 8)
-	w := procwatch.New()
-	if err := w.Watch(ctx, child.PID, func() { fired <- struct{}{} }); err != nil {
+	s := newLinuxSource()
+	if err := s.Watch(ctx, child.PID, func() { fired <- struct{}{} }); err != nil {
 		t.Fatalf("first Watch: %v", err)
 	}
-	if err := w.Watch(ctx, child.PID, func() { fired <- struct{}{} }); err != nil {
+	if err := s.Watch(ctx, child.PID, func() { fired <- struct{}{} }); err != nil {
 		t.Fatalf("duplicate Watch returned error: %v", err)
 	}
-	if n := len(w.Watched()); n != 1 {
+	if n := len(s.Watched()); n != 1 {
 		t.Fatalf("Watched() = %d, want 1 (duplicate must not add a watcher)", n)
 	}
 
@@ -115,19 +119,19 @@ func TestStopCancelsWithoutFiringOnDeath(t *testing.T) {
 	child := testsupport.SpawnSleep(t, 60*time.Second)
 
 	fired := make(chan struct{}, 4)
-	w := procwatch.New()
-	if err := w.Watch(ctx, child.PID, func() { fired <- struct{}{} }); err != nil {
+	s := newLinuxSource()
+	if err := s.Watch(ctx, child.PID, func() { fired <- struct{}{} }); err != nil {
 		t.Fatalf("Watch: %v", err)
 	}
 
-	w.Stop(child.PID)
+	s.Stop(child.PID)
 
 	select {
 	case <-fired:
 		t.Fatal("onDeath fired on Stop — must only fire on actual death")
 	case <-time.After(300 * time.Millisecond):
 	}
-	waitWatchedEmpty(t, w)
+	waitWatchedEmpty(t, s)
 }
 
 // Watching an already-dead pid (PidfdOpen → ESRCH) fires onDeath immediately
@@ -138,8 +142,8 @@ func TestWatchAlreadyDeadFiresImmediately(t *testing.T) {
 	defer cancel()
 
 	fired := make(chan struct{}, 4)
-	w := procwatch.New()
-	if err := w.Watch(ctx, testsupport.DeadPID(), func() { fired <- struct{}{} }); err != nil {
+	s := newLinuxSource()
+	if err := s.Watch(ctx, testsupport.DeadPID(), func() { fired <- struct{}{} }); err != nil {
 		t.Fatalf("Watch(dead): %v", err)
 	}
 
@@ -148,7 +152,7 @@ func TestWatchAlreadyDeadFiresImmediately(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("onDeath did not fire for an already-dead pid")
 	}
-	if watching(w, testsupport.DeadPID()) {
+	if watching(s, testsupport.DeadPID()) {
 		t.Error("ESRCH pid must not be in the watched set")
 	}
 }
