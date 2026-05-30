@@ -43,6 +43,27 @@ func TestIsClaude(t *testing.T) {
 		{"comm match, exe under /claude/", proc.Info{Comm: "claude", Exe: "/home/u/.local/share/claude/claude"}, true},
 		{"comm match, exe elsewhere", proc.Info{Comm: "claude", Exe: "/usr/bin/claude-impostor"}, false},
 		{"case sensitive comm", proc.Info{Comm: "Claude", Exe: ""}, false},
+
+		// A session invoked with flags or a positional prompt carries no
+		// subcommand verb and stays a session.
+		{"interactive --resume", proc.Info{Comm: "claude", Exe: "/x/claude/claude", Args: []string{"/x/claude/claude", "--resume"}}, true},
+		{"interactive positional prompt", proc.Info{Comm: "claude", Exe: "/x/claude/claude", Args: []string{"claude", "fix the build"}}, true},
+
+		// The detached `claude daemon run` background process shares comm + exe
+		// with a real session but is NOT a session — this is the zombie-chip bug.
+		// argv is the exact form observed in /proc/<pid>/cmdline.
+		{"daemon run is not a session", proc.Info{
+			Comm: "claude",
+			Exe:  "/home/u/.local/share/claude/versions/2.1.158",
+			Args: []string{"/home/u/.local/bin/claude", "daemon", "run", "--origin", "transient", "--spawned-by", `{"label":"claude","cwd":"/home/u/Projects/x/.worktrees/y","pid":224404}`},
+		}, false},
+		{"mcp subcommand is not a session", proc.Info{
+			Comm: "claude",
+			Exe:  "/x/claude/claude",
+			Args: []string{"/x/claude/claude", "mcp", "serve"},
+		}, false},
+		// Exclusion holds even when the kernel masked the exe.
+		{"daemon with masked exe", proc.Info{Comm: "claude", Exe: "", Args: []string{"claude", "daemon", "run"}}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
