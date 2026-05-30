@@ -177,38 +177,80 @@ func cmdCycle(c *rpc.Client, direction string) {
 	cmdFocus(c, fmt.Sprintf("%d", snap.Sessions[target].PID))
 }
 
-// cmdAttention jumps to the first session that needs the user. Priority
-// mirrors the waybar chip colors: a session waiting on a permission prompt
-// (red) outranks an idle session (orange). It is a deliberate no-op when every
-// session is working (green) or unknown (grey) — there is nowhere worth
-// jumping. Bound to mod+Shift+a in Hyprland.
+// cmdAttention jumps to a session that needs the user. Priority mirrors the
+// waybar chip colors: sessions waiting on a permission prompt (red) outrank
+// idle sessions (orange). Among the top-priority tier, focus cycles — each
+// press advances from the currently focused session to the next member of that
+// tier, wrapping around, so repeated presses visit every red (or, if there are
+// no reds, every orange) in turn. It is a deliberate no-op when every session
+// is working (green) or unknown (grey) — there is nowhere worth jumping. Bound
+// to mod+Shift+a in Hyprland.
 func cmdAttention(c *rpc.Client) {
 	snap := mustList(c)
-	target := pickAttention(snap.Sessions)
+
+	// The focused session anchors the cycle, so a repeat press steps to the
+	// next member of the tier instead of re-focusing the same one. 0 (no PID)
+	// when nothing is focused, which pickAttention treats as "outside the tier".
+	focusedPID := 0
+	for _, s := range snap.Sessions {
+		if s.Focused {
+			focusedPID = s.PID
+			break
+		}
+	}
+
+	target := pickAttention(snap.Sessions, focusedPID)
 	if target == nil {
 		return
 	}
 	cmdFocus(c, fmt.Sprintf("%d", target.PID))
 }
 
-// pickAttention returns the highest-priority session needing attention:
-// permission outranks idle; working and unknown never qualify. Sessions are
-// assumed start-time ordered (as state.Snapshot guarantees), so the first
-// match within a tier is the oldest such session. Returns nil when nothing
-// needs attention.
-func pickAttention(sessions []state.Session) *state.Session {
-	var firstIdle *state.Session
+// pickAttention returns the next session needing attention, cycling within the
+// highest-priority tier. The tier is the permission sessions (red) if any
+// exist, otherwise the idle sessions (orange); working and unknown sessions
+// never qualify. Members keep snapshot order (oldest-first per state.Snapshot).
+// When focusedPID names a tier member, the next member is returned, wrapping
+// around — so repeated calls cycle through the whole tier, and a single-member
+// tier stays put. When the focused session is outside the tier (or nothing is
+// focused), the first member is returned, so one press jumps in. Returns nil
+// when no session needs attention.
+func pickAttention(sessions []state.Session, focusedPID int) *state.Session {
+	tier := topAttentionTier(sessions)
+	if len(tier) == 0 {
+		return nil
+	}
+
+	current := -1
+	for i, s := range tier {
+		if s.PID == focusedPID {
+			current = i
+			break
+		}
+	}
+	if current == -1 {
+		return tier[0]
+	}
+	return tier[(current+1)%len(tier)]
+}
+
+// topAttentionTier returns the highest-priority group of sessions needing
+// attention — all permission sessions if any exist, otherwise all idle
+// sessions — in snapshot order. Returns nil when nothing needs attention.
+func topAttentionTier(sessions []state.Session) []*state.Session {
+	var permission, idle []*state.Session
 	for i := range sessions {
 		switch sessionStatus(sessions[i]) {
 		case "permission":
-			return &sessions[i]
+			permission = append(permission, &sessions[i])
 		case "idle":
-			if firstIdle == nil {
-				firstIdle = &sessions[i]
-			}
+			idle = append(idle, &sessions[i])
 		}
 	}
-	return firstIdle
+	if len(permission) > 0 {
+		return permission
+	}
+	return idle
 }
 
 // sessionStatus normalizes a missing or empty Claude status to "unknown",
@@ -291,8 +333,9 @@ commands:
   status                  one-line summary
   pick                    emit pid<TAB>label<TAB>ws<TAB>cwd lines for fzf
   cycle next|prev         focus the next/previous session, wrapping
-  attention               jump to the first session needing attention:
-                            first permission (red), else first idle (orange);
+  attention               jump to a session needing attention, cycling within
+                            the top tier: permission (red), else idle (orange);
+                            repeated presses visit each member in turn;
                             no-op if all working (green) or unknown (grey)
   hook <event>            forward Claude Code hook enrichment (stdin = JSON)
   bottombar [sub]         manage the bottom waybar lifecycle:
