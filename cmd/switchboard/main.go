@@ -74,7 +74,7 @@ func main() {
 		}
 	}()
 	go runWMLoop(ctx, store, resolver, manager)
-	go runReconciler(ctx, store, resolver, manager, *reconcileInterval)
+	go runReconciler(ctx, store, resolver, manager, stack, *reconcileInterval)
 
 	server := rpc.New(store, *socketPath, term, manager)
 	if err := os.MkdirAll(filepath.Dir(*socketPath), 0o755); err != nil {
@@ -160,21 +160,25 @@ func handleWMEvent(ctx context.Context, store *state.Store, resolver *mapping.Re
 // Catches anything missed by event-driven updates (e.g. a session whose
 // mapping was incomplete when first created, the initial focus state, or a
 // hyprctl race).
-func runReconciler(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, interval time.Duration) {
+func runReconciler(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
-	reconcileOnce(ctx, store, resolver, manager)
+	reconcileOnce(ctx, store, resolver, manager, stack)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			reconcileOnce(ctx, store, resolver, manager)
+			reconcileOnce(ctx, store, resolver, manager, stack)
 		}
 	}
 }
 
-func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager) {
+func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack) {
+	// Re-publish capabilities every tick: the terminal locator is self-redetecting
+	// (detect.NewAuto), so a terminal that came up after the daemon flips
+	// terminal/navigate from their boot-race "none" values without a restart.
+	store.SetCapabilities(stack.Capabilities())
 	active, _ := manager.ActiveWindow(ctx)
 	store.Apply(func(m map[int]*state.Session) {
 		for _, sess := range m {

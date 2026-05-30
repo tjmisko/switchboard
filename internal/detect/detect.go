@@ -92,24 +92,13 @@ func detectTerminal(force string) terminal.Locator {
 	case "none":
 		return terminal.NewNone()
 	}
-	// auto: compose the available backends innermost-first (tmux owns the pane a
-	// claude actually runs in; wezterm is the outer window). Per-session nesting
-	// means the right backend varies by tty, so the chain tries each in order.
-	var locs []terminal.Locator
-	if tx := terminal.NewTmux(); tx.Available() {
-		locs = append(locs, tx)
-	}
-	if wz := terminal.NewWezterm(); wz.Available() {
-		locs = append(locs, wz)
-	}
-	switch len(locs) {
-	case 0:
-		return terminal.NewNone()
-	case 1:
-		return locs[0]
-	default:
-		return terminal.NewChain(locs...)
-	}
+	// auto: a self-redetecting locator that composes whatever backends are live
+	// at call time (innermost-first: tmux owns the pane a claude runs in, wezterm
+	// is the outer window). Detection must not be one-shot here — the daemon
+	// autostarts before the terminal emulator on login, so a frozen
+	// terminal="none" would strand every chip on its cwd basename, never
+	// reflecting window-title changes, for the whole session.
+	return terminal.NewAuto()
 }
 
 // Capabilities summarizes the stack for the state.json capabilities block.
