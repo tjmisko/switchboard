@@ -15,12 +15,13 @@ type Info struct {
 	Comm  string
 	Exe   string
 	CWD   string
-	TTY   string // e.g. "/dev/pts/2" or "" if not a tty-attached process
-	State string // single-char run state from /proc/<pid>/status (R/S/D/T/t/Z/...)
+	TTY   string   // e.g. "/dev/pts/2" or "" if not a tty-attached process
+	Args  []string // full argv from /proc/<pid>/cmdline; nil when the kernel masks it (zombies, kernel threads)
+	State string   // single-char run state from /proc/<pid>/status (R/S/D/T/t/Z/...)
 }
 
-// Read collects /proc/<pid>/{comm,exe,cwd,status,fd/0..2}. Returns ErrGone if
-// the process disappeared mid-read (the most common race).
+// Read collects /proc/<pid>/{comm,cmdline,exe,cwd,status,fd/0..2}. Returns
+// ErrGone if the process disappeared mid-read (the most common race).
 func Read(pid int) (Info, error) {
 	out := Info{PID: pid}
 
@@ -29,6 +30,8 @@ func Read(pid int) (Info, error) {
 		return out, wrapGone(err)
 	}
 	out.Comm = strings.TrimRight(comm, "\n")
+
+	out.Args = readArgs(pid)
 
 	if exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid)); err == nil {
 		out.Exe = exe
@@ -65,6 +68,23 @@ func State(pid int) (string, error) {
 // e.g. under a debugger) is deliberately excluded.
 func Suspended(state string) bool {
 	return state == "T"
+}
+
+// readArgs reads /proc/<pid>/cmdline — the NUL-separated argv with a trailing
+// NUL. Returns nil (not an error) when the kernel masks it: zombies and kernel
+// threads have an empty cmdline. The argv lets discovery tell an interactive
+// `claude` session apart from a `claude daemon …` background process, which
+// shares the same comm and exe.
+func readArgs(pid int) []string {
+	raw, err := readSmallFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil || raw == "" {
+		return nil
+	}
+	args := strings.Split(strings.TrimRight(raw, "\x00"), "\x00")
+	if len(args) == 1 && args[0] == "" {
+		return nil
+	}
+	return args
 }
 
 // readTTY tries /proc/<pid>/fd/{0,1,2} for a /dev/pts/N link. Interactive TUIs

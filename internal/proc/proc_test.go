@@ -101,6 +101,13 @@ func TestReadAndAllPIDs(t *testing.T) {
 	if info.State != "R" && info.State != "S" {
 		t.Errorf("Read(self).State = %q, want a live state (R or S)", info.State)
 	}
+	// argv is populated from /proc/<pid>/cmdline; our own process always has at
+	// least argv[0]. Assert the observable (non-empty), not the exact binary path.
+	if len(info.Args) == 0 {
+		t.Errorf("Read(self).Args is empty, want at least argv[0]")
+	} else if info.Args[0] == "" {
+		t.Errorf("Read(self).Args[0] is empty, want the program path")
+	}
 
 	if _, err := Read(testsupport.DeadPID()); !errors.Is(err, ErrGone) {
 		t.Errorf("Read(dead pid) err = %v, want ErrGone", err)

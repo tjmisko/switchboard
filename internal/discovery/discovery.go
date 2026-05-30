@@ -13,18 +13,48 @@ import (
 	"github.com/tjmisko/switchboard/internal/proc"
 )
 
-// IsClaude returns true if the given /proc snapshot looks like a Claude Code
-// process. We match on comm == "claude" AND exe under ~/.local/share/claude/
-// (handles both the released binary and dev builds installed elsewhere). The
-// exe check is cheap insurance against name collisions.
+// backgroundSubcommands are `claude <verb> …` invocations that are NOT
+// interactive TUI sessions. The load-bearing one is `daemon`: Claude Code spawns
+// a detached `claude daemon run …` process, reparents it to init, and lets it
+// outlive the session that started it. It shares the claude binary — same comm,
+// same exe under /claude/ — and has no controlling tty, so without this filter
+// it surfaces as an un-navigable "zombie" chip that lingers after its session
+// dies. `mcp` (the MCP server/management verb) is excluded for the same reason.
+// Interactive sessions never carry a verb here: they start with a flag
+// (--resume), a positional prompt, or nothing.
+var backgroundSubcommands = map[string]struct{}{
+	"daemon": {},
+	"mcp":    {},
+}
+
+// IsClaude returns true if the given /proc snapshot is an interactive Claude
+// Code session. We match on comm == "claude" AND exe under
+// ~/.local/share/claude/ (handles both the released binary and dev builds
+// installed elsewhere; the exe check is cheap insurance against name
+// collisions), AND reject background subcommand invocations (see
+// backgroundSubcommands) — those are processes, not sessions.
 func IsClaude(p proc.Info) bool {
 	if p.Comm != "claude" {
+		return false
+	}
+	if isBackgroundSubcommand(p.Args) {
 		return false
 	}
 	if p.Exe == "" {
 		return true // benefit of the doubt — kernel masked exe (rare)
 	}
 	return strings.Contains(p.Exe, "/claude/")
+}
+
+// isBackgroundSubcommand reports whether argv is a `claude <verb> …` invocation
+// of a non-interactive subcommand. args[0] is the program path; args[1] is the
+// subcommand verb when present.
+func isBackgroundSubcommand(args []string) bool {
+	if len(args) < 2 {
+		return false
+	}
+	_, ok := backgroundSubcommands[args[1]]
+	return ok
 }
 
 // procSource is the seam between the scanner and /proc. The default

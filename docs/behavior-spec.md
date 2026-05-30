@@ -58,6 +58,13 @@
 - should be `true` when `comm == "claude"` and `Exe` contains `/claude/`.
 - should be `false` when `comm == "claude"` and `Exe` is non-empty but lacks `/claude/`.
 - should be case-sensitive on comm (`"Claude"` → `false`).
+- should be `false` for a background subcommand — `Args[1] ∈ {daemon, mcp}` — even
+  with `comm == "claude"` and a `/claude/` exe. The detached `claude daemon run`
+  that Claude Code spawns and reparents to init shares comm + exe with a real
+  session but has no controlling tty; without this it surfaces as an
+  un-navigable "zombie" chip that outlives the session that spawned it. A session
+  invoked with flags (`--resume`), a positional prompt, or nothing carries no
+  verb and stays a session.
 
 ### 2.2 `Scanner` seen-set state machine  — §0.5 (inject `procSource` = AllPIDs+Read)
 - should fire `onAppeared` exactly once for a newly-seen claude PID.
