@@ -49,6 +49,14 @@ type ClaudeInfo struct {
 	SessionID  string `json:"session_id,omitempty"`
 	Transcript string `json:"transcript,omitempty"`
 	Status     string `json:"status"` // working|idle|permission (never "unknown")
+
+	// StatusSince marks when Status last transitioned to its current value. The
+	// reconciler uses it to age out a "permission" chip that Claude Code left
+	// latched (a declined question / interrupt fires no clearing hook). Kept
+	// in-memory only (json:"-"): the wire/golden contract is unchanged, and a
+	// re-hydrated session is simply re-evaluated against its transcript on the
+	// first reconcile (zero time reads as "long ago", which is the safe default).
+	StatusSince time.Time `json:"-"`
 }
 
 type Snapshot struct {

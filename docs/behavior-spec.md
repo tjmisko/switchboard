@@ -206,11 +206,16 @@
   activate the pane — in that order — on success.
 
 ### 5.4 `handleHook(req)`  — §0.1 spec / behavior
-- should no-op when both `status == ""` and `SessionID == ""`.
+- should no-op when `status == ""`, `SessionID == ""`, **and** `Transcript == ""`.
 - should no-op when no tracked ancestor is found (a misconfigured hook can never
   corrupt state).
 - should set `Claude.Status` when the mapped status is non-empty, allocating
   `Claude` if nil.
+- should stamp `Claude.StatusSince = now` **only on a real transition** (mapped
+  status differs from the current one), so repeated same-status hooks don't reset
+  the age the reconciler uses to decay a stale `permission` chip.
+- should update `Claude.Transcript` whenever a non-empty transcript path is
+  supplied (the path is stable per session; kept fresh for the tail check).
 - ⚠ should set `Claude.SessionID` **write-once** — only when a session_id is
   supplied and the current value is empty; it is never overwritten
   (characterization).
@@ -273,6 +278,49 @@
 - `movewindowv2`, `windowtitlev2`, `openwindow` should re-`Reconcile` every live
   session.
 - should ignore any other event name.
+
+### 7.3 Attention self-heal — `selfHealStaleAttention` / `shouldDecayPermission`
+A declined `AskUserQuestion` (and a turn interrupt) fires **no** clearing hook —
+`PostToolUse` only fires on success, `Stop` not on interrupt — so a `permission`
+chip latches red with nothing to release it. Each reconcile tick the daemon reads
+the tail of each `permission` session's transcript and decays a *resolved* prompt
+(see §7.4 for why this keys on time, not a dangling tool_use).
+- `shouldDecayPermission` should decay (→ `idle`) when the check returns
+  `StateResolved` (a tool_result is dated after the chip went red — answered **or**
+  declined), regardless of age.
+- should **not** decay when the check returns `StatePending` (nothing has resolved
+  since the prompt appeared — keep nagging), regardless of age. ⚠ This is the
+  nginx-template-setup regression: a pending plan/question whose tool_use is not
+  yet flushed must stay **red**, not demote to orange.
+- should fall back to the TTL **only** when the check is `StateUnknown` (the
+  transcript is missing/unreadable): decay once the status age `>=`
+  `permissionDecayTTL`, so a stuck chip still degenerates if the read truly fails.
+- `selfHealStaleAttention` should pass `Claude.StatusSince` as the `since` bound
+  and run **inside** the reconcile `Apply` (on the locked session map), so it
+  never reads the shared `Claude` pointer outside the lock and folds into the
+  tick's single persist/broadcast.
+- should leave `working` / `idle` / unknown sessions (and sessions with no
+  `Claude` block) untouched.
+- `dropStaleSessions` should stamp `StatusSince = now` on every surviving session
+  with a `Claude` block at startup, so a re-hydrated (zero) `StatusSince` does not
+  read every old tool_result as "resolved after" and wrongly demote a prompt that
+  was live across a restart.
+
+### 7.4 `transcript.ResolutionState(path, since, maxBytes)`  — §0.5 (pure, file/clock-injected)
+Claude Code does **not** flush a pending interactive `tool_use` to the transcript
+until it resolves, so a dangling-tool_use scan cannot tell "pending" from "just
+declined". The reliable signal is the timestamp of the newest `tool_result`
+relative to `since` (when the chip went red).
+- should return `StateResolved` when the newest `tool_result` is dated strictly
+  **after** `since` (the prompt was answered/declined after the chip went red).
+- should return `StatePending` when the newest `tool_result` is at/ before `since`,
+  **or** when there is no tool_result at all (a fresh/unflushed prompt) — read
+  succeeds, so this is keep-red, not a TTL fallback.
+- should track the **newest** tool_result across the window.
+- should return `StateUnknown` **with a non-nil error** only for an empty path or
+  a missing/unreadable file (so the TTL backstop fires solely on real I/O failure).
+- should tolerate blank / malformed / timestamp-less lines, and bound the read to
+  `maxBytes` from EOF (dropping the partial first line).
 
 ---
 

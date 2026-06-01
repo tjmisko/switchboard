@@ -128,6 +128,26 @@ Present once a Claude Code hook has fired for the session.
 | `Stop`, `SessionStart` | `idle` |
 | (any other / unknown) | unchanged (empty mapping; status not modified) |
 
+##### `permission` self-heal (reconciler)
+
+`permission` is the only status with no guaranteed clearing hook: declining an
+`AskUserQuestion` — or interrupting a turn — fires nothing (`PostToolUse` only
+fires on success, `Stop` not on interrupt), so the chip would latch red forever.
+Each reconcile tick the daemon reads the tail of a `permission` session's
+transcript (`transcript` field above) and demotes it to `idle` once the prompt is
+resolved. Because Claude Code does not flush a *pending* interactive `tool_use`
+until it resolves, the check keys on **time**, not on a dangling tool_use: a
+`tool_result` dated after the moment the chip went red (`StatusSince`) means the
+prompt was answered **or** declined → demote; if the newest `tool_result`
+predates that moment (its tool_use simply isn't flushed yet), the prompt is still
+pending → stay red. If the transcript can't be read, a `permissionDecayTTL` (30 s)
+backstop decays it anyway so it never nags forever. The demotion lands as a normal
+`idle` chip — identical to a turn that ended cleanly. This is purely a
+daemon-internal status correction; the on-the-wire `status` value set is unchanged
+(`working` / `idle` / `permission`). The `StatusSince` it keys off is **in-memory
+only** (not in `state.json`); it is stamped to startup time on re-hydrate so a
+prompt live across a daemon restart is not misjudged as resolved.
+
 ## The `capabilities` block (Phase 1.4)
 
 Emitted since Phase 1.4. A top-level `capabilities` object reports the detected

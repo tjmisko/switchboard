@@ -21,8 +21,17 @@ import (
 	"github.com/tjmisko/switchboard/internal/proc"
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
+	"github.com/tjmisko/switchboard/internal/transcript"
 	"github.com/tjmisko/switchboard/internal/wm"
 )
+
+// permissionDecayTTL bounds how long a "permission" chip may stay latched once
+// the transcript check can no longer confirm it is genuinely pending. The
+// accurate path (a declined/answered prompt) clears within one reconcile tick;
+// this TTL only governs the fail-soft case where the transcript is unreadable
+// or inconclusive, so a stuck red chip still self-heals instead of nagging
+// forever.
+const permissionDecayTTL = 30 * time.Second
 
 func main() {
 	statePath := flag.String("state", defaultStatePath(), "path to state.json mirror")
@@ -90,11 +99,22 @@ func main() {
 // looks like claude. Run once at startup, before any live discovery — the
 // scanner will re-add survivors on the first tick.
 func dropStaleSessions(store *state.Store) {
+	now := time.Now()
 	store.Apply(func(m map[int]*state.Session) {
 		for pid := range m {
 			info, err := proc.Read(pid)
 			if err != nil || !discovery.IsClaude(info) {
 				delete(m, pid)
+				continue
+			}
+			// StatusSince is in-memory only (json:"-"), so it loads as zero. Stamp
+			// it to startup time: the attention self-heal compares transcript
+			// resolution times against it, and a zero value would read every old
+			// tool_result as "resolved after" — wrongly demoting a still-pending
+			// prompt that was live across the restart. Startup time keeps such a
+			// chip red until something genuinely resolves after the restart.
+			if s := m[pid]; s.Claude != nil {
+				s.Claude.StatusSince = now
 			}
 		}
 	})
@@ -180,6 +200,7 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 	// terminal/navigate from their boot-race "none" values without a restart.
 	store.SetCapabilities(stack.Capabilities())
 	active, _ := manager.ActiveWindow(ctx)
+	now := time.Now()
 	store.Apply(func(m map[int]*state.Session) {
 		for _, sess := range m {
 			resolver.Reconcile(ctx, sess)
@@ -193,7 +214,53 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 				sess.Suspended = proc.Suspended(st)
 			}
 		}
+		selfHealStaleAttention(m, now, permissionDecayTTL)
 	})
+}
+
+// selfHealStaleAttention releases a "permission" chip that Claude Code left
+// latched. Declining a question — or interrupting a turn — fires no clearing
+// hook (PostToolUse only fires on success; Stop not on interrupt), so the red
+// state has nothing to release it. For each permission session it reads the tail
+// of the transcript and compares resolution times against StatusSince (when the
+// chip went red): a tool_result dated after that means the prompt was answered or
+// declined → demote to idle; otherwise it is still pending → stay red. This
+// keys on time, not a dangling tool_use, because Claude Code does not flush a
+// pending interactive tool_use to the transcript until it resolves.
+//
+// It runs inside the reconcile Apply, so it operates on the locked session map
+// directly (no shared-pointer race) and folds into the tick's single persist.
+// The bounded transcript read under the lock is consistent with the per-session
+// /proc and WM I/O the same loop already performs.
+func selfHealStaleAttention(m map[int]*state.Session, now time.Time, ttl time.Duration) {
+	for _, sess := range m {
+		if sess.Claude == nil || sess.Claude.Status != "permission" {
+			continue
+		}
+		age := now.Sub(sess.Claude.StatusSince)
+		st, _ := transcript.ResolutionState(sess.Claude.Transcript, sess.Claude.StatusSince, transcript.DefaultTailBytes)
+		if shouldDecayPermission(st, age, ttl) {
+			sess.Claude.Status = "idle"
+			sess.Claude.StatusSince = now
+		}
+	}
+}
+
+// shouldDecayPermission decides whether a latched "permission" chip should fall
+// back to idle. The transcript tail check is authoritative: a resolved prompt
+// decays, a still-pending one is preserved (keep nagging). When the check is
+// inconclusive — unreadable transcript, parse failure, no tool_use in the tail
+// window — it fails soft to a TTL so a stuck chip still degenerates eventually
+// instead of nagging forever.
+func shouldDecayPermission(st transcript.PromptState, age, ttl time.Duration) bool {
+	switch st {
+	case transcript.StateResolved:
+		return true
+	case transcript.StatePending:
+		return false
+	default: // StateUnknown
+		return age >= ttl
+	}
 }
 
 func defaultStatePath() string {

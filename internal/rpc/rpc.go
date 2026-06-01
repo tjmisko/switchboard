@@ -17,6 +17,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/tjmisko/switchboard/internal/proc"
 	"github.com/tjmisko/switchboard/internal/state"
@@ -35,9 +36,10 @@ type Request struct {
 	Selector string `json:"selector,omitempty"`
 
 	// hook fields — set when Cmd == "hook"
-	Event     string `json:"event,omitempty"`
-	PID       int    `json:"pid,omitempty"`
-	SessionID string `json:"session_id,omitempty"`
+	Event      string `json:"event,omitempty"`
+	PID        int    `json:"pid,omitempty"`
+	SessionID  string `json:"session_id,omitempty"`
+	Transcript string `json:"transcript,omitempty"`
 }
 
 type Response struct {
@@ -247,7 +249,7 @@ func byIndex(sessions []state.Session, idx int) *state.Session {
 // hook can never corrupt state.
 func (s *Server) handleHook(req Request) {
 	status := statusFromHookEvent(req.Event)
-	if status == "" && req.SessionID == "" {
+	if status == "" && req.SessionID == "" && req.Transcript == "" {
 		return
 	}
 	s.store.Apply(func(m map[int]*state.Session) {
@@ -259,11 +261,20 @@ func (s *Server) handleHook(req Request) {
 		if sess.Claude == nil {
 			sess.Claude = &state.ClaudeInfo{}
 		}
-		if status != "" {
+		// Stamp StatusSince only on a real transition, so repeated same-status
+		// hooks (e.g. successive PostToolUse) don't keep resetting the age the
+		// reconciler uses to decay a stale "permission" chip.
+		if status != "" && status != sess.Claude.Status {
 			sess.Claude.Status = status
+			sess.Claude.StatusSince = time.Now()
 		}
 		if req.SessionID != "" && sess.Claude.SessionID == "" {
 			sess.Claude.SessionID = req.SessionID
+		}
+		// Transcript path is stable per session; keep it fresh so the reconciler
+		// can read the tail to tell a declined prompt from a still-pending one.
+		if req.Transcript != "" {
+			sess.Claude.Transcript = req.Transcript
 		}
 	})
 }
@@ -317,6 +328,6 @@ func Dial(socketPath string) (*Client, error) {
 	}, nil
 }
 
-func (c *Client) Close() error                 { return c.conn.Close() }
-func (c *Client) Send(req Request) error       { return c.enc.Encode(req) }
-func (c *Client) Recv(resp *Response) error    { return c.dec.Decode(resp) }
+func (c *Client) Close() error              { return c.conn.Close() }
+func (c *Client) Send(req Request) error    { return c.enc.Encode(req) }
+func (c *Client) Recv(resp *Response) error { return c.dec.Decode(resp) }

@@ -270,19 +270,23 @@ func sessionStatus(s state.Session) string {
 func cmdHook(c *rpc.Client, event string) {
 	pid := os.Getppid()
 	sessionID := ""
+	transcript := ""
 	if body, err := io.ReadAll(os.Stdin); err == nil && len(body) > 0 {
 		var payload struct {
-			SessionID string `json:"session_id"`
+			SessionID      string `json:"session_id"`
+			TranscriptPath string `json:"transcript_path"`
 		}
 		if json.Unmarshal(body, &payload) == nil {
 			sessionID = payload.SessionID
+			transcript = payload.TranscriptPath
 		}
 	}
 	_ = c.Send(rpc.Request{
-		Cmd:       "hook",
-		Event:     event,
-		PID:       pid,
-		SessionID: sessionID,
+		Cmd:        "hook",
+		Event:      event,
+		PID:        pid,
+		SessionID:  sessionID,
+		Transcript: transcript,
 	})
 	var resp rpc.Response
 	_ = c.Recv(&resp)
