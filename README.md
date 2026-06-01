@@ -72,7 +72,7 @@ polybar / eww / i3blocks.
 ## How it works
 
 ```
-                  ┌──────────────────────────────────────────┐
+                  ┌────────────────────────────────────────────┐
                   │            switchboard (daemon)            │
   OS process  ───►│  discovery: comm == "claude"  (Observe)    │
    layer          │  death watch: pidfd/kqueue → drop session  │
@@ -82,8 +82,8 @@ polybar / eww / i3blocks.
   claude hooks ──►│  RPC "hook": enrich status                 │
                   │                                            │
                   │  → ~/.cache/switchboard/state.json         │
-                  │  → $XDG_RUNTIME_DIR/switchboard.sock (RPC)  │
-                  └──────────────────────────────────────────┘
+                  │  → $XDG_RUNTIME_DIR/switchboard.sock (RPC) │
+                  └────────────────────────────────────────────┘
                         │            │             │
                         ▼            ▼             ▼
                    claude-tui   switchboard-ctl   any bar
@@ -126,10 +126,10 @@ cmd/
 
 internal/
   osproc/      Seam 1 — OS process layer (enumerate + death watch; per-OS)
-  terminal/    Seam 2 — terminal locator (wezterm, tmux, none, chain)
+  terminal/    Seam 2 — terminal locator (wezterm, tmux, auto, none, chain)
   wm/          Seam 3 — window manager (hyprland, sway/i3, x11, none)
   detect/      runtime backend selection + capability reporting
-  proc/        Linux /proc reader (used by osproc_linux)
+  proc/        Linux /proc reader — pid metadata (cwd, tty, comm, state)
   discovery/   1 Hz claude scan filter
   hyprland/    Hyprland IPC client (wrapped by wm/hyprland)
   wezterm/     wezterm multi-mux cli client (wrapped by terminal/wezterm)
@@ -154,7 +154,7 @@ switchboard-ctl focus pid:<n>       # jump to a specific PID (unambiguous)
 switchboard-ctl focus idx:<n>       # jump to the Nth session (unambiguous)
 switchboard-ctl focus <n>           # PID n if present, else index n (back-compat)
 switchboard-ctl cycle next|prev     # focus next/prev session, wrapping
-switchboard-ctl attention           # jump to first permission, else first idle
+switchboard-ctl attention           # first permission, else first idle (repeat to cycle the tier)
 switchboard-ctl pick                # pid<TAB>label<TAB>ws<TAB>cwd lines (for fzf)
 ```
 
