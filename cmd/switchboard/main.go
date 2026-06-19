@@ -215,6 +215,7 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 			}
 		}
 		selfHealStaleAttention(m, now, permissionDecayTTL)
+		selfHealStuckStatus(m, now)
 	})
 }
 
@@ -240,8 +241,64 @@ func selfHealStaleAttention(m map[int]*state.Session, now time.Time, ttl time.Du
 		age := now.Sub(sess.Claude.StatusSince)
 		st, _ := transcript.ResolutionState(sess.Claude.Transcript, sess.Claude.StatusSince, transcript.DefaultTailBytes)
 		if shouldDecayPermission(st, age, ttl) {
+			// This transition has no Claude Code hook behind it (a declined or
+			// interrupted prompt fires none), so unlike the hook-driven edges it
+			// would otherwise leave no trace. Log it with the deciding reason —
+			// transcript-resolved vs the soft TTL fallback — so a self-healed red
+			// chip is distinguishable from one that never latched.
+			log.Printf("status: pid=%d session=%s decay permission->idle (reason=%s age=%s)",
+				sess.PID, shortSessionID(sess.Claude.SessionID), decayReason(st), age.Round(time.Second))
 			sess.Claude.Status = "idle"
 			sess.Claude.StatusSince = now
+		}
+	}
+}
+
+// selfHealStuckStatus recovers the two non-permission status latches the hooks
+// leave behind, both by reading the transcript tail (transcript.NewestSignal):
+//
+//   - idle → working: an orchestrator whose main turn ended (Stop → idle) and was
+//     then woken by a background teammate fires no working hook, so the chip
+//     stays orange while it recomputes. A conversational entry dated after the
+//     chip went idle proves the session resumed.
+//   - working → idle: interrupting a turn (Esc) fires no Stop hook, so the chip
+//     stays green after the user stopped the agent. The "[Request interrupted by
+//     user]" notice dated after the chip went working proves the turn was cut.
+//
+// A cheap stat short-circuits the common quiescent case: if nothing has been
+// written since the chip's last transition, no signal can be newer than it, so
+// the tail read is skipped. The read itself is bounded and runs inside the
+// reconcile Apply, exactly like selfHealStaleAttention. Every flip re-stamps
+// StatusSince, so the entry that triggered it is older than the new StatusSince
+// on the next tick and cannot cause a reverse flip — no flapping.
+//
+// Deliberately keyed on the interrupt marker, not a no-activity TTL: a
+// multi-minute tool run writes nothing to the transcript for the duration, so a
+// TTL would wrongly decay a genuinely busy session; the marker has no such
+// false-positive (a completed tool records "interrupted":false, not a text block).
+func selfHealStuckStatus(m map[int]*state.Session, now time.Time) {
+	for _, sess := range m {
+		c := sess.Claude
+		if c == nil || (c.Status != "idle" && c.Status != "working") {
+			continue
+		}
+		fi, err := os.Stat(c.Transcript)
+		if err != nil || !fi.ModTime().After(c.StatusSince) {
+			continue
+		}
+		kind, ts, err := transcript.NewestSignal(c.Transcript, transcript.DefaultTailBytes)
+		if err != nil || kind == transcript.SignalNone || !ts.After(c.StatusSince) {
+			continue
+		}
+		switch {
+		case c.Status == "idle" && kind == transcript.SignalActivity:
+			log.Printf("status: pid=%d session=%s idle->working (reason=transcript-activity)", sess.PID, shortSessionID(c.SessionID))
+			c.Status = "working"
+			c.StatusSince = now
+		case c.Status == "working" && kind == transcript.SignalInterrupt:
+			log.Printf("status: pid=%d session=%s working->idle (reason=interrupt)", sess.PID, shortSessionID(c.SessionID))
+			c.Status = "idle"
+			c.StatusSince = now
 		}
 	}
 }
@@ -261,6 +318,28 @@ func shouldDecayPermission(st transcript.PromptState, age, ttl time.Duration) bo
 	default: // StateUnknown
 		return age >= ttl
 	}
+}
+
+// decayReason names why a permission chip was demoted, for the log trail:
+// "resolved" — the transcript proved the prompt was answered/declined;
+// "ttl" — the check was inconclusive and the soft timeout fired.
+func decayReason(st transcript.PromptState) string {
+	if st == transcript.StateResolved {
+		return "resolved"
+	}
+	return "ttl"
+}
+
+// shortSessionID trims a Claude session UUID to its first segment for compact
+// log lines while staying unique enough to grep. Empty stays "?".
+func shortSessionID(id string) string {
+	if id == "" {
+		return "?"
+	}
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
 }
 
 func defaultStatePath() string {

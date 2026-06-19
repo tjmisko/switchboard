@@ -24,6 +24,27 @@ const noise = `{"type":"last-prompt","lastPrompt":"hi"}` + "\n" +
 	`{"type":"custom-title","customTitle":"x"}` + "\n" +
 	`{"type":"attachment"}`
 
+func assistantText(ts string) string {
+	return fmt.Sprintf(`{"type":"assistant","timestamp":%q,"message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}`, ts)
+}
+
+func interruptLine(ts string) string {
+	return fmt.Sprintf(`{"type":"user","timestamp":%q,"message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}`, ts)
+}
+
+// userStringContent is a user entry whose content is a bare string, not an array
+// of blocks — a shape Claude Code uses (e.g. command caveats) that the tail
+// parser must tolerate rather than skip.
+func userStringContent(ts, s string) string {
+	return fmt.Sprintf(`{"type":"user","timestamp":%q,"message":{"role":"user","content":%q}}`, ts, s)
+}
+
+// systemLine is a timestamped system entry with no message.role — ancillary, so
+// it must not count as conversational activity.
+func systemLine(ts string) string {
+	return fmt.Sprintf(`{"type":"system","timestamp":%q,"content":"hook output"}`, ts)
+}
+
 func writeTranscript(t *testing.T, lines ...string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "transcript.jsonl")
@@ -92,6 +113,97 @@ func TestResolutionState(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNewestSignal(t *testing.T) {
+	tests := []struct {
+		name     string
+		lines    []string
+		wantKind Signal
+		wantTS   string // "" means the zero time
+	}{
+		{
+			name:     "should report activity when the newest entry is an assistant message",
+			lines:    []string{assistantUse("2026-06-01T21:39:01Z"), assistantText("2026-06-01T21:39:05Z")},
+			wantKind: SignalActivity,
+			wantTS:   "2026-06-01T21:39:05Z",
+		},
+		{
+			name:     "should report activity when the newest entry is a user tool_result",
+			lines:    []string{resultLine("2026-06-01T21:40:00Z")},
+			wantKind: SignalActivity,
+			wantTS:   "2026-06-01T21:40:00Z",
+		},
+		{
+			name:     "should report interrupt when the newest entry is an interrupt notice",
+			lines:    []string{assistantText("2026-06-01T21:39:05Z"), interruptLine("2026-06-01T21:39:10Z")},
+			wantKind: SignalInterrupt,
+			wantTS:   "2026-06-01T21:39:10Z",
+		},
+		{
+			name:     "should report activity when work resumes after an interrupt",
+			lines:    []string{interruptLine("2026-06-01T21:39:10Z"), assistantText("2026-06-01T21:39:20Z")},
+			wantKind: SignalActivity,
+			wantTS:   "2026-06-01T21:39:20Z",
+		},
+		{
+			name:     "should ignore timestamp-less metadata and ancillary system entries",
+			lines:    []string{assistantText("2026-06-01T21:39:05Z"), noise, systemLine("2026-06-01T21:39:30Z")},
+			wantKind: SignalActivity,
+			wantTS:   "2026-06-01T21:39:05Z",
+		},
+		{
+			name:     "should report none when no conversational entry exists",
+			lines:    []string{noise, systemLine("2026-06-01T21:39:30Z")},
+			wantKind: SignalNone,
+			wantTS:   "",
+		},
+		{
+			name:     "should tolerate a user entry whose content is a bare string",
+			lines:    []string{userStringContent("2026-06-01T21:39:08Z", "a caveat")},
+			wantKind: SignalActivity,
+			wantTS:   "2026-06-01T21:39:08Z",
+		},
+		{
+			name:     "should tolerate blank and malformed lines",
+			lines:    []string{"", "not json", `{"type":"x"}`, interruptLine("2026-06-01T21:39:10Z")},
+			wantKind: SignalInterrupt,
+			wantTS:   "2026-06-01T21:39:10Z",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kind, ts, err := NewestSignal(writeTranscript(t, tt.lines...), DefaultTailBytes)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if kind != tt.wantKind {
+				t.Errorf("kind = %v, want %v", kind, tt.wantKind)
+			}
+			var want time.Time
+			if tt.wantTS != "" {
+				want = mustTime(t, tt.wantTS)
+			}
+			if !ts.Equal(want) {
+				t.Errorf("ts = %v, want %v", ts, want)
+			}
+		})
+	}
+}
+
+func TestNewestSignalFailsSoft(t *testing.T) {
+	t.Run("should return none and an error for an empty path", func(t *testing.T) {
+		kind, _, err := NewestSignal("", DefaultTailBytes)
+		if kind != SignalNone || err == nil {
+			t.Errorf("got (%v, %v), want (none, error)", kind, err)
+		}
+	})
+	t.Run("should return none and an error for a missing file", func(t *testing.T) {
+		kind, _, err := NewestSignal(filepath.Join(t.TempDir(), "nope.jsonl"), DefaultTailBytes)
+		if kind != SignalNone || err == nil {
+			t.Errorf("got (%v, %v), want (none, error)", kind, err)
+		}
+	})
 }
 
 func TestResolutionStateFailsSoft(t *testing.T) {

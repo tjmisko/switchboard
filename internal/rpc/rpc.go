@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"strconv"
@@ -265,6 +266,12 @@ func (s *Server) handleHook(req Request) {
 		// hooks (e.g. successive PostToolUse) don't keep resetting the age the
 		// reconciler uses to decay a stale "permission" chip.
 		if status != "" && status != sess.Claude.Status {
+			// Log every chip color change with its cause. This is the forensic
+			// trail for state drift: grepping `status: pid=<n>` reconstructs a
+			// session's full transition history, and the gap between an idle/
+			// permission edge and the next working edge measures how long a chip
+			// lagged reality. event= names which Claude Code hook drove it.
+			log.Printf("status: pid=%d %s %s->%s (event=%s)", pid, sessionLabel(sess, req.SessionID), sess.Claude.Status, status, req.Event)
 			sess.Claude.Status = status
 			sess.Claude.StatusSince = time.Now()
 		}
@@ -295,6 +302,29 @@ func findTrackedAncestor(m map[int]*state.Session, pid int, readProc func(int) (
 		pid = info.PPID
 	}
 	return 0
+}
+
+// sessionLabel builds a stable, human-recognizable identifier for status log
+// lines. The Claude session id survives PID reuse (the same chip across a
+// daemon or session restart), so it anchors the timeline; the terminal window
+// title is what actually names the chip on the bar, so it makes a line readable
+// at a glance. Both are best-effort: a hook can arrive before either resolves,
+// hence the "?" / cwd fallbacks. preferID lets the caller pass req.SessionID,
+// which a hook carries before it has been copied onto the session.
+func sessionLabel(sess *state.Session, preferID string) string {
+	id := preferID
+	if id == "" && sess.Claude != nil {
+		id = sess.Claude.SessionID
+	}
+	if id == "" {
+		id = "?"
+	} else if len(id) > 8 {
+		id = id[:8]
+	}
+	if sess.Wezterm != nil && sess.Wezterm.WindowTitle != "" {
+		return fmt.Sprintf("session=%s %q", id, strings.TrimSpace(sess.Wezterm.WindowTitle))
+	}
+	return fmt.Sprintf("session=%s cwd=%s", id, sess.CWD)
 }
 
 func statusFromHookEvent(event string) string {

@@ -1,8 +1,11 @@
 package rpc
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
+	"strings"
 	"testing"
 
 	"github.com/tjmisko/switchboard/internal/proc"
@@ -52,6 +55,80 @@ func TestStatusFromHookEvent(t *testing.T) {
 				t.Errorf("statusFromHookEvent emitted \"unknown\", which must never happen")
 			}
 		})
+	}
+}
+
+// sessionLabel prefers the request-supplied id (which a hook carries before it
+// is copied onto the session), then the session's own id, then "?"; and it
+// names the chip by window title when known, falling back to cwd.
+func TestSessionLabel(t *testing.T) {
+	tests := []struct {
+		name     string
+		sess     *state.Session
+		preferID string
+		want     string
+	}{
+		{
+			name:     "prefers request id and window title",
+			sess:     &state.Session{CWD: "/home/u/proj", Wezterm: &state.WeztermInfo{WindowTitle: "checklist-supernode-proposal"}},
+			preferID: "ce13c0f2-320b-4c97",
+			want:     `session=ce13c0f2 "checklist-supernode-proposal"`,
+		},
+		{
+			name: "falls back to session id and cwd",
+			sess: &state.Session{CWD: "/home/u/proj", Claude: &state.ClaudeInfo{SessionID: "abcdef12-9999"}},
+			want: "session=abcdef12 cwd=/home/u/proj",
+		},
+		{
+			name: "unknown id renders as ?",
+			sess: &state.Session{CWD: "/home/u/proj"},
+			want: "session=? cwd=/home/u/proj",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sessionLabel(tt.sess, tt.preferID); got != tt.want {
+				t.Errorf("sessionLabel = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// handleHook logs every real status transition (with the driving event) and is
+// silent on a no-op repeat — the forensic trail that lets a drifted chip be
+// traced back to the hook that set it, while same-status hooks stay quiet.
+func TestHandleHookLogsTransitions(t *testing.T) {
+	store := state.New("")
+	store.Apply(func(m map[int]*state.Session) {
+		// Seed the session at the hook PID so findTrackedAncestor self-matches
+		// and never touches the real /proc.
+		m[42] = &state.Session{PID: 42, CWD: "/home/u/proj"}
+	})
+	s := New(store, "", terminal.NewNone(), wm.NewNone())
+
+	var buf bytes.Buffer
+	defer log.SetOutput(log.Writer())
+	log.SetOutput(&buf)
+
+	s.handleHook(Request{Cmd: "hook", Event: "Stop", PID: 42, SessionID: "ce13c0f2-aaaa"})
+	s.handleHook(Request{Cmd: "hook", Event: "PostToolUse", PID: 42})
+
+	out := buf.String()
+	if !strings.Contains(out, "status: pid=42 session=ce13c0f2 cwd=/home/u/proj ->idle (event=Stop)") {
+		t.Errorf("missing idle transition line in:\n%s", out)
+	}
+	if !strings.Contains(out, "idle->working (event=PostToolUse)") {
+		t.Errorf("missing working transition line in:\n%s", out)
+	}
+
+	// A repeat of the current status logs nothing.
+	buf.Reset()
+	s.handleHook(Request{Cmd: "hook", Event: "UserPromptSubmit", PID: 42})
+	if got := store.Snapshot().Sessions[0].Claude.Status; got != "working" {
+		t.Fatalf("status = %q, want working (precondition)", got)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("no-op repeat logged %q, want silence", buf.String())
 	}
 }
 
