@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,6 +32,45 @@ func TestShouldDecayPermission(t *testing.T) {
 				t.Errorf("shouldDecayPermission(%v, %v) = %v, want %v", tt.st, tt.age, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestDecayReason(t *testing.T) {
+	if got := decayReason(transcript.StateResolved); got != "resolved" {
+		t.Errorf("decayReason(resolved) = %q, want resolved", got)
+	}
+	if got := decayReason(transcript.StateUnknown); got != "ttl" {
+		t.Errorf("decayReason(unknown) = %q, want ttl", got)
+	}
+	if got := decayReason(transcript.StatePending); got != "ttl" {
+		t.Errorf("decayReason(pending) = %q, want ttl", got)
+	}
+}
+
+// The self-heal demotion is the one status edge with no hook behind it, so it
+// must leave its own log trail naming the deciding reason. A preserved (still
+// pending) chip stays silent.
+func TestSelfHealStaleAttentionLogsDecay(t *testing.T) {
+	since := mustParse(t, "2026-06-01T21:39:00Z")
+	now := since.Add(time.Minute)
+
+	var buf bytes.Buffer
+	defer log.SetOutput(log.Writer())
+	log.SetOutput(&buf)
+
+	m := permMap(writeTranscript(t, tResult("2026-06-01T21:39:30Z")), since)
+	m[100].Claude.SessionID = "ce13c0f2-aaaa"
+	selfHealStaleAttention(m, now, permissionDecayTTL)
+	if !strings.Contains(buf.String(), "status: pid=100 session=ce13c0f2 decay permission->idle (reason=resolved") {
+		t.Errorf("missing decay log line in:\n%s", buf.String())
+	}
+
+	// A still-pending chip is not demoted, so nothing is logged.
+	buf.Reset()
+	m = permMap(writeTranscript(t, tResult("2026-06-01T21:36:45Z")), since)
+	selfHealStaleAttention(m, now, permissionDecayTTL)
+	if buf.Len() != 0 {
+		t.Errorf("preserved chip logged %q, want silence", buf.String())
 	}
 }
 

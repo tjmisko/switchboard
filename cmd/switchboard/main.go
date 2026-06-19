@@ -240,6 +240,13 @@ func selfHealStaleAttention(m map[int]*state.Session, now time.Time, ttl time.Du
 		age := now.Sub(sess.Claude.StatusSince)
 		st, _ := transcript.ResolutionState(sess.Claude.Transcript, sess.Claude.StatusSince, transcript.DefaultTailBytes)
 		if shouldDecayPermission(st, age, ttl) {
+			// This transition has no Claude Code hook behind it (a declined or
+			// interrupted prompt fires none), so unlike the hook-driven edges it
+			// would otherwise leave no trace. Log it with the deciding reason —
+			// transcript-resolved vs the soft TTL fallback — so a self-healed red
+			// chip is distinguishable from one that never latched.
+			log.Printf("status: pid=%d session=%s decay permission->idle (reason=%s age=%s)",
+				sess.PID, shortSessionID(sess.Claude.SessionID), decayReason(st), age.Round(time.Second))
 			sess.Claude.Status = "idle"
 			sess.Claude.StatusSince = now
 		}
@@ -261,6 +268,28 @@ func shouldDecayPermission(st transcript.PromptState, age, ttl time.Duration) bo
 	default: // StateUnknown
 		return age >= ttl
 	}
+}
+
+// decayReason names why a permission chip was demoted, for the log trail:
+// "resolved" — the transcript proved the prompt was answered/declined;
+// "ttl" — the check was inconclusive and the soft timeout fired.
+func decayReason(st transcript.PromptState) string {
+	if st == transcript.StateResolved {
+		return "resolved"
+	}
+	return "ttl"
+}
+
+// shortSessionID trims a Claude session UUID to its first segment for compact
+// log lines while staying unique enough to grep. Empty stays "?".
+func shortSessionID(id string) string {
+	if id == "" {
+		return "?"
+	}
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
 }
 
 func defaultStatePath() string {
