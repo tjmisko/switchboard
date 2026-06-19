@@ -322,6 +322,49 @@ relative to `since` (when the chip went red).
 - should tolerate blank / malformed / timestamp-less lines, and bound the read to
   `maxBytes` from EOF (dropping the partial first line).
 
+### 7.5 Status self-heal — `selfHealStuckStatus`
+The other two non-`permission` latches the hooks leave behind, both recovered
+from the transcript tail each reconcile tick (symmetric with §7.3):
+- **idle → working**: an orchestrator whose main turn ended (`Stop` → idle) and
+  was woken by a background teammate fires no working hook, so the chip stays
+  orange while it recomputes. Should flip to `working` when `NewestSignal`
+  returns `SignalActivity` dated strictly **after** `Claude.StatusSince`.
+- **working → idle**: interrupting a turn (Esc) fires no `Stop` hook, so the chip
+  stays green. Should flip to `idle` when `NewestSignal` returns `SignalInterrupt`
+  dated strictly **after** `Claude.StatusSince`.
+- should re-stamp `StatusSince = now` on every flip, so the triggering entry is
+  older than the new bound next tick and cannot cause a reverse flip (no
+  flapping); `idle`+interrupt and `working`+activity are no-ops.
+- should skip the tail read when `stat` shows the transcript mtime is **not**
+  after `StatusSince` (nothing written since the chip transitioned), and leave
+  `permission` / unknown sessions (and sessions with no `Claude` block) untouched.
+- should run **inside** the reconcile `Apply`, after `selfHealStaleAttention`, so
+  a permission chip decayed to `idle` this same tick (new `StatusSince = now`) is
+  not immediately re-read as fresh activity.
+- ⚠ keys working→idle on the interrupt **marker**, not a no-activity TTL: a
+  multi-minute tool run writes nothing to the transcript meanwhile, so a TTL would
+  wrongly decay a busy session (a completed tool records `"interrupted":false`,
+  not a text block, so the marker never false-matches it).
+
+### 7.6 `transcript.NewestSignal(path, maxBytes)`  — (pure, file-injected)
+Returns the kind + timestamp of the newest **timestamped** entry that is
+conversational, classifying the entry that the caller compares against the chip's
+last transition.
+- should return `SignalActivity` for the newest entry when it is an `assistant`
+  message, or a `user` message that is **not** an interrupt notice (incl. a
+  `tool_result`).
+- should return `SignalInterrupt` when the newest such entry is a `user` text
+  block prefixed `[Request interrupted by user` (covers the `…for tool use]`
+  variant); a later real entry outranks an earlier interrupt (resumed turn).
+- should ignore timestamp-less metadata (`mode`/`custom-title`/`last-prompt`/…)
+  and `system` entries, so a metadata-only append (which still bumps the file
+  mtime) is never mistaken for work.
+- should tolerate `message.content` as **either** an array of blocks or a bare
+  string (a shape some user entries use), blank / malformed lines, and bound the
+  read to `maxBytes` from EOF.
+- should return `(SignalNone, zero)` when no classifiable entry exists, and a
+  non-nil error only for an empty path or a missing/unreadable file.
+
 ---
 
 ## 8. `internal/wezterm`
