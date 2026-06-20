@@ -15,13 +15,16 @@
 //     (orange) chip never returns to green. NewestSignal recovers both.
 //
 // Detecting resolution from the transcript needs care: Claude Code does **not**
-// flush an interactive tool_use to the .jsonl until it *resolves*. While a prompt
-// is pending, its tool_use is absent and the tail shows the *previous*
-// (already-resolved) tool — so a dangling-tool_use scan cannot tell "pending"
-// from "just declined". The reliable signal is **time**: every conversational
-// entry carries a timestamp, so a tool_result dated after the moment the chip
-// went red means the prompt was answered or declined; if the newest tool_result
-// predates that moment, nothing has resolved since the prompt appeared.
+// flush an interactive tool_use to the .jsonl until it *resolves*, and while the
+// prompt waits the session keeps writing — a background teammate/subagent and any
+// sibling auto-approved tool in the same turn flush tool_results dated *after* the
+// chip went red. So "a tool_result newer than the prompt" cannot tell a resolved
+// prompt from one still pending amid concurrent work; counting it demotes the red
+// chip the instant any background work lands. The reliable signal is the *main
+// conversation thread* advancing past the prompt: an assistant message dated after
+// the prompt (the blocked turn resumed → the awaited tool was approved) or a user
+// interrupt notice (declined / Esc). Tool_results — which subagents and parallel
+// tools emit while the prompt still waits — are deliberately ignored.
 package transcript
 
 import (
@@ -41,12 +44,14 @@ const (
 	// StateUnknown means the transcript could not be read or parsed. Callers
 	// should fall back to their own backstop (e.g. a TTL) rather than guess.
 	StateUnknown PromptState = iota
-	// StatePending means nothing has resolved since the chip went red — either
-	// no tool_result exists yet, or the newest one predates the prompt. The
-	// prompt is still waiting on the user; keep nagging.
+	// StatePending means nothing has resolved since the chip went red — no
+	// assistant message or interrupt notice is newer than the prompt (background
+	// tool_results from subagents/parallel tools do not count). The prompt is
+	// still waiting on the user; keep nagging.
 	StatePending
-	// StateResolved means a tool_result is dated after the prompt appeared — the
-	// user answered or declined (or Claude otherwise moved on).
+	// StateResolved means the main conversation thread advanced past the prompt —
+	// an assistant message or a user interrupt notice dated after it appeared (the
+	// user answered, declined, or interrupted).
 	StateResolved
 )
 
@@ -208,19 +213,37 @@ func readTailEntries(path string, maxBytes int64) ([]entry, error) {
 }
 
 // ResolutionState reads up to maxBytes from the end of the transcript at path and
-// reports whether a prompt that latched the chip red at `since` has been
-// resolved.
+// reports whether a prompt that latched the chip red at `since` has been resolved
+// — distinguishing the user moving past the prompt from unrelated activity (a
+// background teammate/subagent, or a sibling auto-approved tool in the same turn)
+// that keeps writing while the prompt still waits.
 //
-//   - StateResolved — the newest tool_result is dated strictly after `since`.
-//   - StatePending  — no tool_result is newer than `since` (incl. the case of no
-//     tool_result at all, which is a fresh/unflushed prompt — keep nagging).
+// Resolution is signalled only by the *main conversation thread* advancing past
+// the prompt, which takes one of two forms in the tail (see isResolution):
+//
+//   - an assistant message dated after `since` — the blocked turn produced new
+//     output, so the awaited tool was approved and ran (Claude Code withholds the
+//     pending tool_use's assistant message until it resolves, so any assistant
+//     entry newer than `since` postdates the approval);
+//   - a user interrupt notice ("[Request interrupted by user…") dated after
+//     `since` — the prompt was declined or the turn was Esc-interrupted (neither
+//     fires a clearing hook).
+//
+// A plain user tool_result is deliberately NOT a resolution signal: subagent
+// reports and parallel auto-approved tools land as tool_results dated after the
+// prompt while it is still genuinely pending, and counting them would flash a red
+// chip green the moment any background work completed.
+//
+//   - StateResolved — the newest resolution entry is dated strictly after `since`.
+//   - StatePending  — no resolution entry is newer than `since` (incl. none at
+//     all, a fresh/unflushed prompt — keep nagging).
 //   - StateUnknown  — the file is missing/unreadable (returned with a non-nil
 //     error); the caller should apply its TTL backstop.
 //
-// A read that succeeds but finds no usable timestamped tool_result returns
-// StatePending (nil error): "can't see a resolution" defaults to keep-red, so a
-// genuinely pending prompt is never demoted. Only an actual I/O failure yields
-// StateUnknown, so the TTL backstop fires only when the check truly fails.
+// A read that succeeds but finds no usable resolution entry returns StatePending
+// (nil error): "can't see a resolution" defaults to keep-red, so a genuinely
+// pending prompt is never demoted. Only an actual I/O failure yields StateUnknown,
+// so the TTL backstop fires only when the check truly fails.
 func ResolutionState(path string, since time.Time, maxBytes int64) (PromptState, error) {
 	entries, err := readTailEntries(path, maxBytes)
 	if err != nil {
@@ -230,7 +253,7 @@ func ResolutionState(path string, since time.Time, maxBytes int64) (PromptState,
 	var newest time.Time
 	var found bool
 	for _, e := range entries {
-		if !hasToolResult(e) {
+		if !isResolution(e) {
 			continue
 		}
 		ts, ok := e.parsedTime()
@@ -249,13 +272,17 @@ func ResolutionState(path string, since time.Time, maxBytes int64) (PromptState,
 	return StatePending, nil
 }
 
-func hasToolResult(e entry) bool {
-	for _, b := range e.blocks() {
-		if b.Type == "tool_result" {
-			return true
-		}
+// isResolution reports whether an entry represents the main conversation thread
+// advancing past a permission prompt: an assistant message (the blocked turn
+// resumed, so the awaited tool was approved) or a user interrupt notice (the
+// prompt was declined / the turn interrupted). A user tool_result is *not* a
+// resolution — a concurrent subagent report or a sibling parallel tool writes
+// tool_results dated after the prompt while it is still pending.
+func isResolution(e entry) bool {
+	if e.Message.Role == "assistant" {
+		return true
 	}
-	return false
+	return classify(e) == SignalInterrupt
 }
 
 // NewestSignal reads up to maxBytes from the end of the transcript at path and

@@ -135,18 +135,22 @@ Present once a Claude Code hook has fired for the session.
 fires on success, `Stop` not on interrupt), so the chip would latch red forever.
 Each reconcile tick the daemon reads the tail of a `permission` session's
 transcript (`transcript` field above) and demotes it to `idle` once the prompt is
-resolved. Because Claude Code does not flush a *pending* interactive `tool_use`
-until it resolves, the check keys on **time**, not on a dangling tool_use: a
-`tool_result` dated after the moment the chip went red (`StatusSince`) means the
-prompt was answered **or** declined → demote; if the newest `tool_result`
-predates that moment (its tool_use simply isn't flushed yet), the prompt is still
-pending → stay red. If the transcript can't be read, a `permissionDecayTTL` (30 s)
-backstop decays it anyway so it never nags forever. The demotion lands as a normal
-`idle` chip — identical to a turn that ended cleanly. This is purely a
-daemon-internal status correction; the on-the-wire `status` value set is unchanged
-(`working` / `idle` / `permission`). The `StatusSince` it keys off is **in-memory
-only** (not in `state.json`); it is stamped to startup time on re-hydrate so a
-prompt live across a daemon restart is not misjudged as resolved.
+resolved. Resolution is signalled by the **main conversation thread advancing past
+the prompt** after `StatusSince` (the moment the chip went red): an **assistant
+message** (the blocked turn resumed → the awaited tool was approved; Claude Code
+withholds the pending tool_use's assistant message until it resolves) or a **user
+interrupt notice** (`[Request interrupted by user…]` → declined / Esc). A bare
+`tool_result` is **deliberately ignored**: a background teammate/subagent, or a
+sibling auto-approved tool in the same turn, keeps flushing `tool_result`s dated
+after the prompt while it is still genuinely pending, so counting them would flash
+the chip green the instant any concurrent work landed — a pending decision must
+stay red even while subagents work. If the transcript can't be read, a
+`permissionDecayTTL` (30 s) backstop decays it anyway so it never nags forever. The
+demotion lands as a normal `idle` chip — identical to a turn that ended cleanly.
+This is purely a daemon-internal status correction; the on-the-wire `status` value
+set is unchanged (`working` / `idle` / `permission`). The `StatusSince` it keys off
+is **in-memory only** (not in `state.json`); it is stamped to startup time on
+re-hydrate so a prompt live across a daemon restart is not misjudged as resolved.
 
 ## The `capabilities` block (Phase 1.4)
 

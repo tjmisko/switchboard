@@ -223,11 +223,14 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 // latched. Declining a question — or interrupting a turn — fires no clearing
 // hook (PostToolUse only fires on success; Stop not on interrupt), so the red
 // state has nothing to release it. For each permission session it reads the tail
-// of the transcript and compares resolution times against StatusSince (when the
-// chip went red): a tool_result dated after that means the prompt was answered or
-// declined → demote to idle; otherwise it is still pending → stay red. This
-// keys on time, not a dangling tool_use, because Claude Code does not flush a
-// pending interactive tool_use to the transcript until it resolves.
+// of the transcript and asks whether the main conversation thread advanced past
+// the prompt after StatusSince (when the chip went red): an assistant message or
+// a user interrupt notice means it was answered/declined → demote to idle;
+// otherwise it is still pending → stay red. Crucially, a bare tool_result is not
+// treated as resolution — a background teammate/subagent or a sibling auto-tool
+// keeps writing tool_results while the prompt waits, and counting them would flash
+// the chip green the instant any concurrent work landed. A pending decision stays
+// red even while subagents work.
 //
 // It runs inside the reconcile Apply, so it operates on the locked session map
 // directly (no shared-pointer race) and folds into the tick's single persist.
