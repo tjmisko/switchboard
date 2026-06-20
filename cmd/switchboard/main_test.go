@@ -58,16 +58,17 @@ func TestSelfHealStaleAttentionLogsDecay(t *testing.T) {
 	defer log.SetOutput(log.Writer())
 	log.SetOutput(&buf)
 
-	m := permMap(writeTranscript(t, tResult("2026-06-01T21:39:30Z")), since)
+	m := permMap(writeTranscript(t, tInterrupt("2026-06-01T21:39:30Z")), since)
 	m[100].Claude.SessionID = "ce13c0f2-aaaa"
 	selfHealStaleAttention(m, now, permissionDecayTTL)
 	if !strings.Contains(buf.String(), "status: pid=100 session=ce13c0f2 decay permission->idle (reason=resolved") {
 		t.Errorf("missing decay log line in:\n%s", buf.String())
 	}
 
-	// A still-pending chip is not demoted, so nothing is logged.
+	// Concurrent subagent/parallel tool_results land after the prompt but do not
+	// resolve it, so the chip stays red and nothing is logged.
 	buf.Reset()
-	m = permMap(writeTranscript(t, tResult("2026-06-01T21:36:45Z")), since)
+	m = permMap(writeTranscript(t, tResult("2026-06-01T21:39:30Z")), since)
 	selfHealStaleAttention(m, now, permissionDecayTTL)
 	if buf.Len() != 0 {
 		t.Errorf("preserved chip logged %q, want silence", buf.String())
@@ -165,9 +166,9 @@ func TestSelfHealStuckStatus(t *testing.T) {
 
 	t.Run("should not re-flip a session decayed permission->idle in the same tick", func(t *testing.T) {
 		// Mirrors reconcileOnce ordering: a declined permission decays to idle with
-		// StatusSince=now, and the resolving tool_result (older than now) must not
-		// then be read as fresh activity by selfHealStuckStatus.
-		m := permMap(writeTranscript(t, tResult("2026-06-01T21:39:30Z")), since)
+		// StatusSince=now, and the resolving interrupt notice (older than now) must
+		// not then be read as fresh activity by selfHealStuckStatus.
+		m := permMap(writeTranscript(t, tInterrupt("2026-06-01T21:39:30Z")), since)
 		selfHealStaleAttention(m, now, permissionDecayTTL)
 		selfHealStuckStatus(m, now)
 		if got := m[100].Claude.Status; got != "idle" {
@@ -248,19 +249,39 @@ func TestSelfHealStaleAttention(t *testing.T) {
 	since := mustParse(t, "2026-06-01T21:39:00Z")
 	now := since.Add(time.Minute) // "now" is shortly after the prompt appeared
 
-	t.Run("should demote permission to idle when a tool_result lands after the prompt (declined)", func(t *testing.T) {
-		m := permMap(writeTranscript(t, tResult("2026-06-01T21:39:30Z")), since)
+	t.Run("should demote permission to idle when an interrupt notice lands after the prompt (declined)", func(t *testing.T) {
+		m := permMap(writeTranscript(t, tInterrupt("2026-06-01T21:39:30Z")), since)
 		selfHealStaleAttention(m, now, permissionDecayTTL)
 		if got := m[100].Claude.Status; got != "idle" {
 			t.Errorf("status = %q, want idle", got)
 		}
 	})
 
-	t.Run("should keep permission when the newest tool_result predates the prompt (unflushed pending)", func(t *testing.T) {
+	t.Run("should demote permission to idle when an assistant message advances past the prompt (answered)", func(t *testing.T) {
+		m := permMap(writeTranscript(t, tAssistant("2026-06-01T21:39:30Z")), since)
+		selfHealStaleAttention(m, now, permissionDecayTTL)
+		if got := m[100].Claude.Status; got != "idle" {
+			t.Errorf("status = %q, want idle", got)
+		}
+	})
+
+	t.Run("should keep permission when only tool_results land after the prompt (concurrent subagent/parallel work)", func(t *testing.T) {
+		// The reported false positive: a teammate/subagent (or a sibling auto-tool)
+		// keeps flushing tool_results dated after the prompt while it is still
+		// genuinely pending. None of that is the user's decision, so the chip must
+		// stay red — even long after, since pending must keep nagging.
+		m := permMap(writeTranscript(t, tResult("2026-06-01T21:39:30Z"), tResult("2026-06-01T21:40:00Z")), since)
+		selfHealStaleAttention(m, now.Add(time.Hour), permissionDecayTTL)
+		if got := m[100].Claude.Status; got != "permission" {
+			t.Errorf("status = %q, want permission (concurrent work is not a decision)", got)
+		}
+	})
+
+	t.Run("should keep permission when the newest resolution entry predates the prompt (unflushed pending)", func(t *testing.T) {
 		// The pending prompt's tool_use is not flushed; the tail shows only the
-		// previous resolved tool, dated before the chip went red. This is the
+		// previous assistant turn, dated before the chip went red. This is the
 		// nginx-template-setup over-demotion regression.
-		m := permMap(writeTranscript(t, tResult("2026-06-01T21:36:45Z")), since)
+		m := permMap(writeTranscript(t, tAssistant("2026-06-01T21:36:45Z")), since)
 		selfHealStaleAttention(m, now.Add(time.Hour), permissionDecayTTL) // even long after
 		if got := m[100].Claude.Status; got != "permission" {
 			t.Errorf("status = %q, want permission (pending must keep nagging)", got)
