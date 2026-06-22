@@ -23,6 +23,7 @@ import (
 	"github.com/tjmisko/switchboard/internal/proc"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/terminal"
+	"github.com/tjmisko/switchboard/internal/transcript"
 	"github.com/tjmisko/switchboard/internal/wm"
 )
 
@@ -261,6 +262,29 @@ func (s *Server) handleHook(req Request) {
 		sess := m[pid]
 		if sess.Claude == nil {
 			sess.Claude = &state.ClaudeInfo{}
+		}
+		// A "permission" chip must stay red until the *prompt itself* resolves —
+		// not merely until some tool finishes. PostToolUse fires for EVERY tool
+		// that completes, including a sibling tool in the same turn or a background
+		// subagent's Task that lands while an interactive prompt (AskUserQuestion /
+		// plan / approval) is still waiting on the user. Honoring it flips the red
+		// chip green the instant any such tool completes (observed: a
+		// PermissionRequest immediately followed by an unrelated PostToolUse one
+		// second later). Gate it on the same transcript-resolution signal the
+		// reconciler uses (transcript.ResolutionState): only clear when the main
+		// conversation thread has actually advanced past the prompt. A bare
+		// tool_result from concurrent work is not resolution, so the chip holds
+		// red; an unreadable transcript is treated as still-pending too, leaving
+		// selfHealStaleAttention's TTL backstop to decay a truly stuck chip.
+		if status == "working" && req.Event == "PostToolUse" && sess.Claude.Status == "permission" {
+			tpath := sess.Claude.Transcript
+			if req.Transcript != "" {
+				tpath = req.Transcript
+			}
+			if st, _ := transcript.ResolutionState(tpath, sess.Claude.StatusSince, transcript.DefaultTailBytes); st != transcript.StateResolved {
+				log.Printf("status: pid=%d %s hold permission (event=PostToolUse, prompt still pending)", pid, sessionLabel(sess, req.SessionID))
+				status = ""
+			}
 		}
 		// Stamp StatusSince only on a real transition, so repeated same-status
 		// hooks (e.g. successive PostToolUse) don't keep resetting the age the

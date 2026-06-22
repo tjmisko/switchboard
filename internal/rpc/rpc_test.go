@@ -5,8 +5,11 @@ import (
 	"context"
 	"errors"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tjmisko/switchboard/internal/proc"
 	"github.com/tjmisko/switchboard/internal/state"
@@ -130,6 +133,75 @@ func TestHandleHookLogsTransitions(t *testing.T) {
 	if buf.Len() != 0 {
 		t.Errorf("no-op repeat logged %q, want silence", buf.String())
 	}
+}
+
+// A PostToolUse fires for EVERY tool that completes — including a sibling tool in
+// the same turn or a background subagent's Task that lands while an interactive
+// prompt is still waiting on the user. handleHook must not let such a PostToolUse
+// clear a "permission" latch; the chip stays red until the transcript shows the
+// main thread advanced past the prompt. This is the regression behind a red chip
+// flashing green ~1s after the question appeared, before it was answered.
+func TestHandleHookHoldsPermissionWhilePromptPending(t *testing.T) {
+	since := mustRPCTime(t, "2026-06-22T10:50:41Z")
+
+	cases := []struct {
+		name       string
+		lines      []string
+		wantStatus string
+	}{
+		{
+			// The prompt's assistant turn predates `since`; the only thing newer is
+			// a bare tool_result from a concurrent tool. Not a resolution → hold red.
+			name: "sibling tool_result keeps permission red",
+			lines: []string{
+				`{"type":"assistant","timestamp":"2026-06-22T10:50:30Z","message":{"role":"assistant","content":[{"type":"text","text":"let me ask"}]}}`,
+				`{"type":"user","timestamp":"2026-06-22T10:50:42Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_sibling"}]}}`,
+			},
+			wantStatus: "permission",
+		},
+		{
+			// The main thread produced an assistant message after `since` — the turn
+			// resumed, so the prompt was answered → clear to working.
+			name: "assistant message after prompt clears to working",
+			lines: []string{
+				`{"type":"assistant","timestamp":"2026-06-22T10:50:30Z","message":{"role":"assistant","content":[{"type":"text","text":"let me ask"}]}}`,
+				`{"type":"assistant","timestamp":"2026-06-22T10:50:55Z","message":{"role":"assistant","content":[{"type":"text","text":"thanks, continuing"}]}}`,
+			},
+			wantStatus: "working",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tpath := filepath.Join(t.TempDir(), "transcript.jsonl")
+			if err := os.WriteFile(tpath, []byte(strings.Join(tc.lines, "\n")+"\n"), 0o644); err != nil {
+				t.Fatalf("write fixture: %v", err)
+			}
+
+			store := state.New("")
+			store.Apply(func(m map[int]*state.Session) {
+				m[42] = &state.Session{PID: 42, CWD: "/home/u/proj", Claude: &state.ClaudeInfo{
+					Status: "permission", StatusSince: since, Transcript: tpath,
+				}}
+			})
+			s := New(store, "", terminal.NewNone(), wm.NewNone())
+
+			s.handleHook(Request{Cmd: "hook", Event: "PostToolUse", PID: 42})
+
+			if got := store.Snapshot().Sessions[0].Claude.Status; got != tc.wantStatus {
+				t.Errorf("status after PostToolUse = %q, want %q", got, tc.wantStatus)
+			}
+		})
+	}
+}
+
+func mustRPCTime(t *testing.T, s string) time.Time {
+	t.Helper()
+	ts, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		t.Fatalf("parse time %q: %v", s, err)
+	}
+	return ts
 }
 
 // §5.2 pickSession — seed cases over a pure slice. The bare-number form keeps
