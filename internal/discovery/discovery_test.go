@@ -74,6 +74,61 @@ func TestIsClaude(t *testing.T) {
 	}
 }
 
+// IsCodex — codex is a single binary whose subcommand is argv[1]; the bare
+// invocation, a leading flag, a positional prompt, resume, and fork are
+// interactive sessions, while exec/app-server/mcp/utility verbs are not.
+func TestIsCodex(t *testing.T) {
+	tests := []struct {
+		name string
+		info proc.Info
+		want bool
+	}{
+		{"wrong comm", proc.Info{Comm: "claude"}, false},
+		{"bare codex is a session", proc.Info{Comm: "codex", Args: []string{"/usr/local/bin/codex"}}, true},
+		{"no args at all", proc.Info{Comm: "codex"}, true},
+		{"leading flag is a session", proc.Info{Comm: "codex", Args: []string{"codex", "--model", "gpt-5-codex"}}, true},
+		{"positional prompt is a session", proc.Info{Comm: "codex", Args: []string{"codex", "fix the build"}}, true},
+		{"resume is a session", proc.Info{Comm: "codex", Args: []string{"codex", "resume"}}, true},
+		{"fork is a session", proc.Info{Comm: "codex", Args: []string{"codex", "fork"}}, true},
+		{"exec is not a session", proc.Info{Comm: "codex", Args: []string{"codex", "exec", "do it"}}, false},
+		{"exec alias e is not a session", proc.Info{Comm: "codex", Args: []string{"codex", "e"}}, false},
+		{"app-server is not a session", proc.Info{Comm: "codex", Args: []string{"codex", "app-server"}}, false},
+		{"mcp-server is not a session", proc.Info{Comm: "codex", Args: []string{"codex", "mcp-server"}}, false},
+		{"mcp is not a session", proc.Info{Comm: "codex", Args: []string{"codex", "mcp"}}, false},
+		{"login is not a session", proc.Info{Comm: "codex", Args: []string{"codex", "login"}}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsCodex(tt.info); got != tt.want {
+				t.Errorf("IsCodex(%+v) = %v, want %v", tt.info, got, tt.want)
+			}
+		})
+	}
+}
+
+// Classify is the single predicate the scanner filters on: a claude session, a
+// codex session, or neither.
+func TestClassify(t *testing.T) {
+	tests := []struct {
+		name string
+		info proc.Info
+		want Agent
+	}{
+		{"claude session", proc.Info{Comm: "claude", Exe: "/x/claude/claude"}, AgentClaude},
+		{"claude daemon is neither", proc.Info{Comm: "claude", Exe: "/x/claude/claude", Args: []string{"claude", "daemon", "run"}}, AgentNone},
+		{"codex session", proc.Info{Comm: "codex", Args: []string{"codex"}}, AgentCodex},
+		{"codex exec is neither", proc.Info{Comm: "codex", Args: []string{"codex", "exec"}}, AgentNone},
+		{"bash is neither", proc.Info{Comm: "bash"}, AgentNone},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := Classify(tt.info); got != tt.want {
+				t.Errorf("Classify(%+v) = %q, want %q", tt.info, got, tt.want)
+			}
+		})
+	}
+}
+
 // §2.2 Scanner — fires onAppeared once per newly-seen claude PID; Forget lets
 // the next scan re-fire (recycled PID).
 func TestScannerFiresOnceAndForgetReFires(t *testing.T) {

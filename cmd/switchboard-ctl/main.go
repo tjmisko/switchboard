@@ -67,7 +67,12 @@ func main() {
 		if len(args) < 2 {
 			fail("hook requires an event name")
 		}
-		cmdHook(c, args[1])
+		cmdHook(c, args[1], state.AgentKindClaude)
+	case "codex-hook":
+		if len(args) < 2 {
+			fail("codex-hook requires an event name")
+		}
+		cmdHook(c, args[1], state.AgentKindCodex)
 	default:
 		usage()
 		os.Exit(2)
@@ -253,21 +258,23 @@ func topAttentionTier(sessions []state.Session) []*state.Session {
 	return idle
 }
 
-// sessionStatus normalizes a missing or empty Claude status to "unknown",
+// sessionStatus normalizes a missing or empty agent status to "unknown",
 // matching switchboard-waybar's rendering.
 func sessionStatus(s state.Session) string {
-	if s.Claude == nil || s.Claude.Status == "" {
+	info := s.Enrichment()
+	if info == nil || info.Status == "" {
 		return "unknown"
 	}
-	return s.Claude.Status
+	return info.Status
 }
 
-// cmdHook is intended to be invoked from a Claude Code hook command. It
-// reads the hook's JSON payload from stdin, looks up its own getppid() to
-// identify which Claude process called the hook, and forwards an enrichment
-// message to the daemon. Failures are silenced so a broken hook can never
-// block Claude Code.
-func cmdHook(c *rpc.Client, event string) {
+// cmdHook is intended to be invoked from a coding agent's hook command (Claude
+// Code or Codex — agent selects which). It reads the hook's JSON payload from
+// stdin, looks up its own getppid() to identify which agent process called the
+// hook, and forwards an enrichment message to the daemon. Both agents share the
+// snake_case stdin fields (session_id, transcript_path). Failures are silenced
+// so a broken hook can never block the agent.
+func cmdHook(c *rpc.Client, event, agent string) {
 	pid := os.Getppid()
 	sessionID := ""
 	transcript := ""
@@ -287,6 +294,7 @@ func cmdHook(c *rpc.Client, event string) {
 		PID:        pid,
 		SessionID:  sessionID,
 		Transcript: transcript,
+		Agent:      agent,
 	})
 	var resp rpc.Response
 	_ = c.Recv(&resp)
@@ -342,6 +350,7 @@ commands:
                             repeated presses visit each member in turn;
                             no-op if all working (green) or unknown (grey)
   hook <event>            forward Claude Code hook enrichment (stdin = JSON)
+  codex-hook <event>      forward Codex hook enrichment (stdin = JSON)
   bottombar [sub]         manage the bottom waybar lifecycle:
                             watch      long-running; show/hide bar with sessions
                             reconcile  one-shot; re-derive bar visibility (F8)

@@ -63,13 +63,15 @@ func main() {
 	scanner := discovery.New()
 	resolver := mapping.NewResolver(term, manager)
 
-	onClaudeAppeared := func(info proc.Info) {
-		log.Printf("claude pid=%d cwd=%s tty=%s discovered", info.PID, info.CWD, info.TTY)
+	onAgentAppeared := func(info proc.Info) {
+		kind := discovery.Classify(info)
+		log.Printf("%s pid=%d cwd=%s tty=%s discovered", kind, info.PID, info.CWD, info.TTY)
 		sess := resolver.Resolve(ctx, info)
+		sess.Agent = string(kind)
 		store.Apply(func(m map[int]*state.Session) { m[sess.PID] = &sess })
 
 		if err := procSrc.Watch(ctx, info.PID, func() {
-			log.Printf("claude pid=%d died", info.PID)
+			log.Printf("%s pid=%d died", kind, info.PID)
 			store.Apply(func(m map[int]*state.Session) { delete(m, info.PID) })
 			scanner.Forget(info.PID)
 		}); err != nil {
@@ -78,7 +80,7 @@ func main() {
 	}
 
 	go func() {
-		if err := scanner.Run(ctx, *scanInterval, onClaudeAppeared); err != nil && ctx.Err() == nil {
+		if err := scanner.Run(ctx, *scanInterval, onAgentAppeared); err != nil && ctx.Err() == nil {
 			log.Printf("scanner: %v", err)
 		}
 	}()
@@ -103,7 +105,7 @@ func dropStaleSessions(store *state.Store) {
 	store.Apply(func(m map[int]*state.Session) {
 		for pid := range m {
 			info, err := proc.Read(pid)
-			if err != nil || !discovery.IsClaude(info) {
+			if err != nil || discovery.Classify(info) == discovery.AgentNone {
 				delete(m, pid)
 				continue
 			}
@@ -113,8 +115,8 @@ func dropStaleSessions(store *state.Store) {
 			// tool_result as "resolved after" — wrongly demoting a still-pending
 			// prompt that was live across the restart. Startup time keeps such a
 			// chip red until something genuinely resolves after the restart.
-			if s := m[pid]; s.Claude != nil {
-				s.Claude.StatusSince = now
+			if info := m[pid].Enrichment(); info != nil {
+				info.StatusSince = now
 			}
 		}
 	})
