@@ -187,9 +187,11 @@ func cmdCycle(c *rpc.Client, direction string) {
 // idle sessions (orange). Among the top-priority tier, focus cycles — each
 // press advances from the currently focused session to the next member of that
 // tier, wrapping around, so repeated presses visit every red (or, if there are
-// no reds, every orange) in turn. It is a deliberate no-op when every session
-// is working (green) or unknown (grey) — there is nowhere worth jumping. Bound
-// to mod+Shift+a in Hyprland.
+// no reds, every orange) in turn. When nothing needs attention but every
+// session is working (green), the green sessions become the tier so the
+// shortcut still does something useful — it cycles through the running
+// sessions. It is a no-op only when a session is unknown (grey), or when there
+// are no sessions at all. Bound to mod+Shift+a in Hyprland.
 func cmdAttention(c *rpc.Client) {
 	snap := mustList(c)
 
@@ -213,8 +215,10 @@ func cmdAttention(c *rpc.Client) {
 
 // pickAttention returns the next session needing attention, cycling within the
 // highest-priority tier. The tier is the permission sessions (red) if any
-// exist, otherwise the idle sessions (orange); working and unknown sessions
-// never qualify. Members keep snapshot order (oldest-first per state.Snapshot).
+// exist, otherwise the idle sessions (orange), otherwise — only when every
+// session is working — the green sessions; an unknown (grey) session is never
+// a target and suppresses the all-green fallback. Members keep snapshot order
+// (oldest-first per state.Snapshot).
 // When focusedPID names a tier member, the next member is returned, wrapping
 // around — so repeated calls cycle through the whole tier, and a single-member
 // tier stays put. When the focused session is outside the tier (or nothing is
@@ -241,21 +245,34 @@ func pickAttention(sessions []state.Session, focusedPID int) *state.Session {
 
 // topAttentionTier returns the highest-priority group of sessions needing
 // attention — all permission sessions if any exist, otherwise all idle
-// sessions — in snapshot order. Returns nil when nothing needs attention.
+// sessions — in snapshot order. As a last resort, when *every* session is
+// working (green), all of them form the tier so the shortcut still has
+// somewhere to go and instead cycles through the running sessions. A single
+// unknown (grey) session suppresses the green tier, so a half-discovered
+// snapshot stays a no-op rather than jumping somewhere arbitrary. Returns nil
+// when nothing needs attention.
 func topAttentionTier(sessions []state.Session) []*state.Session {
-	var permission, idle []*state.Session
+	var permission, idle, working []*state.Session
 	for i := range sessions {
 		switch sessionStatus(sessions[i]) {
 		case "permission":
 			permission = append(permission, &sessions[i])
 		case "idle":
 			idle = append(idle, &sessions[i])
+		case "working":
+			working = append(working, &sessions[i])
 		}
 	}
 	if len(permission) > 0 {
 		return permission
 	}
-	return idle
+	if len(idle) > 0 {
+		return idle
+	}
+	if len(working) > 0 && len(working) == len(sessions) {
+		return working
+	}
+	return nil
 }
 
 // sessionStatus normalizes a missing or empty agent status to "unknown",
@@ -346,9 +363,10 @@ commands:
   pick                    emit pid<TAB>label<TAB>ws<TAB>cwd lines for fzf
   cycle next|prev         focus the next/previous session, wrapping
   attention               jump to a session needing attention, cycling within
-                            the top tier: permission (red), else idle (orange);
+                            the top tier: permission (red), else idle (orange),
+                            else — only if all are green — working sessions;
                             repeated presses visit each member in turn;
-                            no-op if all working (green) or unknown (grey)
+                            no-op if any session is unknown (grey)
   hook <event>            forward Claude Code hook enrichment (stdin = JSON)
   codex-hook <event>      forward Codex hook enrichment (stdin = JSON)
   bottombar [sub]         manage the bottom waybar lifecycle:

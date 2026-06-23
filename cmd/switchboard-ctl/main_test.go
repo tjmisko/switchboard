@@ -29,8 +29,30 @@ func TestPickAttention(t *testing.T) {
 			wantPID:  0,
 		},
 		{
-			name:     "should return nil when all sessions are working or unknown",
+			name:     "should return nil when working sessions are mixed with unknown ones",
 			sessions: []state.Session{sess(1, "working"), sess(2, "unknown"), sess(3, "")},
+			wantPID:  0,
+		},
+		{
+			name:     "should jump to the first green session when all are green and none focused",
+			sessions: []state.Session{sess(1, "working"), sess(2, "working"), sess(3, "working")},
+			wantPID:  1,
+		},
+		{
+			name:       "should cycle to the next green session when all are green",
+			sessions:   []state.Session{sess(1, "working"), sess(2, "working"), sess(3, "working")},
+			focusedPID: 2,
+			wantPID:    3,
+		},
+		{
+			name:       "should wrap to the first green session from the last when all are green",
+			sessions:   []state.Session{sess(1, "working"), sess(2, "working"), sess(3, "working")},
+			focusedPID: 3,
+			wantPID:    1,
+		},
+		{
+			name:     "should not cycle green when a single unknown session is present",
+			sessions: []state.Session{sess(1, "working"), sess(2, "working"), sess(3, "")},
 			wantPID:  0,
 		},
 		{
