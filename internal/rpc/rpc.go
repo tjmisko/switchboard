@@ -337,7 +337,18 @@ func (s *Server) handleHook(req Request) {
 				info.PendingTool = "" // leaving red: forget the captured prompt tool
 			}
 			info.Status = status
-			info.StatusSince = time.Now()
+			// Date the transition from the transcript entry that triggered this hook,
+			// not from now: the hook reaches us tens-to-hundreds of ms after Claude
+			// recorded that entry, and a wall-clock stamp would sit AHEAD of a fast
+			// follow-up signal (e.g. an immediate Ctrl+C), hiding it from the
+			// reconciler's hookless recovery. See transcript.AnchorTime / the skew
+			// class in docs/timing-hazards.md. Fall back to now only when the tail has
+			// no timestamped turn entry, and never let the anchor run ahead of now.
+			now := time.Now()
+			info.StatusSince = now
+			if anchor, ok := transcript.AnchorTime(info.Transcript, s.tun.TailBytes); ok && anchor.Before(now) {
+				info.StatusSince = anchor
+			}
 			if status == state.StatusPermission {
 				info.PendingTool = req.ToolName // capture the tool the prompt is for (A2)
 			}

@@ -274,6 +274,50 @@ func TestNewestSignalFailsSoft(t *testing.T) {
 	})
 }
 
+// AnchorTime is the source-side fix for the hook-vs-transcript clock skew: it
+// hands the hook handler the timestamp of the newest turn entry so a transition
+// is dated from the event that triggered it, not from the later moment the hook
+// is processed. See docs/timing-hazards.md.
+func TestAnchorTime(t *testing.T) {
+	t.Run("should return the newest turn entry timestamp", func(t *testing.T) {
+		path := writeTranscript(t,
+			assistantText("2026-06-01T21:38:00Z"),
+			interruptLine("2026-06-01T21:39:30Z"),
+		)
+		ts, ok := AnchorTime(path, DefaultTailBytes)
+		if !ok {
+			t.Fatal("ok = false, want true")
+		}
+		if want := mustTime(t, "2026-06-01T21:39:30Z"); !ts.Equal(want) {
+			t.Errorf("ts = %v, want newest entry %v", ts, want)
+		}
+	})
+
+	t.Run("should ignore timestamp-less metadata when picking the newest", func(t *testing.T) {
+		path := writeTranscript(t, assistantText("2026-06-01T21:38:00Z"), noise)
+		ts, ok := AnchorTime(path, DefaultTailBytes)
+		if !ok {
+			t.Fatal("ok = false, want true")
+		}
+		if want := mustTime(t, "2026-06-01T21:38:00Z"); !ts.Equal(want) {
+			t.Errorf("ts = %v, want %v (metadata carries no timestamp)", ts, want)
+		}
+	})
+
+	t.Run("should report not-ok for an empty tail so the caller falls back to now", func(t *testing.T) {
+		path := writeTranscript(t, noise)
+		if _, ok := AnchorTime(path, DefaultTailBytes); ok {
+			t.Error("ok = true, want false (no timestamped turn entry)")
+		}
+	})
+
+	t.Run("should report not-ok for an unreadable transcript", func(t *testing.T) {
+		if _, ok := AnchorTime(filepath.Join(t.TempDir(), "nope.jsonl"), DefaultTailBytes); ok {
+			t.Error("ok = true, want false (unreadable)")
+		}
+	})
+}
+
 func TestResolutionStateFailsSoft(t *testing.T) {
 	since := mustTime(t, "2026-06-01T21:39:00Z")
 	t.Run("should return unknown and an error for an empty path", func(t *testing.T) {

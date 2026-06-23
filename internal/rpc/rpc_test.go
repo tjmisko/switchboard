@@ -149,6 +149,39 @@ func TestHandleHookLogsTransitions(t *testing.T) {
 	}
 }
 
+// A hook reaches the daemon only after Claude Code has recorded the entry that
+// triggered it, so a transition must be dated from that transcript entry — not
+// from the later moment the hook is processed. Anchoring kills the skew behind
+// the hookless-recovery races: with a wall-clock StatusSince, a fast follow-up
+// signal (e.g. an immediate Ctrl+C) carries a transcript timestamp OLDER than
+// StatusSince and the reconciler discards it as stale. See docs/timing-hazards.md.
+func TestHandleHookAnchorsStatusSinceToTranscript(t *testing.T) {
+	promptTime := mustRPCTime(t, "2026-06-22T10:50:00Z")
+	tpath := filepath.Join(t.TempDir(), "transcript.jsonl")
+	line := `{"type":"user","timestamp":"2026-06-22T10:50:00Z","message":{"role":"user","content":[{"type":"text","text":"do the thing"}]}}`
+	if err := os.WriteFile(tpath, []byte(line+"\n"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	store := state.New("")
+	store.Apply(func(m map[int]*state.Session) {
+		m[42] = &state.Session{PID: 42, CWD: "/p", Claude: &state.ClaudeInfo{
+			Status: "idle", Transcript: tpath,
+		}}
+	})
+	s := New(store, "", terminal.NewNone(), wm.NewNone())
+
+	s.handleHook(Request{Cmd: "hook", Event: "UserPromptSubmit", PID: 42})
+
+	got := store.Snapshot().Sessions[0].Claude
+	if got.Status != "working" {
+		t.Fatalf("status = %q, want working", got.Status)
+	}
+	if !got.StatusSince.Equal(promptTime) {
+		t.Errorf("StatusSince = %v, want anchored to transcript entry %v (not wall-clock now)", got.StatusSince, promptTime)
+	}
+}
+
 // A PostToolUse fires for EVERY tool that completes — including a sibling tool in
 // the same turn or a background subagent's Task that lands while an interactive
 // prompt is still waiting on the user. handleHook must not let such a PostToolUse
