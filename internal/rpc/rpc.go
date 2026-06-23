@@ -42,6 +42,10 @@ type Request struct {
 	PID        int    `json:"pid,omitempty"`
 	SessionID  string `json:"session_id,omitempty"`
 	Transcript string `json:"transcript,omitempty"`
+	// Agent names which coding agent fired the hook: "claude" (default when
+	// empty) or "codex". It routes the enrichment to the right block and selects
+	// the event→status mapping.
+	Agent string `json:"agent,omitempty"`
 }
 
 type Response struct {
@@ -250,7 +254,11 @@ func byIndex(sessions []state.Session, idx int) *state.Session {
 // session or an unrecognized event is silently ignored, so a misconfigured
 // hook can never corrupt state.
 func (s *Server) handleHook(req Request) {
-	status := statusFromHookEvent(req.Event)
+	agent := req.Agent
+	if agent == "" {
+		agent = state.AgentKindClaude
+	}
+	status := statusFromHookEvent(agent, req.Event)
 	if status == "" && req.SessionID == "" && req.Transcript == "" {
 		return
 	}
@@ -260,9 +268,7 @@ func (s *Server) handleHook(req Request) {
 			return
 		}
 		sess := m[pid]
-		if sess.Claude == nil {
-			sess.Claude = &state.ClaudeInfo{}
-		}
+		info := sess.AgentBlock(agent)
 		// A "permission" chip must stay red until the *prompt itself* resolves —
 		// not merely until some tool finishes. PostToolUse fires for EVERY tool
 		// that completes, including a sibling tool in the same turn or a background
@@ -276,12 +282,16 @@ func (s *Server) handleHook(req Request) {
 		// tool_result from concurrent work is not resolution, so the chip holds
 		// red; an unreadable transcript is treated as still-pending too, leaving
 		// selfHealStaleAttention's TTL backstop to decay a truly stuck chip.
-		if status == "working" && req.Event == "PostToolUse" && sess.Claude.Status == "permission" {
-			tpath := sess.Claude.Transcript
+		//
+		// Claude-only: Codex does not record approvals in its rollout (the
+		// transcript check can't see them), so a codex PostToolUse advances
+		// straight to working without this guard.
+		if agent == state.AgentKindClaude && status == "working" && req.Event == "PostToolUse" && info.Status == "permission" {
+			tpath := info.Transcript
 			if req.Transcript != "" {
 				tpath = req.Transcript
 			}
-			if st, _ := transcript.ResolutionState(tpath, sess.Claude.StatusSince, transcript.DefaultTailBytes); st != transcript.StateResolved {
+			if st, _ := transcript.ResolutionState(tpath, info.StatusSince, transcript.DefaultTailBytes); st != transcript.StateResolved {
 				log.Printf("status: pid=%d %s hold permission (event=PostToolUse, prompt still pending)", pid, sessionLabel(sess, req.SessionID))
 				status = ""
 			}
@@ -289,23 +299,23 @@ func (s *Server) handleHook(req Request) {
 		// Stamp StatusSince only on a real transition, so repeated same-status
 		// hooks (e.g. successive PostToolUse) don't keep resetting the age the
 		// reconciler uses to decay a stale "permission" chip.
-		if status != "" && status != sess.Claude.Status {
+		if status != "" && status != info.Status {
 			// Log every chip color change with its cause. This is the forensic
 			// trail for state drift: grepping `status: pid=<n>` reconstructs a
 			// session's full transition history, and the gap between an idle/
 			// permission edge and the next working edge measures how long a chip
-			// lagged reality. event= names which Claude Code hook drove it.
-			log.Printf("status: pid=%d %s %s->%s (event=%s)", pid, sessionLabel(sess, req.SessionID), sess.Claude.Status, status, req.Event)
-			sess.Claude.Status = status
-			sess.Claude.StatusSince = time.Now()
+			// lagged reality. agent=/event= name which agent and hook drove it.
+			log.Printf("status: pid=%d %s %s->%s (agent=%s event=%s)", pid, sessionLabel(sess, req.SessionID), info.Status, status, agent, req.Event)
+			info.Status = status
+			info.StatusSince = time.Now()
 		}
-		if req.SessionID != "" && sess.Claude.SessionID == "" {
-			sess.Claude.SessionID = req.SessionID
+		if req.SessionID != "" && info.SessionID == "" {
+			info.SessionID = req.SessionID
 		}
 		// Transcript path is stable per session; keep it fresh so the reconciler
 		// can read the tail to tell a declined prompt from a still-pending one.
 		if req.Transcript != "" {
-			sess.Claude.Transcript = req.Transcript
+			info.Transcript = req.Transcript
 		}
 	})
 }
@@ -337,8 +347,10 @@ func findTrackedAncestor(m map[int]*state.Session, pid int, readProc func(int) (
 // which a hook carries before it has been copied onto the session.
 func sessionLabel(sess *state.Session, preferID string) string {
 	id := preferID
-	if id == "" && sess.Claude != nil {
-		id = sess.Claude.SessionID
+	if id == "" {
+		if info := sess.Enrichment(); info != nil {
+			id = info.SessionID
+		}
 	}
 	if id == "" {
 		id = "?"
@@ -351,7 +363,22 @@ func sessionLabel(sess *state.Session, preferID string) string {
 	return fmt.Sprintf("session=%s cwd=%s", id, sess.CWD)
 }
 
-func statusFromHookEvent(event string) string {
+// statusFromHookEvent maps a hook event to a chip status for the given agent.
+// The two agents share most of the vocabulary; Codex additionally emits
+// PreToolUse (Claude Code does not wire it here). Any unmapped event returns ""
+// (status unchanged) and "unknown" is never emitted.
+func statusFromHookEvent(agent, event string) string {
+	if agent == state.AgentKindCodex {
+		switch event {
+		case "UserPromptSubmit", "PreToolUse", "PostToolUse":
+			return "working"
+		case "PermissionRequest":
+			return "permission"
+		case "Stop", "SessionStart":
+			return "idle"
+		}
+		return ""
+	}
 	switch event {
 	case "UserPromptSubmit", "PostToolUse":
 		return "working"

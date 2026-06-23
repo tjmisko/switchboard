@@ -14,8 +14,9 @@ import (
 // breaking change to every bar/consumer that reads state.json.
 var goldenPath = filepath.Join("testdata", "state.golden.json")
 
-// canonicalSnapshot is the schema example: one fully-populated session (every
-// optional block present, every ClaudeInfo field set) followed by one minimal
+// canonicalSnapshot is the schema example: a fully-populated claude session
+// (every optional block present, every AgentInfo field set), a codex session on
+// the Observe tier (the additive "agent"/"codex" fields), and one minimal
 // session (all optional blocks omitted, only the always-present fields). All
 // timestamps are fixed and UTC so encode/decode is deterministic.
 func canonicalSnapshot() Snapshot {
@@ -28,6 +29,7 @@ func canonicalSnapshot() Snapshot {
 				StartedAt: time.Date(2026, 5, 28, 9, 0, 0, 0, time.UTC),
 				Focused:   true,
 				Suspended: true,
+				Agent:     AgentKindClaude,
 				Wezterm: &WeztermInfo{
 					MuxPID:      4790,
 					MuxSocket:   "/run/user/1000/wezterm/gui-sock-4790",
@@ -42,10 +44,23 @@ func canonicalSnapshot() Snapshot {
 					WorkspaceID: 4,
 					Monitor:     "DP-1",
 				},
-				Claude: &ClaudeInfo{
+				Claude: &AgentInfo{
 					SessionID:  "e0b4b21f-aaf6-4ab0-a8d6-2d595aba4065",
 					Transcript: "/home/tjmisko/.claude/projects/switchboard/e0b4b21f.jsonl",
 					Status:     "working",
+				},
+			},
+			{
+				PID:       4999,
+				CWD:       "/home/tjmisko/Projects/api",
+				TTY:       "/dev/pts/7",
+				StartedAt: time.Date(2026, 5, 28, 9, 2, 0, 0, time.UTC),
+				Focused:   false,
+				Agent:     AgentKindCodex,
+				Codex: &AgentInfo{
+					SessionID:  "0199736b-b713-74e2-99a2-f015a1c42816",
+					Transcript: "/home/tjmisko/.codex/sessions/2026/05/28/rollout-2026-05-28T09-02-00-0199736b-b713-74e2-99a2-f015a1c42816.jsonl",
+					Status:     "idle",
 				},
 			},
 			{

@@ -7,6 +7,7 @@
       "started_at": "2026-05-28T09:00:00Z",
       "focused": true,
       "suspended": true,
+      "agent": "claude",
       "wezterm": {
         "mux_pid": 4790,
         "mux_socket": "/run/user/1000/wezterm/gui-sock-4790",
@@ -25,6 +26,19 @@
         "session_id": "e0b4b21f-aaf6-4ab0-a8d6-2d595aba4065",
         "transcript": "/home/tjmisko/.claude/projects/switchboard/e0b4b21f.jsonl",
         "status": "working"
+      }
+    },
+    {
+      "pid": 4999,
+      "cwd": "/home/tjmisko/Projects/api",
+      "tty": "/dev/pts/7",
+      "started_at": "2026-05-28T09:02:00Z",
+      "focused": false,
+      "agent": "codex",
+      "codex": {
+        "session_id": "0199736b-b713-74e2-99a2-f015a1c42816",
+        "transcript": "/home/tjmisko/.codex/sessions/2026/05/28/rollout-2026-05-28T09-02-00-0199736b-b713-74e2-99a2-f015a1c42816.jsonl",
+        "status": "idle"
       }
     },
     {

@@ -33,26 +33,40 @@ func TestFocusNavigateUnsupportedOnObserveOnlyStack(t *testing.T) {
 	}
 }
 
-// §5.1 statusFromHookEvent — full mapping table including the ⚠ never-emit
-// "unknown" contract.
+// §5.1 statusFromHookEvent — full mapping table for both agents, including the
+// ⚠ never-emit "unknown" contract. An empty agent defaults to the claude map.
 func TestStatusFromHookEvent(t *testing.T) {
 	tests := []struct {
+		agent string
 		event string
 		want  string
 	}{
-		{"UserPromptSubmit", "working"},
-		{"PostToolUse", "working"},
-		{"PermissionRequest", "permission"},
-		{"Stop", "idle"},
-		{"SessionStart", "idle"},
-		{"Bogus", ""},
-		{"", ""},
+		// claude
+		{"claude", "UserPromptSubmit", "working"},
+		{"claude", "PostToolUse", "working"},
+		{"claude", "PermissionRequest", "permission"},
+		{"claude", "Stop", "idle"},
+		{"claude", "SessionStart", "idle"},
+		{"claude", "PreToolUse", ""}, // claude does not wire PreToolUse here
+		{"claude", "Bogus", ""},
+		{"claude", "", ""},
+		// empty agent → claude mapping
+		{"", "PostToolUse", "working"},
+		// codex (adds PreToolUse → working)
+		{"codex", "UserPromptSubmit", "working"},
+		{"codex", "PreToolUse", "working"},
+		{"codex", "PostToolUse", "working"},
+		{"codex", "PermissionRequest", "permission"},
+		{"codex", "Stop", "idle"},
+		{"codex", "SessionStart", "idle"},
+		{"codex", "PreCompact", ""}, // unmapped → status unchanged
+		{"codex", "Bogus", ""},
 	}
 	for _, tt := range tests {
-		t.Run(tt.event, func(t *testing.T) {
-			got := statusFromHookEvent(tt.event)
+		t.Run(tt.agent+"/"+tt.event, func(t *testing.T) {
+			got := statusFromHookEvent(tt.agent, tt.event)
 			if got != tt.want {
-				t.Errorf("statusFromHookEvent(%q) = %q, want %q", tt.event, got, tt.want)
+				t.Errorf("statusFromHookEvent(%q, %q) = %q, want %q", tt.agent, tt.event, got, tt.want)
 			}
 			if got == "unknown" {
 				t.Errorf("statusFromHookEvent emitted \"unknown\", which must never happen")
@@ -117,10 +131,10 @@ func TestHandleHookLogsTransitions(t *testing.T) {
 	s.handleHook(Request{Cmd: "hook", Event: "PostToolUse", PID: 42})
 
 	out := buf.String()
-	if !strings.Contains(out, "status: pid=42 session=ce13c0f2 cwd=/home/u/proj ->idle (event=Stop)") {
+	if !strings.Contains(out, "status: pid=42 session=ce13c0f2 cwd=/home/u/proj ->idle (agent=claude event=Stop)") {
 		t.Errorf("missing idle transition line in:\n%s", out)
 	}
-	if !strings.Contains(out, "idle->working (event=PostToolUse)") {
+	if !strings.Contains(out, "idle->working (agent=claude event=PostToolUse)") {
 		t.Errorf("missing working transition line in:\n%s", out)
 	}
 
@@ -192,6 +206,37 @@ func TestHandleHookHoldsPermissionWhilePromptPending(t *testing.T) {
 				t.Errorf("status after PostToolUse = %q, want %q", got, tc.wantStatus)
 			}
 		})
+	}
+}
+
+// A codex hook routes its enrichment to the session's Codex block (not Claude),
+// stamps the agent kind, and uses the codex event→status map. This is the
+// multi-agent routing contract: one session map, per-agent blocks.
+func TestHandleHookRoutesCodex(t *testing.T) {
+	store := state.New("")
+	store.Apply(func(m map[int]*state.Session) {
+		m[7] = &state.Session{PID: 7, CWD: "/home/u/proj"}
+	})
+	s := New(store, "", terminal.NewNone(), wm.NewNone())
+
+	s.handleHook(Request{Cmd: "hook", Agent: "codex", Event: "PermissionRequest", PID: 7, SessionID: "0199736b-codex"})
+
+	sess := store.Snapshot().Sessions[0]
+	if sess.Agent != "codex" {
+		t.Errorf("session agent = %q, want codex", sess.Agent)
+	}
+	if sess.Claude != nil {
+		t.Errorf("claude block populated for a codex hook: %+v", sess.Claude)
+	}
+	if sess.Codex == nil || sess.Codex.Status != "permission" {
+		t.Errorf("codex block = %+v, want status=permission", sess.Codex)
+	}
+	if sess.Codex.SessionID != "0199736b-codex" {
+		t.Errorf("codex session_id = %q, want 0199736b-codex", sess.Codex.SessionID)
+	}
+	// Enrichment() must surface the codex block for renderers.
+	if got := sess.Enrichment(); got == nil || got.Status != "permission" {
+		t.Errorf("Enrichment() = %+v, want the codex block", got)
 	}
 }
 

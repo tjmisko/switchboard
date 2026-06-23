@@ -19,14 +19,68 @@ type Session struct {
 	TTY       string    `json:"tty"`
 	StartedAt time.Time `json:"started_at"`
 	Focused   bool      `json:"focused"`
-	// Suspended is true when the claude process is job-control-stopped (Ctrl-Z /
+	// Suspended is true when the agent process is job-control-stopped (Ctrl-Z /
 	// SIGSTOP). Renderers grey such chips out. Omitted when false so the common
 	// case stays off the wire.
 	Suspended bool `json:"suspended,omitempty"`
 
+	// Agent names the coding-agent CLI that owns this session: "claude" or
+	// "codex" (the AgentKind* constants). Set at discovery from the process. It
+	// selects which enrichment block (claude/codex) hooks write and how a
+	// renderer reads status. Omitted only when the kind is not yet known.
+	Agent string `json:"agent,omitempty"`
+
 	Wezterm  *WeztermInfo  `json:"wezterm,omitempty"`
 	Hyprland *HyprlandInfo `json:"hyprland,omitempty"`
-	Claude   *ClaudeInfo   `json:"claude,omitempty"`
+	// Claude and Codex are the per-agent enrichment blocks; they share one shape
+	// (AgentInfo). Exactly one is populated, matching Agent — the other is
+	// omitted. The split keeps the frozen "claude" wire key intact for existing
+	// bar consumers while adding "codex" purely additively.
+	Claude *AgentInfo `json:"claude,omitempty"`
+	Codex  *AgentInfo `json:"codex,omitempty"`
+}
+
+// Agent kind identifiers, stored in Session.Agent. They match the string values
+// of discovery.Agent, which is where a session's kind originates.
+const (
+	AgentKindClaude = "claude"
+	AgentKindCodex  = "codex"
+)
+
+// Enrichment returns the populated per-agent block for this session (selected by
+// Agent), or nil when no hook has fired yet. Renderers call it to read status
+// without knowing which agent produced it.
+func (s Session) Enrichment() *AgentInfo {
+	switch s.Agent {
+	case AgentKindCodex:
+		return s.Codex
+	case AgentKindClaude:
+		return s.Claude
+	default:
+		if s.Claude != nil {
+			return s.Claude
+		}
+		return s.Codex
+	}
+}
+
+// AgentBlock returns the enrichment block for the given agent kind, allocating
+// it (and recording the kind on the session) when absent. Hook handling routes
+// through it so one code path serves every agent.
+func (s *Session) AgentBlock(kind string) *AgentInfo {
+	if s.Agent == "" {
+		s.Agent = kind
+	}
+	if kind == AgentKindCodex {
+		if s.Codex == nil {
+			s.Codex = &AgentInfo{}
+		}
+		return s.Codex
+	}
+	if s.Claude == nil {
+		s.Claude = &AgentInfo{}
+	}
+	return s.Claude
 }
 
 type WeztermInfo struct {
@@ -45,7 +99,10 @@ type HyprlandInfo struct {
 	Monitor     string `json:"monitor"`
 }
 
-type ClaudeInfo struct {
+// AgentInfo is the per-session enrichment a coding agent's hooks feed in. The
+// shape is identical for every agent (Claude Code, Codex); Session.Agent and the
+// wire key it sits under ("claude"/"codex") say which agent produced it.
+type AgentInfo struct {
 	SessionID  string `json:"session_id,omitempty"`
 	Transcript string `json:"transcript,omitempty"`
 	Status     string `json:"status"` // working|idle|permission (never "unknown")
@@ -58,6 +115,10 @@ type ClaudeInfo struct {
 	// first reconcile (zero time reads as "long ago", which is the safe default).
 	StatusSince time.Time `json:"-"`
 }
+
+// ClaudeInfo is the original name for AgentInfo, kept as an alias so existing
+// callers and tests compile unchanged.
+type ClaudeInfo = AgentInfo
 
 type Snapshot struct {
 	Sessions     []Session     `json:"sessions"`

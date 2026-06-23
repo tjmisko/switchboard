@@ -191,6 +191,50 @@ Status colors come from Claude Code hooks. Without them, sessions still appear
 The forwarder is fire-and-forget; a broken hook can never corrupt state or
 block Claude Code.
 
+## Codex hooks (optional status enrichment)
+
+Switchboard also discovers **OpenAI Codex** TUI sessions (`comm == "codex"`,
+excluding `exec`/`mcp`/`app-server`/… subcommands) and tracks their status the
+same way. They reach the Navigate tier identically — the focus join keys on the
+tty, which is agent-agnostic. Status comes from Codex's hooks via
+`switchboard-ctl codex-hook <Event>`, which reads the hook's stdin JSON exactly
+like the Claude forwarder.
+
+Recent Codex ships a Claude-Code-style hooks system. In `~/.codex/hooks.json`
+(or an inline `[hooks]` table in `~/.codex/config.toml`), wire each lifecycle
+event to the codex forwarder:
+
+```jsonc
+// representative — confirm the exact file shape against the Codex hooks docs
+{
+  "hooks": {
+    "SessionStart":      [{ "command": "switchboard-ctl codex-hook SessionStart" }],
+    "UserPromptSubmit":  [{ "command": "switchboard-ctl codex-hook UserPromptSubmit" }],
+    "PreToolUse":        [{ "command": "switchboard-ctl codex-hook PreToolUse" }],
+    "PostToolUse":       [{ "command": "switchboard-ctl codex-hook PostToolUse" }],
+    "PermissionRequest": [{ "command": "switchboard-ctl codex-hook PermissionRequest" }],
+    "Stop":              [{ "command": "switchboard-ctl codex-hook Stop" }]
+  }
+}
+```
+
+The status mapping mirrors Claude's (`UserPromptSubmit`/`PreToolUse`/
+`PostToolUse` → working, `PermissionRequest` → permission, `Stop`/`SessionStart`
+→ idle). Two honest limitations today:
+
+- **`permission` needs the live hook.** Codex does not record approval requests
+  in its on-disk rollout, so a "blocked on approval" state is observable only via
+  the `PermissionRequest` hook — there is no transcript-tail self-heal for it as
+  there is for Claude. A Codex session with no hooks configured shows only
+  `working`/`idle`.
+- **Self-heal is Claude-only** for now. The idle↔working / stale-permission
+  reconcilers read the Claude transcript format; the analogous Codex rollout
+  parser is future work (see [`docs/codex-investigation.md`](docs/codex-investigation.md),
+  phase C-4). Codex status therefore tracks the hooks directly.
+
+Without any hooks, Codex sessions still appear (Observe) with `unknown` status,
+exactly like an un-hooked Claude session.
+
 ## Requirements
 
 - **Observe:** Linux with `pidfd_open(2)` (kernel 5.3+). Go 1.25 to build.
