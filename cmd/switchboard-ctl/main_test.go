@@ -34,6 +34,18 @@ func TestPickAttention(t *testing.T) {
 			wantPID:  0,
 		},
 		{
+			// delegating is green (work happening, no action needed), so it must
+			// never qualify for the attention jump — same as working.
+			name:     "should ignore delegating sessions (green, no action needed)",
+			sessions: []state.Session{sess(1, "working"), sess(2, "delegating"), sess(3, "delegating")},
+			wantPID:  0,
+		},
+		{
+			name:     "should jump past a delegating session to a genuinely idle one",
+			sessions: []state.Session{sess(1, "delegating"), sess(2, "idle")},
+			wantPID:  2,
+		},
+		{
 			name:     "should jump to the only idle session when no permission exists",
 			sessions: []state.Session{sess(1, "working"), sess(2, "idle"), sess(3, "working")},
 			wantPID:  2,
