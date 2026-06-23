@@ -310,3 +310,139 @@ func TestResolutionStateTailWindow(t *testing.T) {
 		t.Errorf("ResolutionState (small window) = %v, want resolved", got)
 	}
 }
+
+// taskUse is an assistant tool_use that spawns a subagent (name Task), with a
+// distinct id so InFlightTasks can pair it against its completion.
+func taskUse(ts, id string) string {
+	return fmt.Sprintf(`{"type":"assistant","timestamp":%q,"message":{"role":"assistant","content":[{"type":"tool_use","id":%q,"name":"Task"}]}}`, ts, id)
+}
+
+// taskResult is the user tool_result that lands in the MAIN transcript when a
+// subagent finishes, back-linked to its launching tool_use by tool_use_id.
+func taskResult(ts, id string) string {
+	return fmt.Sprintf(`{"type":"user","timestamp":%q,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":%q}]}}`, ts, id)
+}
+
+func TestResolveKind(t *testing.T) {
+	since := mustTime(t, "2026-06-01T21:39:00Z")
+
+	tests := []struct {
+		name  string
+		lines []string
+		want  ResolutionKind
+	}{
+		{
+			name:  "should be resumed when an assistant message advances past the prompt (approved → green)",
+			lines: []string{assistantText("2026-06-01T21:38:00Z"), assistantUse("2026-06-01T21:42:30Z")},
+			want:  ResolutionResumed,
+		},
+		{
+			name:  "should be interrupted when the newest resolution is an interrupt notice (Esc → orange)",
+			lines: []string{assistantText("2026-06-01T21:38:00Z"), interruptLine("2026-06-01T21:42:30Z")},
+			want:  ResolutionInterrupted,
+		},
+		{
+			// A decline the model continued past: the rejection is followed by an
+			// assistant message, which is newest, so it reads as resumed (green) —
+			// consistent with "green = work happening".
+			name:  "should be resumed when an assistant message follows an interrupt (decline the model continued past)",
+			lines: []string{interruptLine("2026-06-01T21:42:00Z"), assistantText("2026-06-01T21:42:30Z")},
+			want:  ResolutionResumed,
+		},
+		{
+			name:  "should be none when only tool_results land after the prompt (concurrent subagent/parallel work)",
+			lines: []string{assistantText("2026-06-01T21:38:00Z"), resultLine("2026-06-01T21:42:30Z")},
+			want:  ResolutionNone,
+		},
+		{
+			name:  "should be none when every resolution entry predates the prompt (unflushed pending)",
+			lines: []string{assistantText("2026-06-01T21:36:45Z"), interruptLine("2026-06-01T21:38:59Z")},
+			want:  ResolutionNone,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ResolveKind(writeTranscript(t, tt.lines...), since, DefaultTailBytes)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("ResolveKind = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveKindFailsSoft(t *testing.T) {
+	since := mustTime(t, "2026-06-01T21:39:00Z")
+	got, err := ResolveKind("", since, DefaultTailBytes)
+	if got != ResolutionNone || err == nil {
+		t.Errorf("got (%v, %v), want (none, error)", got, err)
+	}
+}
+
+func TestInFlightTasks(t *testing.T) {
+	tests := []struct {
+		name  string
+		lines []string
+		want  int
+	}{
+		{
+			name:  "should be zero with no Task tool_use in the tail",
+			lines: []string{assistantText("2026-06-01T21:39:00Z"), resultLine("2026-06-01T21:39:05Z")},
+			want:  0,
+		},
+		{
+			name:  "should count one in-flight Task whose result has not landed",
+			lines: []string{taskUse("2026-06-01T21:39:00Z", "toolu_a")},
+			want:  1,
+		},
+		{
+			name:  "should count N in-flight Tasks",
+			lines: []string{taskUse("2026-06-01T21:39:00Z", "toolu_a"), taskUse("2026-06-01T21:39:01Z", "toolu_b"), taskUse("2026-06-01T21:39:02Z", "toolu_c")},
+			want:  3,
+		},
+		{
+			name:  "should be zero once every launched Task has a matching result (drained)",
+			lines: []string{taskUse("2026-06-01T21:39:00Z", "toolu_a"), taskUse("2026-06-01T21:39:01Z", "toolu_b"), taskResult("2026-06-01T21:39:30Z", "toolu_a"), taskResult("2026-06-01T21:39:31Z", "toolu_b")},
+			want:  0,
+		},
+		{
+			name:  "should count only the still-open Task when some have drained",
+			lines: []string{taskUse("2026-06-01T21:39:00Z", "toolu_a"), taskUse("2026-06-01T21:39:01Z", "toolu_b"), taskResult("2026-06-01T21:39:30Z", "toolu_a")},
+			want:  1,
+		},
+		{
+			// A non-Task tool_use (e.g. AskUserQuestion) is not a subagent and must
+			// not be counted as delegated work in flight.
+			name:  "should ignore non-Task tool_use blocks",
+			lines: []string{assistantUse("2026-06-01T21:39:00Z")},
+			want:  0,
+		},
+		{
+			// Tail clamp: a result whose launching tool_use scrolled out of the
+			// window pairs against nothing; the count must not go negative.
+			name:  "should clamp at zero when a result has no in-window tool_use",
+			lines: []string{taskResult("2026-06-01T21:39:30Z", "toolu_gone")},
+			want:  0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := InFlightTasks(writeTranscript(t, tt.lines...), DefaultTailBytes)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("InFlightTasks = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestInFlightTasksFailsSoft(t *testing.T) {
+	got, err := InFlightTasks("", DefaultTailBytes)
+	if got != 0 || err == nil {
+		t.Errorf("got (%d, %v), want (0, error)", got, err)
+	}
+}

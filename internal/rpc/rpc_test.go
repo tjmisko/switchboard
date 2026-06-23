@@ -209,6 +209,69 @@ func TestHandleHookHoldsPermissionWhilePromptPending(t *testing.T) {
 	}
 }
 
+// A2: the identity-correlated fast path. A PermissionRequest stashes the tool it
+// was raised for; a later PostToolUse whose tool_name MATCHES clears red at hook
+// speed (no transcript needed), while a sibling/Task PostToolUse whose tool_name
+// differs holds red and falls back to the transcript check.
+func TestHandleHookEarlyClearByToolName(t *testing.T) {
+	t.Run("matching tool_name clears red at hook speed", func(t *testing.T) {
+		store := state.New("")
+		store.Apply(func(m map[int]*state.Session) {
+			m[42] = &state.Session{PID: 42, CWD: "/p"}
+		})
+		s := New(store, "", terminal.NewNone(), wm.NewNone())
+
+		// Red onset captures the pending tool.
+		s.handleHook(Request{Cmd: "hook", Event: "PermissionRequest", PID: 42, ToolName: "AskUserQuestion"})
+		if got := store.Snapshot().Sessions[0].Claude.PendingTool; got != "AskUserQuestion" {
+			t.Fatalf("PendingTool = %q, want AskUserQuestion", got)
+		}
+		// The approved tool's own PostToolUse clears it — no transcript involved.
+		s.handleHook(Request{Cmd: "hook", Event: "PostToolUse", PID: 42, ToolName: "AskUserQuestion"})
+		sess := store.Snapshot().Sessions[0]
+		if sess.Claude.Status != "working" {
+			t.Errorf("status = %q, want working (tool-name match clears)", sess.Claude.Status)
+		}
+		if sess.Claude.PendingTool != "" {
+			t.Errorf("PendingTool = %q, want cleared on leaving red", sess.Claude.PendingTool)
+		}
+	})
+
+	t.Run("non-matching Task PostToolUse holds red", func(t *testing.T) {
+		// No transcript on disk, so the fallback is StateUnknown→hold: a background
+		// Task completing while an AskUserQuestion is pending must not clear red.
+		store := state.New("")
+		store.Apply(func(m map[int]*state.Session) {
+			m[42] = &state.Session{PID: 42, CWD: "/p"}
+		})
+		s := New(store, "", terminal.NewNone(), wm.NewNone())
+
+		s.handleHook(Request{Cmd: "hook", Event: "PermissionRequest", PID: 42, ToolName: "AskUserQuestion"})
+		s.handleHook(Request{Cmd: "hook", Event: "PostToolUse", PID: 42, ToolName: "Task"})
+		if got := store.Snapshot().Sessions[0].Claude.Status; got != "permission" {
+			t.Errorf("status = %q, want permission (sibling Task must not clear)", got)
+		}
+	})
+
+	t.Run("tool-name match is tunable off", func(t *testing.T) {
+		store := state.New("")
+		store.Apply(func(m map[int]*state.Session) {
+			m[42] = &state.Session{PID: 42, CWD: "/p"}
+		})
+		s := New(store, "", terminal.NewNone(), wm.NewNone())
+		tun := s.tun
+		tun.EarlyClearApproveByToolName = false
+		s.SetTuning(tun)
+
+		s.handleHook(Request{Cmd: "hook", Event: "PermissionRequest", PID: 42, ToolName: "AskUserQuestion"})
+		s.handleHook(Request{Cmd: "hook", Event: "PostToolUse", PID: 42, ToolName: "AskUserQuestion"})
+		// With the fast path off and no transcript, it falls back to hold.
+		if got := store.Snapshot().Sessions[0].Claude.Status; got != "permission" {
+			t.Errorf("status = %q, want permission (fast path disabled, no transcript → hold)", got)
+		}
+	})
+}
+
 // A codex hook routes its enrichment to the session's Codex block (not Claude),
 // stamps the agent kind, and uses the codex event→status map. This is the
 // multi-agent routing contract: one session map, per-agent blocks.

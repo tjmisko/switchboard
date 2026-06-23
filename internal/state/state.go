@@ -47,6 +47,20 @@ const (
 	AgentKindCodex  = "codex"
 )
 
+// Status values stored in AgentInfo.Status. The first three are hook-driven and
+// frozen wire values; StatusDelegating is daemon-derived: an idle main thread
+// with subagents still in flight (it renders GREEN — work is happening, no
+// action needed — see docs/status-color-state-model.md cases 5/14). Renderers
+// that do not special-case it must treat it as working (green), never as
+// attention-worthy. "unknown" is never stored; renderers synthesize it from an
+// empty status.
+const (
+	StatusWorking    = "working"
+	StatusIdle       = "idle"
+	StatusPermission = "permission"
+	StatusDelegating = "delegating"
+)
+
 // Enrichment returns the populated per-agent block for this session (selected by
 // Agent), or nil when no hook has fired yet. Renderers call it to read status
 // without knowing which agent produced it.
@@ -105,7 +119,15 @@ type HyprlandInfo struct {
 type AgentInfo struct {
 	SessionID  string `json:"session_id,omitempty"`
 	Transcript string `json:"transcript,omitempty"`
-	Status     string `json:"status"` // working|idle|permission (never "unknown")
+	Status     string `json:"status"` // working|idle|permission|delegating (never "unknown")
+
+	// InFlightSubagents is how many subagent Tasks the main thread has launched
+	// but not yet collected (transcript.InFlightTasks), recomputed each reconcile
+	// tick. It is the S dimension: >0 with an idle main thread is the delegating
+	// (green) case. Exposed on the wire (omitempty, so absent when 0 — the golden
+	// contract is unchanged) so renderers can show "N agents" in the tooltip and
+	// `switchboard-ctl list` reveals the true state behind a green chip.
+	InFlightSubagents int `json:"in_flight_subagents,omitempty"`
 
 	// StatusSince marks when Status last transitioned to its current value. The
 	// reconciler uses it to age out a "permission" chip that Claude Code left
@@ -114,6 +136,14 @@ type AgentInfo struct {
 	// re-hydrated session is simply re-evaluated against its transcript on the
 	// first reconcile (zero time reads as "long ago", which is the safe default).
 	StatusSince time.Time `json:"-"`
+
+	// PendingTool is the tool_name the current "permission" prompt was raised for
+	// (captured from the PermissionRequest hook at red-onset). The hold gate
+	// matches a later PostToolUse's tool_name against it to clear red at hook speed
+	// when the *approved* tool completes — distinct from a sibling/Task PostToolUse
+	// that must keep the chip red (docs/status-color-state-model.md A2/case 12).
+	// In-memory only: it is transient onset state, not part of the wire contract.
+	PendingTool string `json:"-"`
 }
 
 // ClaudeInfo is the original name for AgentInfo, kept as an alias so existing

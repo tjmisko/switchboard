@@ -35,6 +35,12 @@ func main() {
 		cmdBottombar(args[1:], *socketPath)
 		return
 	}
+	// diagnose reads the journal (not the daemon socket), so it runs before the
+	// mandatory dial too — it must work even when the daemon is down.
+	if args[0] == "diagnose" {
+		cmdDiagnose(args[1:])
+		return
+	}
 
 	c, err := rpc.Dial(*socketPath)
 	if err != nil {
@@ -295,14 +301,21 @@ func cmdHook(c *rpc.Client, event, agent string) {
 	pid := os.Getppid()
 	sessionID := ""
 	transcript := ""
+	toolName := ""
 	if body, err := io.ReadAll(os.Stdin); err == nil && len(body) > 0 {
 		var payload struct {
 			SessionID      string `json:"session_id"`
 			TranscriptPath string `json:"transcript_path"`
+			// tool_name is present on PermissionRequest/PostToolUse payloads. It
+			// lets the daemon clear a red chip at hook speed when the approved tool
+			// itself completes (see rpc.clearsPermission); absent on other events,
+			// which just disables that fast path.
+			ToolName string `json:"tool_name"`
 		}
 		if json.Unmarshal(body, &payload) == nil {
 			sessionID = payload.SessionID
 			transcript = payload.TranscriptPath
+			toolName = payload.ToolName
 		}
 	}
 	_ = c.Send(rpc.Request{
@@ -311,6 +324,7 @@ func cmdHook(c *rpc.Client, event, agent string) {
 		PID:        pid,
 		SessionID:  sessionID,
 		Transcript: transcript,
+		ToolName:   toolName,
 		Agent:      agent,
 	})
 	var resp rpc.Response
@@ -373,6 +387,10 @@ commands:
                             watch      long-running; show/hide bar with sessions
                             reconcile  one-shot; re-derive bar visibility (F8)
                             stop       kill the bottom bar
+  diagnose [flags] [desc] explain a wrong chip color: pull the status-decision
+                            log lines for a time window and name the Tuning knob
+                            behind each, e.g. diagnose --around 14:32 red stuck.
+                            Reads the journal (or --file); needs no daemon.
 
 flags:
   --socket <path>         daemon socket (default: $XDG_RUNTIME_DIR/switchboard.sock)

@@ -51,3 +51,30 @@ func TestRenderSlotEmpty(t *testing.T) {
 		t.Errorf("out-of-range slot should be 'empty': %v", out.Class)
 	}
 }
+
+// A delegating chip (idle main thread, subagents in flight) renders GREEN: its
+// primary class is "working" so existing CSS paints it green with no change, and
+// a secondary "delegating" class rides along for an optional badge. The tooltip
+// explains the green with the agent count.
+func TestRenderSlotDelegating(t *testing.T) {
+	snap := state.Snapshot{
+		Sessions: []state.Session{
+			{PID: 4821, CWD: "/home/u/proj", Claude: &state.ClaudeInfo{
+				Status: state.StatusDelegating, InFlightSubagents: 2,
+			}},
+		},
+	}
+	out := renderSlot(snap, 0)
+	if !slices.Contains(out.Class, "working") {
+		t.Errorf("delegating chip must carry the green 'working' class: %v", out.Class)
+	}
+	if !slices.Contains(out.Class, "delegating") {
+		t.Errorf("delegating chip missing its 'delegating' marker class: %v", out.Class)
+	}
+	if out.Alt != "working" {
+		t.Errorf("Alt = %q, want working (green)", out.Alt)
+	}
+	if !strings.Contains(out.Tooltip, "delegating · 2 agents") {
+		t.Errorf("tooltip should explain the green with the agent count: %q", out.Tooltip)
+	}
+}

@@ -145,7 +145,9 @@ func waitingFrame(socketPath string, cause error) string {
 // statusStyle maps a session status to a glyph and color.
 func statusStyle(status string) (glyph, color string) {
 	switch status {
-	case "working":
+	case "working", "delegating":
+		// delegating = idle main thread with subagents in flight: work is happening
+		// (by proxy), so it shares working's green — no action needed.
 		return "●", colGreen
 	case "permission":
 		return "●", colRed
