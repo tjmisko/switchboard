@@ -154,7 +154,7 @@ switchboard-ctl focus pid:<n>       # jump to a specific PID (unambiguous)
 switchboard-ctl focus idx:<n>       # jump to the Nth session (unambiguous)
 switchboard-ctl focus <n>           # PID n if present, else index n (back-compat)
 switchboard-ctl cycle next|prev     # focus next/prev session, wrapping
-switchboard-ctl attention           # first permission, else first idle (repeat to cycle the tier)
+switchboard-ctl attention           # first permission, else first idle, else cycle green if all green (repeat to cycle the tier)
 switchboard-ctl pick                # pid<TAB>label<TAB>ws<TAB>cwd lines (for fzf)
 ```
 
