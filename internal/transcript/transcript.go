@@ -143,6 +143,13 @@ type entry struct {
 type block struct {
 	Type string `json:"type"`
 	Text string `json:"text"`
+	// Tool-call fields, populated only for the relevant block types. Name/ID
+	// identify a tool_use (the tool invoked and its id); ToolUseID back-links a
+	// tool_result to the tool_use it answers. They let InFlightTasks pair launched
+	// subagent Tasks against their completions over the tail.
+	Name      string `json:"name"`
+	ID        string `json:"id"`
+	ToolUseID string `json:"tool_use_id"`
 }
 
 // blocks parses message.content tolerantly: an array of typed blocks yields its
@@ -242,7 +249,7 @@ func readTailEntries(path string, maxBytes int64) ([]entry, error) {
 // that keeps writing while the prompt still waits.
 //
 // Resolution is signalled only by the *main conversation thread* advancing past
-// the prompt, which takes one of two forms in the tail (see isResolution):
+// the prompt, which takes one of two forms in the tail (see resolutionKindOf):
 //
 //   - an assistant message dated after `since` — the blocked turn produced new
 //     output, so the awaited tool was approved and ran (Claude Code withholds the
@@ -268,15 +275,78 @@ func readTailEntries(path string, maxBytes int64) ([]entry, error) {
 // pending prompt is never demoted. Only an actual I/O failure yields StateUnknown,
 // so the TTL backstop fires only when the check truly fails.
 func ResolutionState(path string, since time.Time, maxBytes int64) (PromptState, error) {
-	entries, err := readTailEntries(path, maxBytes)
+	kind, err := ResolveKind(path, since, maxBytes)
 	if err != nil {
 		return StateUnknown, err
 	}
+	if kind == ResolutionNone {
+		return StatePending, nil
+	}
+	return StateResolved, nil
+}
+
+// ResolutionKind classifies *how* a permission prompt resolved, which selects
+// the chip's exit color (see the reconciler's selfHealStaleAttention). The plain
+// PromptState answers "is it resolved?"; this answers "resolved which way?", so
+// an approved prompt whose turn resumed can go straight to green (working)
+// instead of bouncing through orange (idle) on the way (see §2.1 / P3 in
+// docs/status-color-state-model.md).
+type ResolutionKind int
+
+const (
+	// ResolutionNone — nothing dated after `since` advanced the main thread past
+	// the prompt; it is still pending (keep nagging). Bare tool_results from
+	// concurrent subagent/parallel work do not count.
+	ResolutionNone ResolutionKind = iota
+	// ResolutionResumed — the newest post-`since` resolution entry is an assistant
+	// message: the blocked turn produced new output, so the awaited tool was
+	// approved and work resumed. The chip should exit to working (green).
+	ResolutionResumed
+	// ResolutionInterrupted — the newest post-`since` resolution entry is a user
+	// interrupt notice ("[Request interrupted by user…"): the turn was Esc'd or
+	// the prompt declined with no continuation, returning control to the user. The
+	// chip should exit to idle (orange).
+	ResolutionInterrupted
+)
+
+func (k ResolutionKind) String() string {
+	switch k {
+	case ResolutionResumed:
+		return "resumed"
+	case ResolutionInterrupted:
+		return "interrupted"
+	default:
+		return "none"
+	}
+}
+
+// ResolveKind reports how a prompt that latched the chip red at `since` resolved.
+// It is the kind-aware core of ResolutionState: it scans the tail for the newest
+// entry that advances the main conversation thread past the prompt and returns
+// what kind it was — an assistant message (ResolutionResumed) or a user interrupt
+// notice (ResolutionInterrupted) — newest wins, so a decline the model continued
+// past (an assistant message after the rejection) reads as Resumed. A bare
+// tool_result is deliberately NOT a resolution: concurrent subagent/parallel work
+// flushes tool_results dated after the prompt while it is still pending, so
+// counting them would clear the red chip the instant any background work landed.
+//
+//   - (kind, nil) where kind != None — the newest resolution entry is dated
+//     strictly after `since`.
+//   - (ResolutionNone, nil) — nothing newer than `since` resolved it (incl. none
+//     at all, a fresh/unflushed prompt — keep nagging).
+//   - (ResolutionNone, err) — the file is missing/unreadable; the caller should
+//     apply its TTL backstop.
+func ResolveKind(path string, since time.Time, maxBytes int64) (ResolutionKind, error) {
+	entries, err := readTailEntries(path, maxBytes)
+	if err != nil {
+		return ResolutionNone, err
+	}
 
 	var newest time.Time
-	var found bool
+	kind := ResolutionNone
 	for _, e := range entries {
-		if !isResolution(e) {
+		k := resolutionKindOf(e)
+		if k == ResolutionNone {
 			continue
 		}
 		ts, ok := e.parsedTime()
@@ -285,27 +355,76 @@ func ResolutionState(path string, since time.Time, maxBytes int64) (PromptState,
 		}
 		if ts.After(newest) {
 			newest = ts
-			found = true
+			kind = k
 		}
 	}
 
-	if found && newest.After(since) {
-		return StateResolved, nil
+	if kind != ResolutionNone && newest.After(since) {
+		return kind, nil
 	}
-	return StatePending, nil
+	return ResolutionNone, nil
 }
 
-// isResolution reports whether an entry represents the main conversation thread
-// advancing past a permission prompt: an assistant message (the blocked turn
-// resumed, so the awaited tool was approved) or a user interrupt notice (the
-// prompt was declined / the turn interrupted). A user tool_result is *not* a
-// resolution — a concurrent subagent report or a sibling parallel tool writes
-// tool_results dated after the prompt while it is still pending.
-func isResolution(e entry) bool {
+// resolutionKindOf maps an entry to the resolution it represents: an assistant
+// message means the blocked turn resumed (approved → Resumed); a user interrupt
+// notice means it was declined/interrupted (Interrupted). Everything else —
+// including a bare user tool_result from concurrent subagent/parallel work — is
+// ResolutionNone.
+func resolutionKindOf(e entry) ResolutionKind {
 	if e.Message.Role == "assistant" {
-		return true
+		return ResolutionResumed
 	}
-	return classify(e) == SignalInterrupt
+	if classify(e) == SignalInterrupt {
+		return ResolutionInterrupted
+	}
+	return ResolutionNone
+}
+
+// taskToolNames are the tool_use names whose invocation spawns a subagent. Work
+// done inside such a subagent is "work happening" for the delegating-green rule
+// (docs/status-color-state-model.md §5 cases 5/14): a main thread that has ended
+// its turn but still has an in-flight Task is delegating, not idle.
+var taskToolNames = map[string]bool{"Task": true, "Agent": true}
+
+// InFlightTasks counts the subagent Tasks the main thread has launched but not
+// yet collected: tool_use blocks named Task/Agent in the tail whose id has no
+// matching tool_result.tool_use_id. The daemon reads this each reconcile tick to
+// decide whether an idle main thread is actually delegating (→ render green).
+//
+// The read is tail-bounded (maxBytes), so a Task whose launching tool_use has
+// scrolled out of the window but whose result is still in-window cannot be
+// paired; the count is clamped at 0 rather than going negative. With the default
+// window (DefaultTailBytes) this only bites pathologically long turns. Returns a
+// non-nil error only on I/O failure (an empty/missing transcript), letting the
+// caller leave the last-known count rather than guess.
+func InFlightTasks(path string, maxBytes int64) (int, error) {
+	entries, err := readTailEntries(path, maxBytes)
+	if err != nil {
+		return 0, err
+	}
+	launched := make(map[string]struct{})
+	done := make(map[string]struct{})
+	for _, e := range entries {
+		for _, b := range e.blocks() {
+			switch b.Type {
+			case "tool_use":
+				if taskToolNames[b.Name] && b.ID != "" {
+					launched[b.ID] = struct{}{}
+				}
+			case "tool_result":
+				if b.ToolUseID != "" {
+					done[b.ToolUseID] = struct{}{}
+				}
+			}
+		}
+	}
+	n := 0
+	for id := range launched {
+		if _, ok := done[id]; !ok {
+			n++
+		}
+	}
+	return n, nil
 }
 
 // NewestSignal reads up to maxBytes from the end of the transcript at path and
