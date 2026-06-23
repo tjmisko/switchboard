@@ -41,6 +41,13 @@ func userStringContent(ts, s string) string {
 	return fmt.Sprintf(`{"type":"user","timestamp":%q,"message":{"role":"user","content":%q}}`, ts, s)
 }
 
+// bashStdout is the synthetic user entry Claude Code writes for a `!` bash
+// command's output. It runs with no agent turn (fires neither UserPromptSubmit
+// nor Stop), so it must not read as conversational activity.
+func bashStdout(ts, s string) string {
+	return userStringContent(ts, "<bash-stdout>"+s+"</bash-stdout>")
+}
+
 // systemLine is a timestamped system entry with no message.role — ancillary, so
 // it must not count as conversational activity.
 func systemLine(ts string) string {
@@ -186,6 +193,44 @@ func TestNewestSignal(t *testing.T) {
 			lines:    []string{userStringContent("2026-06-01T21:39:08Z", "a caveat")},
 			wantKind: SignalActivity,
 			wantTS:   "2026-06-01T21:39:08Z",
+		},
+		{
+			// The regression: a `!` bash command in an idle session flushes a
+			// <bash-stdout> entry dated after the Stop, but runs no agent turn — it
+			// must NOT read as activity, else the idle→working self-heal promotes a
+			// correctly-orange chip back to green where it latches forever.
+			name:     "should not treat a bash-command entry as activity",
+			lines:    []string{assistantText("2026-06-01T21:39:05Z"), bashStdout("2026-06-01T21:39:40Z", "On branch main")},
+			wantKind: SignalActivity,
+			wantTS:   "2026-06-01T21:39:05Z",
+		},
+		{
+			// With only local-command side-channel entries (a `!` bash command and a
+			// `/` slash command) in the tail, there is no agent signal at all.
+			name: "should report none when the tail holds only local-command entries",
+			lines: []string{
+				userStringContent("2026-06-01T21:39:30Z", "<bash-input>git status</bash-input>"),
+				bashStdout("2026-06-01T21:39:31Z", "nothing to commit"),
+				userStringContent("2026-06-01T21:39:35Z", "<command-name>clear</command-name>"),
+				userStringContent("2026-06-01T21:39:36Z", "<local-command-stdout></local-command-stdout>"),
+			},
+			wantKind: SignalNone,
+			wantTS:   "",
+		},
+		{
+			// A purely-local slash command (/rename) starts no agent and fires no
+			// UserPromptSubmit, so its <command-name>/<local-command-stdout> entries
+			// must not promote an idle chip — same latch risk as a `!` command. An
+			// agent-starting slash command is unaffected: it fires UserPromptSubmit, so
+			// the chip is already working by reconcile and this branch never runs.
+			name: "should not treat a local slash command as activity",
+			lines: []string{
+				assistantText("2026-06-01T21:39:05Z"),
+				userStringContent("2026-06-01T21:39:50Z", "<command-name>rename</command-name>"),
+				userStringContent("2026-06-01T21:39:51Z", "<local-command-stdout>renamed</local-command-stdout>"),
+			},
+			wantKind: SignalActivity,
+			wantTS:   "2026-06-01T21:39:05Z",
 		},
 		{
 			name:     "should tolerate blank and malformed lines",

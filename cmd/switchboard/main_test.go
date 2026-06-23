@@ -105,6 +105,19 @@ func TestSelfHealStuckStatus(t *testing.T) {
 		}
 	})
 
+	t.Run("should keep idle when a bash command runs after the chip went idle", func(t *testing.T) {
+		// The reported bug: a Stop fired (chip→idle), then the user ran `!git status`
+		// in the session. Claude Code flushed a <bash-stdout> user entry dated after
+		// the chip went idle, which read as activity and promoted the correctly-orange
+		// chip back to green — where it latched, since a `!` command fires no Stop hook
+		// to bring it back down. A local command must not count as a resume signal.
+		m := stuckMap("idle", writeTranscript(t, tAssistant("2026-06-01T21:38:00Z"), tBash("2026-06-01T21:39:40Z")), since)
+		selfHealStuckStatus(m, now)
+		if got := m[100].Claude.Status; got != "idle" {
+			t.Errorf("status = %q, want idle (a bash command is not agent activity)", got)
+		}
+	})
+
 	t.Run("should keep idle when only timestamp-less metadata was written", func(t *testing.T) {
 		// The metadata entry bumps the file mtime (so the read happens) but carries
 		// no timestamp; the newest conversational entry predates the chip, so it
@@ -198,6 +211,12 @@ func tAssistant(ts string) string {
 
 func tInterrupt(ts string) string {
 	return `{"type":"user","timestamp":"` + ts + `","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}`
+}
+
+// tBash is the synthetic user entry Claude Code writes for a `!` bash command's
+// output. It runs no agent turn, so it must not flip an idle chip to working.
+func tBash(ts string) string {
+	return `{"type":"user","timestamp":"` + ts + `","message":{"role":"user","content":"<bash-stdout>On branch main</bash-stdout>"}}`
 }
 
 // tMeta is a timestamp-less metadata entry — the kind that bumps the transcript
