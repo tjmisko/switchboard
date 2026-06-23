@@ -121,7 +121,8 @@ agent's first hook fires. Renderers read whichever is present.
 |-------|-----------|----------|---------|
 | `session_id` | string | omitted when empty | Agent session UUID, supplied by hooks (Claude Code's session id; Codex's thread/conversation id). **Write-once**: set on the first hook that carries it and never overwritten. |
 | `transcript` | string | omitted when empty | Path to the session transcript when known: Claude Code's project `.jsonl`, or Codex's `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. |
-| `status` | string | always (when block present) | Session activity. One of: `working`, `idle`, `permission`. ⚠ The doc-comment also lists `unknown`, but the daemon **never emits it** — consumers should still tolerate an unrecognized value defensively. May be `""` before the first status-bearing hook. |
+| `status` | string | always (when block present) | Session activity. One of: `working`, `idle`, `permission`, `delegating`. `delegating` is daemon-derived (added with the status-color state-model work): an idle main thread with subagents still in flight — it renders the **same green as `working`** ("work is happening, no action needed"). Consumers that do not know it MUST treat it as `working`, never as attention-worthy. ⚠ The doc-comment also lists `unknown`, but the daemon **never emits it** — tolerate an unrecognized value defensively. May be `""` before the first status-bearing hook. |
+| `in_flight_subagents` | number | omitted when 0 | How many subagent `Task`s the main thread has launched but not yet collected, recomputed each reconcile tick from the transcript tail. It is the signal behind a `delegating` chip; renderers show it as "N agents" in the tooltip, and `switchboard-ctl list --json` exposes it so a green chip's true state (genuinely working vs delegating) is visible. Claude-only. |
 
 #### `status` value mapping
 
@@ -149,23 +150,53 @@ no hooks configured shows only `working`/`idle`.
 `AskUserQuestion` — or interrupting a turn — fires nothing (`PostToolUse` only
 fires on success, `Stop` not on interrupt), so the chip would latch red forever.
 Each reconcile tick the daemon reads the tail of a `permission` session's
-transcript (`transcript` field above) and demotes it to `idle` once the prompt is
-resolved. Resolution is signalled by the **main conversation thread advancing past
-the prompt** after `StatusSince` (the moment the chip went red): an **assistant
-message** (the blocked turn resumed → the awaited tool was approved; Claude Code
-withholds the pending tool_use's assistant message until it resolves) or a **user
-interrupt notice** (`[Request interrupted by user…]` → declined / Esc). A bare
-`tool_result` is **deliberately ignored**: a background teammate/subagent, or a
-sibling auto-approved tool in the same turn, keeps flushing `tool_result`s dated
-after the prompt while it is still genuinely pending, so counting them would flash
-the chip green the instant any concurrent work landed — a pending decision must
-stay red even while subagents work. If the transcript can't be read, a
-`permissionDecayTTL` (30 s) backstop decays it anyway so it never nags forever. The
-demotion lands as a normal `idle` chip — identical to a turn that ended cleanly.
-This is purely a daemon-internal status correction; the on-the-wire `status` value
-set is unchanged (`working` / `idle` / `permission`). The `StatusSince` it keys off
-is **in-memory only** (not in `state.json`); it is stamped to startup time on
+transcript (`transcript` field above) and exits it once the prompt is resolved.
+Resolution is signalled by the **main conversation thread advancing past the
+prompt** after `StatusSince` (the moment the chip went red), and the *kind* of
+resolution now selects the **exit color**:
+
+- an **assistant message** (the blocked turn resumed → the awaited tool was
+  approved; Claude Code withholds the pending tool_use's assistant message until
+  it resolves) exits to **`working`** (green) **directly** — no orange bounce;
+- a **user interrupt notice** (`[Request interrupted by user…]` → declined / Esc)
+  exits to **`idle`** (orange), or to **`delegating`** (green) if subagents are
+  still in flight (work continues).
+
+A bare `tool_result` is **deliberately ignored**: a background teammate/subagent,
+or a sibling auto-approved tool in the same turn, keeps flushing `tool_result`s
+dated after the prompt while it is still genuinely pending, so counting them would
+flash the chip green the instant any concurrent work landed — a pending decision
+must stay red even while subagents work. If the transcript can't be read, a TTL
+backstop (`statustune.Tuning.PermissionDecayTTL`, default 30 s) exits it anyway so
+it never nags forever.
+
+There is also a **hook-speed early clear**: the `PermissionRequest` hook stashes
+the tool it was raised for, and a later `PostToolUse` whose `tool_name` matches
+(the *approved* tool completed) exits red immediately — collapsing the
+approve-path lag without waiting for the transcript. A non-matching / `Task`
+`PostToolUse` keeps the chip red.
+
+This is purely a daemon-internal status correction. Every exit is recorded by a
+canonical decision log line (see below). The `StatusSince` it keys off is
+**in-memory only** (not in `state.json`); it is stamped to startup time on
 re-hydrate so a prompt live across a daemon restart is not misjudged as resolved.
+
+##### `delegating` self-heal & decision log
+
+Independently, each tick recomputes `in_flight_subagents`; an **idle** main thread
+with a count `> 0` is promoted to **`delegating`** (green), reverting to `idle`
+when the last teammate drains. This fixes the orchestrator-goes-orange-between-
+wake-ups drift.
+
+Every reconciler/hook status decision — change *or* deliberate hold — emits one
+line prefixed `status: pid=<n> session=<id>` carrying the from→to (or `==` for a
+hold), the **rule id** (maps to the case table in
+`docs/status-color-state-model.md` §5), the reason, and the observed tuple
+`[S=<subagents> pending=<tool> age=<dur>]`. `switchboard-ctl diagnose` reads these
+back — given approximate timing and a plain-English symptom it surfaces the
+relevant lines, names the `statustune.Tuning` knob behind each, and reports the
+RED-episode durations — so a wrong-color complaint maps directly to the field to
+change. (Grepping the prefix by hand still works.)
 
 ## The `capabilities` block (Phase 1.4)
 

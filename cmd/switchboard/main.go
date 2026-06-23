@@ -21,17 +21,10 @@ import (
 	"github.com/tjmisko/switchboard/internal/proc"
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
+	"github.com/tjmisko/switchboard/internal/statustune"
 	"github.com/tjmisko/switchboard/internal/transcript"
 	"github.com/tjmisko/switchboard/internal/wm"
 )
-
-// permissionDecayTTL bounds how long a "permission" chip may stay latched once
-// the transcript check can no longer confirm it is genuinely pending. The
-// accurate path (a declined/answered prompt) clears within one reconcile tick;
-// this TTL only governs the fail-soft case where the transcript is unreadable
-// or inconclusive, so a stuck red chip still self-heals instead of nagging
-// forever.
-const permissionDecayTTL = 30 * time.Second
 
 func main() {
 	statePath := flag.String("state", defaultStatePath(), "path to state.json mirror")
@@ -44,6 +37,12 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	// tun holds every status-color knob (statustune.Tuning). It is built once here
+	// and threaded into both decision sites — the RPC hook gate and the reconciler
+	// — so all color behavior is tuned from one place. Defaults encode the §8
+	// recommendations; override fields here to retune without touching the logic.
+	tun := statustune.Default()
 
 	stack := detect.Detect(detect.Options{WM: *wmFlag, Terminal: *terminalFlag})
 	caps := stack.Capabilities()
@@ -85,9 +84,10 @@ func main() {
 		}
 	}()
 	go runWMLoop(ctx, store, resolver, manager)
-	go runReconciler(ctx, store, resolver, manager, stack, *reconcileInterval)
+	go runReconciler(ctx, store, resolver, manager, stack, *reconcileInterval, tun)
 
 	server := rpc.New(store, *socketPath, term, manager)
+	server.SetTuning(tun)
 	if err := os.MkdirAll(filepath.Dir(*socketPath), 0o755); err != nil {
 		log.Fatalf("mkdir socket dir: %v", err)
 	}
@@ -182,21 +182,21 @@ func handleWMEvent(ctx context.Context, store *state.Store, resolver *mapping.Re
 // Catches anything missed by event-driven updates (e.g. a session whose
 // mapping was incomplete when first created, the initial focus state, or a
 // hyprctl race).
-func runReconciler(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, interval time.Duration) {
+func runReconciler(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, interval time.Duration, tun statustune.Tuning) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
-	reconcileOnce(ctx, store, resolver, manager, stack)
+	reconcileOnce(ctx, store, resolver, manager, stack, tun)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			reconcileOnce(ctx, store, resolver, manager, stack)
+			reconcileOnce(ctx, store, resolver, manager, stack, tun)
 		}
 	}
 }
 
-func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack) {
+func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, tun statustune.Tuning) {
 	// Re-publish capabilities every tick: the terminal locator is self-redetecting
 	// (detect.NewAuto), so a terminal that came up after the daemon flips
 	// terminal/navigate from their boot-race "none" values without a restart.
@@ -215,9 +215,17 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 			if st, err := proc.State(sess.PID); err == nil {
 				sess.Suspended = proc.Suspended(st)
 			}
+			// Recompute the S dimension — in-flight subagent Tasks — from the main
+			// transcript so the self-heals (and the wire/tooltip) see current
+			// delegation. Claude-only; a quiet read failure leaves the last count.
+			if c := sess.Claude; c != nil && c.Transcript != "" {
+				if n, err := transcript.InFlightTasks(c.Transcript, tun.TailBytes); err == nil {
+					c.InFlightSubagents = n
+				}
+			}
 		}
-		selfHealStaleAttention(m, now, permissionDecayTTL)
-		selfHealStuckStatus(m, now)
+		selfHealStaleAttention(m, now, tun)
+		selfHealStuckStatus(m, now, tun)
 	})
 }
 
@@ -238,24 +246,31 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 // directly (no shared-pointer race) and folds into the tick's single persist.
 // The bounded transcript read under the lock is consistent with the per-session
 // /proc and WM I/O the same loop already performs.
-func selfHealStaleAttention(m map[int]*state.Session, now time.Time, ttl time.Duration) {
+func selfHealStaleAttention(m map[int]*state.Session, now time.Time, tun statustune.Tuning) {
 	for _, sess := range m {
-		if sess.Claude == nil || sess.Claude.Status != "permission" {
+		c := sess.Claude
+		if c == nil || c.Status != state.StatusPermission {
 			continue
 		}
-		age := now.Sub(sess.Claude.StatusSince)
-		st, _ := transcript.ResolutionState(sess.Claude.Transcript, sess.Claude.StatusSince, transcript.DefaultTailBytes)
-		if shouldDecayPermission(st, age, ttl) {
-			// This transition has no Claude Code hook behind it (a declined or
-			// interrupted prompt fires none), so unlike the hook-driven edges it
-			// would otherwise leave no trace. Log it with the deciding reason —
-			// transcript-resolved vs the soft TTL fallback — so a self-healed red
-			// chip is distinguishable from one that never latched.
-			log.Printf("status: pid=%d session=%s decay permission->idle (reason=%s age=%s)",
-				sess.PID, shortSessionID(sess.Claude.SessionID), decayReason(st), age.Round(time.Second))
-			sess.Claude.Status = "idle"
-			sess.Claude.StatusSince = now
+		age := now.Sub(c.StatusSince)
+		kind, err := transcript.ResolveKind(c.Transcript, c.StatusSince, tun.TailBytes)
+		exit, rule, reason, ok := permissionExit(kind, err != nil, age, c.InFlightSubagents, tun)
+		if !ok {
+			continue // still pending (or too soon to give up) → keep red, silently
 		}
+		// This transition has no Claude Code hook behind it (a declined or
+		// interrupted prompt fires none), so unlike the hook-driven edges it would
+		// otherwise leave no trace. The decision log records WHICH rule fired and
+		// the full observed state, so a self-healed red chip — and its exit color —
+		// is fully reconstructable from the journal.
+		statustune.Decision{
+			PID: sess.PID, Session: shortSessionID(c.SessionID),
+			From: state.StatusPermission, To: exit, Rule: rule, Reason: reason,
+			Subagents: c.InFlightSubagents, Pending: c.PendingTool, Age: age,
+		}.Log()
+		c.Status = exit
+		c.StatusSince = now
+		c.PendingTool = ""
 	}
 }
 
@@ -281,58 +296,105 @@ func selfHealStaleAttention(m map[int]*state.Session, now time.Time, ttl time.Du
 // multi-minute tool run writes nothing to the transcript for the duration, so a
 // TTL would wrongly decay a genuinely busy session; the marker has no such
 // false-positive (a completed tool records "interrupted":false, not a text block).
-func selfHealStuckStatus(m map[int]*state.Session, now time.Time) {
+func selfHealStuckStatus(m map[int]*state.Session, now time.Time, tun statustune.Tuning) {
 	for _, sess := range m {
 		c := sess.Claude
-		if c == nil || (c.Status != "idle" && c.Status != "working") {
+		if c == nil {
 			continue
 		}
+		// Delegating (cases 5/14, fixes complaint #2): an idle main thread with
+		// subagents still in flight is working-by-proxy → render green. This is
+		// decided from the S dimension (recomputed in reconcileOnce), NOT from a
+		// transcript-activity read, and so runs BEFORE the mtime pre-gate below:
+		// while a teammate runs, the MAIN transcript is quiet (the subagent writes
+		// its own), so the pre-gate would skip it and the chip would lag orange.
+		// Revert to idle once the last teammate drains.
+		if tun.DelegatingEnabled {
+			switch {
+			case c.Status == state.StatusIdle && c.InFlightSubagents > 0:
+				logStuck(sess, c, state.StatusDelegating, statustune.RuleDelegating, "idle with subagents in flight", now)
+				c.Status = state.StatusDelegating
+				c.StatusSince = now
+				continue
+			case c.Status == state.StatusDelegating && c.InFlightSubagents == 0:
+				logStuck(sess, c, state.StatusIdle, statustune.RuleDrained, "subagents drained", now)
+				c.Status = state.StatusIdle
+				c.StatusSince = now
+				continue
+			case c.Status == state.StatusDelegating:
+				continue // still delegating; nothing to recover
+			}
+		}
+		if c.Status != state.StatusIdle && c.Status != state.StatusWorking {
+			continue
+		}
+		// A cheap stat short-circuits the quiescent case: if nothing was written
+		// since the chip transitioned, no signal can be newer than it. (Delegating
+		// is handled above precisely because this gate would skip it.)
 		fi, err := os.Stat(c.Transcript)
 		if err != nil || !fi.ModTime().After(c.StatusSince) {
 			continue
 		}
-		kind, ts, err := transcript.NewestSignal(c.Transcript, transcript.DefaultTailBytes)
+		kind, ts, err := transcript.NewestSignal(c.Transcript, tun.TailBytes)
 		if err != nil || kind == transcript.SignalNone || !ts.After(c.StatusSince) {
 			continue
 		}
 		switch {
-		case c.Status == "idle" && kind == transcript.SignalActivity:
-			log.Printf("status: pid=%d session=%s idle->working (reason=transcript-activity)", sess.PID, shortSessionID(c.SessionID))
-			c.Status = "working"
+		case c.Status == state.StatusIdle && kind == transcript.SignalActivity:
+			logStuck(sess, c, state.StatusWorking, statustune.RuleResumeActivity, "transcript activity after idle", now)
+			c.Status = state.StatusWorking
 			c.StatusSince = now
-		case c.Status == "working" && kind == transcript.SignalInterrupt:
-			log.Printf("status: pid=%d session=%s working->idle (reason=interrupt)", sess.PID, shortSessionID(c.SessionID))
-			c.Status = "idle"
+		case c.Status == state.StatusWorking && kind == transcript.SignalInterrupt:
+			logStuck(sess, c, state.StatusIdle, statustune.RuleInterrupt, "interrupt notice after working", now)
+			c.Status = state.StatusIdle
 			c.StatusSince = now
 		}
 	}
 }
 
-// shouldDecayPermission decides whether a latched "permission" chip should fall
-// back to idle. The transcript tail check is authoritative: a resolved prompt
-// decays, a still-pending one is preserved (keep nagging). When the check is
-// inconclusive — unreadable transcript, parse failure, no tool_use in the tail
-// window — it fails soft to a TTL so a stuck chip still degenerates eventually
-// instead of nagging forever.
-func shouldDecayPermission(st transcript.PromptState, age, ttl time.Duration) bool {
-	switch st {
-	case transcript.StateResolved:
-		return true
-	case transcript.StatePending:
-		return false
-	default: // StateUnknown
-		return age >= ttl
-	}
+// logStuck emits the decision log for a reconciler-driven (hookless) status edge,
+// capturing the full observed state so a wrong color can be traced to its inputs.
+func logStuck(sess *state.Session, c *state.AgentInfo, to, rule, reason string, now time.Time) {
+	statustune.Decision{
+		PID: sess.PID, Session: shortSessionID(c.SessionID),
+		From: c.Status, To: to, Rule: rule, Reason: reason,
+		Subagents: c.InFlightSubagents, Pending: c.PendingTool,
+		Age: now.Sub(c.StatusSince),
+	}.Log()
 }
 
-// decayReason names why a permission chip was demoted, for the log trail:
-// "resolved" — the transcript proved the prompt was answered/declined;
-// "ttl" — the check was inconclusive and the soft timeout fired.
-func decayReason(st transcript.PromptState) string {
-	if st == transcript.StateResolved {
-		return "resolved"
+// permissionExit decides whether — and to which color — a latched "permission"
+// chip should exit, given the transcript resolution kind, whether the transcript
+// was unreadable, how long it has been red, the in-flight subagent count, and the
+// tuning. It is the pure core of selfHealStaleAttention (kept separate so the
+// §5 case table is unit-testable). ok=false keeps the chip red. The cases:
+//
+//   - unreadable transcript: keep red until the TTL backstop fires (case 15;
+//     observed 0× — the accurate path resolves first). The exit is the interrupt
+//     color (your turn) since an abandoned prompt is most like a declined one.
+//   - resumed (assistant message): approved → turn resumed → green, DIRECTLY,
+//     with no orange bounce (case 9, P3).
+//   - interrupted (Esc/decline) with subagents in flight: work continues →
+//     green/delegating (case 11, Q3); otherwise your turn → orange (case 10).
+//   - none (readable but nothing resolved it): still pending → keep red.
+func permissionExit(kind transcript.ResolutionKind, unreadable bool, age time.Duration, subagents int, tun statustune.Tuning) (exit, rule, reason string, ok bool) {
+	if unreadable {
+		if age >= tun.PermissionDecayTTL {
+			return tun.InterruptExitStatus, statustune.RuleTTLBackstop, "transcript unreadable; ttl elapsed", true
+		}
+		return "", "", "", false
 	}
-	return "ttl"
+	switch kind {
+	case transcript.ResolutionResumed:
+		return tun.ResumeExitStatus, statustune.RuleApproveResume, "transcript: turn resumed", true
+	case transcript.ResolutionInterrupted:
+		if subagents > 0 {
+			return tun.EscWithTeammatesStatus, statustune.RuleDeclineDelegating, "interrupt with subagents in flight", true
+		}
+		return tun.InterruptExitStatus, statustune.RuleDeclineIdle, "transcript: declined/interrupted", true
+	default: // ResolutionNone
+		return "", "", "", false
+	}
 }
 
 // shortSessionID trims a Claude session UUID to its first segment for compact

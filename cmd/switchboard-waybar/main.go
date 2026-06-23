@@ -81,7 +81,15 @@ func renderSlot(snap state.Snapshot, slot int) waybarOutput {
 		return waybarOutput{Text: "", Class: []string{"empty"}}
 	}
 	s := snap.Sessions[slot]
-	classes := []string{sessionStatus(s)}
+	status := sessionStatus(s)
+	// The primary class paints the chip's color; delegating reuses working's green
+	// (Q1 default: pure green, no CSS change needed). The raw "delegating" rides
+	// along as a secondary class so the bar CAN add a badge/different shade later
+	// without losing the green underneath.
+	classes := []string{chipClass(status)}
+	if status == state.StatusDelegating {
+		classes = append(classes, "delegating")
+	}
 	if s.Focused {
 		classes = append(classes, "focused")
 	}
@@ -92,8 +100,17 @@ func renderSlot(snap state.Snapshot, slot int) waybarOutput {
 		Text:    shortName(s),
 		Tooltip: sessionTooltip(s),
 		Class:   classes,
-		Alt:     sessionStatus(s),
+		Alt:     chipClass(status),
 	}
+}
+
+// chipClass maps a session status to the CSS class that paints its color.
+// delegating shares working's green; everything else maps to itself.
+func chipClass(status string) string {
+	if status == state.StatusDelegating {
+		return state.StatusWorking
+	}
+	return status
 }
 
 // renderAggregate is the original single-module mode. Kept for ad-hoc
@@ -132,10 +149,34 @@ func sessionTooltip(s state.Session) string {
 		ws = s.Hyprland.Workspace
 	}
 	status := sessionStatus(s)
+	// A delegating chip is green but idle on the main thread; spell out why so the
+	// tooltip explains the green ("2 agents" working) rather than looking stuck.
+	if status == state.StatusDelegating {
+		if n := subagentCount(s); n > 0 {
+			status = fmt.Sprintf("delegating · %d agent%s", n, plural(n))
+		}
+	}
 	if s.Suspended {
 		status += ", suspended"
 	}
 	return fmt.Sprintf("%s [%s] — ws %s — %s (pid %d)", name, status, ws, s.CWD, s.PID)
+}
+
+// subagentCount reports the in-flight subagent count from the session's
+// enrichment block (0 when absent), for the delegating tooltip.
+func subagentCount(s state.Session) int {
+	if info := s.Enrichment(); info != nil {
+		return info.InFlightSubagents
+	}
+	return 0
+}
+
+// plural returns the plural suffix for n.
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
 }
 
 // shortName picks the human label for a session. Prefer the wezterm window

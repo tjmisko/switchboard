@@ -22,6 +22,7 @@ import (
 
 	"github.com/tjmisko/switchboard/internal/proc"
 	"github.com/tjmisko/switchboard/internal/state"
+	"github.com/tjmisko/switchboard/internal/statustune"
 	"github.com/tjmisko/switchboard/internal/terminal"
 	"github.com/tjmisko/switchboard/internal/transcript"
 	"github.com/tjmisko/switchboard/internal/wm"
@@ -46,6 +47,13 @@ type Request struct {
 	// empty) or "codex". It routes the enrichment to the right block and selects
 	// the event→status mapping.
 	Agent string `json:"agent,omitempty"`
+	// ToolName is the hook's tool_name when the event carries one (PermissionRequest,
+	// PostToolUse). It is stashed at red-onset (PendingTool) and matched on a later
+	// PostToolUse to clear red at hook speed when the approved tool completes —
+	// while a non-matching/Task PostToolUse keeps the chip red. Empty for events
+	// with no tool (UserPromptSubmit/Stop/SessionStart), which just disables the
+	// fast path and falls back to the transcript check.
+	ToolName string `json:"tool_name,omitempty"`
 }
 
 type Response struct {
@@ -59,11 +67,17 @@ type Server struct {
 	socketPath string
 	term       terminal.Locator
 	wm         wm.Manager
+	tun        statustune.Tuning
 }
 
 func New(store *state.Store, socketPath string, term terminal.Locator, manager wm.Manager) *Server {
-	return &Server{store: store, socketPath: socketPath, term: term, wm: manager}
+	return &Server{store: store, socketPath: socketPath, term: term, wm: manager, tun: statustune.Default()}
 }
+
+// SetTuning overrides the status-color tuning (defaults from statustune.Default).
+// Call once at startup before Serve; the hook handler reads it without a lock,
+// which is safe because it is not mutated after startup.
+func (s *Server) SetTuning(t statustune.Tuning) { s.tun = t }
 
 // Serve listens on the socket path and accepts connections until ctx is done.
 // The socket file is removed on startup (in case of unclean shutdown) and on
@@ -269,32 +283,41 @@ func (s *Server) handleHook(req Request) {
 		}
 		sess := m[pid]
 		info := sess.AgentBlock(agent)
+		// Transcript path is stable per session; refresh it BEFORE the hold gate so
+		// its transcript fallback reads the current tail (and so the reconciler can
+		// later tell a declined prompt from a still-pending one).
+		if req.Transcript != "" {
+			info.Transcript = req.Transcript
+		}
+
 		// A "permission" chip must stay red until the *prompt itself* resolves —
 		// not merely until some tool finishes. PostToolUse fires for EVERY tool
 		// that completes, including a sibling tool in the same turn or a background
 		// subagent's Task that lands while an interactive prompt (AskUserQuestion /
-		// plan / approval) is still waiting on the user. Honoring it flips the red
-		// chip green the instant any such tool completes (observed: a
-		// PermissionRequest immediately followed by an unrelated PostToolUse one
-		// second later). Gate it on the same transcript-resolution signal the
-		// reconciler uses (transcript.ResolutionState): only clear when the main
-		// conversation thread has actually advanced past the prompt. A bare
-		// tool_result from concurrent work is not resolution, so the chip holds
-		// red; an unreadable transcript is treated as still-pending too, leaving
-		// selfHealStaleAttention's TTL backstop to decay a truly stuck chip.
-		//
-		// Claude-only: Codex does not record approvals in its rollout (the
-		// transcript check can't see them), so a codex PostToolUse advances
-		// straight to working without this guard.
+		// plan / approval) is still waiting on the user. Honoring it blindly flips
+		// the red chip green the instant any such tool completes. clearsPermission
+		// gates it two ways (see there): the identity-correlated fast path (the
+		// approved tool's own PostToolUse, by tool_name) clears at hook speed; else
+		// the transcript must show the turn resumed. A bare/Task tool_result is not
+		// resolution, so the chip holds red — the reconciler's TTL backstop decays a
+		// truly stuck one. Codex is exempt: it records no approvals in its rollout,
+		// so a codex PostToolUse advances straight to working without this guard.
+		gateLogged := false
 		if agent == state.AgentKindClaude && status == "working" && req.Event == "PostToolUse" && info.Status == "permission" {
-			tpath := info.Transcript
-			if req.Transcript != "" {
-				tpath = req.Transcript
+			clear, rule, reason := s.clearsPermission(info, req.ToolName)
+			d := statustune.Decision{
+				PID: pid, Session: shortID(coalesce(req.SessionID, info.SessionID)),
+				From: "permission", To: "permission", Rule: rule, Reason: reason,
+				Pending: info.PendingTool, Subagents: info.InFlightSubagents,
+				Age: time.Since(info.StatusSince),
 			}
-			if st, _ := transcript.ResolutionState(tpath, info.StatusSince, transcript.DefaultTailBytes); st != transcript.StateResolved {
-				log.Printf("status: pid=%d %s hold permission (event=PostToolUse, prompt still pending)", pid, sessionLabel(sess, req.SessionID))
-				status = ""
+			if clear {
+				d.To = "working"
+			} else {
+				status = "" // hold red
 			}
+			d.Log()
+			gateLogged = true
 		}
 		// Stamp StatusSince only on a real transition, so repeated same-status
 		// hooks (e.g. successive PostToolUse) don't keep resetting the age the
@@ -304,20 +327,65 @@ func (s *Server) handleHook(req Request) {
 			// trail for state drift: grepping `status: pid=<n>` reconstructs a
 			// session's full transition history, and the gap between an idle/
 			// permission edge and the next working edge measures how long a chip
-			// lagged reality. agent=/event= name which agent and hook drove it.
-			log.Printf("status: pid=%d %s %s->%s (agent=%s event=%s)", pid, sessionLabel(sess, req.SessionID), info.Status, status, agent, req.Event)
+			// lagged reality. agent=/event= name which agent and hook drove it. The
+			// permission gate already logged its (richer) decision, so skip the
+			// generic line there to avoid a duplicate.
+			if !gateLogged {
+				log.Printf("status: pid=%d %s %s->%s (agent=%s event=%s)", pid, sessionLabel(sess, req.SessionID), info.Status, status, agent, req.Event)
+			}
+			if info.Status == state.StatusPermission && status != state.StatusPermission {
+				info.PendingTool = "" // leaving red: forget the captured prompt tool
+			}
 			info.Status = status
 			info.StatusSince = time.Now()
+			if status == state.StatusPermission {
+				info.PendingTool = req.ToolName // capture the tool the prompt is for (A2)
+			}
 		}
 		if req.SessionID != "" && info.SessionID == "" {
 			info.SessionID = req.SessionID
 		}
-		// Transcript path is stable per session; keep it fresh so the reconciler
-		// can read the tail to tell a declined prompt from a still-pending one.
-		if req.Transcript != "" {
-			info.Transcript = req.Transcript
-		}
 	})
+}
+
+// clearsPermission decides whether a PostToolUse should release a red chip and
+// names the rule/reason for the forensic decision log. Two gates, fast first:
+//
+//   - identity-correlated fast path (A2): the PostToolUse's tool_name matches the
+//     tool the prompt was raised for (PendingTool), i.e. the *approved* tool just
+//     completed. Clears at hook speed — the fix for the ~26s approve-path lag.
+//   - transcript fallback: the main thread produced an assistant message after the
+//     prompt (ResolutionResumed), i.e. the turn resumed. Covers the case where the
+//     tool_name was not forwarded.
+//
+// A decline/interrupt deliberately does NOT clear here (it fires no PostToolUse;
+// and exiting a hook-driven *working* edge to green on an interrupt would paint
+// the wrong color) — the reconciler demotes it to idle/orange instead. Anything
+// else holds red (case 12: a bare/sibling/Task tool_result is not resolution).
+func (s *Server) clearsPermission(info *state.AgentInfo, toolName string) (clear bool, rule, reason string) {
+	if s.tun.EarlyClearApproveByToolName && toolName != "" && toolName == info.PendingTool {
+		return true, statustune.RuleApproveToolMatch, "tool-name match: " + toolName
+	}
+	if k, _ := transcript.ResolveKind(info.Transcript, info.StatusSince, s.tun.TailBytes); k == transcript.ResolutionResumed {
+		return true, statustune.RuleApproveTranscript, "transcript: turn resumed"
+	}
+	return false, statustune.RuleHoldBareResult, "prompt still pending"
+}
+
+// shortID trims a session id to its first segment for compact decision logs.
+func shortID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
+}
+
+// coalesce returns the first non-empty string.
+func coalesce(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }
 
 // findTrackedAncestor walks up the ppid chain starting at pid, returning the

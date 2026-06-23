@@ -279,22 +279,30 @@
   session.
 - should ignore any other event name.
 
-### 7.3 Attention self-heal — `selfHealStaleAttention` / `shouldDecayPermission`
+### 7.3 Attention self-heal — `selfHealStaleAttention` / `permissionExit`
 A declined `AskUserQuestion` (and a turn interrupt) fires **no** clearing hook —
 `PostToolUse` only fires on success, `Stop` not on interrupt — so a `permission`
 chip latches red with nothing to release it. Each reconcile tick the daemon reads
-the tail of each `permission` session's transcript and decays a *resolved* prompt
-(see §7.4 for why this keys on time, not a dangling tool_use).
-- `shouldDecayPermission` should decay (→ `idle`) when the check returns
-  `StateResolved` (a tool_result is dated after the chip went red — answered **or**
-  declined), regardless of age.
-- should **not** decay when the check returns `StatePending` (nothing has resolved
-  since the prompt appeared — keep nagging), regardless of age. ⚠ This is the
+the tail of each `permission` session's transcript and exits a *resolved* prompt
+to a color chosen by the resolution **kind** (`permissionExit`, the pure core; see
+§7.4 for why this keys on time, not a dangling tool_use). All knobs are
+`statustune.Tuning` fields.
+- should exit to **`working`** (green, directly — no orange bounce) when the kind
+  is `ResolutionResumed` (an assistant message dated after the chip went red — the
+  approved turn resumed), regardless of age.
+- should exit to **`idle`** (orange) when the kind is `ResolutionInterrupted`
+  (interrupt notice — Esc/declined) **and** no subagents are in flight; should exit
+  to **`delegating`** (green) instead when `InFlightSubagents > 0` (work continues).
+- should **not** exit when the kind is `ResolutionNone` (nothing has resolved since
+  the prompt appeared — keep nagging), regardless of age. ⚠ This is the
   nginx-template-setup regression: a pending plan/question whose tool_use is not
-  yet flushed must stay **red**, not demote to orange.
-- should fall back to the TTL **only** when the check is `StateUnknown` (the
-  transcript is missing/unreadable): decay once the status age `>=`
-  `permissionDecayTTL`, so a stuck chip still degenerates if the read truly fails.
+  yet flushed must stay **red**, not demote.
+- should fall back to the TTL **only** when the transcript is unreadable: exit (to
+  the interrupt color) once the status age `>=` `Tuning.PermissionDecayTTL`, so a
+  stuck chip still degenerates if the read truly fails.
+- every exit (and the hook-path hold/early-clear) is recorded by a
+  `statustune.Decision` log line carrying the rule id and the observed `[S= pending=
+  age=]` tuple — the forensic trail for retuning a wrong color.
 - `selfHealStaleAttention` should pass `Claude.StatusSince` as the `since` bound
   and run **inside** the reconcile `Apply` (on the locked session map), so it
   never reads the shared `Claude` pointer outside the lock and folds into the
@@ -332,6 +340,13 @@ from the transcript tail each reconcile tick (symmetric with §7.3):
 - **working → idle**: interrupting a turn (Esc) fires no `Stop` hook, so the chip
   stays green. Should flip to `idle` when `NewestSignal` returns `SignalInterrupt`
   dated strictly **after** `Claude.StatusSince`.
+- **idle → delegating** (and back): independent of the activity read above, an
+  idle main thread with `InFlightSubagents > 0` (recomputed each tick by
+  `transcript.InFlightTasks`) is promoted to **`delegating`** (green — teammate
+  work is happening), reverting to `idle` when the count returns to 0. This is
+  decided from the subagent count **before** the mtime pre-gate, because the main
+  transcript is quiet while a teammate runs (it would otherwise be skipped). Gated
+  by `Tuning.DelegatingEnabled`.
 - should re-stamp `StatusSince = now` on every flip, so the triggering entry is
   older than the new bound next tick and cannot cause a reverse flip (no
   flapping); `idle`+interrupt and `working`+activity are no-ops.

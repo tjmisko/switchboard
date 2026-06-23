@@ -47,6 +47,26 @@ func TestRenderSnapshotListsSessions(t *testing.T) {
 	}
 }
 
+// A delegating session renders its "delegating" label in green (work is
+// happening by proxy), distinct from idle's yellow.
+func TestRenderSnapshotDelegatingIsGreen(t *testing.T) {
+	snap := state.Snapshot{
+		Sessions: []state.Session{
+			{PID: 4821, CWD: "/home/u/proj", Claude: &state.ClaudeInfo{
+				Status: state.StatusDelegating, InFlightSubagents: 2,
+			}},
+		},
+	}
+	plain := renderSnapshot(snap, "/home/u", false)
+	if !strings.Contains(plain, "delegating") {
+		t.Errorf("plain frame missing 'delegating' label:\n%s", plain)
+	}
+	colored := renderSnapshot(snap, "/home/u", true)
+	if !strings.Contains(colored, colGreen) {
+		t.Errorf("delegating session should be painted green:\n%q", colored)
+	}
+}
+
 func TestRenderSnapshotGreysSuspended(t *testing.T) {
 	snap := state.Snapshot{
 		Sessions: []state.Session{
