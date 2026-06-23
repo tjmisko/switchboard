@@ -220,10 +220,11 @@ func tierSummary(caps *state.Capabilities) string {
 }
 
 func sessionStatus(s state.Session) string {
-	if s.Claude == nil || s.Claude.Status == "" {
+	info := s.Enrichment()
+	if info == nil || info.Status == "" {
 		return "unknown"
 	}
-	return s.Claude.Status
+	return info.Status
 }
 
 func abbrevHome(path, home string) string {

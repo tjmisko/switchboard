@@ -1,8 +1,16 @@
 # Investigation — a Codex status indicator in switchboard
 
-> Status: **investigation only** (no code). Scope: what it would take to give
-> OpenAI **Codex CLI** sessions the same Observe-tier status chip switchboard
-> gives Claude Code — `working` / `idle` / `permission` — plus Navigate.
+> Status: **investigation + a basic implementation**. This document is the
+> design record; phases **C-1 (discovery), C-2 (schema), C-3 (hooks)** are
+> implemented in the same branch (Codex discovery via `comm == "codex"` + argv
+> filter, the additive `agent`/`codex` state fields, and the
+> `switchboard-ctl codex-hook` forwarder). Phases **C-4 (rollout self-heal),
+> C-5 (notify fallback), C-6 (polish)** remain future work, and the ⚠
+> live-verification gaps below still stand (no Codex plan here to run a session).
+>
+> Scope: what it would take to give OpenAI **Codex CLI** sessions the same
+> Observe-tier status chip switchboard gives Claude Code — `working` / `idle` /
+> `permission` — plus Navigate.
 >
 > Grounding: read against `openai/codex@main` source + developers.openai.com
 > docs (June 2026), and corroborated against the real on-disk artifacts of a

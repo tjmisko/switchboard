@@ -39,7 +39,7 @@ should treat the file as a whole-document replace, not a delta.
 
 | Field | JSON type | Always present | Meaning |
 |-------|-----------|----------------|---------|
-| `sessions` | array of `Session` | yes | All currently-tracked Claude Code sessions. May be empty (`[]`) when no sessions exist. |
+| `sessions` | array of `Session` | yes | All currently-tracked coding-agent sessions (Claude Code and Codex). May be empty (`[]`) when no sessions exist. |
 | `updated_at` | RFC 3339 timestamp string | yes | When this snapshot was produced (`time.Now()` at encode). Monotonic-ish wall clock; advisory only. |
 
 **Ordering guarantee:** `sessions` is sorted ascending by `started_at`. ⚠ The
@@ -63,9 +63,11 @@ data has not been resolved yet.
   "started_at": "2026-05-28T09:00:00Z",
   "focused": true,
   "suspended": true,         // omitted when false
-  "wezterm":  { /* WeztermInfo,  optional */ },
+  "agent": "claude",         // "claude" | "codex"; omitted until the kind is known
+  "wezterm":  { /* WeztermInfo, optional */ },
   "hyprland": { /* HyprlandInfo, optional */ },
-  "claude":   { /* ClaudeInfo,   optional */ }
+  "claude":   { /* AgentInfo, optional — present for a claude session */ },
+  "codex":    { /* AgentInfo, optional — present for a codex session */ }
 }
 ```
 
@@ -76,10 +78,12 @@ data has not been resolved yet.
 | `tty` | string | always | stable | Controlling pseudo-terminal, e.g. `/dev/pts/3`. **OS-specific literal** (macOS will report `/dev/ttysNNN`); consumers should treat it as an opaque join key, never parse the prefix. May be `""` for a non-tty-attached process — such a session cannot be mapped to a terminal/window (Observe-only). |
 | `started_at` | RFC 3339 timestamp | always | stable | When Switchboard first observed the session (wall clock at discovery), **not** the process's real start time. |
 | `focused` | boolean | always | stable | Whether this session's window is the active window in the WM. Best-effort; `false` for any session without a resolved WM address. |
-| `suspended` | boolean | omitted when false | stable | Whether the `claude` process is job-control-stopped — paused by `SIGTSTP`/`SIGSTOP` (Ctrl-Z). Derived from the `State:` field of `/proc/<pid>/status` (`T`); refreshed each reconcile tick (~5 s). Renderers grey such chips out, since the `claude.status` is stale while paused. `t` (tracing stop, e.g. under a debugger) does **not** count. Linux-only signal today; absent on backends that can't read process run-state. |
+| `suspended` | boolean | omitted when false | stable | Whether the agent process is job-control-stopped — paused by `SIGTSTP`/`SIGSTOP` (Ctrl-Z). Derived from the `State:` field of `/proc/<pid>/status` (`T`); refreshed each reconcile tick (~5 s). Renderers grey such chips out, since the status is stale while paused. `t` (tracing stop, e.g. under a debugger) does **not** count. Linux-only signal today; absent on backends that can't read process run-state. |
+| `agent` | string | omitted until known | additive | Which coding-agent CLI owns the session: `"claude"` or `"codex"`. Set at discovery from the process. Selects which enrichment block (`claude`/`codex`) carries the status. Consumers should tolerate its absence (pre-multi-agent daemons) and any unrecognized value. |
 | `wezterm` | object \| absent | optional | provisional | Terminal-locator data. Present once the tty is matched to a **wezterm** pane. Other terminal backends (e.g. tmux) do **not** populate it — those sessions are still observed via `/proc`, and focus re-locates the pane by tty at request time. Field set is terminal-backend-specific and may generalize when the seam grows a neutral terminal block. |
 | `hyprland` | object \| absent | optional | provisional | Window-manager data. Present once the pane is matched to a WM window. WM-backend-specific; will generalize behind a neutral window block as other WM backends land. |
-| `claude` | object \| absent | optional | stable | Claude-side enrichment fed by hooks. Present once at least one hook fires for the session. |
+| `claude` | object \| absent | optional | stable | Claude-side enrichment fed by Claude Code hooks. Present once at least one hook fires for a **claude** session. Shape is `AgentInfo` (below). |
+| `codex` | object \| absent | optional | additive | Codex-side enrichment fed by Codex hooks. Present once at least one hook fires for a **codex** session. Same `AgentInfo` shape as `claude`. A session populates exactly one of `claude`/`codex`, matching `agent`. |
 
 ### `wezterm` (`WeztermInfo`) — provisional
 
@@ -107,26 +111,37 @@ fields always present when the block exists.
 | `workspace_id` | integer | Numeric Hyprland workspace id. Drives the bottom-bar chip ordering (chips follow workspace order). `0` means unresolved (Hyprland workspace ids are positive, or negative for special workspaces). |
 | `monitor` | string | Monitor name. ⚠ Currently **never populated** (always `""`); reserved. See `docs/decisions.md`. |
 
-### `claude` (`ClaudeInfo`) — stable
+### `claude` / `codex` (`AgentInfo`) — claude stable, codex additive
 
-Present once a Claude Code hook has fired for the session.
+The per-agent enrichment block. A session populates exactly one, under the key
+matching its `agent`. Both share one shape (`AgentInfo`) and appear once that
+agent's first hook fires. Renderers read whichever is present.
 
 | Field | JSON type | Presence | Meaning |
 |-------|-----------|----------|---------|
-| `session_id` | string | omitted when empty | Claude Code session UUID, supplied by hooks. **Write-once**: set on the first hook that carries it and never overwritten. |
-| `transcript` | string | omitted when empty | Path to the session transcript `.jsonl`, when known. |
+| `session_id` | string | omitted when empty | Agent session UUID, supplied by hooks (Claude Code's session id; Codex's thread/conversation id). **Write-once**: set on the first hook that carries it and never overwritten. |
+| `transcript` | string | omitted when empty | Path to the session transcript when known: Claude Code's project `.jsonl`, or Codex's `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. |
 | `status` | string | always (when block present) | Session activity. One of: `working`, `idle`, `permission`. ⚠ The doc-comment also lists `unknown`, but the daemon **never emits it** — consumers should still tolerate an unrecognized value defensively. May be `""` before the first status-bearing hook. |
 
 #### `status` value mapping
 
-`status` is derived from the Claude Code hook `event` that last fired:
+`status` is derived from the hook `event` that last fired. The two agents share
+most of the vocabulary; Codex additionally maps `PreToolUse`:
 
-| Hook event | `status` |
-|------------|----------|
-| `UserPromptSubmit`, `PostToolUse` | `working` |
-| `PermissionRequest` | `permission` |
-| `Stop`, `SessionStart` | `idle` |
-| (any other / unknown) | unchanged (empty mapping; status not modified) |
+| Hook event | `claude` status | `codex` status |
+|------------|-----------------|----------------|
+| `UserPromptSubmit` | `working` | `working` |
+| `PreToolUse` | (unmapped) | `working` |
+| `PostToolUse` | `working` | `working` |
+| `PermissionRequest` | `permission` | `permission` |
+| `Stop`, `SessionStart` | `idle` | `idle` |
+| (any other / unknown) | unchanged | unchanged |
+
+⚠ Codex caveat: Codex does **not** record approval requests in its on-disk
+rollout, so the `permission` status is recoverable only from a live
+`PermissionRequest` hook — there is no transcript-tail self-heal for it (see the
+`permission` self-heal below, which is Claude-only today). A Codex session with
+no hooks configured shows only `working`/`idle`.
 
 ##### `permission` self-heal (reconciler)
 
@@ -236,9 +251,13 @@ re-locates the pane by `tty` at request time.
   as portable WM/terminal backends land — likely generalizing into
   backend-neutral `terminal`/`window` blocks with the WM-specific blocks
   retained or aliased. Treat `hyprland.address` as an opaque ref.
-- **Additive changes** (new optional fields, the `capabilities` block) are
-  **not** breaking; consumers must ignore unknown fields and tolerate missing
-  optional fields.
+- **Additive changes** (new optional fields, the `capabilities` block, the
+  `agent` discriminator and the `codex` enrichment block) are **not** breaking;
+  consumers must ignore unknown fields and tolerate missing optional fields. The
+  `claude` block is unchanged — a consumer reading `.claude.status` keeps working;
+  to be agent-aware, read `.codex.status` too (e.g. `.claude.status // .codex.status`).
+  The Go struct behind `claude`/`codex` was renamed `ClaudeInfo` → `AgentInfo`
+  (with a `ClaudeInfo` alias retained); the wire format is unchanged.
 - **Empty vs. absent:** always-present string fields use `""` for "unknown";
   optional blocks are **omitted** entirely (never `null`) when unresolved.
   `claude.session_id`/`transcript` are omitted when empty; `claude.status` is

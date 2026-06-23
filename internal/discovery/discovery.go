@@ -1,4 +1,5 @@
-// Package discovery scans /proc for claude processes. We poll once a second
+// Package discovery scans /proc for coding-agent sessions (Claude Code and
+// Codex; see Classify). We poll once a second
 // rather than subscribing to netlink CN_PROC because /proc scans are cheap
 // (~200-500 procfs entries, kernel-side memory) and avoid needing
 // CAP_NET_ADMIN. Latency is bounded by the tick interval.
@@ -55,6 +56,73 @@ func isBackgroundSubcommand(args []string) bool {
 	}
 	_, ok := backgroundSubcommands[args[1]]
 	return ok
+}
+
+// Agent identifies a supported coding-agent CLI discovered in /proc. AgentNone
+// (the empty value) means "not a tracked interactive session".
+type Agent string
+
+const (
+	AgentNone   Agent = ""
+	AgentClaude Agent = "claude"
+	AgentCodex  Agent = "codex"
+)
+
+// Classify reports which interactive coding-agent session a /proc snapshot is,
+// or AgentNone when it is neither Claude Code nor Codex. It is the single
+// predicate the scanner filters on, so adding an agent is a matter of extending
+// this switch. The returned value's string matches state.AgentKind*.
+func Classify(p proc.Info) Agent {
+	switch {
+	case IsClaude(p):
+		return AgentClaude
+	case IsCodex(p):
+		return AgentCodex
+	default:
+		return AgentNone
+	}
+}
+
+// codexNonInteractiveSubcommands are `codex <verb> …` invocations that are NOT
+// interactive TUI sessions. Codex is a single `codex` binary whose subcommand is
+// argv[1]; unlike claude, most of its surface is non-session — a headless
+// `exec`, the `app-server`/`mcp-server`/`mcp` servers, and `login`/`doctor`/
+// `update`/… utilities — so we blocklist those and treat everything else (the
+// bare `codex`, a leading flag, a positional prompt, `resume`, `fork`) as a
+// session. Mirrors claude's verb filter; a future non-interactive verb must be
+// added here.
+var codexNonInteractiveSubcommands = map[string]struct{}{
+	"exec": {}, "e": {},
+	"app-server": {}, "mcp-server": {}, "mcp": {}, "remote-control": {}, "sandbox": {},
+	"login": {}, "logout": {}, "doctor": {}, "completion": {}, "update": {},
+	"plugin": {}, "features": {}, "cloud": {}, "apply": {},
+	"archive": {}, "unarchive": {}, "delete": {}, "execpolicy": {}, "app": {},
+}
+
+// IsCodex returns true if the /proc snapshot is an interactive Codex CLI
+// session: comm == "codex" with an argv[1] that is not a non-interactive
+// subcommand (see codexNonInteractiveSubcommands). No exe-path check — codex is
+// not installed under a distinctive directory the way claude is.
+func IsCodex(p proc.Info) bool {
+	if p.Comm != "codex" {
+		return false
+	}
+	return codexIsInteractive(p.Args)
+}
+
+// codexIsInteractive reports whether a `codex …` argv launches an interactive
+// session. args[0] is the program path; args[1] is the subcommand verb when
+// present. A bare invocation, a leading flag, or a non-blocklisted verb counts.
+func codexIsInteractive(args []string) bool {
+	if len(args) < 2 {
+		return true // bare `codex` → TUI
+	}
+	verb := args[1]
+	if strings.HasPrefix(verb, "-") {
+		return true // `codex --model … ` etc. → still the TUI
+	}
+	_, nonInteractive := codexNonInteractiveSubcommands[verb]
+	return !nonInteractive
 }
 
 // procSource is the seam between the scanner and /proc. The default
@@ -128,7 +196,7 @@ func (s *Scanner) scanOnce(onAppeared func(proc.Info)) {
 		if err != nil {
 			continue
 		}
-		if !IsClaude(info) {
+		if Classify(info) == AgentNone {
 			continue
 		}
 		s.mu.Lock()

@@ -23,8 +23,8 @@ func TestLoadHydratesFromGolden(t *testing.T) {
 	}
 
 	snap := store.Snapshot()
-	if len(snap.Sessions) != 2 {
-		t.Fatalf("hydrated %d sessions, want 2", len(snap.Sessions))
+	if len(snap.Sessions) != 3 {
+		t.Fatalf("hydrated %d sessions, want 3", len(snap.Sessions))
 	}
 
 	byPID := map[int]state.Session{}
@@ -41,6 +41,20 @@ func TestLoadHydratesFromGolden(t *testing.T) {
 	}
 	if !byPID[4821].Focused {
 		t.Errorf("session 4821 should be focused per golden")
+	}
+	// The codex session hydrates with its kind and codex enrichment block intact.
+	if s, ok := byPID[4999]; !ok {
+		t.Errorf("codex session 4999 not hydrated")
+	} else {
+		if s.Agent != state.AgentKindCodex {
+			t.Errorf("session 4999 agent = %q, want codex", s.Agent)
+		}
+		if s.Codex == nil || s.Codex.Status != "idle" {
+			t.Errorf("session 4999 codex block = %+v, want status=idle", s.Codex)
+		}
+		if s.Claude != nil {
+			t.Errorf("codex session 4999 should have nil Claude, got %+v", s.Claude)
+		}
 	}
 }
 
