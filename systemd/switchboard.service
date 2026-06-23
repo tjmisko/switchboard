@@ -1,17 +1,36 @@
 [Unit]
 Description=Switchboard — Claude Code session tracker daemon
+# Order after / stop with the graphical session where a compositor uses that
+# target, but do NOT gate startup on it (see [Install]).
 PartOf=graphical-session.target
 After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/go/bin/switchboard
+# Bind the WM backend even when the user manager never inherited the compositor
+# env (login race, OOM restart, or a bare `systemctl --user restart`). Two paths:
+#   fast  — if HYPRLAND_INSTANCE_SIGNATURE is already in the environment (the
+#           compositor ran `systemctl --user import-environment`), use it as-is.
+#   slow  — otherwise discover the live instance from its lock file: each
+#           $XDG_RUNTIME_DIR/hypr/<sig>/hyprland.lock holds the compositor PID on
+#           line 1; the dir whose PID is still in /proc is the live session.
+# Without this, an empty signature makes detection report wm=none and the daemon
+# silently drops to the Observe tier — chips render but focus is a no-op.
+# `exec` hands the PID to the daemon so Type=simple/Restart tracking stays exact.
+ExecStart=/bin/sh -c 'if [ -z "$$HYPRLAND_INSTANCE_SIGNATURE" ]; then for d in "$$XDG_RUNTIME_DIR"/hypr/*/; do [ -r "$$d/hyprland.lock" ] || continue; read -r p _ < "$$d/hyprland.lock"; [ -e "/proc/$$p" ] || continue; s=$${d%%/}; HYPRLAND_INSTANCE_SIGNATURE=$${s##*/}; export HYPRLAND_INSTANCE_SIGNATURE; break; done; fi; exec %h/go/bin/switchboard'
 Restart=always
 RestartSec=2
-# Hyprland exports these into the user systemd environment via
-# `systemctl --user import-environment` in the Hyprland startup script.
+# Fast path only: the compositor may import these into the user-manager
+# environment at login. Not required — ExecStart self-discovers the signature.
 PassEnvironment=HYPRLAND_INSTANCE_SIGNATURE XDG_RUNTIME_DIR XDG_CACHE_HOME
 NoNewPrivileges=true
 
 [Install]
-WantedBy=graphical-session.target
+# Want from default.target, not graphical-session.target. The compositor
+# activates graphical-session.target (if at all) exactly once at login; when the
+# per-user `systemd --user` is restarted on its own — e.g. it was OOM-killed and
+# re-spawned by the system manager — that target is never re-reached, so a unit
+# wanted only by it would stay dead. Every user-manager start reaches
+# default.target, so the daemon recovers automatically and retries until
+# Hyprland is reachable.
+WantedBy=default.target
