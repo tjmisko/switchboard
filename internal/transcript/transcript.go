@@ -99,6 +99,29 @@ func (s Signal) String() string {
 // not match.
 const interruptMarkerPrefix = "[Request interrupted by user"
 
+// localCommandPrefixes are the tags Claude Code wraps around the synthetic user
+// entries it writes for local side-channel commands — a `!` bash command
+// (<bash-input>/<bash-stdout>/<bash-stderr>, plus a <local-command-caveat>), and a
+// `/` slash command (<command-name>/<command-message>/<command-args> and its
+// <local-command-stdout|stderr> output). These run with NO agent turn: they fire
+// neither UserPromptSubmit nor Stop, so they must not count as conversational
+// activity. Treating them as activity made the idle→working self-heal misfire — a
+// user who runs `!git status` in an idle (orange) session flushed a <bash-stdout>
+// entry dated after the Stop, which NewestSignal read as "the session resumed" and
+// promoted the chip back to green, where it latched forever (no Stop hook ever
+// follows a local command to bring it down).
+//
+// Slash commands warrant care because some DO start an agent — but that path is
+// already covered without this signal: a command that kicks off a turn fires
+// UserPromptSubmit, which sets the chip working via the hook, so by reconcile time
+// the status is no longer "idle" and the idle→working branch is never consulted.
+// The classification only matters when the chip is *still* idle — i.e. no
+// UserPromptSubmit fired — i.e. a purely-local command (/clear, /rename) that
+// started no agent, exactly the case that must not flip green. A genuine prompt,
+// likewise, fires UserPromptSubmit, so excluding all of these costs no real resume
+// signal (at worst the first assistant message lands a beat later and flips it).
+var localCommandPrefixes = []string{"<bash-", "<command-", "<local-command-"}
+
 // DefaultTailBytes bounds how much of the file end the readers consume. The
 // signals we need (the newest tool_result, the newest conversational entry) live
 // at the very end, so a small window keeps the check cheap even on multi-megabyte
@@ -287,10 +310,13 @@ func isResolution(e entry) bool {
 
 // NewestSignal reads up to maxBytes from the end of the transcript at path and
 // returns the kind and timestamp of the newest timestamped entry that is either
-// conversational activity (an assistant message, or a user message that is not an
-// interrupt notice) or a user interrupt notice. Timestamp-less metadata and
-// ancillary system entries are ignored. It returns (SignalNone, zero, nil) when
-// the tail holds no classifiable entry, and a non-nil error only on I/O failure.
+// conversational activity (an assistant message, or a user message that is
+// neither an interrupt notice nor a local-command side-channel record) or a user
+// interrupt notice. Timestamp-less metadata, ancillary system entries, and the
+// synthetic `!` bash / `/` slash-command entries (see localCommandPrefixes) are
+// ignored — none represent an agent turn. It returns (SignalNone, zero, nil)
+// when the tail holds no classifiable entry, and a non-nil error only on I/O
+// failure.
 //
 // Callers compare the returned timestamp against the moment the chip last
 // transitioned: a SignalActivity newer than that means an idle chip's session
@@ -323,19 +349,43 @@ func NewestSignal(path string, maxBytes int64) (Signal, time.Time, error) {
 
 // classify maps an entry to its status signal: an assistant message is activity;
 // a user message is an interrupt notice when a text block carries the interrupt
-// marker, otherwise activity. Everything else (system, metadata) is SignalNone.
+// marker, a local-command side-channel entry (no agent turn — see
+// localCommandPrefixes) when it carries one of those tags, otherwise activity.
+// Everything else (system, metadata) is SignalNone. A user tool_result keeps
+// counting as activity: its blocks are tool_result, not text, so neither special
+// case matches — that is the real "agent is mid-turn" signal the resume self-heal
+// relies on.
 func classify(e entry) Signal {
 	switch e.Message.Role {
 	case "assistant":
 		return SignalActivity
 	case "user":
 		for _, b := range e.blocks() {
-			if b.Type == "text" && strings.HasPrefix(strings.TrimSpace(b.Text), interruptMarkerPrefix) {
+			if b.Type != "text" {
+				continue
+			}
+			text := strings.TrimSpace(b.Text)
+			if strings.HasPrefix(text, interruptMarkerPrefix) {
 				return SignalInterrupt
+			}
+			if isLocalCommand(text) {
+				return SignalNone
 			}
 		}
 		return SignalActivity
 	default:
 		return SignalNone
 	}
+}
+
+// isLocalCommand reports whether trimmed user-entry text is one of Claude Code's
+// synthetic local-command records (a `!` bash command or `/` slash command),
+// which fire no UserPromptSubmit/Stop hook pair and so are not agent activity.
+func isLocalCommand(text string) bool {
+	for _, p := range localCommandPrefixes {
+		if strings.HasPrefix(text, p) {
+			return true
+		}
+	}
+	return false
 }
