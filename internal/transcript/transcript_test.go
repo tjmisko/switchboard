@@ -318,6 +318,47 @@ func TestAnchorTime(t *testing.T) {
 	})
 }
 
+func TestAnchorSince(t *testing.T) {
+	// now sits after the newest entry, as a real hook (processed after Claude wrote
+	// the entry) would.
+	now := mustTime(t, "2026-06-01T21:40:00Z")
+
+	t.Run("into idle should return now, not the transcript anchor", func(t *testing.T) {
+		// The flush-ordering race: the completing turn's final assistant message is
+		// in the tail (it flushed late), but an idle edge must NOT date StatusSince
+		// from it — otherwise the reconciler reads it as "activity after idle" and
+		// re-greens the chip. now (the turn-end boundary) is the race-free anchor.
+		path := writeTranscript(t, assistantText("2026-06-01T21:39:30Z"))
+		if got := AnchorSince(path, now, true, DefaultTailBytes); !got.Equal(now) {
+			t.Errorf("got %v, want now %v (idle edge ignores the transcript anchor)", got, now)
+		}
+	})
+
+	t.Run("into working should pull back to the newest turn entry", func(t *testing.T) {
+		path := writeTranscript(t, assistantText("2026-06-01T21:39:30Z"))
+		want := mustTime(t, "2026-06-01T21:39:30Z")
+		if got := AnchorSince(path, now, false, DefaultTailBytes); !got.Equal(want) {
+			t.Errorf("got %v, want anchor %v (working edge anchors to the entry)", got, want)
+		}
+	})
+
+	t.Run("into working should never run now backward", func(t *testing.T) {
+		// A turn entry timestamped after the hook-processing instant must not pull
+		// StatusSince ahead of now (the anchor.Before(now) guard).
+		path := writeTranscript(t, assistantText("2026-06-01T21:41:00Z"))
+		if got := AnchorSince(path, now, false, DefaultTailBytes); !got.Equal(now) {
+			t.Errorf("got %v, want now %v (anchor after now is ignored)", got, now)
+		}
+	})
+
+	t.Run("into working with no anchor should fall back to now", func(t *testing.T) {
+		path := writeTranscript(t, noise) // no timestamped turn entry
+		if got := AnchorSince(path, now, false, DefaultTailBytes); !got.Equal(now) {
+			t.Errorf("got %v, want now %v (empty tail falls back to now)", got, now)
+		}
+	})
+}
+
 func TestResolutionStateFailsSoft(t *testing.T) {
 	since := mustTime(t, "2026-06-01T21:39:00Z")
 	t.Run("should return unknown and an error for an empty path", func(t *testing.T) {

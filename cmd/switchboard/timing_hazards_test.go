@@ -18,11 +18,12 @@ import (
 //
 // Each row models the real two-phase flow:
 //
-//  1. a status hook fires; the daemon dates the transition from the newest
-//     transcript entry at that instant (transcript.AnchorTime — the skew fix),
-//     NOT from wall-clock now;
+//  1. a status hook fires; the daemon dates the transition via the anchoring
+//     policy (transcript.AnchorSince): an edge into working/permission anchors to
+//     the newest transcript entry at that instant (the skew fix), an edge into idle
+//     anchors to wall-clock now (the flush-race fix);
 //  2. the transcript keeps growing (a later interrupt, a teammate's tool_result,
-//     a `!bash` line, …);
+//     a `!bash` line, a turn's final assistant message flushed after its Stop, …);
 //  3. a reconcile tick runs selfHealStuckStatus and must land on the right color.
 //
 // The ids match the headings in docs/timing-hazards.md. Add a row AND a doc entry
@@ -40,6 +41,7 @@ func TestTimingHazards(t *testing.T) {
 		id        string   // matches a heading in docs/timing-hazards.md
 		atHook    []string // transcript entries present when the status hook fired
 		status    string   // the color the hook set
+		hookAt    string   // wall-clock instant the daemon ran the hook (default: newest atHook entry; set later to model a flush lag)
 		subagents int      // teammates in flight at reconcile
 		appended  []string // entries written between the hook and the reconcile
 		stale     bool     // force the file mtime before StatusSince (no fresh write)
@@ -104,6 +106,24 @@ func TestTimingHazards(t *testing.T) {
 			want:      "working",
 		},
 		{
+			// THE bug this branch fixes (the flush-ordering race). A turn ends: its
+			// final assistant message (t30s) is generated, the Stop hook fires, and the
+			// daemon processes it at hookAt (t40s) — but Claude flushes that assistant
+			// line to the .jsonl a beat LATER, so at hook time the newest entry on disk
+			// is only the earlier tool_result (t0). Anchoring StatusSince to that stale
+			// on-disk entry let the late-flushed assistant message read as "activity
+			// after idle" and re-green the chip after EVERY Stop. Anchoring an idle edge
+			// to wall-clock now (hookAt, after the turn truly ended) keeps it idle: the
+			// completing turn's own message (t30s, before t40s) cannot re-trigger.
+			id:        "H7-stop-final-message-flush-race",
+			atHook:    []string{tResult(t0)},
+			status:    "idle",
+			hookAt:    t40s,
+			appended:  []string{tAssistant(t30s)},
+			afterHook: 5 * time.Minute,
+			want:      "idle",
+		},
+		{
 			// Delegating is decided from the in-flight-subagent count, not a transcript
 			// read, so it must fire even when the main transcript is quiet (stale mtime)
 			// — the case the activity pre-gate would otherwise skip.
@@ -119,12 +139,22 @@ func TestTimingHazards(t *testing.T) {
 
 	for _, h := range hazards {
 		t.Run(h.id, func(t *testing.T) {
-			// Phase 1: the daemon anchors StatusSince to the newest entry at hook time.
-			since, ok := transcript.AnchorTime(writeTranscript(t, h.atHook...), transcript.DefaultTailBytes)
+			// Phase 1: the daemon processes the hook at wall-clock `hookNow`, then
+			// dates StatusSince per its anchoring policy (transcript.AnchorSince) over
+			// the transcript visible AT THAT INSTANT. hookNow defaults to the newest
+			// atHook entry (no flush lag); a flush-race row overrides it to a time after
+			// an entry that has not been flushed yet.
+			atHookPath := writeTranscript(t, h.atHook...)
+			anchor, ok := transcript.AnchorTime(atHookPath, transcript.DefaultTailBytes)
 			if !ok {
 				t.Fatalf("AnchorTime: no turn entry in atHook fixture")
 			}
-			reconcileNow := since.Add(h.afterHook)
+			hookNow := anchor
+			if h.hookAt != "" {
+				hookNow = mustParseTime(t, h.hookAt)
+			}
+			since := transcript.AnchorSince(atHookPath, hookNow, h.status == "idle", transcript.DefaultTailBytes)
+			reconcileNow := hookNow.Add(h.afterHook)
 
 			// Phase 2: the transcript grows to its reconcile-time tail.
 			full := writeTranscript(t, append(append([]string{}, h.atHook...), h.appended...)...)
@@ -152,4 +182,15 @@ func TestTimingHazards(t *testing.T) {
 // (and dates) just before firing UserPromptSubmit.
 func tUserText(ts, s string) string {
 	return `{"type":"user","timestamp":"` + ts + `","message":{"role":"user","content":[{"type":"text","text":"` + s + `"}]}}`
+}
+
+// mustParseTime parses an RFC3339 fixture timestamp into the wall-clock instant a
+// row uses for hookAt (the moment the daemon ran the hook).
+func mustParseTime(t *testing.T, ts string) time.Time {
+	t.Helper()
+	parsed, err := time.Parse(time.RFC3339, ts)
+	if err != nil {
+		t.Fatalf("parse %q: %v", ts, err)
+	}
+	return parsed
 }

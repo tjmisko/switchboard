@@ -65,27 +65,55 @@ against (the transcript entry).
 ### The fix: anchor `StatusSince` to the transcript
 
 `transcript.AnchorTime` returns the timestamp of the newest turn entry in the
-tail. `handleHook` dates the transition from that, falling back to wall-clock
-`now` only when the tail holds no timestamped entry:
-
-```go
-now := time.Now()
-info.StatusSince = now
-if anchor, ok := transcript.AnchorTime(info.Transcript, s.tun.TailBytes); ok && anchor.Before(now) {
-    info.StatusSince = anchor
-}
-```
-
-This puts `StatusSince` on the **same event stream, sampled at the same causal
-point**, as the signals the reconciler later compares against it, so a genuinely
-later signal always reads as later — independent of hook latency. It is also more
-accurate for the permission-decay age and the resume check, which use the same
-`StatusSince`.
+tail. For an edge **into working/permission**, `handleHook` dates the transition
+from that, falling back to wall-clock `now` only when the tail holds no
+timestamped entry. This puts `StatusSince` on the **same event stream, sampled at
+the same causal point**, as the signals the reconciler later compares against it,
+so a genuinely later signal always reads as later — independent of hook latency.
+It is also more accurate for the permission-decay age and the resume check, which
+use the same `StatusSince`.
 
 Why anchor instead of just dropping the `> StatusSince` gate? The gate is what
 makes the recovery non-flapping (a healed edge re-stamps `StatusSince`, so the
 triggering entry can't re-fire it). Keeping the gate and fixing the value it
 compares against preserves that property while closing the race at its source.
+
+## 2.1 The opposite direction: the flush-ordering race (into idle)
+
+The transcript anchor is exactly **wrong** for an edge **into idle** (`Stop` /
+`SessionStart`), because the two streams race the other way. A `Stop` hook fires
+right after the turn's final assistant message is generated, but Claude Code
+flushes that message's `.jsonl` line a beat **later** — so at the instant the
+daemon processes the `Stop`, the newest entry *on disk* is an **earlier** turn
+entry:
+
+```
+T0    Claude writes a user tool_result                  (on disk, ts = T0)
+T0+9s Claude generates the turn's final assistant msg   (ts = T0+9s, NOT yet flushed)
+T0+9s Claude spawns the Stop hook
+T0+Δ  daemon processes Stop, AnchorTime sees only T0  →  StatusSince = T0
+T0+Δ+ε Claude flushes the final assistant line          (now on disk, ts = T0+9s)
+```
+
+Next reconcile tick, `NewestSignal` finds the assistant message at `T0+9s`, which
+is **after** `StatusSince = T0`, so the idle→working "resume-activity" rule reads
+the **completing turn's own last message** as "the session resumed" and re-greens
+the chip. It then latches green until the next `Stop` — which flaps the same way.
+The non-flapping guarantee (§2) is defeated because the triggering entry is *newer*
+than the anchored `StatusSince`, not older.
+
+The race-free anchor for an idle edge is wall-clock `now`: a `Stop` can only fire
+**after** the turn truly ended, so the turn's own messages — all dated before
+`now` — cannot re-trigger, while a genuine resumption (an orchestrator woken by a
+teammate) is dated after `now` and still does. `transcript.AnchorSince` folds both
+directions into one policy:
+
+```go
+now := time.Now()
+info.StatusSince = transcript.AnchorSince(info.Transcript, now, status == state.StatusIdle, s.tun.TailBytes)
+// into working/permission → anchor to the triggering entry (§2, the skew fix)
+// into idle               → wall-clock now            (the flush-race fix)
+```
 
 ---
 
@@ -99,6 +127,7 @@ compares against preserves that property while closing the race at its source.
 | **H4-local-command-after-idle** | `Stop` → orange, then `!bash` | `idle` | `<bash-stdout>` user entry | stay **idle** — a `!`/`/` local command is not agent activity, and the anchor must not let the final assistant message (at `StatusSince`) read as fresh. |
 | **H5-teammate-resume-after-idle** | orchestrator idle, teammate lands a result | `idle` | tool_result after the chip went idle | resume → **working**. |
 | **H6-delegating-quiet-transcript** | idle main thread, subagents in flight | `idle` | (nothing written) | promote → **delegating** from the subagent count, even with a stale mtime the activity pre-gate would skip. |
+| **H7-stop-final-message-flush-race** | `Stop` → orange, then the turn's own final assistant message flushes late | `idle` | assistant message dated before the `Stop` lands on disk after it | stay **idle** (§2.1). The idle edge anchors `StatusSince` to wall-clock `now`, not to the stale on-disk entry, so the late-flushed message (dated before `now`) is not "activity after idle" — without this the chip re-greened after every `Stop`. |
 
 ### Adding a hazard
 

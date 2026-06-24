@@ -495,6 +495,41 @@ func AnchorTime(path string, maxBytes int64) (ts time.Time, ok bool) {
 	return newest, true
 }
 
+// AnchorSince picks the time a status transition should be dated from
+// (StatusSince), given the wall-clock instant `now` the daemon processed the
+// triggering hook and whether the transition is into an idle (turn-ended) state.
+// There are two opposite clock-skew risks, one per direction — see
+// docs/timing-hazards.md:
+//
+//   - Into working/permission: the hook reaches us AFTER Claude wrote the entry
+//     that triggered it, so a wall-clock `now` sits ahead of that entry and would
+//     filter a fast follow-up signal (an immediate Ctrl+C after a prompt) as
+//     stale. Pull StatusSince back to the triggering entry (AnchorTime) so a
+//     genuinely-later signal always reads as later, regardless of hook latency.
+//
+//   - Into idle (Stop/SessionStart): the only signal that should re-activate the
+//     chip is one dated AFTER the turn ended. But the completing turn's OWN final
+//     assistant message is dated before the Stop yet is flushed to the .jsonl a
+//     beat AFTER the Stop hook reaches us — so anchoring to "the newest turn entry
+//     on disk at hook time" can land BEFORE that late-flushed message, which the
+//     reconciler then reads as "activity after idle" and falsely re-greens the
+//     chip (the flush-ordering race). Wall-clock `now` is the race-free anchor: a
+//     Stop can only fire after the turn truly ended, so the turn's own messages —
+//     all dated before `now` — cannot re-trigger, while a genuine resumption dated
+//     after `now` still does.
+//
+// The pull-back never runs `now` backward: it applies only when the anchor is
+// strictly before `now`, and a missing/unreadable transcript falls back to `now`.
+func AnchorSince(path string, now time.Time, intoIdle bool, maxBytes int64) time.Time {
+	if intoIdle {
+		return now
+	}
+	if anchor, ok := AnchorTime(path, maxBytes); ok && anchor.Before(now) {
+		return anchor
+	}
+	return now
+}
+
 // classify maps an entry to its status signal: an assistant message is activity;
 // a user message is an interrupt notice when a text block carries the interrupt
 // marker, a local-command side-channel entry (no agent turn — see

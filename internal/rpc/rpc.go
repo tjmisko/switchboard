@@ -337,18 +337,19 @@ func (s *Server) handleHook(req Request) {
 				info.PendingTool = "" // leaving red: forget the captured prompt tool
 			}
 			info.Status = status
-			// Date the transition from the transcript entry that triggered this hook,
-			// not from now: the hook reaches us tens-to-hundreds of ms after Claude
-			// recorded that entry, and a wall-clock stamp would sit AHEAD of a fast
-			// follow-up signal (e.g. an immediate Ctrl+C), hiding it from the
-			// reconciler's hookless recovery. See transcript.AnchorTime / the skew
-			// class in docs/timing-hazards.md. Fall back to now only when the tail has
-			// no timestamped turn entry, and never let the anchor run ahead of now.
+			// Date the transition per the anchoring policy (transcript.AnchorSince):
+			// for an edge INTO working/permission, pull StatusSince back to the
+			// transcript entry that triggered this hook, because the hook reaches us
+			// tens-to-hundreds of ms after Claude recorded that entry and a wall-clock
+			// stamp would sit AHEAD of a fast follow-up signal (e.g. an immediate
+			// Ctrl+C), hiding it from the reconciler's hookless recovery. For an edge
+			// INTO idle (Stop/SessionStart), use wall-clock now instead: the completing
+			// turn's own final assistant message is flushed a beat AFTER the Stop hook
+			// yet dated before it, so a transcript anchor would let it read as "activity
+			// after idle" and falsely re-green the chip. Both skew classes are in
+			// docs/timing-hazards.md.
 			now := time.Now()
-			info.StatusSince = now
-			if anchor, ok := transcript.AnchorTime(info.Transcript, s.tun.TailBytes); ok && anchor.Before(now) {
-				info.StatusSince = anchor
-			}
+			info.StatusSince = transcript.AnchorSince(info.Transcript, now, status == state.StatusIdle, s.tun.TailBytes)
 			if status == state.StatusPermission {
 				info.PendingTool = req.ToolName // capture the tool the prompt is for (A2)
 			}
