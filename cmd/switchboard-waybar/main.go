@@ -8,6 +8,11 @@
 //	                 ~/.config/waybar/config.jsonc, which declares N slot
 //	                 modules so each can carry real GTK CSS (border, hover,
 //	                 padding).
+//
+// Waybar's row does not wrap, so when many sessions crowd the bar each slot
+// abbreviates its label with an ellipsis to fit (internal/barlayout.Fit). Every
+// slot sees the full snapshot and computes the same fit, so the abbreviation is
+// consistent across chips; the tooltip still shows the full, untruncated name.
 package main
 
 import (
@@ -19,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/barlayout"
 	sblabel "github.com/tjmisko/switchboard/internal/label"
 	"github.com/tjmisko/switchboard/internal/projectname"
 	"github.com/tjmisko/switchboard/internal/rpc"
@@ -37,8 +43,13 @@ func main() {
 	slot := flag.Int("slot", -1, "emit JSON for Nth session only (waybar slot mode)")
 	flag.Parse()
 
+	// The abbreviation budget is the monitor's usable width against fixed chip
+	// metrics. Width is stable for the bar's lifetime, so resolve it once.
+	availPx := barlayout.ScreenWidthPx()
+	metrics := barlayout.DefaultMetrics()
+
 	for {
-		runOnce(*socketPath, *slot)
+		runOnce(*socketPath, *slot, availPx, metrics)
 		// Daemon socket dropped — emit a degraded chip so waybar shows
 		// something while we wait, then retry.
 		if *slot >= 0 {
@@ -50,7 +61,7 @@ func main() {
 	}
 }
 
-func runOnce(socketPath string, slot int) {
+func runOnce(socketPath string, slot int, availPx float64, metrics barlayout.Metrics) {
 	c, err := rpc.Dial(socketPath)
 	if err != nil {
 		return
@@ -68,7 +79,7 @@ func runOnce(socketPath string, slot int) {
 			continue
 		}
 		if slot >= 0 {
-			emit(renderSlot(*resp.Snapshot, slot))
+			emit(renderSlot(*resp.Snapshot, slot, availPx, metrics))
 		} else {
 			emit(renderAggregate(*resp.Snapshot))
 		}
@@ -78,12 +89,21 @@ func runOnce(socketPath string, slot int) {
 // renderSlot emits JSON for the Nth session. The class array carries the
 // status, a "focused" flag, and a "suspended" flag so waybar CSS can paint the
 // chip. Empty slots get class=["empty"] so the CSS can collapse them.
-func renderSlot(snap state.Snapshot, slot int) waybarOutput {
+//
+// The chip text is the session's label abbreviated (with an ellipsis) so the
+// whole set fits the bar; the tooltip keeps the full name. Every slot fits the
+// same label set, so the abbreviation agrees across chips.
+func renderSlot(snap state.Snapshot, slot int, availPx float64, metrics barlayout.Metrics) waybarOutput {
 	if slot >= len(snap.Sessions) {
 		return waybarOutput{Text: "", Class: []string{"empty"}}
 	}
-	s := snap.Sessions[slot]
 	cfg := projectname.Load()
+	labels := make([]string, len(snap.Sessions))
+	for i := range snap.Sessions {
+		labels[i] = sblabel.Chip(cfg, snap.Sessions[i])
+	}
+	labels = barlayout.Fit(labels, availPx, metrics)
+	s := snap.Sessions[slot]
 	status := sessionStatus(s)
 	// The primary class paints the chip's color; delegating reuses working's green
 	// (Q1 default: pure green, no CSS change needed). The raw "delegating" rides
@@ -100,7 +120,7 @@ func renderSlot(snap state.Snapshot, slot int) waybarOutput {
 		classes = append(classes, "suspended")
 	}
 	return waybarOutput{
-		Text:    sblabel.Chip(cfg, s),
+		Text:    labels[slot],
 		Tooltip: sessionTooltip(cfg, s),
 		Class:   classes,
 		Alt:     chipClass(status),
