@@ -466,6 +466,35 @@ func NewestSignal(path string, maxBytes int64) (Signal, time.Time, error) {
 	return kind, newest, nil
 }
 
+// AnchorTime returns the timestamp a hook-driven status transition should be
+// dated from: the newest turn entry in the transcript tail. It exists to kill a
+// clock-skew class of bug (see docs/timing-hazards.md).
+//
+// A hook fires only AFTER Claude Code has written the entry that triggered it,
+// but the daemon stamps the transition when it PROCESSES the hook — later, by the
+// hook subprocess spawn + socket round-trip (tens to hundreds of ms). Dating the
+// transition from that late wall-clock moment puts StatusSince AHEAD of the
+// transcript event it represents. The reconciler then asks "did anything happen
+// after the chip transitioned?" by comparing transcript timestamps against
+// StatusSince — and a fast follow-up action that lands inside the hook gap (a
+// Ctrl+C right after a prompt) carries a transcript timestamp EARLIER than that
+// inflated StatusSince, so the real signal is wrongly filtered as stale and the
+// hookless recovery never fires.
+//
+// Anchoring to the newest turn entry puts StatusSince on the same event stream,
+// sampled at the same causal point, as the signals later compared against it, so
+// a genuinely-later signal always reads as later regardless of hook latency.
+// ok is false when the tail holds no timestamped turn entry (empty or unreadable
+// transcript), so the caller falls back to wall-clock now — the pre-fix behavior,
+// now confined to that degenerate case.
+func AnchorTime(path string, maxBytes int64) (ts time.Time, ok bool) {
+	_, newest, err := NewestSignal(path, maxBytes)
+	if err != nil || newest.IsZero() {
+		return time.Time{}, false
+	}
+	return newest, true
+}
+
 // classify maps an entry to its status signal: an assistant message is activity;
 // a user message is an interrupt notice when a text block carries the interrupt
 // marker, a local-command side-channel entry (no agent turn — see
