@@ -19,6 +19,8 @@ import (
 	"strings"
 	"time"
 
+	sblabel "github.com/tjmisko/switchboard/internal/label"
+	"github.com/tjmisko/switchboard/internal/projectname"
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
 )
@@ -81,6 +83,7 @@ func renderSlot(snap state.Snapshot, slot int) waybarOutput {
 		return waybarOutput{Text: "", Class: []string{"empty"}}
 	}
 	s := snap.Sessions[slot]
+	cfg := projectname.Load()
 	status := sessionStatus(s)
 	// The primary class paints the chip's color; delegating reuses working's green
 	// (Q1 default: pure green, no CSS change needed). The raw "delegating" rides
@@ -97,8 +100,8 @@ func renderSlot(snap state.Snapshot, slot int) waybarOutput {
 		classes = append(classes, "suspended")
 	}
 	return waybarOutput{
-		Text:    shortName(s),
-		Tooltip: sessionTooltip(s),
+		Text:    sblabel.Chip(cfg, s),
+		Tooltip: sessionTooltip(cfg, s),
 		Class:   classes,
 		Alt:     chipClass(status),
 	}
@@ -119,13 +122,14 @@ func renderAggregate(snap state.Snapshot) waybarOutput {
 	if len(snap.Sessions) == 0 {
 		return waybarOutput{Text: "", Tooltip: "no claude sessions", Class: []string{"empty"}}
 	}
+	cfg := projectname.Load()
 	var parts []string
 	for _, s := range snap.Sessions {
 		mark := ""
 		if s.Focused {
 			mark = "*"
 		}
-		parts = append(parts, mark+shortName(s))
+		parts = append(parts, mark+sblabel.Chip(cfg, s))
 	}
 	return waybarOutput{
 		Text:  strings.Join(parts, "  "),
@@ -142,24 +146,79 @@ func sessionStatus(s state.Session) string {
 	return info.Status
 }
 
-func sessionTooltip(s state.Session) string {
-	name := shortName(s)
+// sessionTooltip renders the Compact-stacked hover with pango markup:
+//
+//	<b>arachne</b>   ● working
+//	assess-npm-vulnerabilities
+//	~/Projects/Arachne · ws 4 · pid 292511
+//
+// Line 1 is the project abbreviation + a status-colored dot; line 2 is the bare
+// task name (the project prefix stripped, since the abbrev already shows it);
+// line 3 is dimmed metadata.
+func sessionTooltip(cfg projectname.Config, s state.Session) string {
+	abbrev := projectname.CanonicalForDir(cfg, s.CWD)
+	task := projectname.TaskForDir(cfg, s.CWD, sblabel.RawName(s))
+	status := sessionStatus(s)
+
+	statusText := status
+	// A delegating chip is green but idle on the main thread; spell out why so the
+	// green reads as "N agents working" rather than looking stuck.
+	if status == state.StatusDelegating {
+		if n := subagentCount(s); n > 0 {
+			statusText = fmt.Sprintf("delegating · %d agent%s", n, plural(n))
+		}
+	}
+	if s.Suspended {
+		statusText += " · suspended"
+	}
+
 	ws := "-"
 	if s.Hyprland != nil && s.Hyprland.Workspace != "" {
 		ws = s.Hyprland.Workspace
 	}
-	status := sessionStatus(s)
-	// A delegating chip is green but idle on the main thread; spell out why so the
-	// tooltip explains the green ("2 agents" working) rather than looking stuck.
-	if status == state.StatusDelegating {
-		if n := subagentCount(s); n > 0 {
-			status = fmt.Sprintf("delegating · %d agent%s", n, plural(n))
+	dot := fmt.Sprintf("<span foreground='%s'>●</span>", statusColor(status))
+	meta := fmt.Sprintf("%s · ws %s · pid %d", contractHome(s.CWD), ws, s.PID)
+	return fmt.Sprintf(
+		"<b>%s</b>   %s %s\n%s\n<span foreground='#6c7086' size='smaller'>%s</span>",
+		pangoEscape(abbrev), dot, pangoEscape(statusText),
+		pangoEscape(task),
+		pangoEscape(meta),
+	)
+}
+
+// statusColor maps a session status to the pango hex color of its tooltip dot,
+// matching the chip palette (working/delegating green, idle amber, permission
+// red, otherwise grey).
+func statusColor(status string) string {
+	switch status {
+	case state.StatusWorking, state.StatusDelegating:
+		return "#a6e3a1"
+	case state.StatusIdle:
+		return "#f9e2af"
+	case state.StatusPermission:
+		return "#f38ba8"
+	default:
+		return "#6c7086"
+	}
+}
+
+// contractHome replaces a leading $HOME with ~ for a shorter metadata line.
+func contractHome(p string) string {
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if p == home {
+			return "~"
+		}
+		if rest, ok := strings.CutPrefix(p, home+"/"); ok {
+			return "~/" + rest
 		}
 	}
-	if s.Suspended {
-		status += ", suspended"
-	}
-	return fmt.Sprintf("%s [%s] — ws %s — %s (pid %d)", name, status, ws, s.CWD, s.PID)
+	return p
+}
+
+// pangoEscape escapes the pango markup metacharacters in user-controlled text
+// (session/project names) so they render literally.
+func pangoEscape(s string) string {
+	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(s)
 }
 
 // subagentCount reports the in-flight subagent count from the session's
@@ -177,25 +236,6 @@ func plural(n int) string {
 		return ""
 	}
 	return "s"
-}
-
-// shortName picks the human label for a session. Prefer the wezterm window
-// title (which Claude Code itself writes via OSC) over a cwd basename.
-func shortName(s state.Session) string {
-	if s.Wezterm != nil && s.Wezterm.WindowTitle != "" {
-		title := s.Wezterm.WindowTitle
-		for _, prefix := range []string{"✳ ", "⠂ ", "⠐ ", "⠁ ", "⠈ ", "⠠ ", "⠄ ", "⡀ ", "⢀ "} {
-			if rest, ok := strings.CutPrefix(title, prefix); ok {
-				title = rest
-				break
-			}
-		}
-		return title
-	}
-	if s.CWD != "" {
-		return filepath.Base(s.CWD)
-	}
-	return fmt.Sprintf("pid %d", s.PID)
 }
 
 func emit(o waybarOutput) {

@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	sblabel "github.com/tjmisko/switchboard/internal/label"
+	"github.com/tjmisko/switchboard/internal/projectname"
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
 )
@@ -39,6 +41,12 @@ func main() {
 	// mandatory dial too — it must work even when the daemon is down.
 	if args[0] == "diagnose" {
 		cmdDiagnose(args[1:])
+		return
+	}
+	// name resolves/edits project abbreviations from the projectname config and
+	// the filesystem only — no daemon needed, so it runs before the dial.
+	if args[0] == "name" {
+		cmdName(args[1:])
 		return
 	}
 
@@ -132,14 +140,14 @@ func cmdStatus(c *rpc.Client) {
 
 // cmdPick emits one tab-separated line per session, ordered as the snapshot.
 // Format: PID \t LABEL \t CWD \t WORKSPACE
-// LABEL is the wezterm window title (with leading spinner glyph stripped) or
-// the cwd basename as fallback. Intended to be piped into fzf with
-// `--with-nth=2..` so the user sees the label but the PID stays in the
-// selected line for the focus call.
+// LABEL is the project-prefixed, de-duplicated session name (see
+// internal/label). Intended to be piped into fzf with `--with-nth=2..` so the
+// user sees the label but the PID stays in the selected line for the focus call.
 func cmdPick(c *rpc.Client) {
 	snap := mustList(c)
+	cfg := projectname.Load()
 	for _, s := range snap.Sessions {
-		label := shortName(s)
+		label := sblabel.Chip(cfg, s)
 		ws := "-"
 		if s.Hyprland != nil && s.Hyprland.Workspace != "" {
 			ws = s.Hyprland.Workspace
@@ -331,21 +339,51 @@ func cmdHook(c *rpc.Client, event, agent string) {
 	_ = c.Recv(&resp)
 }
 
-func shortName(s state.Session) string {
-	if s.Wezterm != nil && s.Wezterm.WindowTitle != "" {
-		title := s.Wezterm.WindowTitle
-		for _, prefix := range []string{"✳ ", "⠂ ", "⠐ ", "⠁ ", "⠈ ", "⠠ ", "⠄ ", "⡀ ", "⢀ "} {
-			if rest, ok := strings.CutPrefix(title, prefix); ok {
-				title = rest
-				break
-			}
+// cmdName resolves or edits project abbreviations. Subcommands:
+//
+//	resolve --cwd <dir> --name <name>   print the prefixed, de-duplicated name
+//	abbrev  --cwd <dir>                  print the project's canonical abbrev
+//	set     <dir> <abbrev>               persist an abbrev for the dir's git root
+func cmdName(args []string) {
+	if len(args) == 0 {
+		fail("name requires a subcommand: resolve|abbrev|set")
+	}
+	switch args[0] {
+	case "resolve":
+		fs := flag.NewFlagSet("name resolve", flag.ExitOnError)
+		cwd := fs.String("cwd", "", "project directory (default: current)")
+		name := fs.String("name", "", "desired session name to prefix")
+		_ = fs.Parse(args[1:])
+		fmt.Println(projectname.ResolveForDir(projectname.Load(), dirOrCwd(*cwd), *name))
+	case "abbrev":
+		fs := flag.NewFlagSet("name abbrev", flag.ExitOnError)
+		cwd := fs.String("cwd", "", "project directory (default: current)")
+		_ = fs.Parse(args[1:])
+		fmt.Println(projectname.CanonicalForDir(projectname.Load(), dirOrCwd(*cwd)))
+	case "set":
+		rest := args[1:]
+		if len(rest) < 2 {
+			fail("usage: name set <dir> <abbrev>")
 		}
-		return title
+		root := projectname.ProjectRoot(rest[0])
+		if err := projectname.SetAbbrev(root, rest[1]); err != nil {
+			fail("name set: %v", err)
+		}
+		fmt.Printf("%s -> %s\n", root, projectname.CanonicalForDir(projectname.Load(), root))
+	default:
+		fail("unknown name subcommand %q (resolve|abbrev|set)", args[0])
 	}
-	if s.CWD != "" {
-		return filepath.Base(s.CWD)
+}
+
+// dirOrCwd returns dir when non-empty, else the current working directory.
+func dirOrCwd(dir string) string {
+	if dir != "" {
+		return dir
 	}
-	return fmt.Sprintf("pid %d", s.PID)
+	if wd, err := os.Getwd(); err == nil {
+		return wd
+	}
+	return "."
 }
 
 func mustList(c *rpc.Client) state.Snapshot {
@@ -381,6 +419,8 @@ commands:
                             else — only if all are green — working sessions;
                             repeated presses visit each member in turn;
                             no-op if any session is unknown (grey)
+  name <sub>              project abbreviations: resolve --cwd --name,
+                            abbrev --cwd, or set <dir> <abbrev>
   hook <event>            forward Claude Code hook enrichment (stdin = JSON)
   codex-hook <event>      forward Codex hook enrichment (stdin = JSON)
   bottombar [sub]         manage the bottom waybar lifecycle:
