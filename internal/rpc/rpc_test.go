@@ -186,6 +186,51 @@ func TestHandleHookRecordsHistoryTransitions(t *testing.T) {
 	}
 }
 
+// The activity command records a global, session-less user-activity edge: a valid
+// "idle" or "active" is written to the durable log as an EventActivity carrying
+// that value in To (and no PID/session), while any other value is rejected and
+// records nothing. This is the contract a dashboard derives global active/idle
+// intervals from, so the To values are exact.
+func TestHandleActivityRecordsGlobalIdleActive(t *testing.T) {
+	dir := t.TempDir()
+	store := state.New("")
+	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailMinimal, Dir: dir})
+	s := New(store, "", terminal.NewNone(), wm.NewNone())
+	s.SetHistory(sink)
+
+	if err := s.handleActivity(Request{Cmd: "activity", Activity: "idle"}); err != nil {
+		t.Fatalf("activity idle: unexpected error %v", err)
+	}
+	if err := s.handleActivity(Request{Cmd: "activity", Activity: "active"}); err != nil {
+		t.Fatalf("activity active: unexpected error %v", err)
+	}
+	// An unrecognized value is rejected (so a misconfigured idle timer can't
+	// pollute the stream) and records nothing.
+	if err := s.handleActivity(Request{Cmd: "activity", Activity: "asleep"}); err == nil {
+		t.Errorf("activity asleep: want a rejection error, got nil")
+	}
+	if err := s.handleActivity(Request{Cmd: "activity", Activity: ""}); err == nil {
+		t.Errorf("activity empty: want a rejection error, got nil")
+	}
+	sink.Close()
+
+	evs := readHistoryEvents(t, dir)
+	if len(evs) != 2 {
+		t.Fatalf("recorded %d events, want 2 (idle, active; invalid values rejected):\n%+v", len(evs), evs)
+	}
+	for i, ev := range evs {
+		if ev.Type != history.EventActivity {
+			t.Errorf("event %d type = %q, want %q", i, ev.Type, history.EventActivity)
+		}
+		if ev.PID != 0 || ev.SessionID != "" {
+			t.Errorf("event %d is not session-less: pid=%d session=%q", i, ev.PID, ev.SessionID)
+		}
+	}
+	if evs[0].To != "idle" || evs[1].To != "active" {
+		t.Errorf("activity To values = [%q,%q], want [idle, active]", evs[0].To, evs[1].To)
+	}
+}
+
 // readHistoryEvents reads every event across all day-files in dir, in file then
 // line order.
 func readHistoryEvents(t *testing.T, dir string) []history.Event {

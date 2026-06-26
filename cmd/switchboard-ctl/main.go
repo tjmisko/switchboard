@@ -99,6 +99,11 @@ func main() {
 			fail("codex-hook requires an event name")
 		}
 		cmdHook(c, args[1], state.AgentKindCodex)
+	case "activity":
+		if len(args) < 2 {
+			fail("activity requires a value: idle|active")
+		}
+		cmdActivity(c, args[1])
 	default:
 		usage()
 		os.Exit(2)
@@ -134,6 +139,24 @@ func cmdList(c *rpc.Client, jsonOut bool) {
 
 func cmdFocus(c *rpc.Client, selector string) {
 	if err := c.Send(rpc.Request{Cmd: "focus", Selector: selector}); err != nil {
+		fail("send: %v", err)
+	}
+	var resp rpc.Response
+	if err := c.Recv(&resp); err != nil {
+		fail("recv: %v", err)
+	}
+	if resp.Error != "" {
+		fail("%s", resp.Error)
+	}
+}
+
+// cmdActivity reports a global user-activity edge to the daemon — "idle" when an
+// idle daemon (e.g. hypridle) sees no input for its timeout, "active" when input
+// resumes. Session-less; the daemon records it for the delegation/attention
+// metrics. Mirrors cmdFocus: send, surface the daemon's reply, exit nonzero on a
+// rejected value (the daemon is the single validator of idle|active).
+func cmdActivity(c *rpc.Client, value string) {
+	if err := c.Send(rpc.Request{Cmd: "activity", Activity: value}); err != nil {
 		fail("send: %v", err)
 	}
 	var resp rpc.Response
@@ -435,6 +458,8 @@ commands:
                             abbrev --cwd, or set <dir> <abbrev>
   hook <event>            forward Claude Code hook enrichment (stdin = JSON)
   codex-hook <event>      forward Codex hook enrichment (stdin = JSON)
+  activity idle|active    report a global user-activity edge for the delegation
+                            metrics (idle daemon, e.g. hypridle); session-less
   bottombar [sub]         manage the bottom waybar lifecycle:
                             watch      long-running; show/hide bar with sessions
                             reconcile  one-shot; re-derive bar visibility (F8)
