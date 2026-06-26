@@ -121,6 +121,15 @@ type AgentInfo struct {
 	Transcript string `json:"transcript,omitempty"`
 	Status     string `json:"status"` // working|idle|permission|delegating (never "unknown")
 
+	// StatusSinceWire is the wire projection of StatusSince: the instant the
+	// current status began, so a renderer can show "idle 3m" / "waiting 45s" in
+	// the tooltip without the daemon pre-formatting a duration. It is DERIVED —
+	// stamped from StatusSince onto a per-snapshot copy of the block in
+	// snapshotLocked — never written by hook/reconciler logic, which keep using
+	// the in-memory StatusSince below. A pointer so it omits cleanly before the
+	// first status edge and so encoding/json formats it exactly like started_at.
+	StatusSinceWire *time.Time `json:"status_since,omitempty"`
+
 	// InFlightSubagents is how many subagent Tasks the main thread has launched
 	// but not yet collected (transcript.InFlightTasks), recomputed each reconcile
 	// tick. It is the S dimension: >0 with an idle main thread is the delegating
@@ -132,9 +141,11 @@ type AgentInfo struct {
 	// StatusSince marks when Status last transitioned to its current value. The
 	// reconciler uses it to age out a "permission" chip that Claude Code left
 	// latched (a declined question / interrupt fires no clearing hook). Kept
-	// in-memory only (json:"-"): the wire/golden contract is unchanged, and a
-	// re-hydrated session is simply re-evaluated against its transcript on the
-	// first reconcile (zero time reads as "long ago", which is the safe default).
+	// in-memory (json:"-") as the source of truth for the duration math; it is
+	// projected to the wire as StatusSinceWire (status_since) at snapshot time, so
+	// the in-memory value's zero-reads-as-"long ago" reconcile semantics are
+	// unchanged (a re-hydrated session is re-evaluated against its transcript on
+	// the first reconcile; dropStaleSessions re-stamps it to startup time).
 	StatusSince time.Time `json:"-"`
 
 	// PendingTool is the tool_name the current "permission" prompt was raised for
@@ -217,7 +228,13 @@ func (s *Store) Snapshot() Snapshot {
 func (s *Store) snapshotLocked() Snapshot {
 	sessions := make([]Session, 0, len(s.sessions))
 	for _, sess := range s.sessions {
-		sessions = append(sessions, *sess)
+		cp := *sess
+		// Deep-copy the enrichment blocks so the snapshot never shares the live
+		// *AgentInfo with a later Apply (a read-after-unlock race), and project the
+		// in-memory StatusSince onto the wire-only StatusSinceWire on that copy.
+		cp.Claude = enrichForWire(sess.Claude)
+		cp.Codex = enrichForWire(sess.Codex)
+		sessions = append(sessions, cp)
 	}
 	// Sort into chip order (lessChipOrder), which carries a PID tie-break for
 	// determinism: equal sort keys would otherwise leave order to map iteration,
@@ -227,6 +244,24 @@ func (s *Store) snapshotLocked() Snapshot {
 		return lessChipOrder(sessions[i], sessions[j])
 	})
 	return Snapshot{Sessions: sessions, UpdatedAt: time.Now(), Capabilities: s.caps}
+}
+
+// enrichForWire returns a wire-ready copy of an enrichment block: a value copy
+// (so the snapshot never shares the live pointer with a concurrent Apply) with
+// the in-memory StatusSince projected onto StatusSinceWire — non-nil only once a
+// status edge has stamped it, so the wire field omits cleanly before then. nil
+// in, nil out.
+func enrichForWire(info *AgentInfo) *AgentInfo {
+	if info == nil {
+		return nil
+	}
+	cp := *info
+	cp.StatusSinceWire = nil
+	if !cp.StatusSince.IsZero() {
+		since := cp.StatusSince
+		cp.StatusSinceWire = &since
+	}
+	return &cp
 }
 
 // lessChipOrder defines the left-to-right chip order on the bottom bar:

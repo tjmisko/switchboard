@@ -13,6 +13,8 @@ degrades gracefully: it works on any Linux box with zero desktop configuration,
 and lights up click-to-focus when it recognizes your window manager and
 terminal.
 
+> **Provenance.** Switchboard's design and architecture are mine; the Go implementation was built by AI coding agents under my direction, growing out of a shell prototype I hand-wrote.
+
 ## Capability tiers
 
 Everything hangs on two tiers. Switchboard never hard-fails on a missing
@@ -67,7 +69,39 @@ switchboard · 3 sessions · navigate · wm=hyprland term=wezterm
 
 Prefer your own UI? Read `~/.cache/switchboard/state.json` directly — see the
 [schema](docs/state-schema.md) and [bar recipes](docs/bars/README.md) for
-polybar / eww / i3blocks.
+polybar / eww / i3blocks. Every chip's tooltip also shows how long the session
+has held its current status (`idle · 3m`, `permission · 45s`), from the
+additive `status_since` field.
+
+## Activity history & timeline (opt-in)
+
+Switchboard can also *remember*: an append-only log of every status transition,
+session lifecycle, subagent fan-out, and token-usage sample, so you can see — over
+time — when and how hard your agents worked.
+
+It is **off by default** (it records when and where you work). Turn it on with one
+file, `$XDG_CONFIG_HOME/switchboard/history.json`:
+
+```json
+{ "enabled": true, "detail": "minimal", "retain_days": 90, "max_bytes": 104857600 }
+```
+
+The log is one JSON-per-line file per UTC day under
+`$XDG_STATE_HOME/switchboard/history/`, local-only, with a privacy tier
+(`minimal` omits cwd / task descriptions). Inspect and render it — no daemon
+needed:
+
+```bash
+switchboard-ctl history tail            # recent events
+switchboard-ctl timeline                # per-session swimlanes + attention stats
+switchboard-ctl timeline --json         # the stable contract for a future dashboard
+```
+
+`timeline` draws each session as a colored bar over time (parallel sessions
+overlap) and reports the three "hours of agent attention" figures — union
+wall-clock, per-session sum, and fan-out-weighted — plus subagents launched and
+tokens used. See the [activity-log schema](docs/history-schema.md) and the
+[design plan](docs/usage-history-plan.md).
 
 ## How it works
 

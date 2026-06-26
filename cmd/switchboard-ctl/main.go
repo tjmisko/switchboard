@@ -49,6 +49,18 @@ func main() {
 		cmdName(args[1:])
 		return
 	}
+	// history reads/manages the on-disk activity log directly (like diagnose), so
+	// it runs before the dial — it must work whether or not the daemon is up.
+	if args[0] == "history" {
+		cmdHistory(args[1:])
+		return
+	}
+	// timeline derives swimlanes + attention stats from the on-disk activity log;
+	// also file-only, so it runs before the dial.
+	if args[0] == "timeline" {
+		cmdTimeline(args[1:])
+		return
+	}
 
 	c, err := rpc.Dial(*socketPath)
 	if err != nil {
@@ -431,6 +443,11 @@ commands:
                             log lines for a time window and name the Tuning knob
                             behind each, e.g. diagnose --around 14:32 red stuck.
                             Reads the journal (or --file); needs no daemon.
+  history <sub>           the durable activity log (opt-in): path, tail, stat,
+                            purge. Reads the on-disk files; needs no daemon.
+  timeline [flags]        render the activity log as per-session swimlanes plus
+                            attention stats, e.g. timeline --day 2026-06-26.
+                            --json emits the structured data; needs no daemon.
 
 flags:
   --socket <path>         daemon socket (default: $XDG_RUNTIME_DIR/switchboard.sock)

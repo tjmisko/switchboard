@@ -25,7 +25,8 @@
       "claude": {
         "session_id": "e0b4b21f-aaf6-4ab0-a8d6-2d595aba4065",
         "transcript": "/home/tjmisko/.claude/projects/switchboard/e0b4b21f.jsonl",
-        "status": "working"
+        "status": "working",
+        "status_since": "2026-05-28T09:01:00Z"
       }
     },
     {

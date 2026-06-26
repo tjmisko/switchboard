@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/barlayout"
+	"github.com/tjmisko/switchboard/internal/durfmt"
 	sblabel "github.com/tjmisko/switchboard/internal/label"
 	"github.com/tjmisko/switchboard/internal/projectname"
 	"github.com/tjmisko/switchboard/internal/rpc"
@@ -121,7 +122,7 @@ func renderSlot(snap state.Snapshot, slot int, availPx float64, metrics barlayou
 	}
 	return waybarOutput{
 		Text:    labels[slot],
-		Tooltip: sessionTooltip(cfg, s),
+		Tooltip: sessionTooltip(cfg, s, time.Now()),
 		Class:   classes,
 		Alt:     chipClass(status),
 	}
@@ -175,7 +176,7 @@ func sessionStatus(s state.Session) string {
 // Line 1 is the project abbreviation + a status-colored dot; line 2 is the bare
 // task name (the project prefix stripped, since the abbrev already shows it);
 // line 3 is dimmed metadata.
-func sessionTooltip(cfg projectname.Config, s state.Session) string {
+func sessionTooltip(cfg projectname.Config, s state.Session, now time.Time) string {
 	abbrev := projectname.CanonicalForDir(cfg, s.CWD)
 	task := projectname.TaskForDir(cfg, s.CWD, sblabel.RawName(s))
 	status := sessionStatus(s)
@@ -186,6 +187,13 @@ func sessionTooltip(cfg projectname.Config, s state.Session) string {
 	if status == state.StatusDelegating {
 		if n := subagentCount(s); n > 0 {
 			statusText = fmt.Sprintf("delegating · %d agent%s", n, plural(n))
+		}
+	}
+	// How long the session has held this status: "idle · 3m", "permission · 45s".
+	// Skipped while suspended — the status (and its clock) is stale until resume.
+	if !s.Suspended {
+		if d := durfmt.Since(statusSince(s), now); d != "" {
+			statusText += " · " + d
 		}
 	}
 	if s.Suspended {
@@ -248,6 +256,16 @@ func subagentCount(s state.Session) int {
 		return info.InFlightSubagents
 	}
 	return 0
+}
+
+// statusSince returns the wire timestamp the current status began (nil when no
+// enrichment block exists or no status edge has stamped it), for the hover
+// duration counter.
+func statusSince(s state.Session) *time.Time {
+	if info := s.Enrichment(); info != nil {
+		return info.StatusSinceWire
+	}
+	return nil
 }
 
 // plural returns the plural suffix for n.

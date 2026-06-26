@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/history"
 	"github.com/tjmisko/switchboard/internal/proc"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/statustune"
@@ -68,6 +69,7 @@ type Server struct {
 	term       terminal.Locator
 	wm         wm.Manager
 	tun        statustune.Tuning
+	hist       *history.Sink
 }
 
 func New(store *state.Store, socketPath string, term terminal.Locator, manager wm.Manager) *Server {
@@ -78,6 +80,10 @@ func New(store *state.Store, socketPath string, term terminal.Locator, manager w
 // Call once at startup before Serve; the hook handler reads it without a lock,
 // which is safe because it is not mutated after startup.
 func (s *Server) SetTuning(t statustune.Tuning) { s.tun = t }
+
+// SetHistory wires the activity-log sink the hook handler records transitions to.
+// Call once at startup before Serve. A nil sink (the default) records nothing.
+func (s *Server) SetHistory(h *history.Sink) { s.hist = h }
 
 // Serve listens on the socket path and accepts connections until ctx is done.
 // The socket file is removed on startup (in case of unclean shutdown) and on
@@ -303,6 +309,10 @@ func (s *Server) handleHook(req Request) {
 		// truly stuck one. Codex is exempt: it records no approvals in its rollout,
 		// so a codex PostToolUse advances straight to working without this guard.
 		gateLogged := false
+		// transitionRule/Reason carry the permission-gate's decision into the
+		// history event below, so an approve-cleared edge records WHY it cleared
+		// (the plain hook edges leave them empty).
+		var transitionRule, transitionReason string
 		if agent == state.AgentKindClaude && status == "working" && req.Event == "PostToolUse" && info.Status == "permission" {
 			clear, rule, reason := s.clearsPermission(info, req.ToolName)
 			d := statustune.Decision{
@@ -313,6 +323,7 @@ func (s *Server) handleHook(req Request) {
 			}
 			if clear {
 				d.To = "working"
+				transitionRule, transitionReason = rule, reason
 			} else {
 				status = "" // hold red
 			}
@@ -333,6 +344,23 @@ func (s *Server) handleHook(req Request) {
 			if !gateLogged {
 				log.Printf("status: pid=%d %s %s->%s (agent=%s event=%s)", pid, sessionLabel(sess, req.SessionID), info.Status, status, agent, req.Event)
 			}
+			// Mirror the edge into the durable activity log (Phase usage-history).
+			// Captured BEFORE the mutation below: `from` is the prior status, the age
+			// is how long it was held (the closed interval), and pendingForEvent is
+			// the tool a permission edge concerns (entering: this prompt's tool;
+			// leaving: the tool that was pending, before it is forgotten).
+			pendingForEvent := info.PendingTool
+			if status == state.StatusPermission {
+				pendingForEvent = req.ToolName
+			}
+			evNow := time.Now()
+			s.hist.Record(history.Event{
+				Ts: evNow, Type: history.EventTransition,
+				SessionID: coalesce(req.SessionID, info.SessionID), PID: pid, Agent: agent, CWD: sess.CWD,
+				From: info.Status, To: status, Rule: transitionRule, Reason: transitionReason,
+				Subagents: info.InFlightSubagents, Pending: pendingForEvent,
+				DurPrevMs: history.HeldMs(info.StatusSince, evNow),
+			})
 			if info.Status == state.StatusPermission && status != state.StatusPermission {
 				info.PendingTool = "" // leaving red: forget the captured prompt tool
 			}
