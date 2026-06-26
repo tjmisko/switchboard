@@ -137,6 +137,9 @@ type entry struct {
 	Message   struct {
 		Role    string          `json:"role"`
 		Content json.RawMessage `json:"content"`
+		// Usage is the per-assistant-message token accounting Claude Code records;
+		// UsageSince sums it to track plan consumption. Absent on user/system entries.
+		Usage *Usage `json:"usage"`
 	} `json:"message"`
 }
 
@@ -150,6 +153,13 @@ type block struct {
 	Name      string `json:"name"`
 	ID        string `json:"id"`
 	ToolUseID string `json:"tool_use_id"`
+	// Input is the tool_use's arguments. For a Task/Agent tool_use it carries the
+	// subagent's type and human description, which Tasks surfaces for the rich
+	// subagent_spawn history events.
+	Input struct {
+		Description  string `json:"description"`
+		SubagentType string `json:"subagent_type"`
+	} `json:"input"`
 }
 
 // blocks parses message.content tolerantly: an array of typed blocks yields its
@@ -386,45 +396,152 @@ func resolutionKindOf(e entry) ResolutionKind {
 // its turn but still has an in-flight Task is delegating, not idle.
 var taskToolNames = map[string]bool{"Task": true, "Agent": true}
 
-// InFlightTasks counts the subagent Tasks the main thread has launched but not
-// yet collected: tool_use blocks named Task/Agent in the tail whose id has no
-// matching tool_result.tool_use_id. The daemon reads this each reconcile tick to
-// decide whether an idle main thread is actually delegating (→ render green).
-//
-// The read is tail-bounded (maxBytes), so a Task whose launching tool_use has
-// scrolled out of the window but whose result is still in-window cannot be
-// paired; the count is clamped at 0 rather than going negative. With the default
-// window (DefaultTailBytes) this only bites pathologically long turns. Returns a
-// non-nil error only on I/O failure (an empty/missing transcript), letting the
-// caller leave the last-known count rather than guess.
-func InFlightTasks(path string, maxBytes int64) (int, error) {
+// Task is a subagent the main thread launched via a Task/Agent tool_use, tagged
+// with the metadata Claude Code stores in the tool_use input (the subagent type
+// and the human description) and whether its tool_result has landed (Done). The
+// daemon diffs the Task set across reconcile ticks to emit subagent_spawn/stop
+// history events.
+type Task struct {
+	ID          string // the tool_use id (links spawn to stop)
+	AgentType   string // subagent_type from the Task input (e.g. "Explore")
+	Description string // the human description from the Task input
+	Done        bool   // its tool_result has landed
+}
+
+// Tasks returns every subagent Task in the transcript tail, in launch order,
+// each tagged Done if its tool_result has landed. Tail-bounded (maxBytes): a
+// Task whose launching tool_use has scrolled out of the window is not reported.
+// Returns a non-nil error only on I/O failure.
+func Tasks(path string, maxBytes int64) ([]Task, error) {
 	entries, err := readTailEntries(path, maxBytes)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	launched := make(map[string]struct{})
-	done := make(map[string]struct{})
+	type meta struct{ agentType, description string }
+	launched := map[string]meta{}
+	var order []string
+	done := map[string]bool{}
 	for _, e := range entries {
 		for _, b := range e.blocks() {
 			switch b.Type {
 			case "tool_use":
 				if taskToolNames[b.Name] && b.ID != "" {
-					launched[b.ID] = struct{}{}
+					if _, seen := launched[b.ID]; !seen {
+						order = append(order, b.ID)
+					}
+					launched[b.ID] = meta{b.Input.SubagentType, b.Input.Description}
 				}
 			case "tool_result":
 				if b.ToolUseID != "" {
-					done[b.ToolUseID] = struct{}{}
+					done[b.ToolUseID] = true
 				}
 			}
 		}
 	}
+	tasks := make([]Task, 0, len(order))
+	for _, id := range order {
+		m := launched[id]
+		tasks = append(tasks, Task{ID: id, AgentType: m.agentType, Description: m.description, Done: done[id]})
+	}
+	return tasks, nil
+}
+
+// InFlightTasks counts the subagent Tasks the main thread has launched but not
+// yet collected — the S dimension behind the delegating (green) status. The
+// daemon reads it each reconcile tick to decide whether an idle main thread is
+// actually delegating. It is Tasks filtered to the not-yet-Done; see there for
+// the tail-bounding caveat. Returns a non-nil error only on I/O failure, letting
+// the caller leave the last-known count rather than guess.
+func InFlightTasks(path string, maxBytes int64) (int, error) {
+	tasks, err := Tasks(path, maxBytes)
+	if err != nil {
+		return 0, err
+	}
 	n := 0
-	for id := range launched {
-		if _, ok := done[id]; !ok {
+	for _, t := range tasks {
+		if !t.Done {
 			n++
 		}
 	}
 	return n, nil
+}
+
+// Usage is the token accounting summed from a transcript's assistant messages —
+// the raw signal behind plan-usage tracking. The four fields mirror Claude
+// Code's per-message usage block; cache reads typically dominate.
+type Usage struct {
+	InputTokens         int64 `json:"input_tokens"`
+	OutputTokens        int64 `json:"output_tokens"`
+	CacheReadTokens     int64 `json:"cache_read_input_tokens"`
+	CacheCreationTokens int64 `json:"cache_creation_input_tokens"`
+}
+
+// IsZero reports whether no tokens were counted.
+func (u Usage) IsZero() bool {
+	return u.InputTokens == 0 && u.OutputTokens == 0 && u.CacheReadTokens == 0 && u.CacheCreationTokens == 0
+}
+
+func (u *Usage) add(o Usage) {
+	u.InputTokens += o.InputTokens
+	u.OutputTokens += o.OutputTokens
+	u.CacheReadTokens += o.CacheReadTokens
+	u.CacheCreationTokens += o.CacheCreationTokens
+}
+
+// UsageSince sums the token usage of assistant messages appended to the
+// transcript at path since byteOffset, returning the summed delta and the new
+// offset to resume from. Unlike the status readers it is NOT tail-bounded — it
+// reads exactly the new bytes (cheap on a growing multi-MB transcript) and
+// counts only complete, newline-terminated lines, so a line caught mid-write is
+// re-read next call rather than double-counted. A file shorter than byteOffset
+// (a /clear or session replacement truncated it) restarts from 0. The daemon
+// emits a usage_sample history event from each non-zero delta and persists the
+// returned offset per session.
+func UsageSince(path string, byteOffset int64) (Usage, int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return Usage{}, byteOffset, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return Usage{}, byteOffset, err
+	}
+	size := fi.Size()
+	if size < byteOffset {
+		byteOffset = 0 // truncated/replaced transcript
+	}
+	if size == byteOffset {
+		return Usage{}, byteOffset, nil
+	}
+	if _, err := f.Seek(byteOffset, io.SeekStart); err != nil {
+		return Usage{}, byteOffset, err
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return Usage{}, byteOffset, err
+	}
+	lastNL := bytes.LastIndexByte(data, '\n')
+	if lastNL < 0 {
+		return Usage{}, byteOffset, nil // no complete line appended yet
+	}
+	complete := data[:lastNL+1]
+	newOffset := byteOffset + int64(len(complete))
+
+	var total Usage
+	for _, raw := range bytes.Split(complete, []byte{'\n'}) {
+		if len(bytes.TrimSpace(raw)) == 0 {
+			continue
+		}
+		var e entry
+		if json.Unmarshal(raw, &e) != nil {
+			continue
+		}
+		if e.Message.Role == "assistant" && e.Message.Usage != nil {
+			total.add(*e.Message.Usage)
+		}
+	}
+	return total, newOffset, nil
 }
 
 // NewestSignal reads up to maxBytes from the end of the transcript at path and

@@ -121,6 +121,7 @@ agent's first hook fires. Renderers read whichever is present.
 |-------|-----------|----------|---------|
 | `session_id` | string | omitted when empty | Agent session UUID, supplied by hooks (Claude Code's session id; Codex's thread/conversation id). **Write-once**: set on the first hook that carries it and never overwritten. |
 | `transcript` | string | omitted when empty | Path to the session transcript when known: Claude Code's project `.jsonl`, or Codex's `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. |
+| `status_since` | RFC 3339 timestamp \| absent | optional | When `status` last transitioned to its current value — the wire projection of the daemon's in-memory `StatusSince`, stamped onto the snapshot. Renderers compute the hover duration (`idle · 3m`, `permission · 45s`) as `now - status_since`. **Omitted** (never `null`/zero) until the first status edge stamps it; absent on a block that only carries `session_id`/`transcript`. Additive (Phase: usage-history); consumers tolerate its absence. Formatted identically to `started_at`. |
 | `status` | string | always (when block present) | Session activity. One of: `working`, `idle`, `permission`, `delegating`. `delegating` is daemon-derived (added with the status-color state-model work): an idle main thread with subagents still in flight — it renders the **same green as `working`** ("work is happening, no action needed"). Consumers that do not know it MUST treat it as `working`, never as attention-worthy. ⚠ The doc-comment also lists `unknown`, but the daemon **never emits it** — tolerate an unrecognized value defensively. May be `""` before the first status-bearing hook. |
 | `in_flight_subagents` | number | omitted when 0 | How many subagent `Task`s the main thread has launched but not yet collected, recomputed each reconcile tick from the transcript tail. It is the signal behind a `delegating` chip; renderers show it as "N agents" in the tooltip, and `switchboard-ctl list --json` exposes it so a green chip's true state (genuinely working vs delegating) is visible. Claude-only. |
 
@@ -238,7 +239,7 @@ unsupported desktop). Sessions still carry `pid`/`cwd`/`tty`/`status`; the
       "tty": "/dev/pts/3",
       "started_at": "2026-05-28T09:00:00Z",
       "focused": false,
-      "claude": { "status": "working" }
+      "claude": { "status": "working", "status_since": "2026-05-28T09:05:00Z" }
     }
   ],
   "updated_at": "2026-05-28T09:05:30Z",
@@ -260,7 +261,7 @@ The optional blocks are filled and `capabilities.navigate` is `true`:
       "focused": true,
       "wezterm":  { "mux_pid": 4790, "mux_socket": "/run/user/1000/wezterm/gui-sock-4790", "pane_id": 12, "tab_id": 7, "window_id": 3, "window_title": "claude — switchboard" },
       "hyprland": { "address": "0x5640f1a2b3c0", "workspace": "4", "workspace_id": 4, "monitor": "" },
-      "claude":   { "status": "working" }
+      "claude":   { "status": "working", "status_since": "2026-05-28T09:05:00Z" }
     }
   ],
   "updated_at": "2026-05-28T09:05:30Z",
@@ -282,8 +283,9 @@ re-locates the pane by `tty` at request time.
   as portable WM/terminal backends land — likely generalizing into
   backend-neutral `terminal`/`window` blocks with the WM-specific blocks
   retained or aliased. Treat `hyprland.address` as an opaque ref.
-- **Additive changes** (new optional fields, the `capabilities` block, the
-  `agent` discriminator and the `codex` enrichment block) are **not** breaking;
+- **Additive changes** (new optional fields like `status_since`, the
+  `capabilities` block, the `agent` discriminator and the `codex` enrichment
+  block) are **not** breaking;
   consumers must ignore unknown fields and tolerate missing optional fields. The
   `claude` block is unchanged — a consumer reading `.claude.status` keeps working;
   to be agent-aware, read `.codex.status` too (e.g. `.claude.status // .codex.status`).

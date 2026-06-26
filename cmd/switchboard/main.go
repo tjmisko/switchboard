@@ -17,8 +17,10 @@ import (
 
 	"github.com/tjmisko/switchboard/internal/detect"
 	"github.com/tjmisko/switchboard/internal/discovery"
+	"github.com/tjmisko/switchboard/internal/history"
 	"github.com/tjmisko/switchboard/internal/mapping"
 	"github.com/tjmisko/switchboard/internal/proc"
+	"github.com/tjmisko/switchboard/internal/projectname"
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/statustune"
@@ -33,10 +35,25 @@ func main() {
 	reconcileInterval := flag.Duration("reconcile-interval", 5*time.Second, "full reconcile interval")
 	wmFlag := flag.String("wm", "auto", "WM backend: auto|hyprland|sway|i3|x11|none")
 	terminalFlag := flag.String("terminal", "auto", "terminal backend: auto|wezterm|tmux|none")
+	historyDir := flag.String("history-dir", "", "activity-log directory (default $XDG_STATE_HOME/switchboard/history)")
 	flag.Parse()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	// Activity log (opt-in via $XDG_CONFIG_HOME/switchboard/history.json). The sink
+	// is best-effort and asynchronous, so recording an event never blocks the
+	// state lock the hook/reconcile paths hold. Project labels are resolved here
+	// (off the hot path) from a cached projectname config.
+	histCfg := history.LoadConfig()
+	if *historyDir != "" {
+		histCfg.Dir = *historyDir
+	}
+	nameCfg := projectname.Load()
+	histCfg.ResolveProject = func(cwd string) string { return projectname.CanonicalForDir(nameCfg, cwd) }
+	sink := history.NewSink(histCfg)
+	defer sink.Close()
+	log.Printf("history: enabled=%t detail=%s dir=%s", sink.Enabled(), histCfg.Detail, sink.Dir())
 
 	// tun holds every status-color knob (statustune.Tuning). It is built once here
 	// and threaded into both decision sites — the RPC hook gate and the reconciler
@@ -68,10 +85,22 @@ func main() {
 		sess := resolver.Resolve(ctx, info)
 		sess.Agent = string(kind)
 		store.Apply(func(m map[int]*state.Session) { m[sess.PID] = &sess })
+		// session_start bounds the session's first interval. The session id is not
+		// known until the first hook fires, so this event carries only pid/agent/cwd.
+		sink.Record(history.Event{Ts: time.Now(), Type: history.EventSessionStart,
+			PID: sess.PID, Agent: sess.Agent, CWD: sess.CWD})
 
 		if err := procSrc.Watch(ctx, info.PID, func() {
 			log.Printf("%s pid=%d died", kind, info.PID)
-			store.Apply(func(m map[int]*state.Session) { delete(m, info.PID) })
+			store.Apply(func(m map[int]*state.Session) {
+				// session_end closes the last interval. Read the session (for its id/
+				// agent/cwd) before deleting it.
+				if s := m[info.PID]; s != nil {
+					sink.Record(history.Event{Ts: time.Now(), Type: history.EventSessionEnd,
+						SessionID: enrichmentID(s), PID: s.PID, Agent: s.Agent, CWD: s.CWD})
+				}
+				delete(m, info.PID)
+			})
 			scanner.Forget(info.PID)
 		}); err != nil {
 			log.Printf("watch pid=%d: %v", info.PID, err)
@@ -84,10 +113,11 @@ func main() {
 		}
 	}()
 	go runWMLoop(ctx, store, resolver, manager)
-	go runReconciler(ctx, store, resolver, manager, stack, *reconcileInterval, tun)
+	go runReconciler(ctx, store, resolver, manager, stack, *reconcileInterval, tun, sink)
 
 	server := rpc.New(store, *socketPath, term, manager)
 	server.SetTuning(tun)
+	server.SetHistory(sink)
 	if err := os.MkdirAll(filepath.Dir(*socketPath), 0o755); err != nil {
 		log.Fatalf("mkdir socket dir: %v", err)
 	}
@@ -182,21 +212,22 @@ func handleWMEvent(ctx context.Context, store *state.Store, resolver *mapping.Re
 // Catches anything missed by event-driven updates (e.g. a session whose
 // mapping was incomplete when first created, the initial focus state, or a
 // hyprctl race).
-func runReconciler(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, interval time.Duration, tun statustune.Tuning) {
+func runReconciler(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, interval time.Duration, tun statustune.Tuning, sink *history.Sink) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
-	reconcileOnce(ctx, store, resolver, manager, stack, tun)
+	rstate := newReconcileState()
+	reconcileOnce(ctx, store, resolver, manager, stack, tun, sink, rstate)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			reconcileOnce(ctx, store, resolver, manager, stack, tun)
+			reconcileOnce(ctx, store, resolver, manager, stack, tun, sink, rstate)
 		}
 	}
 }
 
-func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, tun statustune.Tuning) {
+func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, tun statustune.Tuning, sink *history.Sink, rstate *reconcileState) {
 	// Re-publish capabilities every tick: the terminal locator is self-redetecting
 	// (detect.NewAuto), so a terminal that came up after the daemon flips
 	// terminal/navigate from their boot-race "none" values without a restart.
@@ -211,22 +242,54 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 			}
 			// Refresh job-control suspension (Ctrl-Z). On ErrGone the procwatch
 			// death callback will drop the session shortly; leave the last-known
-			// value until then rather than flapping.
+			// value until then rather than flapping. A change is logged to history
+			// as a suspend/resume edge (it greys/un-greys the chip in a timeline).
 			if st, err := proc.State(sess.PID); err == nil {
-				sess.Suspended = proc.Suspended(st)
+				susp := proc.Suspended(st)
+				if susp != sess.Suspended {
+					evType := history.EventResume
+					if susp {
+						evType = history.EventSuspend
+					}
+					sink.Record(history.Event{Ts: now, Type: evType,
+						SessionID: enrichmentID(sess), PID: sess.PID, Agent: sess.Agent, CWD: sess.CWD})
+				}
+				sess.Suspended = susp
 			}
 			// Recompute the S dimension — in-flight subagent Tasks — from the main
 			// transcript so the self-heals (and the wire/tooltip) see current
-			// delegation. Claude-only; a quiet read failure leaves the last count.
-			if c := sess.Claude; c != nil && c.Transcript != "" {
-				if n, err := transcript.InFlightTasks(c.Transcript, tun.TailBytes); err == nil {
-					c.InFlightSubagents = n
-				}
+			// delegation, and emit fanout (subagent spawn/stop) + usage (token)
+			// history events derived from the same read. Claude-only.
+			if c := sess.Claude; c != nil {
+				rstate.observe(sink, sess, c, now, tun)
 			}
 		}
-		selfHealStaleAttention(m, now, tun)
-		selfHealStuckStatus(m, now, tun)
+		selfHealStaleAttention(m, now, tun, sink)
+		selfHealStuckStatus(m, now, tun, sink)
+		rstate.prune(m)
 	})
+}
+
+// recordReconcileTransition mirrors a hookless reconciler status edge into the
+// activity log, computing the closed interval's length from the still-current
+// StatusSince (call it BEFORE re-stamping StatusSince). A no-op on a disabled sink.
+func recordReconcileTransition(sink *history.Sink, sess *state.Session, c *state.AgentInfo, to, rule, reason string, now time.Time) {
+	sink.Record(history.Event{
+		Ts: now, Type: history.EventTransition,
+		SessionID: c.SessionID, PID: sess.PID, Agent: sess.Agent, CWD: sess.CWD,
+		From: c.Status, To: to, Rule: rule, Reason: reason,
+		Subagents: c.InFlightSubagents, Pending: c.PendingTool,
+		DurPrevMs: history.HeldMs(c.StatusSince, now),
+	})
+}
+
+// enrichmentID returns the session's agent session id (the stable history join
+// key), or "" before any hook has supplied it.
+func enrichmentID(s *state.Session) string {
+	if info := s.Enrichment(); info != nil {
+		return info.SessionID
+	}
+	return ""
 }
 
 // selfHealStaleAttention releases a "permission" chip that Claude Code left
@@ -246,7 +309,7 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 // directly (no shared-pointer race) and folds into the tick's single persist.
 // The bounded transcript read under the lock is consistent with the per-session
 // /proc and WM I/O the same loop already performs.
-func selfHealStaleAttention(m map[int]*state.Session, now time.Time, tun statustune.Tuning) {
+func selfHealStaleAttention(m map[int]*state.Session, now time.Time, tun statustune.Tuning, sink *history.Sink) {
 	for _, sess := range m {
 		c := sess.Claude
 		if c == nil || c.Status != state.StatusPermission {
@@ -268,6 +331,7 @@ func selfHealStaleAttention(m map[int]*state.Session, now time.Time, tun statust
 			From: state.StatusPermission, To: exit, Rule: rule, Reason: reason,
 			Subagents: c.InFlightSubagents, Pending: c.PendingTool, Age: age,
 		}.Log()
+		recordReconcileTransition(sink, sess, c, exit, rule, reason, now)
 		c.Status = exit
 		c.StatusSince = now
 		c.PendingTool = ""
@@ -296,7 +360,7 @@ func selfHealStaleAttention(m map[int]*state.Session, now time.Time, tun statust
 // multi-minute tool run writes nothing to the transcript for the duration, so a
 // TTL would wrongly decay a genuinely busy session; the marker has no such
 // false-positive (a completed tool records "interrupted":false, not a text block).
-func selfHealStuckStatus(m map[int]*state.Session, now time.Time, tun statustune.Tuning) {
+func selfHealStuckStatus(m map[int]*state.Session, now time.Time, tun statustune.Tuning, sink *history.Sink) {
 	for _, sess := range m {
 		c := sess.Claude
 		if c == nil {
@@ -312,12 +376,12 @@ func selfHealStuckStatus(m map[int]*state.Session, now time.Time, tun statustune
 		if tun.DelegatingEnabled {
 			switch {
 			case c.Status == state.StatusIdle && c.InFlightSubagents > 0:
-				logStuck(sess, c, state.StatusDelegating, statustune.RuleDelegating, "idle with subagents in flight", now)
+				logStuck(sink, sess, c, state.StatusDelegating, statustune.RuleDelegating, "idle with subagents in flight", now)
 				c.Status = state.StatusDelegating
 				c.StatusSince = now
 				continue
 			case c.Status == state.StatusDelegating && c.InFlightSubagents == 0:
-				logStuck(sess, c, state.StatusIdle, statustune.RuleDrained, "subagents drained", now)
+				logStuck(sink, sess, c, state.StatusIdle, statustune.RuleDrained, "subagents drained", now)
 				c.Status = state.StatusIdle
 				c.StatusSince = now
 				continue
@@ -341,11 +405,11 @@ func selfHealStuckStatus(m map[int]*state.Session, now time.Time, tun statustune
 		}
 		switch {
 		case c.Status == state.StatusIdle && kind == transcript.SignalActivity:
-			logStuck(sess, c, state.StatusWorking, statustune.RuleResumeActivity, "transcript activity after idle", now)
+			logStuck(sink, sess, c, state.StatusWorking, statustune.RuleResumeActivity, "transcript activity after idle", now)
 			c.Status = state.StatusWorking
 			c.StatusSince = now
 		case c.Status == state.StatusWorking && kind == transcript.SignalInterrupt:
-			logStuck(sess, c, state.StatusIdle, statustune.RuleInterrupt, "interrupt notice after working", now)
+			logStuck(sink, sess, c, state.StatusIdle, statustune.RuleInterrupt, "interrupt notice after working", now)
 			c.Status = state.StatusIdle
 			c.StatusSince = now
 		}
@@ -353,14 +417,17 @@ func selfHealStuckStatus(m map[int]*state.Session, now time.Time, tun statustune
 }
 
 // logStuck emits the decision log for a reconciler-driven (hookless) status edge,
-// capturing the full observed state so a wrong color can be traced to its inputs.
-func logStuck(sess *state.Session, c *state.AgentInfo, to, rule, reason string, now time.Time) {
+// capturing the full observed state so a wrong color can be traced to its inputs,
+// and mirrors the edge into the durable activity log. Called BEFORE the caller
+// re-stamps StatusSince, so the closed interval's length is correct.
+func logStuck(sink *history.Sink, sess *state.Session, c *state.AgentInfo, to, rule, reason string, now time.Time) {
 	statustune.Decision{
 		PID: sess.PID, Session: shortSessionID(c.SessionID),
 		From: c.Status, To: to, Rule: rule, Reason: reason,
 		Subagents: c.InFlightSubagents, Pending: c.PendingTool,
 		Age: now.Sub(c.StatusSince),
 	}.Log()
+	recordReconcileTransition(sink, sess, c, to, rule, reason, now)
 }
 
 // permissionExit decides whether — and to which color — a latched "permission"

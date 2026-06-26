@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/durfmt"
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
 )
@@ -40,7 +41,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "claude-tui:", err)
 			os.Exit(1)
 		}
-		fmt.Print(renderSnapshot(snap, home, false))
+		fmt.Print(renderSnapshot(snap, home, false, time.Now()))
 		return
 	}
 
@@ -113,7 +114,7 @@ func streamInto(ctx context.Context, socketPath, home string) error {
 			return err
 		}
 		if resp.Snapshot != nil {
-			drawFrame(renderSnapshot(*resp.Snapshot, home, true))
+			drawFrame(renderSnapshot(*resp.Snapshot, home, true, time.Now()))
 		}
 	}
 }
@@ -161,7 +162,7 @@ func statusStyle(status string) (glyph, color string) {
 // renderSnapshot turns a snapshot into a printable frame. color toggles ANSI so
 // the -once/plain path and tests stay readable. Lines end in CRLF so the frame
 // renders correctly in a terminal's raw alt-screen.
-func renderSnapshot(snap state.Snapshot, home string, color bool) string {
+func renderSnapshot(snap state.Snapshot, home string, color bool, now time.Time) string {
 	c := func(code, s string) string {
 		if !color {
 			return s
@@ -203,9 +204,17 @@ func renderSnapshot(snap state.Snapshot, home string, color bool) string {
 		if s.Suspended {
 			cwd = c(colGrey, cwd)
 		}
-		fmt.Fprintf(&b, "%s %s %s %s %s%s\r\n",
+		// How long the session has held this status ("3m", "45s"). Skipped while
+		// suspended — the status and its clock are stale until resume.
+		dur := ""
+		if !s.Suspended {
+			if d := durfmt.Since(statusSince(s), now); d != "" {
+				dur = "  " + d
+			}
+		}
+		fmt.Fprintf(&b, "%s %s %s %s %s%s%s\r\n",
 			focus, c(gcol, glyph), label, cwd,
-			c(colGrey, fmt.Sprintf("pid %d", s.PID)), c(colGrey, ws))
+			c(colGrey, fmt.Sprintf("pid %d", s.PID)), c(colGrey, ws), c(colGrey, dur))
 	}
 	return b.String()
 }
@@ -227,6 +236,16 @@ func sessionStatus(s state.Session) string {
 		return "unknown"
 	}
 	return info.Status
+}
+
+// statusSince returns the wire timestamp the current status began (nil when no
+// enrichment block exists or no status edge has stamped it), for the duration
+// counter on each session line.
+func statusSince(s state.Session) *time.Time {
+	if info := s.Enrichment(); info != nil {
+		return info.StatusSinceWire
+	}
+	return nil
 }
 
 func abbrevHome(path, home string) string {

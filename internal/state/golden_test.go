@@ -48,6 +48,10 @@ func canonicalSnapshot() Snapshot {
 					SessionID:  "e0b4b21f-aaf6-4ab0-a8d6-2d595aba4065",
 					Transcript: "/home/tjmisko/.claude/projects/switchboard/e0b4b21f.jsonl",
 					Status:     "working",
+					// status_since: the wire projection of StatusSince, present once a
+					// status edge has stamped it (omitted before then — see the codex/
+					// minimal sessions). Renderers compute "working 3m" from it.
+					StatusSinceWire: timePtr(time.Date(2026, 5, 28, 9, 1, 0, 0, time.UTC)),
 				},
 			},
 			{
@@ -74,6 +78,9 @@ func canonicalSnapshot() Snapshot {
 		UpdatedAt: time.Date(2026, 5, 28, 9, 5, 30, 0, time.UTC),
 	}
 }
+
+// timePtr returns the address of t, for the optional *time.Time wire fields.
+func timePtr(t time.Time) *time.Time { return &t }
 
 // encodeSnapshot mirrors Store.persist exactly: two-space indent, trailing
 // newline from Encode. The golden file must be byte-identical to this output.

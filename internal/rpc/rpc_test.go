@@ -1,8 +1,10 @@
 package rpc
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"log"
 	"os"
@@ -11,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/history"
 	"github.com/tjmisko/switchboard/internal/proc"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/terminal"
@@ -147,6 +150,67 @@ func TestHandleHookLogsTransitions(t *testing.T) {
 	if buf.Len() != 0 {
 		t.Errorf("no-op repeat logged %q, want silence", buf.String())
 	}
+}
+
+// With an enabled history sink, every hook-driven status edge is mirrored into
+// the durable activity log (one transition event per edge, carrying the
+// from/to/agent and the closed interval's length), while a no-op repeat records
+// nothing. This is the daemon-side wiring of the activity log.
+func TestHandleHookRecordsHistoryTransitions(t *testing.T) {
+	dir := t.TempDir()
+	store := state.New("")
+	store.Apply(func(m map[int]*state.Session) {
+		m[42] = &state.Session{PID: 42, CWD: "/home/u/proj", Agent: state.AgentKindClaude}
+	})
+	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: dir})
+	s := New(store, "", terminal.NewNone(), wm.NewNone())
+	s.SetHistory(sink)
+
+	s.handleHook(Request{Cmd: "hook", Event: "Stop", PID: 42, SessionID: "ce13c0f2-aaaa"})
+	s.handleHook(Request{Cmd: "hook", Event: "UserPromptSubmit", PID: 42, SessionID: "ce13c0f2-aaaa"})
+	s.handleHook(Request{Cmd: "hook", Event: "PostToolUse", PID: 42, SessionID: "ce13c0f2-aaaa"}) // no-op (already working)
+	sink.Close()
+
+	evs := readHistoryEvents(t, dir)
+	if len(evs) != 2 {
+		t.Fatalf("recorded %d events, want 2 (idle, working; the repeat is silent):\n%+v", len(evs), evs)
+	}
+	if evs[0].Type != history.EventTransition || evs[0].To != "idle" {
+		t.Errorf("event 0 = %+v, want a transition to idle", evs[0])
+	}
+	if evs[1].From != "idle" || evs[1].To != "working" {
+		t.Errorf("event 1 = %+v, want idle->working", evs[1])
+	}
+	if evs[1].SessionID != "ce13c0f2-aaaa" || evs[1].Agent != "claude" || evs[1].CWD != "/home/u/proj" {
+		t.Errorf("event 1 missing identity fields: %+v", evs[1])
+	}
+}
+
+// readHistoryEvents reads every event across all day-files in dir, in file then
+// line order.
+func readHistoryEvents(t *testing.T, dir string) []history.Event {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read history dir: %v", err)
+	}
+	var evs []history.Event
+	for _, e := range entries {
+		f, err := os.Open(filepath.Join(dir, e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		sc := bufio.NewScanner(f)
+		for sc.Scan() {
+			var ev history.Event
+			if err := json.Unmarshal(sc.Bytes(), &ev); err != nil {
+				t.Fatalf("decode %q: %v", sc.Text(), err)
+			}
+			evs = append(evs, ev)
+		}
+		f.Close()
+	}
+	return evs
 }
 
 // A hook reaches the daemon only after Claude Code has recorded the entry that
