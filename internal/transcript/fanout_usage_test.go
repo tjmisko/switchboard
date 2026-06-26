@@ -44,6 +44,62 @@ func assistantUsage(ts string, in, out, cacheRead, cacheCreate int64) string {
 		ts, in, out, cacheRead, cacheCreate)
 }
 
+func assistantUsageModel(ts, model string, in, out, cacheRead, cacheCreate int64) string {
+	return fmt.Sprintf(`{"type":"assistant","timestamp":%q,"message":{"role":"assistant","model":%q,"content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":%d,"output_tokens":%d,"cache_read_input_tokens":%d,"cache_creation_input_tokens":%d}}}`,
+		ts, model, in, out, cacheRead, cacheCreate)
+}
+
+func TestUsageSinceByModelBucketsPerModel(t *testing.T) {
+	path := writeTranscript(t,
+		assistantUsageModel("2026-06-01T21:39:00Z", "claude-opus-4-8", 100, 50, 9000, 200),
+		assistantUsageModel("2026-06-01T21:39:05Z", "claude-haiku-4-5", 10, 5, 0, 0),
+		assistantUsageModel("2026-06-01T21:39:10Z", "claude-opus-4-8", 30, 20, 1000, 0),
+	)
+	byModel, off, err := UsageSinceByModel(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(byModel) != 2 {
+		t.Fatalf("got %d model buckets, want 2: %+v", len(byModel), byModel)
+	}
+	if opus := byModel["claude-opus-4-8"]; opus.InputTokens != 130 || opus.OutputTokens != 70 ||
+		opus.CacheReadTokens != 10000 || opus.CacheCreationTokens != 200 {
+		t.Errorf("opus bucket = %+v, want 130/70/10000/200", opus)
+	}
+	if haiku := byModel["claude-haiku-4-5"]; haiku.InputTokens != 10 || haiku.OutputTokens != 5 {
+		t.Errorf("haiku bucket = %+v, want 10/5", haiku)
+	}
+	if off == 0 {
+		t.Errorf("offset should advance past the consumed lines")
+	}
+
+	// A second call from the advanced offset sees nothing new (same offset semantics
+	// as UsageSince — both share readNewLines).
+	again, off2, err := UsageSinceByModel(path, off)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again) != 0 || off2 != off {
+		t.Errorf("re-read from offset should be empty; got %+v off %d (was %d)", again, off2, off)
+	}
+}
+
+func TestUsageSinceByModelBucketsUnlabeledUnderEmptyKey(t *testing.T) {
+	// A message with no model field (an older transcript) lands under "" so its
+	// tokens are still recorded; the deriver prices the empty key as unknown.
+	path := writeTranscript(t, assistantUsage("2026-06-01T21:39:00Z", 7, 3, 0, 0))
+	byModel, _, err := UsageSinceByModel(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(byModel) != 1 {
+		t.Fatalf("got %d buckets, want 1: %+v", len(byModel), byModel)
+	}
+	if u := byModel[""]; u.InputTokens != 7 || u.OutputTokens != 3 {
+		t.Errorf("unlabeled bucket = %+v, want {7,3}", u)
+	}
+}
+
 func TestUsageSinceSumsNewAssistantMessages(t *testing.T) {
 	path := writeTranscript(t,
 		assistantUsage("2026-06-01T21:39:00Z", 100, 50, 9000, 200),

@@ -137,6 +137,10 @@ type entry struct {
 	Message   struct {
 		Role    string          `json:"role"`
 		Content json.RawMessage `json:"content"`
+		// Model names the model that produced an assistant message (e.g.
+		// "claude-opus-4-8"); UsageSinceByModel buckets token usage by it so each
+		// model's tokens can be priced at its own rate. Absent on user/system entries.
+		Model string `json:"model"`
 		// Usage is the per-assistant-message token accounting Claude Code records;
 		// UsageSince sums it to track plan consumption. Absent on user/system entries.
 		Usage *Usage `json:"usage"`
@@ -498,36 +502,10 @@ func (u *Usage) add(o Usage) {
 // emits a usage_sample history event from each non-zero delta and persists the
 // returned offset per session.
 func UsageSince(path string, byteOffset int64) (Usage, int64, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return Usage{}, byteOffset, err
+	complete, newOffset, err := readNewLines(path, byteOffset)
+	if err != nil || len(complete) == 0 {
+		return Usage{}, newOffset, err
 	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return Usage{}, byteOffset, err
-	}
-	size := fi.Size()
-	if size < byteOffset {
-		byteOffset = 0 // truncated/replaced transcript
-	}
-	if size == byteOffset {
-		return Usage{}, byteOffset, nil
-	}
-	if _, err := f.Seek(byteOffset, io.SeekStart); err != nil {
-		return Usage{}, byteOffset, err
-	}
-	data, err := io.ReadAll(f)
-	if err != nil {
-		return Usage{}, byteOffset, err
-	}
-	lastNL := bytes.LastIndexByte(data, '\n')
-	if lastNL < 0 {
-		return Usage{}, byteOffset, nil // no complete line appended yet
-	}
-	complete := data[:lastNL+1]
-	newOffset := byteOffset + int64(len(complete))
-
 	var total Usage
 	for _, raw := range bytes.Split(complete, []byte{'\n'}) {
 		if len(bytes.TrimSpace(raw)) == 0 {
@@ -542,6 +520,76 @@ func UsageSince(path string, byteOffset int64) (Usage, int64, error) {
 		}
 	}
 	return total, newOffset, nil
+}
+
+// UsageSinceByModel is UsageSince broken down per model: it sums each new
+// assistant message's tokens into a bucket keyed by its message.model, so the
+// daemon can emit one usage_sample per model and price each at its own rate.
+// Messages with no model land under the empty-string key. The offset,
+// truncation, and partial-final-line semantics are identical to UsageSince (they
+// share readNewLines), so either may be driven off the same per-session cursor.
+// Returns a nil map when nothing new was appended.
+func UsageSinceByModel(path string, byteOffset int64) (map[string]Usage, int64, error) {
+	complete, newOffset, err := readNewLines(path, byteOffset)
+	if err != nil || len(complete) == 0 {
+		return nil, newOffset, err
+	}
+	byModel := map[string]Usage{}
+	for _, raw := range bytes.Split(complete, []byte{'\n'}) {
+		if len(bytes.TrimSpace(raw)) == 0 {
+			continue
+		}
+		var e entry
+		if json.Unmarshal(raw, &e) != nil {
+			continue
+		}
+		if e.Message.Role == "assistant" && e.Message.Usage != nil {
+			u := byModel[e.Message.Model]
+			u.add(*e.Message.Usage)
+			byModel[e.Message.Model] = u
+		}
+	}
+	return byModel, newOffset, nil
+}
+
+// readNewLines returns the complete (newline-terminated) bytes appended to path
+// since byteOffset, plus the offset to resume from — the shared, careful tail
+// logic behind UsageSince/UsageSinceByModel. It reads exactly the new bytes
+// (cheap on a growing multi-MB transcript), drops a line caught mid-write (the
+// trailing partial is excluded and re-read next call rather than double-counted),
+// and restarts from 0 when the file is shorter than byteOffset (a /clear or
+// session replacement truncated it). Returns (nil, byteOffset, nil) when nothing
+// complete is new, and (nil, byteOffset, err) only on I/O failure.
+func readNewLines(path string, byteOffset int64) ([]byte, int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, byteOffset, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, byteOffset, err
+	}
+	size := fi.Size()
+	if size < byteOffset {
+		byteOffset = 0 // truncated/replaced transcript
+	}
+	if size == byteOffset {
+		return nil, byteOffset, nil
+	}
+	if _, err := f.Seek(byteOffset, io.SeekStart); err != nil {
+		return nil, byteOffset, err
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, byteOffset, err
+	}
+	lastNL := bytes.LastIndexByte(data, '\n')
+	if lastNL < 0 {
+		return nil, byteOffset, nil // no complete line appended yet
+	}
+	complete := data[:lastNL+1]
+	return complete, byteOffset + int64(len(complete)), nil
 }
 
 // NewestSignal reads up to maxBytes from the end of the transcript at path and
