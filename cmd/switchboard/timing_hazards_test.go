@@ -169,7 +169,7 @@ func TestTimingHazards(t *testing.T) {
 			// Phase 3: a reconcile tick must land on the right color.
 			m := stuckMap(h.status, full, since)
 			m[100].Claude.InFlightSubagents = h.subagents
-			selfHealStuckStatus(m, reconcileNow, testTune)
+			selfHealStuckStatus(m, reconcileNow, testTune, nil)
 
 			if got := m[100].Claude.Status; got != h.want {
 				t.Errorf("status = %q, want %q", got, h.want)

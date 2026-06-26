@@ -4,8 +4,10 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tjmisko/switchboard/internal/barlayout"
+	"github.com/tjmisko/switchboard/internal/projectname"
 	"github.com/tjmisko/switchboard/internal/state"
 )
 
@@ -14,6 +16,36 @@ var (
 	testAvail   = 100000.0
 	testMetrics = barlayout.DefaultMetrics()
 )
+
+func TestSessionTooltipShowsStatusDuration(t *testing.T) {
+	now := time.Date(2026, 6, 26, 14, 30, 0, 0, time.UTC)
+	since := now.Add(-45 * time.Second)
+	s := state.Session{
+		PID: 4821, CWD: "/home/u/proj",
+		Claude: &state.ClaudeInfo{Status: "permission", StatusSinceWire: &since},
+	}
+	tip := sessionTooltip(projectname.Config{}, s, now)
+	if !strings.Contains(tip, "permission · 45s") {
+		t.Errorf("tooltip should show the permission-wait duration:\n%s", tip)
+	}
+}
+
+func TestSessionTooltipSuspendedShowsNoDuration(t *testing.T) {
+	now := time.Date(2026, 6, 26, 14, 30, 0, 0, time.UTC)
+	since := now.Add(-5 * time.Minute)
+	s := state.Session{
+		PID: 4821, CWD: "/home/u/proj", Suspended: true,
+		Claude: &state.ClaudeInfo{Status: "working", StatusSinceWire: &since},
+	}
+	tip := sessionTooltip(projectname.Config{}, s, now)
+	// Suspended status (and its clock) is stale; show "suspended", not a counter.
+	if strings.Contains(tip, "5m") {
+		t.Errorf("suspended session should not show a stale duration:\n%s", tip)
+	}
+	if !strings.Contains(tip, "suspended") {
+		t.Errorf("suspended session should be labeled suspended:\n%s", tip)
+	}
+}
 
 func TestRenderSlotStatusAndFlags(t *testing.T) {
 	snap := state.Snapshot{

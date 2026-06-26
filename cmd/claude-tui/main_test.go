@@ -8,6 +8,22 @@ import (
 	"github.com/tjmisko/switchboard/internal/state"
 )
 
+func TestRenderSnapshotShowsStatusDuration(t *testing.T) {
+	now := time.Date(2026, 6, 26, 14, 30, 0, 0, time.UTC)
+	since := now.Add(-3 * time.Minute)
+	snap := state.Snapshot{
+		Sessions: []state.Session{
+			{PID: 4821, CWD: "/home/u/proj", Claude: &state.ClaudeInfo{
+				Status: "idle", StatusSinceWire: &since,
+			}},
+		},
+	}
+	got := renderSnapshot(snap, "/home/u", false, now)
+	if !strings.Contains(got, "3m") {
+		t.Errorf("session line should carry the idle duration '3m':\n%s", got)
+	}
+}
+
 func TestRenderSnapshotListsSessions(t *testing.T) {
 	snap := state.Snapshot{
 		Sessions: []state.Session{
@@ -21,7 +37,7 @@ func TestRenderSnapshotListsSessions(t *testing.T) {
 		Capabilities: &state.Capabilities{Observe: true, Navigate: true, WM: "hyprland", Terminal: "wezterm"},
 	}
 
-	got := renderSnapshot(snap, "/home/u", false)
+	got := renderSnapshot(snap, "/home/u", false, time.Now())
 
 	for _, want := range []string{
 		"2 sessions",
@@ -57,11 +73,11 @@ func TestRenderSnapshotDelegatingIsGreen(t *testing.T) {
 			}},
 		},
 	}
-	plain := renderSnapshot(snap, "/home/u", false)
+	plain := renderSnapshot(snap, "/home/u", false, time.Now())
 	if !strings.Contains(plain, "delegating") {
 		t.Errorf("plain frame missing 'delegating' label:\n%s", plain)
 	}
-	colored := renderSnapshot(snap, "/home/u", true)
+	colored := renderSnapshot(snap, "/home/u", true, time.Now())
 	if !strings.Contains(colored, colGreen) {
 		t.Errorf("delegating session should be painted green:\n%q", colored)
 	}
@@ -79,7 +95,7 @@ func TestRenderSnapshotGreysSuspended(t *testing.T) {
 
 	// Plain (no color): suspended sessions read "suspended", not their stale
 	// underlying status.
-	plain := renderSnapshot(snap, "/home/u", false)
+	plain := renderSnapshot(snap, "/home/u", false, time.Now())
 	if !strings.Contains(plain, "suspended") {
 		t.Errorf("plain frame missing 'suspended' label:\n%s", plain)
 	}
@@ -88,14 +104,14 @@ func TestRenderSnapshotGreysSuspended(t *testing.T) {
 	}
 
 	// Colored: the line is painted grey (the suspended treatment).
-	colored := renderSnapshot(snap, "/home/u", true)
+	colored := renderSnapshot(snap, "/home/u", true, time.Now())
 	if !strings.Contains(colored, colGrey) {
 		t.Errorf("colored suspended frame missing grey escape:\n%q", colored)
 	}
 }
 
 func TestRenderSnapshotEmptyAndNoCaps(t *testing.T) {
-	got := renderSnapshot(state.Snapshot{UpdatedAt: time.Now()}, "/home/u", false)
+	got := renderSnapshot(state.Snapshot{UpdatedAt: time.Now()}, "/home/u", false, time.Now())
 	if !strings.Contains(got, "0 sessions") {
 		t.Errorf("want '0 sessions', got:\n%s", got)
 	}

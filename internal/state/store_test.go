@@ -10,6 +10,39 @@ import (
 	"github.com/tjmisko/switchboard/internal/state"
 )
 
+// Snapshot projects the in-memory StatusSince onto the wire-only StatusSinceWire
+// (status_since) — set once a status edge has stamped it, omitted before then —
+// without mutating the live block the daemon keeps reconciling.
+func TestSnapshotStampsStatusSinceWire(t *testing.T) {
+	store := state.New("")
+	since := time.Date(2026, 6, 26, 14, 0, 0, 0, time.UTC)
+	store.Apply(func(m map[int]*state.Session) {
+		m[1] = &state.Session{PID: 1, Agent: state.AgentKindClaude,
+			Claude: &state.AgentInfo{Status: "idle", StatusSince: since}}
+		m[2] = &state.Session{PID: 2, Agent: state.AgentKindClaude,
+			Claude: &state.AgentInfo{Status: ""}} // no edge yet → zero StatusSince
+	})
+
+	snap := store.Snapshot()
+	bySession := map[int]state.Session{}
+	for _, s := range snap.Sessions {
+		bySession[s.PID] = s
+	}
+	if w := bySession[1].Claude.StatusSinceWire; w == nil || !w.Equal(since) {
+		t.Errorf("session 1 status_since = %v, want %v", w, since)
+	}
+	if w := bySession[2].Claude.StatusSinceWire; w != nil {
+		t.Errorf("session 2 has no status edge yet; status_since should be omitted, got %v", w)
+	}
+
+	// The projection must not leak onto the live block (it is derived per snapshot).
+	store.Apply(func(m map[int]*state.Session) {
+		if w := m[1].Claude.StatusSinceWire; w != nil {
+			t.Errorf("live block mutated: StatusSinceWire = %v, want nil", w)
+		}
+	})
+}
+
 // §4.1 Apply — mutates, broadcasts, and persists. We observe both side effects:
 // a subscriber receives the post-mutation snapshot and the on-disk mirror
 // reflects the same session set.
