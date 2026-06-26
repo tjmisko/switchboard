@@ -38,6 +38,10 @@ const (
 	EventSubagentSpawn = "subagent_spawn" // a Task/Agent subagent was launched
 	EventSubagentStop  = "subagent_stop"  // its result landed (it finished)
 	EventUsageSample   = "usage_sample"   // token usage accrued since the last sample
+	// v2 — session names, model/cost, focus & attention.
+	EventSessionLabel = "session_label" // the session's name/label changed (Label set)
+	EventFocus        = "focus"          // window focus moved (SessionID = focused agent, empty = focus left all agents)
+	EventActivity     = "activity"       // user went idle / active (global; To = idle|active)
 )
 
 // Detail tiers. Minimal records only what a timeline needs (ids, status, timing,
@@ -75,16 +79,21 @@ type Event struct {
 	AgentType string `json:"agent_type,omitempty"`  // e.g. "Explore", "general-purpose"
 
 	// Usage payload (usage_sample): tokens accrued since the previous sample.
-	TokIn          int64 `json:"tok_in,omitempty"`
-	TokOut         int64 `json:"tok_out,omitempty"`
-	TokCacheRead   int64 `json:"tok_cache_read,omitempty"`
-	TokCacheCreate int64 `json:"tok_cache_create,omitempty"`
+	// Model names the model the tokens were spent on (e.g. "claude-opus-4-8"),
+	// used to price the sample; it is minimal-safe (names the model tier, not
+	// your work) so it is kept alongside the token counts at the minimal tier.
+	TokIn          int64  `json:"tok_in,omitempty"`
+	TokOut         int64  `json:"tok_out,omitempty"`
+	TokCacheRead   int64  `json:"tok_cache_read,omitempty"`
+	TokCacheCreate int64  `json:"tok_cache_create,omitempty"`
+	Model          string `json:"model,omitempty"`
 
 	// Full-tier only (scrubbed at the minimal tier).
 	CWD         string `json:"cwd,omitempty"`         // working directory
 	Pending     string `json:"pending,omitempty"`     // the tool a permission prompt was for
 	Reason      string `json:"reason,omitempty"`      // human detail behind a rule
 	Description string `json:"description,omitempty"` // a subagent's task description
+	Label       string `json:"label,omitempty"`       // a session's current name (session_label) — can name your work, so scrubbed
 }
 
 // DefaultDir is where the activity log lives: $XDG_STATE_HOME/switchboard/history,

@@ -43,12 +43,14 @@ The daemon logs `history: enabled=… detail=… dir=…` at startup. Recording 
 
 | Tier | Records | Omits |
 |------|---------|-------|
-| `minimal` (default) | `ts`, `type`, `session_id`, `pid`, `agent`, `project` (abbrev), `from`/`to`, `rule`, `subagents`, `dur_prev_ms`, `agent_type`, `tool_use_id`, token counts | `cwd`, `pending`, `reason`, `description` |
-| `full` | everything above **plus** `cwd`, `pending`, `reason`, `description` | — |
+| `minimal` (default) | `ts`, `type`, `session_id`, `pid`, `agent`, `project` (abbrev), `from`/`to`, `rule`, `subagents`, `dur_prev_ms`, `agent_type`, `tool_use_id`, token counts, `model` | `cwd`, `pending`, `reason`, `description`, `label` |
+| `full` | everything above **plus** `cwd`, `pending`, `reason`, `description`, `label` | — |
 
-The subagent `agent_type` (e.g. `Explore`) and token counts are kept at the
-minimal tier — they describe *how much* and *what kind*, not the content of your
-work; the subagent `description` (the task text) is scrubbed.
+The subagent `agent_type` (e.g. `Explore`), token counts, and the usage-sample
+`model` are kept at the minimal tier — they describe *how much*, *what kind*, and
+*which model*, not the content of your work; the subagent `description` (the task
+text) and the session `label` (the session's name, which can reveal what you are
+working on) are scrubbed.
 
 The minimal tier keeps everything a timeline needs while omitting what reveals
 *what* you are doing (the raw path, the tool a prompt was for). The project
@@ -79,6 +81,10 @@ minimal log still labels each event by project.
   // usage payload (usage_sample) — tokens accrued since the previous sample:
   "tok_in": 4200, "tok_out": 1850,
   "tok_cache_read": 920000, "tok_cache_create": 15000,
+  "model": "claude-opus-4-8",        // the model the tokens were spent on (priced by CostUSD); minimal-safe
+
+  // session-label payload (session_label):
+  "label": "sb-invest",              // the session's current name (full tier — scrubbed at minimal)
 
   // full tier only:
   "cwd": "/home/u/Projects/switchboard",
@@ -103,7 +109,10 @@ present (stable across PID reuse), falling back to `pid` for the pre-hook
 | `session_end` | the process dies | closes the last interval |
 | `subagent_spawn` | a `Task`/`Agent` subagent is launched (seen in the main transcript) | `tool_use_id`, `agent_type`, `description` |
 | `subagent_stop` | that subagent's result lands | `tool_use_id`, `agent_type` |
-| `usage_sample` | tokens accrued since the last sample (each reconcile tick) | `tok_in`, `tok_out`, `tok_cache_read`, `tok_cache_create` |
+| `usage_sample` | tokens accrued since the last sample (each reconcile tick), one per model | `tok_in`, `tok_out`, `tok_cache_read`, `tok_cache_create`, `model` |
+| `session_label` | the session's name/label changed | `session_id`, `label` (full tier) |
+| `focus` | window focus moved to/away from an agent session (Hyprland) | `session_id` = focused agent session, empty = focus left all agent windows |
+| `activity` | the user went idle / active (global, session-less; from an idle daemon) | `to` = `idle` \| `active` |
 
 Fanout (`subagent_*`) is derived by diffing the main transcript's `Task` tool_use
 ↔ `tool_result` pairing across reconcile ticks; no extra hook is required.
@@ -114,6 +123,44 @@ primed at discovery so a pre-existing transcript's backlog is not double-counted
 (`UserPromptSubmit`→working, `Stop`→idle, `PermissionRequest`→permission) and the
 hookless reconciler edges (permission self-heal, delegating promotion,
 interrupt/resume recovery) all funnel one `transition` event apiece.
+
+## Cost (pricing)
+
+There is **no native source for dollar cost** on a solo Pro/Max subscription, so
+cost is recomputed from `tokens × per-model price`, keyed on the `usage_sample`'s
+`model`. The single price table and the recompute function live in
+`internal/history/pricing.go`:
+
+```go
+// internal/history/pricing.go — the exact exported contract consumers depend on.
+func CostUSD(model string, tokIn, tokOut, cacheRead, cacheCreate int64) float64
+```
+
+- **Token params are `int64`** (matching `transcript.Usage` / `Event.Tok*`).
+- **Returns dollars** (a float): Σ over the four token buckets of
+  `tokens × perMTokRate / 1e6`.
+- **Unknown / unpriced model → `0`** (never panics), so a foreign model
+  contributes no cost rather than a wrong one.
+- **Model matching is robust** to real transcript model ids
+  (`claude-opus-4-8`, `claude-opus-4-8[1m]`, `claude-sonnet-4-6`,
+  `claude-haiku-4-5-20251001`, `claude-fable-5`): the id is normalized (a `[…]`
+  context-window suffix and a trailing `-YYYYMMDD` date are stripped) and matched
+  on the family substring.
+
+The `prices` table — dollars **per million tokens** (per MTok), confirmed against
+the `claude-api` reference (Anthropic public pricing); `cacheCreate` is the
+5-minute cache-write rate (1.25× input — small drift vs the 1h rate is accepted):
+
+| family (key) | model ids | input | output | cacheRead | cacheCreate |
+|------|-----------|------:|-------:|----------:|------------:|
+| `opus` | `claude-opus-4-8` / `-4-7` / `-4-6` | 5 | 25 | 0.5 | 6.25 |
+| `sonnet` | `claude-sonnet-4-6` | 3 | 15 | 0.3 | 3.75 |
+| `haiku` | `claude-haiku-4-5` | 1 | 5 | 0.1 | 1.25 |
+| `fable` | `claude-fable-5` | 10 | 50 | 1 | 12.5 |
+
+Consumers (timeline derivation, plan-window, dashboard) call `CostUSD` rather
+than duplicating the table; `cost_usd` fields in `timeline --json` are **float
+dollars**.
 
 ## Deriving the timeline (what a consumer does)
 
