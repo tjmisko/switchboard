@@ -55,6 +55,12 @@ type Request struct {
 	// with no tool (UserPromptSubmit/Stop/SessionStart), which just disables the
 	// fast path and falls back to the transcript check.
 	ToolName string `json:"tool_name,omitempty"`
+
+	// Activity carries the global user-activity edge — set when Cmd == "activity".
+	// It is session-less: "idle" when an idle daemon (e.g. hypridle) sees no input
+	// for its timeout, "active" when input resumes. Exactly those two values are
+	// valid; handleActivity rejects anything else.
+	Activity string `json:"activity,omitempty"`
 }
 
 type Response struct {
@@ -142,6 +148,13 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		case "hook":
 			s.handleHook(req)
 			_ = enc.Encode(Response{OK: true})
+		case "activity":
+			err := s.handleActivity(req)
+			if err != nil {
+				_ = enc.Encode(Response{Error: err.Error()})
+			} else {
+				_ = enc.Encode(Response{OK: true})
+			}
 		default:
 			_ = enc.Encode(Response{Error: "unknown cmd: " + req.Cmd})
 		}
@@ -410,6 +423,28 @@ func (s *Server) clearsPermission(info *state.AgentInfo, toolName string) (clear
 		return true, statustune.RuleApproveTranscript, "transcript: turn resumed"
 	}
 	return false, statustune.RuleHoldBareResult, "prompt still pending"
+}
+
+// handleActivity records a global, session-less user-activity edge: "idle" when
+// the user stepped away from the keyboard, "active" when input resumed. The signal
+// is fed by an idle daemon (hypridle) via `switchboard-ctl activity <idle|active>`;
+// any other value is rejected so a misconfigured timer can never pollute the
+// stream. Unlike a per-session transition it carries no PID/session — a dashboard
+// derives global active/idle intervals from the To values alone. Recording is
+// best-effort: a nil/disabled sink drops it (Sink.Record is a no-op), but the
+// value is still validated so the client learns it sent garbage.
+func (s *Server) handleActivity(req Request) error {
+	switch req.Activity {
+	case "idle", "active":
+	default:
+		return fmt.Errorf("activity must be idle|active (got %q)", req.Activity)
+	}
+	s.hist.Record(history.Event{
+		Ts:   time.Now(),
+		Type: history.EventActivity,
+		To:   req.Activity,
+	})
+	return nil
 }
 
 // shortID trims a session id to its first segment for compact decision logs.
