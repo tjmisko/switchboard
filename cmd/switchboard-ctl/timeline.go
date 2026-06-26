@@ -13,6 +13,10 @@ import (
 	"github.com/tjmisko/switchboard/internal/history"
 )
 
+// planWindowHours is the width of the rolling plan-usage window (Anthropic's
+// ~5-hour limit window) the --plan-window flag totals cost/tokens over.
+const planWindowHours = 5
+
 // cmdTimeline renders the activity log as a per-session swimlane view plus the
 // summary stats (per-status totals and the three "hours of agent attention"
 // figures). It reads the on-disk log directly — no daemon — and emits text by
@@ -32,13 +36,15 @@ func cmdTimeline(args []string) {
 	width := fs.Int("width", 48, "swimlane bar width in columns")
 	asJSON := fs.Bool("json", false, "emit the swimlanes + summary as JSON")
 	noColor := fs.Bool("no-color", false, "disable ANSI color")
+	planWindow := fs.Bool("plan-window", false, "include the rolling 5h plan_window cost/token total")
 	_ = fs.Parse(args)
 
 	from, to, label := resolveWindow(*day, *since, *until)
 	// Clamp the open-interval end to now, so a running session today extends to
 	// the present rather than the (future) end-of-day bound.
+	now := time.Now()
 	end := to
-	if now := time.Now(); end.After(now) {
+	if end.After(now) {
 		end = now
 	}
 
@@ -47,21 +53,40 @@ func cmdTimeline(args []string) {
 		fail("read %s: %v", *dir, err)
 	}
 	lanes := history.BuildSwimlanes(events, end)
-	summary := history.Summarize(lanes)
+	summary := history.Summarize(lanes, events)
 	totals := history.AggregateTotals(events)
+
+	// The plan window is a separate rolling [now-5h, now] read (independent of the
+	// display window), priced by the producer (A4).
+	var planWin *history.PlanWindow
+	if *planWindow {
+		pwFrom, pwTo := now.Add(-planWindowHours*time.Hour), now
+		pwEvents, err := history.ReadRange(*dir, pwFrom, pwTo)
+		if err != nil {
+			fail("read plan window %s: %v", *dir, err)
+		}
+		pw := history.AggregatePlanWindow(pwEvents, pwFrom, pwTo)
+		planWin = &pw
+	}
 
 	if *asJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(struct {
-			Window  string             `json:"window"`
-			Lanes   []history.Swimlane `json:"lanes"`
-			Summary history.Summary    `json:"summary"`
-			Totals  history.Totals     `json:"totals"`
-		}{label, lanes, summary, totals})
+			Window     string              `json:"window"`
+			Lanes      []history.Swimlane  `json:"lanes"`
+			Summary    history.Summary     `json:"summary"`
+			Totals     history.Totals      `json:"totals"`
+			PlanWindow *history.PlanWindow `json:"plan_window,omitempty"`
+		}{label, lanes, summary, totals, planWin})
 		return
 	}
 	renderSwimlanes(os.Stdout, label, lanes, summary, totals, *width, !*noColor && isTTY(os.Stdout))
+	if planWin != nil {
+		fmt.Fprintf(os.Stdout, "\nplan window (last %gh)\n", planWin.Hours)
+		fmt.Fprintf(os.Stdout, "  %-12s $%.2f\n", "cost", planWin.CostUSD)
+		fmt.Fprintf(os.Stdout, "  %-12s %s\n", "tokens", humanCount(planWin.TokIn+planWin.TokOut+planWin.TokCacheRead+planWin.TokCacheCreate))
+	}
 }
 
 // resolveWindow turns the day/since/until flags into a [from, to) UTC window and
@@ -129,12 +154,21 @@ func renderSwimlanes(w *os.File, label string, lanes []history.Swimlane, s histo
 	fmt.Fprintf(w, "  %-26s %s\n", "attention · A (union)", durfmt.Compact(s.AttentionUnion))
 	fmt.Fprintf(w, "  %-26s %s\n", "attention · B (per-session)", durfmt.Compact(s.AttentionPerSession))
 	fmt.Fprintf(w, "  %-26s %s\n", "attention · C (fanout-weighted)", durfmt.Compact(s.AttentionFanout))
+	// Delegation split — only meaningful when there is focus/activity signal.
+	if s.AttendedActive > 0 || s.PromptActive > 0 {
+		fmt.Fprintf(w, "  %-26s %s\n", "delegated (you away)", durfmt.Compact(s.DelegatedActive))
+		fmt.Fprintf(w, "  %-26s %s\n", "attended (you watching)", durfmt.Compact(s.AttendedActive))
+		fmt.Fprintf(w, "  %-26s %.0f%%\n", "delegation effectiveness", s.DelegationEffectiveness*100)
+	}
 	if totals.Subagents > 0 {
 		fmt.Fprintf(w, "  %-26s %d\n", "subagents launched", totals.Subagents)
 	}
 	if tok := totals.TotalTokens(); tok > 0 {
 		fmt.Fprintf(w, "  %-26s %s  (in %s · out %s · cache %s)\n", "tokens used", humanCount(tok),
 			humanCount(totals.TokIn), humanCount(totals.TokOut), humanCount(totals.TokCacheRead+totals.TokCacheCreate))
+	}
+	if totals.CostUSD > 0 {
+		fmt.Fprintf(w, "  %-26s $%.2f\n", "cost (recomputed)", totals.CostUSD)
 	}
 }
 
