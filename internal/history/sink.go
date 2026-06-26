@@ -149,6 +149,8 @@ func (s *Sink) scrub(ev *Event) {
 	ev.Pending = ""
 	ev.Reason = ""
 	ev.Description = ""
+	ev.Label = "" // a session name can reveal what you are working on
+	// Model is minimal-safe (names the model, not your work) and is kept.
 }
 
 // --- retention ---

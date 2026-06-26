@@ -112,7 +112,7 @@ func main() {
 			log.Printf("scanner: %v", err)
 		}
 	}()
-	go runWMLoop(ctx, store, resolver, manager)
+	go runWMLoop(ctx, store, resolver, manager, sink)
 	go runReconciler(ctx, store, resolver, manager, stack, *reconcileInterval, tun, sink)
 
 	server := rpc.New(store, *socketPath, term, manager)
@@ -152,7 +152,7 @@ func dropStaleSessions(store *state.Store) {
 	})
 }
 
-func runWMLoop(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager) {
+func runWMLoop(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, sink *history.Sink) {
 	for ctx.Err() == nil {
 		events, err := manager.Subscribe(ctx)
 		if err != nil {
@@ -165,7 +165,7 @@ func runWMLoop(ctx context.Context, store *state.Store, resolver *mapping.Resolv
 			}
 		}
 		for evt := range events {
-			handleWMEvent(ctx, store, resolver, evt)
+			handleWMEvent(ctx, store, resolver, evt, sink)
 		}
 		// channel closed (connection EOF or ctx cancel) — loop will retry
 	}
@@ -174,7 +174,7 @@ func runWMLoop(ctx context.Context, store *state.Store, resolver *mapping.Resolv
 // handleWMEvent reacts to a neutral window event. Addresses arrive already
 // normalized to Clients() form (the wm seam owns the Hyprland 0x quirk), so the
 // daemon compares them directly against sess.Hyprland.Address.
-func handleWMEvent(ctx context.Context, store *state.Store, resolver *mapping.Resolver, evt wm.Event) {
+func handleWMEvent(ctx context.Context, store *state.Store, resolver *mapping.Resolver, evt wm.Event, sink *history.Sink) {
 	switch evt.Kind {
 	case wm.EventWindowClosed:
 		// Drop any session living in the closed window. Covers the "user closed
@@ -187,14 +187,9 @@ func handleWMEvent(ctx context.Context, store *state.Store, resolver *mapping.Re
 			}
 		})
 	case wm.EventFocusChanged:
+		now := time.Now()
 		store.Apply(func(m map[int]*state.Session) {
-			for _, sess := range m {
-				if sess.Hyprland == nil {
-					sess.Focused = false
-					continue
-				}
-				sess.Focused = sess.Hyprland.Address == evt.Address
-			}
+			applyFocus(m, evt.Address, sink, now)
 		})
 	case wm.EventLayoutChanged:
 		// Something changed — kick a reconcile on any session that might match.
@@ -237,9 +232,6 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 	store.Apply(func(m map[int]*state.Session) {
 		for _, sess := range m {
 			resolver.Reconcile(ctx, sess)
-			if sess.Hyprland != nil {
-				sess.Focused = sess.Hyprland.Address == active
-			}
 			// Refresh job-control suspension (Ctrl-Z). On ErrGone the procwatch
 			// death callback will drop the session shortly; leave the last-known
 			// value until then rather than flapping. A change is logged to history
@@ -264,6 +256,10 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 				rstate.observe(sink, sess, c, now, tun)
 			}
 		}
+		// Re-sync focus against the active window (the backstop for any focus event
+		// the live socket2 stream missed) and record a focus edge on a real change.
+		// Runs after the resolve loop so every session's Hyprland address is current.
+		applyFocus(m, active, sink, now)
 		selfHealStaleAttention(m, now, tun, sink)
 		selfHealStuckStatus(m, now, tun, sink)
 		rstate.prune(m)
@@ -280,6 +276,46 @@ func recordReconcileTransition(sink *history.Sink, sess *state.Session, c *state
 		From: c.Status, To: to, Rule: rule, Reason: reason,
 		Subagents: c.InFlightSubagents, Pending: c.PendingTool,
 		DurPrevMs: history.HeldMs(c.StatusSince, now),
+	})
+}
+
+// applyFocus reconciles every session's Focused flag against the active window
+// address and records a focus event when the focused AGENT session changes. It
+// runs inside store.Apply (the caller holds the state lock): it reads the prior
+// Focused flags to recover which agent session was focused, flips them to match
+// activeAddr, and — only on a real change — sink.Records an EventFocus. The
+// event's SessionID is the newly-focused agent session, or EMPTY when focus left
+// every agent window (a non-agent window, or none, is now active); that empty-
+// SessionID signal is what the timeline deriver uses to close a focus span.
+//
+// Change is keyed on the focused session id, not the pid, so a non-agent window
+// and an agent whose first hook has not yet assigned a SessionID both read as
+// "no agent focused" (empty) and collapse to one state — the reconcile backstop
+// re-emits with the real id once the hook lands. activeAddr is the normalized
+// active-window address ("" → no/unknown window, so all sessions unfocus). The
+// event carries only ids/pid/agent (no cwd) — focus is minimal-safe.
+func applyFocus(m map[int]*state.Session, activeAddr string, sink *history.Sink, now time.Time) {
+	prevID := ""
+	for _, sess := range m {
+		if sess.Focused {
+			prevID = enrichmentID(sess)
+			break
+		}
+	}
+	newID, newPID, newAgent := "", 0, ""
+	for _, sess := range m {
+		focused := activeAddr != "" && sess.Hyprland != nil && sess.Hyprland.Address == activeAddr
+		sess.Focused = focused
+		if focused {
+			newID, newPID, newAgent = enrichmentID(sess), sess.PID, sess.Agent
+		}
+	}
+	if newID == prevID {
+		return
+	}
+	sink.Record(history.Event{
+		Ts: now, Type: history.EventFocus,
+		SessionID: newID, PID: newPID, Agent: newAgent,
 	})
 }
 

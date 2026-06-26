@@ -104,7 +104,7 @@ func TestSummarizeAttentionStats(t *testing.T) {
 		tr(1, "s1", 15, "idle", "working", 2),
 		{Ts: ts(25), Type: EventSessionEnd, PID: 1, SessionID: "s1"},
 	}
-	s := Summarize(BuildSwimlanes(evs, ts(25)))
+	s := Summarize(BuildSwimlanes(evs, ts(25)), evs)
 
 	if got := s.ByStatus["working"]; got != 20*time.Second {
 		t.Errorf("working total = %v, want 20s", got)
@@ -136,7 +136,7 @@ func TestSummarizeUnionDisjointSumsBothAcrossGap(t *testing.T) {
 		tr(2, "b", 20, "", "working", 0),
 		tr(2, "b", 30, "working", "idle", 0),
 	}
-	s := Summarize(BuildSwimlanes(evs, ts(40)))
+	s := Summarize(BuildSwimlanes(evs, ts(40)), evs)
 	if s.AttentionUnion != 20*time.Second {
 		t.Errorf("disjoint union = %v, want 20s (both intervals summed across the gap)", s.AttentionUnion)
 	}
@@ -154,7 +154,7 @@ func TestSummarizeUnionNestedCountsOuterOnly(t *testing.T) {
 		tr(2, "b", 5, "", "working", 0),
 		tr(2, "b", 10, "working", "idle", 0),
 	}
-	s := Summarize(BuildSwimlanes(evs, ts(40)))
+	s := Summarize(BuildSwimlanes(evs, ts(40)), evs)
 	if s.AttentionUnion != 20*time.Second {
 		t.Errorf("nested union = %v, want 20s (outer interval only)", s.AttentionUnion)
 	}
@@ -175,7 +175,7 @@ func TestSummarizeUnionAdjacentMergesContiguous(t *testing.T) {
 		tr(2, "b", 10, "", "working", 0),
 		tr(2, "b", 20, "working", "idle", 0),
 	}
-	s := Summarize(BuildSwimlanes(evs, ts(40)))
+	s := Summarize(BuildSwimlanes(evs, ts(40)), evs)
 	if s.AttentionUnion != 20*time.Second {
 		t.Errorf("adjacent union = %v, want 20s (contiguous merge)", s.AttentionUnion)
 	}
@@ -269,11 +269,377 @@ func TestSummarizeUnionMergesParallelSessions(t *testing.T) {
 		tr(2, "b", 5, "", "working", 0),
 		tr(2, "b", 20, "working", "idle", 0),
 	}
-	s := Summarize(BuildSwimlanes(evs, ts(30)))
+	s := Summarize(BuildSwimlanes(evs, ts(30)), evs)
 	if s.AttentionPerSession != 25*time.Second {
 		t.Errorf("per-session = %v, want 25s", s.AttentionPerSession)
 	}
 	if s.AttentionUnion != 20*time.Second {
 		t.Errorf("union = %v, want 20s (overlap counted once)", s.AttentionUnion)
 	}
+}
+
+// --- v2 derive helpers ---------------------------------------------------
+
+func focusEv(sec int, sid string) Event {
+	return Event{Ts: ts(sec), Type: EventFocus, SessionID: sid}
+}
+
+func activityEv(sec int, to string) Event {
+	return Event{Ts: ts(sec), Type: EventActivity, To: to}
+}
+
+func usageEv(pid, sec int, model string, in, out, cr, cc int64) Event {
+	return Event{Ts: ts(sec), Type: EventUsageSample, PID: pid, Model: model,
+		TokIn: in, TokOut: out, TokCacheRead: cr, TokCacheCreate: cc}
+}
+
+// --- A1 labels -----------------------------------------------------------
+
+func TestBuildSwimlanesLabelsOverTime(t *testing.T) {
+	evs := []Event{
+		{Ts: ts(0), Type: EventSessionStart, PID: 1, SessionID: "s1"},
+		{Ts: ts(0), Type: EventSessionLabel, PID: 1, Label: "alpha"},
+		{Ts: ts(20), Type: EventSessionLabel, PID: 1, Label: "beta"},
+		{Ts: ts(40), Type: EventSessionEnd, PID: 1, SessionID: "s1"},
+	}
+	lanes := BuildSwimlanes(evs, ts(99))
+	want := []LabelSpan{
+		{Label: "alpha", Start: ts(0), End: ts(20)},
+		{Label: "beta", Start: ts(20), End: ts(40)},
+	}
+	got := lanes[0].Labels
+	if len(got) != len(want) {
+		t.Fatalf("labels = %+v, want %d spans", got, len(want))
+	}
+	for i := range want {
+		if got[i].Label != want[i].Label || !got[i].Start.Equal(want[i].Start) || !got[i].End.Equal(want[i].End) {
+			t.Errorf("label %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestBuildSwimlanesLabelDedupAndOpenCapsAtEnd(t *testing.T) {
+	// A repeated label is ignored (keeps the original start); the final, never-
+	// re-labeled span is capped at the lane end (no session_end).
+	evs := []Event{
+		{Ts: ts(0), Type: EventSessionStart, PID: 1, SessionID: "s1"},
+		{Ts: ts(5), Type: EventSessionLabel, PID: 1, Label: "alpha"},
+		{Ts: ts(10), Type: EventSessionLabel, PID: 1, Label: "alpha"}, // dup — ignored
+	}
+	lanes := BuildSwimlanes(evs, ts(30))
+	got := lanes[0].Labels
+	if len(got) != 1 {
+		t.Fatalf("labels = %+v, want 1 span (dup ignored)", got)
+	}
+	if got[0].Label != "alpha" || !got[0].Start.Equal(ts(5)) || !got[0].End.Equal(ts(30)) {
+		t.Errorf("label span = %+v, want alpha 5-30 (capped at end)", got[0])
+	}
+}
+
+// --- A3 subagents --------------------------------------------------------
+
+func TestBuildSwimlanesSubagentSpansPairAndCap(t *testing.T) {
+	evs := []Event{
+		{Ts: ts(0), Type: EventSessionStart, PID: 1, SessionID: "s1"},
+		{Ts: ts(5), Type: EventSubagentSpawn, PID: 1, ToolUseID: "t1", AgentType: "Explore", Description: "search"},
+		{Ts: ts(10), Type: EventSubagentSpawn, PID: 1, ToolUseID: "t2", AgentType: "general-purpose"},
+		{Ts: ts(20), Type: EventSubagentStop, PID: 1, ToolUseID: "t1"},
+		{Ts: ts(30), Type: EventSessionEnd, PID: 1, SessionID: "s1"}, // t2 still open → capped at 30
+	}
+	lanes := BuildSwimlanes(evs, ts(99))
+	got := lanes[0].Subagents
+	want := []SubagentSpan{
+		{AgentType: "Explore", ToolUseID: "t1", Description: "search", Start: ts(5), End: ts(20)},
+		{AgentType: "general-purpose", ToolUseID: "t2", Start: ts(10), End: ts(30)},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("subagents = %+v, want %d (sorted by start)", got, len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("subagent %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestBuildSwimlanesSubagentUnpairedStopDropped(t *testing.T) {
+	// A stop whose tool_use_id was never spawned (spawn before the window) pairs
+	// with nothing and is dropped rather than fabricating a span.
+	evs := []Event{
+		{Ts: ts(0), Type: EventSessionStart, PID: 1, SessionID: "s1"},
+		{Ts: ts(10), Type: EventSubagentStop, PID: 1, ToolUseID: "orphan"},
+		{Ts: ts(20), Type: EventSessionEnd, PID: 1, SessionID: "s1"},
+	}
+	lanes := BuildSwimlanes(evs, ts(99))
+	if len(lanes[0].Subagents) != 0 {
+		t.Errorf("orphan stop should yield no spans, got %+v", lanes[0].Subagents)
+	}
+}
+
+// --- A2 per-lane cost + tokens ------------------------------------------
+
+func TestBuildSwimlanesPerLaneCostAndTokens(t *testing.T) {
+	// opus input 5/MTok: 400k → $2.00; sonnet output 15/MTok: 200k → $3.00.
+	evs := []Event{
+		{Ts: ts(0), Type: EventSessionStart, PID: 1, SessionID: "s1"},
+		usageEv(1, 5, "claude-opus-4-8", 400_000, 0, 0, 0),
+		usageEv(1, 10, "claude-sonnet-4-6", 0, 200_000, 0, 0),
+		{Ts: ts(20), Type: EventSessionEnd, PID: 1, SessionID: "s1"},
+	}
+	lane := BuildSwimlanes(evs, ts(99))[0]
+	if lane.TokIn != 400_000 || lane.TokOut != 200_000 {
+		t.Errorf("per-lane tokens = in %d out %d, want 400000/200000", lane.TokIn, lane.TokOut)
+	}
+	if lane.TokCacheRead != 0 || lane.TokCacheCreate != 0 {
+		t.Errorf("per-lane cache tokens = %d/%d, want 0/0", lane.TokCacheRead, lane.TokCacheCreate)
+	}
+	if !approx(lane.CostUSD, 5.0) {
+		t.Errorf("per-lane cost = $%.4f, want $5.00 (2 opus + 3 sonnet)", lane.CostUSD)
+	}
+}
+
+func TestAggregateTotalsCostUSD(t *testing.T) {
+	evs := []Event{
+		usageEv(1, 5, "claude-opus-4-8", 1_000_000, 0, 0, 0), // input 5/MTok → $5.00
+		usageEv(1, 6, "unknown-model", 9_999_999, 0, 0, 0),   // unpriced → $0
+	}
+	tot := AggregateTotals(evs)
+	if !approx(tot.CostUSD, 5.0) {
+		t.Errorf("totals cost = $%.4f, want $5.00 (unknown model contributes nothing)", tot.CostUSD)
+	}
+}
+
+// --- A4 plan window ------------------------------------------------------
+
+func TestAggregatePlanWindow(t *testing.T) {
+	from, to := ts(0), ts(0).Add(5*time.Hour)
+	evs := []Event{
+		usageEv(1, 5, "claude-opus-4-8", 1_000_000, 0, 200_000, 0), // $5 input + $0.10 cacheRead
+		{Ts: ts(6), Type: EventTransition, To: "working"},          // not a usage_sample → ignored
+	}
+	pw := AggregatePlanWindow(evs, from, to)
+	if pw.Hours != 5 {
+		t.Errorf("hours = %v, want 5", pw.Hours)
+	}
+	if !pw.From.Equal(from) || !pw.To.Equal(to) {
+		t.Errorf("bounds = %v..%v, want %v..%v", pw.From, pw.To, from, to)
+	}
+	if pw.TokIn != 1_000_000 || pw.TokCacheRead != 200_000 {
+		t.Errorf("tokens = in %d cacheRead %d, want 1000000/200000", pw.TokIn, pw.TokCacheRead)
+	}
+	if !approx(pw.CostUSD, 5.10) { // 5.00 input + 0.10 cacheRead (0.5/MTok × 0.2M)
+		t.Errorf("plan-window cost = $%.4f, want $5.10", pw.CostUSD)
+	}
+}
+
+// --- C1 focus intervals --------------------------------------------------
+
+func TestBuildSwimlanesFocusSpansPerSession(t *testing.T) {
+	// Focus toggles s1 → s2 → s1 → none. Each lane gets only its own spans.
+	evs := []Event{
+		{Ts: ts(0), Type: EventSessionStart, PID: 1, SessionID: "s1"},
+		{Ts: ts(0), Type: EventSessionStart, PID: 2, SessionID: "s2"},
+		focusEv(5, "s1"),
+		focusEv(15, "s2"),
+		focusEv(25, "s1"),
+		focusEv(35, ""), // focus left all agents — closes s1's span, opens nothing
+	}
+	lanes := BuildSwimlanes(evs, ts(50))
+	byID := map[string]Swimlane{}
+	for _, l := range lanes {
+		byID[l.SessionID] = l
+	}
+	wantS1 := []FocusSpan{{Start: ts(5), End: ts(15)}, {Start: ts(25), End: ts(35)}}
+	wantS2 := []FocusSpan{{Start: ts(15), End: ts(25)}}
+	if !equalFocus(byID["s1"].Focus, wantS1) {
+		t.Errorf("s1 focus = %+v, want %+v", byID["s1"].Focus, wantS1)
+	}
+	if !equalFocus(byID["s2"].Focus, wantS2) {
+		t.Errorf("s2 focus = %+v, want %+v", byID["s2"].Focus, wantS2)
+	}
+}
+
+func TestBuildSwimlanesFocusOpenSpanCapsAtLaneEnd(t *testing.T) {
+	// Focus never leaves s1; its span caps at the lane's end (session_end).
+	evs := []Event{
+		{Ts: ts(0), Type: EventSessionStart, PID: 1, SessionID: "s1"},
+		focusEv(5, "s1"),
+		{Ts: ts(40), Type: EventSessionEnd, PID: 1, SessionID: "s1"},
+	}
+	lanes := BuildSwimlanes(evs, ts(99))
+	want := []FocusSpan{{Start: ts(5), End: ts(40)}}
+	if !equalFocus(lanes[0].Focus, want) {
+		t.Errorf("focus = %+v, want %+v (capped at lane end 40, not stream end 99)", lanes[0].Focus, want)
+	}
+}
+
+// --- C3 delegation metrics ----------------------------------------------
+
+func TestSummarizeDelegationMetrics(t *testing.T) {
+	// One session working 0-60 (then idle to 80). Focus on s1 over [10,30] and
+	// [50,70]. User active over [0,20] and [40,75] (presumed active at start,
+	// idle@20, active@40, idle@75).
+	evs := []Event{
+		{Ts: ts(0), Type: EventSessionStart, PID: 1, SessionID: "s1"},
+		tr(1, "s1", 0, "", "working", 0),
+		tr(1, "s1", 60, "working", "idle", 0),
+		{Ts: ts(80), Type: EventSessionEnd, PID: 1, SessionID: "s1"},
+		focusEv(10, "s1"), focusEv(30, ""), focusEv(50, "s1"), focusEv(70, ""),
+		activityEv(20, "idle"), activityEv(40, "active"), activityEv(75, "idle"),
+	}
+	lanes := BuildSwimlanes(evs, ts(99))
+	s := Summarize(lanes, evs)
+
+	// attendedMask = focus ∧ active = [10,20] ∪ [50,70].
+	// attended = agent-active(0-60) ∧ attendedMask = [10,20] ∪ [50,60] = 20s.
+	if s.AttendedActive != 20*time.Second {
+		t.Errorf("attended = %v, want 20s", s.AttendedActive)
+	}
+	// delegated = agent-active − attendedMask = [0,10] ∪ [20,50] ∪ [60,?]… = 40s.
+	if s.DelegatedActive != 40*time.Second {
+		t.Errorf("delegated = %v, want 40s", s.DelegatedActive)
+	}
+	// prompt = focus ∧ active = [10,20] ∪ [50,70] = 30s (includes [60,70] when the
+	// agent was idle — at the prompt but not attending live work).
+	if s.PromptActive != 30*time.Second {
+		t.Errorf("prompt = %v, want 30s", s.PromptActive)
+	}
+	// effectiveness = 40 / (40+20) = 0.6667.
+	if !approx(s.DelegationEffectiveness, 40.0/60.0) {
+		t.Errorf("effectiveness = %v, want 0.6667", s.DelegationEffectiveness)
+	}
+	// Invariant: delegated + attended == per-session agent-active.
+	if s.DelegatedActive+s.AttendedActive != s.AttentionPerSession {
+		t.Errorf("delegated+attended (%v) != attention-B (%v)", s.DelegatedActive+s.AttendedActive, s.AttentionPerSession)
+	}
+}
+
+func TestSummarizeDelegationDegradesWithoutFocusOrActivity(t *testing.T) {
+	// No focus, no activity events: all agent-active time reads as delegated,
+	// effectiveness is 1, and there is no divide-by-zero.
+	evs := []Event{
+		{Ts: ts(0), Type: EventSessionStart, PID: 1, SessionID: "s1"},
+		tr(1, "s1", 0, "", "working", 0),
+		tr(1, "s1", 30, "working", "idle", 0),
+		{Ts: ts(40), Type: EventSessionEnd, PID: 1, SessionID: "s1"},
+	}
+	s := Summarize(BuildSwimlanes(evs, ts(99)), evs)
+	if s.DelegatedActive != 30*time.Second {
+		t.Errorf("delegated = %v, want 30s (all active, no attendance signal)", s.DelegatedActive)
+	}
+	if s.AttendedActive != 0 || s.PromptActive != 0 {
+		t.Errorf("attended/prompt = %v/%v, want 0/0", s.AttendedActive, s.PromptActive)
+	}
+	if !approx(s.DelegationEffectiveness, 1.0) {
+		t.Errorf("effectiveness = %v, want 1.0", s.DelegationEffectiveness)
+	}
+}
+
+func TestSummarizeDelegationNoActiveNoDivideByZero(t *testing.T) {
+	// A session that is never agent-active: denominator is zero → effectiveness 0.
+	evs := []Event{
+		{Ts: ts(0), Type: EventSessionStart, PID: 1, SessionID: "s1"},
+		tr(1, "s1", 0, "", "idle", 0),
+		{Ts: ts(40), Type: EventSessionEnd, PID: 1, SessionID: "s1"},
+		focusEv(5, "s1"), activityEv(10, "idle"),
+	}
+	s := Summarize(BuildSwimlanes(evs, ts(99)), evs)
+	if s.DelegatedActive != 0 || s.AttendedActive != 0 {
+		t.Errorf("no agent-active → delegated/attended = %v/%v, want 0/0", s.DelegatedActive, s.AttendedActive)
+	}
+	if s.DelegationEffectiveness != 0 {
+		t.Errorf("effectiveness = %v, want 0 (no active time, no divide by zero)", s.DelegationEffectiveness)
+	}
+}
+
+// --- interval algebra ----------------------------------------------------
+
+func TestIntersectSpans(t *testing.T) {
+	a := []span{{ts(0), ts(10)}, {ts(20), ts(30)}}
+	b := []span{{ts(5), ts(25)}}
+	got := totalDur(intersectSpans(a, b))
+	// [0,10]∩[5,25]=[5,10] (5s); [20,30]∩[5,25]=[20,25] (5s) → 10s.
+	if got != 10*time.Second {
+		t.Errorf("intersect total = %v, want 10s", got)
+	}
+}
+
+func TestSubtractSpans(t *testing.T) {
+	a := []span{{ts(0), ts(30)}}
+	b := []span{{ts(5), ts(10)}, {ts(20), ts(25)}}
+	got := subtractSpans(a, b)
+	want := []span{{ts(0), ts(5)}, {ts(10), ts(20)}, {ts(25), ts(30)}}
+	if len(got) != len(want) {
+		t.Fatalf("subtract = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if !got[i].start.Equal(want[i].start) || !got[i].end.Equal(want[i].end) {
+			t.Errorf("subtract[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+	if totalDur(got) != 20*time.Second { // 5 + 10 + 5
+		t.Errorf("subtract total = %v, want 20s", totalDur(got))
+	}
+}
+
+func TestUserActiveSpansPresumesActiveAtStart(t *testing.T) {
+	// First event is idle@20 → presumed active [0,20]; resume active@40 → idle
+	// [20,40]; trailing active [40,60].
+	evs := []Event{activityEv(20, "idle"), activityEv(40, "active")}
+	got := userActiveSpans(evs, ts(0), ts(60))
+	want := []span{{ts(0), ts(20)}, {ts(40), ts(60)}}
+	if len(got) != len(want) {
+		t.Fatalf("active spans = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if !got[i].start.Equal(want[i].start) || !got[i].end.Equal(want[i].end) {
+			t.Errorf("active[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+	if userActiveSpans(nil, ts(0), ts(60)) != nil {
+		t.Errorf("no activity events should yield nil (no idle signal)")
+	}
+}
+
+func TestActivityTimelineAlternatesBothStates(t *testing.T) {
+	// Same stream as the active-only test, but the top-level timeline keeps BOTH
+	// states: presumed active [0,20], idle [20,40], active [40,60].
+	evs := []Event{activityEv(20, "idle"), activityEv(40, "active")}
+	got := ActivityTimeline(evs, ts(0), ts(60))
+	want := []ActivitySpan{
+		{State: "active", Start: ts(0), End: ts(20)},
+		{State: "idle", Start: ts(20), End: ts(40)},
+		{State: "active", Start: ts(40), End: ts(60)},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("activity spans = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i].State != want[i].State || !got[i].Start.Equal(want[i].Start) || !got[i].End.Equal(want[i].End) {
+			t.Errorf("activity[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+	if ActivityTimeline(nil, ts(0), ts(60)) != nil {
+		t.Errorf("no activity events should yield a nil timeline (omitted from JSON)")
+	}
+}
+
+func approx(a, b float64) bool {
+	d := a - b
+	if d < 0 {
+		d = -d
+	}
+	return d < 1e-9
+}
+
+func equalFocus(got, want []FocusSpan) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range want {
+		if !got[i].Start.Equal(want[i].Start) || !got[i].End.Equal(want[i].End) {
+			return false
+		}
+	}
+	return true
 }
