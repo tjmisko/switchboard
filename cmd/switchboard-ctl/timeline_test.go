@@ -1,6 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -55,8 +59,8 @@ func TestHumanCount(t *testing.T) {
 		want string
 	}{
 		{0, "0"},
-		{999, "999"},        // boundary: just under 1k stays a plain count
-		{1000, "1.0k"},      // boundary: 1k switches to k
+		{999, "999"},   // boundary: just under 1k stays a plain count
+		{1000, "1.0k"}, // boundary: 1k switches to k
 		{1500, "1.5k"},
 		{999999, "1000.0k"}, // just under 1M still renders in k
 		{1000000, "1.0M"},   // boundary: 1M switches to M
@@ -121,5 +125,100 @@ func TestRenderBarPlainUsesStatusInitials(t *testing.T) {
 	// First half working (w), second half permission (p).
 	if !strings.HasPrefix(bar, "ww") || !strings.HasSuffix(bar, "pp") {
 		t.Errorf("plain bar = %q, want ww..pp", bar)
+	}
+}
+
+// captureStdout runs fn with os.Stdout redirected to a pipe and returns what it
+// wrote (cmdTimeline writes the JSON envelope straight to os.Stdout).
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	done := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, r)
+		done <- buf.String()
+	}()
+	fn()
+	_ = w.Close()
+	os.Stdout = orig
+	return <-done
+}
+
+// writeDay writes events as one-JSON-per-line into the day-file dir/day.jsonl.
+func writeDay(t *testing.T, dir, day string, evs ...history.Event) {
+	t.Helper()
+	var b bytes.Buffer
+	for _, ev := range evs {
+		line, err := json.Marshal(ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b.Write(line)
+		b.WriteByte('\n')
+	}
+	if err := os.WriteFile(history.DayPath(dir, day), b.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTimelineJSONPlanWindowFlag(t *testing.T) {
+	dir := t.TempDir()
+	// A recent usage_sample lands in both today's display window and the rolling
+	// 5h plan window. opus input 1M tokens → $5.00.
+	t0 := time.Now().UTC().Add(-time.Minute)
+	day := t0.Format("2006-01-02")
+	writeDay(t, dir, day, history.Event{
+		Ts: t0, Type: history.EventUsageSample, PID: 1, SessionID: "s1",
+		Model: "claude-opus-4-8", TokIn: 1_000_000,
+	})
+
+	out := captureStdout(t, func() {
+		cmdTimeline([]string{"--dir", dir, "--day", day, "--json", "--plan-window"})
+	})
+
+	var env struct {
+		Lanes      []history.Swimlane  `json:"lanes"`
+		Totals     history.Totals      `json:"totals"`
+		PlanWindow *history.PlanWindow `json:"plan_window"`
+	}
+	if err := json.Unmarshal([]byte(out), &env); err != nil {
+		t.Fatalf("unmarshal envelope: %v\n%s", err, out)
+	}
+	if env.PlanWindow == nil {
+		t.Fatalf("plan_window absent with --plan-window:\n%s", out)
+	}
+	if env.PlanWindow.Hours != planWindowHours {
+		t.Errorf("plan_window.hours = %v, want %d", env.PlanWindow.Hours, planWindowHours)
+	}
+	if env.PlanWindow.CostUSD < 4.99 || env.PlanWindow.CostUSD > 5.01 {
+		t.Errorf("plan_window.cost_usd = %v, want ~5.00", env.PlanWindow.CostUSD)
+	}
+	if env.Totals.CostUSD < 4.99 || env.Totals.CostUSD > 5.01 {
+		t.Errorf("totals.cost_usd = %v, want ~5.00", env.Totals.CostUSD)
+	}
+	if len(env.Lanes) != 1 || env.Lanes[0].CostUSD < 4.99 {
+		t.Errorf("lane cost_usd not carried: %+v", env.Lanes)
+	}
+}
+
+func TestTimelineJSONPlanWindowOmittedByDefault(t *testing.T) {
+	dir := t.TempDir()
+	t0 := time.Now().UTC().Add(-time.Minute)
+	day := t0.Format("2006-01-02")
+	writeDay(t, dir, day, history.Event{
+		Ts: t0, Type: history.EventSessionStart, PID: 1, SessionID: "s1",
+	})
+
+	out := captureStdout(t, func() {
+		cmdTimeline([]string{"--dir", dir, "--day", day, "--json"})
+	})
+	if strings.Contains(out, "plan_window") {
+		t.Errorf("plan_window should be omitted without the flag:\n%s", out)
 	}
 }
