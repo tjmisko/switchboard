@@ -55,6 +55,10 @@ func cmdTimeline(args []string) {
 	lanes := history.BuildSwimlanes(events, end)
 	summary := history.Summarize(lanes, events)
 	totals := history.AggregateTotals(events)
+	// The global user-activity timeline (idle/active), bounded to the lanes' span,
+	// is surfaced top-level for the dashboard's idle-dim + focus∧active overlay.
+	// nil (no activity events) marshals away under omitempty.
+	activity := history.ActivityTimeline(events, summary.From, summary.To)
 
 	// The plan window is a separate rolling [now-5h, now] read (independent of the
 	// display window), priced by the producer (A4).
@@ -73,12 +77,13 @@ func cmdTimeline(args []string) {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(struct {
-			Window     string              `json:"window"`
-			Lanes      []history.Swimlane  `json:"lanes"`
-			Summary    history.Summary     `json:"summary"`
-			Totals     history.Totals      `json:"totals"`
-			PlanWindow *history.PlanWindow `json:"plan_window,omitempty"`
-		}{label, lanes, summary, totals, planWin})
+			Window     string                 `json:"window"`
+			Lanes      []history.Swimlane     `json:"lanes"`
+			Summary    history.Summary        `json:"summary"`
+			Totals     history.Totals         `json:"totals"`
+			Activity   []history.ActivitySpan `json:"activity,omitempty"`
+			PlanWindow *history.PlanWindow    `json:"plan_window,omitempty"`
+		}{label, lanes, summary, totals, activity, planWin})
 		return
 	}
 	renderSwimlanes(os.Stdout, label, lanes, summary, totals, *width, !*noColor && isTTY(os.Stdout))

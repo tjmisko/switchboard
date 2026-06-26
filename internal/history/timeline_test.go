@@ -601,6 +601,29 @@ func TestUserActiveSpansPresumesActiveAtStart(t *testing.T) {
 	}
 }
 
+func TestActivityTimelineAlternatesBothStates(t *testing.T) {
+	// Same stream as the active-only test, but the top-level timeline keeps BOTH
+	// states: presumed active [0,20], idle [20,40], active [40,60].
+	evs := []Event{activityEv(20, "idle"), activityEv(40, "active")}
+	got := ActivityTimeline(evs, ts(0), ts(60))
+	want := []ActivitySpan{
+		{State: "active", Start: ts(0), End: ts(20)},
+		{State: "idle", Start: ts(20), End: ts(40)},
+		{State: "active", Start: ts(40), End: ts(60)},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("activity spans = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i].State != want[i].State || !got[i].Start.Equal(want[i].Start) || !got[i].End.Equal(want[i].End) {
+			t.Errorf("activity[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+	if ActivityTimeline(nil, ts(0), ts(60)) != nil {
+		t.Errorf("no activity events should yield a nil timeline (omitted from JSON)")
+	}
+}
+
 func approx(a, b float64) bool {
 	d := a - b
 	if d < 0 {

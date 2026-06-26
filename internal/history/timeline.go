@@ -590,6 +590,62 @@ func userActiveSpans(events []Event, from, to time.Time) []span {
 	return mergeSpans(out)
 }
 
+// ActivitySpan is one stretch of the global user-activity timeline: the user was
+// State ("active" or "idle") for [Start, End]. Successive spans alternate state
+// and tile [from, to] whenever the activity stream has any event. It is the
+// public, top-level view of the same idle/active signal the delegation metrics
+// consume internally (userActiveSpans) — the dashboard dims the idle stretches
+// and outlines focus∧active from it. (C2.)
+type ActivitySpan struct {
+	State string    `json:"state"` // "active" | "idle"
+	Start time.Time `json:"start"`
+	End   time.Time `json:"end"`
+}
+
+// ActivityTimeline derives the alternating global activity spans — BOTH "active"
+// and "idle", unlike userActiveSpans which keeps only the active ones — from the
+// activity stream (EventActivity, To ∈ {"idle","active"}), tiling [from, to]. The
+// user is presumed active at the window start (an idle daemon emits "idle" on
+// timeout and "active" on resume, so the first event is normally a move away from
+// active). With no activity events it returns nil — there is no idle signal to
+// surface, and the dashboard overlay degrades to focus-only.
+func ActivityTimeline(events []Event, from, to time.Time) []ActivitySpan {
+	var acts []Event
+	for _, ev := range events {
+		if ev.Type != EventActivity {
+			continue
+		}
+		if ev.To != activityIdle && ev.To != activityActive {
+			continue // ignore malformed states
+		}
+		acts = append(acts, ev)
+	}
+	if len(acts) == 0 {
+		return nil
+	}
+	sort.SliceStable(acts, func(i, j int) bool { return acts[i].Ts.Before(acts[j].Ts) })
+	var out []ActivitySpan
+	state := activityActive
+	start := from
+	emit := func(t time.Time) {
+		if !start.IsZero() && t.After(start) {
+			out = append(out, ActivitySpan{State: state, Start: start, End: t})
+		}
+	}
+	for _, ev := range acts {
+		if ev.To == state {
+			continue // no real change in activity state
+		}
+		emit(ev.Ts)
+		state = ev.To
+		start = ev.Ts
+	}
+	if !to.IsZero() {
+		emit(to)
+	}
+	return out
+}
+
 // mergeSpans returns the disjoint, sorted union of the input spans (overlapping
 // or adjacent spans coalesced). Empty/backwards spans are dropped.
 func mergeSpans(in []span) []span {

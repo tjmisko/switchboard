@@ -183,9 +183,59 @@ definitions (all reported) are:
   compute directed, counting teammates (approximate; subagents sampled at each
   opening transition).
 
-`--json` emits `{window, lanes, summary, totals}` — the stable contract a GUI
-dashboard would consume. Durations in the JSON are **nanoseconds** (Go
-`time.Duration`); token fields are raw counts.
+### `--json` contract (v2)
+
+`--json` emits the stable envelope a GUI dashboard consumes. **Durations are
+nanoseconds** (Go `time.Duration`), token counts are raw, and `cost_usd` /
+`delegation_effectiveness` are floats. Every v2 field is `omitempty` — purely
+additive to the original `{window, lanes, summary, totals}`:
+
+```jsonc
+{
+  "window": "2026-06-26",
+  "lanes": [{
+    "session_id": "…", "pid": 4821, "agent": "claude", "project": "sb",
+    "start": "…", "end": "…",
+    "intervals": [{ "status": "working", "start": "…", "end": "…", "subagents": 0 }],
+    "labels":    [{ "label": "sb-invest", "start": "…", "end": "…" }],       // name over time (A1)
+    "subagents": [{ "agent_type": "Explore", "tool_use_id": "…",
+                    "description": "…", "start": "…", "end": "…" }],         // launched subagents (A3)
+    "focus":     [{ "start": "…", "end": "…" }],                            // this session held OS focus (C1)
+    "cost_usd": 10.5, "tok_in": 2000000, "tok_out": 100000,                 // per-lane usage + recomputed cost (A2)
+    "tok_cache_read": 0, "tok_cache_create": 0
+  }],
+  "summary": {
+    "from": "…", "to": "…", "sessions": 1,
+    "by_status": { "working": 600000000000 },
+    "attention_union": 0, "attention_per_session": 0, "attention_fanout": 0,
+    "prompt_active": 240000000000,     // focused-on-an-agent ∧ user-active
+    "attended_active": 240000000000,   // agent-active ∧ (focused ∧ user-active) — supervising
+    "delegated_active": 360000000000,  // agent-active ∧ ¬(focused ∧ user-active) — true delegation
+    "delegation_effectiveness": 0.6    // delegated / (delegated + attended), in [0,1]
+  },
+  "totals": { "tok_in": 2000000, "tok_out": 100000, "tok_cache_read": 0,
+              "tok_cache_create": 0, "subagents": 1, "cost_usd": 10.5 },
+  "activity": [{ "state": "active", "start": "…", "end": "…" },             // global idle/active timeline (C2)
+               { "state": "idle",   "start": "…", "end": "…" }],
+  "plan_window": { "hours": 5, "from": "…", "to": "…", "cost_usd": 10.5,    // only with --plan-window (A4)
+                   "tok_in": 0, "tok_out": 0, "tok_cache_read": 0, "tok_cache_create": 0 }
+}
+```
+
+**Delegation (C3)** splits agent-active time by whether you were *attending* it —
+focused on that session while active at the keyboard. It needs the `focus` stream
+(Hyprland) **and** the `activity` stream (an idle daemon, e.g. hypridle); with
+neither, all agent-active time reads as delegated and effectiveness is 1 (or 0
+when there is no agent-active time — never a divide by zero).
+
+**`activity[]`** is the top-level global idle/active timeline (both states,
+alternating, tiling the window), surfaced for the dashboard's idle-dimming and
+focus∧active overlay. Absent when there are no `activity` events in range.
+
+**`plan_window`** (only with `--plan-window`) is a rolling `[now-5h, now]`
+cost/token total — the self-computed dollar half of the dashboard's plan gauge;
+the official utilization **%** comes from a separate cached file the dashboard
+reads, never from this producer.
 
 ## Inspecting / managing it
 
