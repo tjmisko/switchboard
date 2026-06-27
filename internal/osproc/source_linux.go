@@ -54,8 +54,16 @@ func (s *linuxSource) Read(pid int) (Info, error) {
 	return fromProc(info), err
 }
 
+// AllPIDs lists the visible pids cheaply — one getdents over /proc, with no
+// per-pid exe/cwd/tty reads. It is the fast-path the discovery scanner uses
+// (via an optional-interface upgrade) to Read only pids it has not seen before,
+// preserving the "enumerate cheaply, Read the unseen" hot path. It is NOT part
+// of the neutral Source contract; a Source that omits it is driven from
+// Enumerate instead.
+func (s *linuxSource) AllPIDs() ([]int, error) { return proc.AllPIDs() }
+
 func fromProc(p proc.Info) Info {
-	return Info{PID: p.PID, PPID: p.PPID, Comm: p.Comm, Exe: p.Exe, CWD: p.CWD, TTY: p.TTY}
+	return Info{PID: p.PID, PPID: p.PPID, Comm: p.Comm, Exe: p.Exe, CWD: p.CWD, TTY: p.TTY, Args: p.Args}
 }
 
 // Watch starts polling pid's pidfd. onDeath is called exactly once, from a

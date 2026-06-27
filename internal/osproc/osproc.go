@@ -17,7 +17,10 @@ import (
 
 // Info is the neutral process record. TTY is an opaque join key whose literal
 // form is OS-specific (/dev/pts/N on Linux, /dev/ttysNNN on macOS); consumers
-// treat it as a join key, never parse the prefix.
+// treat it as a join key, never parse the prefix. Args is the full argv (argv[0]
+// is the program path), used by discovery to tell an interactive agent session
+// apart from a background subcommand (e.g. `claude daemon run`); it is nil when
+// the kernel masks it (zombies, kernel threads).
 type Info struct {
 	PID  int
 	PPID int
@@ -25,6 +28,7 @@ type Info struct {
 	Exe  string
 	CWD  string
 	TTY  string
+	Args []string
 }
 
 // ErrGone means the process disappeared between enumeration and read (the most

@@ -1,6 +1,6 @@
 // Package mapping resolves a claude PID into a fully-decorated Session record
-// by combining /proc (cwd, tty), the terminal locator (pane/window IDs), and
-// the window manager (address, workspace).
+// by combining the OS process snapshot (cwd, tty), the terminal locator
+// (pane/window IDs), and the window manager (address, workspace).
 //
 // The match keys are:
 //   - claude.tty == terminal pane tty   (kernel-controlled, bulletproof)
@@ -13,7 +13,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/tjmisko/switchboard/internal/proc"
+	"github.com/tjmisko/switchboard/internal/osproc"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/terminal"
 	"github.com/tjmisko/switchboard/internal/wm"
@@ -34,7 +34,7 @@ func NewResolver(term terminal.Locator, manager wm.Manager) *Resolver {
 // Resolve maps the given claude process to a Session, filling in terminal and
 // WM metadata as far as it can. Missing data is left nil — the caller can retry
 // on the next reconcile tick.
-func (r *Resolver) Resolve(ctx context.Context, info proc.Info) state.Session {
+func (r *Resolver) Resolve(ctx context.Context, info osproc.Info) state.Session {
 	sess := state.Session{
 		PID:       info.PID,
 		CWD:       info.CWD,

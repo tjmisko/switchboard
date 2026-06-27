@@ -19,6 +19,7 @@ import (
 	"github.com/tjmisko/switchboard/internal/discovery"
 	"github.com/tjmisko/switchboard/internal/history"
 	"github.com/tjmisko/switchboard/internal/mapping"
+	"github.com/tjmisko/switchboard/internal/osproc"
 	"github.com/tjmisko/switchboard/internal/proc"
 	"github.com/tjmisko/switchboard/internal/projectname"
 	"github.com/tjmisko/switchboard/internal/rpc"
@@ -71,15 +72,17 @@ func main() {
 	if err := store.Load(); err != nil {
 		log.Printf("hydrate: %v (continuing)", err)
 	}
-	dropStaleSessions(store)
-
 	procSrc := stack.OSProc
 	term := stack.Terminal
 	manager := stack.WM
-	scanner := discovery.New()
+	// Stale-drop reads through the same osproc.Source the scanner and death-watch
+	// use, so there is exactly one process-reading backend. Runs before the live
+	// scan starts; the scanner re-adds survivors on the first tick.
+	dropStaleSessions(store, procSrc)
+	scanner := discovery.New(procSrc)
 	resolver := mapping.NewResolver(term, manager)
 
-	onAgentAppeared := func(info proc.Info) {
+	onAgentAppeared := func(info osproc.Info) {
 		kind := discovery.Classify(info)
 		log.Printf("%s pid=%d cwd=%s tty=%s discovered", kind, info.PID, info.CWD, info.TTY)
 		sess := resolver.Resolve(ctx, info)
@@ -129,12 +132,14 @@ func main() {
 
 // dropStaleSessions removes hydrated sessions whose PID is gone or no longer
 // looks like claude. Run once at startup, before any live discovery — the
-// scanner will re-add survivors on the first tick.
-func dropStaleSessions(store *state.Store) {
+// scanner will re-add survivors on the first tick. It reads through the
+// osproc.Source (ErrGone on a missing pid is dropped by the err != nil branch),
+// keeping discovery and stale-drop on a single process-reading backend.
+func dropStaleSessions(store *state.Store, procSrc osproc.Source) {
 	now := time.Now()
 	store.Apply(func(m map[int]*state.Session) {
 		for pid := range m {
-			info, err := proc.Read(pid)
+			info, err := procSrc.Read(pid)
 			if err != nil || discovery.Classify(info) == discovery.AgentNone {
 				delete(m, pid)
 				continue
