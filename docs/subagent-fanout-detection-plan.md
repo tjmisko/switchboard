@@ -206,11 +206,63 @@ Layer 2 makes it real-time; Layer 3 hardens the cross-check.
 - [ ] **T10 — (optional, worktree) Dashboard.** `spawnDepth` nesting +
       background-agent badge in `switchboard-dashboard`.
 
-## Open questions
+## Empirical findings & corrected design (Wave 1, 2026-06-27)
 
-- Exact `SubagentStart`/`SubagentStop` stdin schema (T4 resolves).
-- Is there a reliable per-subagent "done" marker in `agent-<id>.jsonl` (final
-  result entry) or must we lean on mtime quiescence?
-- Background agents: does `SubagentStop` fire for them, or only the
-  task-notification path?
-- `spawnDepth` ≥ 2 — represent grandchildren in the timeline, or flatten?
+Four parallel agents (binary decompile of CC 2.1.195 + 633 real meta.json + 641
+subagent jsonl + adversarial corpus review) corrected three load-bearing
+assumptions above. Authoritative facts now:
+
+- **meta.json is heterogeneous.** Only `agentType` is present in 100% of files;
+  `toolUseId` is **absent in ~36%** (in-process teammates, grandchildren, bare
+  variants); `spawnDepth` absent in ~65%. Fields are camelCase. **The only
+  universal key is the `agent-<id>` filename stem** — which also equals the
+  hook's `agent_id` and the sibling `agent-<id>.jsonl`. ⇒ Key everything by
+  `agent_id`; treat `toolUseId` as a best-effort transcript cross-check only.
+  Add an `AgentID` field to `history.Event` so spans/dedup key on it.
+- **Hooks (binary-verified, 2.1.195).** `SubagentStart` and `SubagentStop` both
+  exist; payloads are snake_case and carry `agent_id`, `agent_type`,
+  `session_id` (parent), `cwd`, and on Stop `agent_transcript_path`. **No
+  `tool_use_id` in the payload** — correlate by `agent_id`. The hook must be a
+  pure **trigger** for a re-scan, never a second writer of the counter (single
+  writer = the Observer). See `[[cc-subagent-hook-schema]]` memory.
+- **Done marker.** Last jsonl line `.message.stop_reason == "end_turn"` ⇒ a
+  subagent's final turn ended. Guard with mtime quiescence (a between-turns
+  `end_turn` is possible) and a hard age cap that force-closes as
+  completion=unknown so inflight can never leak. Absent jsonl ⇒ running.
+- **Background** = parent tool_use `input.run_in_background == true` (only count
+  it for `name` ∈ {Agent,Task}; it also appears on Bash etc.). `SubagentStop`
+  may NOT fire for background agents ⇒ dir/jsonl-quiescence stays authoritative.
+- **spawnDepth semantics (verified on the corpus):** `1` = direct child of main
+  (toolUseId in main transcript 79/81); `2` = grandchild (toolUseId in main
+  transcript **0/8**); absent = mostly direct. ⇒ **Exclude `spawnDepth>=2` from
+  the main thread's inflight/fanout count** (render nested as decoration only);
+  count depth-1/absent. (The earlier "filter to depth 0" idea was backwards.)
+- **The flat `subagents/` dir mixes depths 0/1/2 of one session.** Grandchildren
+  cannot be completion-correlated via the main transcript (their tool_use isn't
+  there) — close them via child-jsonl quiescence/cap only.
+- **Orphans:** ~8 `agent-<id>.jsonl` exist with no sibling meta; metas are NEVER
+  deleted. ⇒ spawn set = {meta files} ∪ {jsonl files} keyed by `agent_id`.
+
+### Hardening the Observer (from the adversarial review)
+
+- **G1 restart/resume double-count (CRITICAL):** metas are immortal and state is
+  pid-keyed, so a restart or `claude --resume` (new pid, same session-id, same
+  dir) would re-emit every historical spawn. ⇒ Key durable state by
+  **session-id**, and on first sight **seed the seen-set by replaying already-
+  emitted `subagent_spawn`/`stop` events for that session-id from the history
+  log** (mirror how `observeUsage` primes its offset to filesize).
+- **G5 cursor reset:** on `/clear`/compaction the file shrinks (`offset>size`);
+  clamp `offset ≤ filesize` and, on shrink, re-derive `seen` from history, not
+  from zero. Idempotency lives in the `agent_id`-keyed seen-set, not the cursor.
+- **G7 race:** a `SubagentStop` trigger can arrive before the meta flushes;
+  buffer a stop for an as-yet-unseen `agent_id` so a meta arriving a tick later
+  doesn't resurrect it. Preserve "spawn+stop in one pass" for rapid lifecycles.
+- **G9 clock skew:** date a dir-discovered spawn from the meta/jsonl mtime (not
+  reconcile-now) and clamp `stop ≥ spawn` so spans aren't dropped as negative.
+- **G10:** deriving the subagents dir as the sibling of `c.Transcript` is robust
+  to worktrees/`/name`/XDG — do not re-derive from cwd or a project slug.
+
+### Resolved open questions
+- Hook stdin schema: resolved (binary). Done marker: resolved (stop_reason +
+  quiescence + cap). Background: parent tool_use input; Stop may not fire → keep
+  jsonl path. spawnDepth≥2: exclude from count, render nested.
