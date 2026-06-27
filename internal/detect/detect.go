@@ -58,7 +58,7 @@ func detectWM(force string) wm.Manager {
 
 // detectWMAuto selects the WM backend by environment precedence:
 //
-//	Hyprland  (HYPRLAND_INSTANCE_SIGNATURE)
+//	Hyprland  ($HYPRLAND_INSTANCE_SIGNATURE, or a live instance on disk)
 //	sway      (SWAYSOCK)
 //	i3        (I3SOCK)
 //	X11/EWMH  (DISPLAY)
@@ -68,10 +68,16 @@ func detectWM(force string) wm.Manager {
 // sway or i3, DISPLAY is also set (XWayland), but the richer native IPC — with
 // pids (sway) and a precise event stream — is preferred. X11/EWMH is the
 // fallback for any other DISPLAY-backed WM.
+//
+// The Hyprland probe asks the backend itself (Available), which discovers a
+// running instance under $XDG_RUNTIME_DIR/hypr even when
+// $HYPRLAND_INSTANCE_SIGNATURE is absent — the daemon may be (re)started by a
+// fresh user manager that never inherited the compositor's environment.
 func detectWMAuto() wm.Manager {
+	if h := wm.NewHyprland(); h.Available() {
+		return h
+	}
 	switch {
-	case os.Getenv("HYPRLAND_INSTANCE_SIGNATURE") != "":
-		return wm.NewHyprland()
 	case os.Getenv("SWAYSOCK") != "":
 		return wm.NewI3()
 	case os.Getenv("I3SOCK") != "":

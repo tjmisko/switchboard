@@ -16,8 +16,11 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // Client is one entry from `hyprctl clients -j`.
@@ -215,13 +218,129 @@ func requestSocketPath() (string, error) { return socketPath(".socket.sock") }
 func socket2Path() (string, error)       { return socketPath(".socket2.sock") }
 
 func socketPath(name string) (string, error) {
-	sig := os.Getenv("HYPRLAND_INSTANCE_SIGNATURE")
-	if sig == "" {
-		return "", errors.New("HYPRLAND_INSTANCE_SIGNATURE not set; not running under Hyprland?")
-	}
 	xdg := os.Getenv("XDG_RUNTIME_DIR")
 	if xdg == "" {
 		return "", errors.New("XDG_RUNTIME_DIR not set")
 	}
+	sig, err := InstanceSignature()
+	if err != nil {
+		return "", err
+	}
 	return filepath.Join(xdg, "hypr", sig, name), nil
+}
+
+// InstanceSignature resolves the Hyprland instance signature used to locate the
+// IPC sockets under $XDG_RUNTIME_DIR/hypr/<sig>/. It prefers
+// $HYPRLAND_INSTANCE_SIGNATURE — the variable Hyprland exports into the session
+// it launches — and falls back to discovering the live instance on disk when the
+// variable is absent.
+//
+// This is a defense-in-depth complement to the systemd unit's ExecStart, which
+// performs the same lock-file discovery before exec'ing the daemon. The Go
+// fallback also covers daemons launched OUTSIDE that wrapper — a developer
+// `go run`, a login shell, or any supervisor that did not inherit the
+// compositor's imported environment after a user-manager (e.g. OOM) restart.
+// Without it the daemon would silently drop to a WM-less degraded mode until the
+// next full login.
+func InstanceSignature() (string, error) {
+	if sig := os.Getenv("HYPRLAND_INSTANCE_SIGNATURE"); sig != "" {
+		return sig, nil
+	}
+	xdg := os.Getenv("XDG_RUNTIME_DIR")
+	if xdg == "" {
+		return "", errors.New("HYPRLAND_INSTANCE_SIGNATURE and XDG_RUNTIME_DIR both unset; not running under Hyprland?")
+	}
+	return discoverInstance(filepath.Join(xdg, "hypr"))
+}
+
+// discoverInstance returns the name of the live Hyprland instance directory
+// under hyprDir, applying the same liveness test the systemd unit's ExecStart
+// uses: each $XDG_RUNTIME_DIR/hypr/<sig>/hyprland.lock holds the running
+// compositor's PID on line 1, and the live session is the one whose PID is still
+// present (checked with unix.Kill(pid, 0), the portable equivalent of the unit's
+// `[ -e /proc/<pid> ]`). Stale dirs from prior sessions linger until reboot, so a
+// bare directory listing is ambiguous; the PID check disambiguates.
+//
+// Tie-breaking, in order:
+//  1. a dir whose lock names a live PID wins (the current session);
+//  2. if more than one is live (should not happen), the most recently modified
+//     .socket.sock wins;
+//  3. if no lock names a live PID (e.g. an older Hyprland that writes no lock),
+//     fall back to the newest .socket.sock as a last resort.
+func discoverInstance(hyprDir string) (string, error) {
+	entries, err := os.ReadDir(hyprDir)
+	if err != nil {
+		return "", fmt.Errorf("discover Hyprland instance: %w", err)
+	}
+	var (
+		liveBest    string
+		liveBestMod time.Time
+		liveFound   bool
+		sockBest    string
+		sockBestMod time.Time
+		sockFound   bool
+	)
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		dir := filepath.Join(hyprDir, e.Name())
+		sockMod, hasSock := socketModTime(filepath.Join(dir, ".socket.sock"))
+		if hasSock && (!sockFound || sockMod.After(sockBestMod)) {
+			sockBest, sockBestMod, sockFound = e.Name(), sockMod, true
+		}
+		if pid, ok := lockPID(filepath.Join(dir, "hyprland.lock")); ok && pidAlive(pid) {
+			if !liveFound || sockMod.After(liveBestMod) {
+				liveBest, liveBestMod, liveFound = e.Name(), sockMod, true
+			}
+		}
+	}
+	switch {
+	case liveFound:
+		return liveBest, nil
+	case sockFound:
+		return sockBest, nil
+	default:
+		return "", fmt.Errorf("no live Hyprland instance under %s", hyprDir)
+	}
+}
+
+// lockPID parses the compositor PID from the first line of a hyprland.lock file,
+// matching the unit's `read -r p _ < hyprland.lock`: the PID is the first
+// whitespace-delimited token of line 1.
+func lockPID(lockPath string) (int, bool) {
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
+		return 0, false
+	}
+	firstLine, _, _ := strings.Cut(string(data), "\n")
+	fields := strings.Fields(firstLine)
+	if len(fields) == 0 {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(fields[0])
+	if err != nil || pid <= 0 {
+		return 0, false
+	}
+	return pid, true
+}
+
+// pidAlive reports whether a process with pid exists, the portable analogue of
+// the unit's `[ -e /proc/<pid> ]`. Signal 0 performs no delivery, only the
+// existence/permission check; EPERM means the process exists but is owned by
+// another user (still alive).
+func pidAlive(pid int) bool {
+	err := unix.Kill(pid, 0)
+	return err == nil || err == unix.EPERM
+}
+
+// socketModTime returns the modification time of the request socket at path and
+// whether it exists. It is used only to break ties between live instances and as
+// the last-resort selector when no lock names a live PID.
+func socketModTime(path string) (time.Time, bool) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return fi.ModTime(), true
 }
