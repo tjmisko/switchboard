@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/fanout"
 	"github.com/tjmisko/switchboard/internal/history"
 	"github.com/tjmisko/switchboard/internal/state"
-	"github.com/tjmisko/switchboard/internal/statustune"
 )
 
 func readEvents(t *testing.T, dir string) []history.Event {
@@ -56,82 +56,9 @@ func writeLines(t *testing.T, path string, lines ...string) {
 	}
 }
 
-func taskUse(id, agentType, desc string) string {
-	return `{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"` + id +
-		`","name":"Task","input":{"subagent_type":"` + agentType + `","description":"` + desc + `"}}]}}`
-}
-
-func taskResult(id string) string {
-	return `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"` + id + `"}]}}`
-}
-
-func TestObserveFanoutSpawnThenStop(t *testing.T) {
-	dir := t.TempDir()
-	tpath := filepath.Join(dir, "t.jsonl")
-	writeLines(t, tpath, taskUse("toolu_a", "Explore", "map the auth code"))
-
-	histDir := t.TempDir()
-	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
-	rs := newReconcileState()
-	sess := &state.Session{PID: 1, Agent: "claude", CWD: "/home/u/proj",
-		Claude: &state.AgentInfo{SessionID: "s1", Transcript: tpath}}
-
-	rs.observe(sink, sess, sess.Claude, time.Now(), statustune.Default())
-	if sess.Claude.InFlightSubagents != 1 {
-		t.Errorf("in-flight = %d, want 1", sess.Claude.InFlightSubagents)
-	}
-
-	// The subagent finishes: its result lands in the main transcript.
-	writeLines(t, tpath, taskUse("toolu_a", "Explore", "map the auth code"), taskResult("toolu_a"))
-	rs.observe(sink, sess, sess.Claude, time.Now(), statustune.Default())
-	if sess.Claude.InFlightSubagents != 0 {
-		t.Errorf("after drain, in-flight = %d, want 0", sess.Claude.InFlightSubagents)
-	}
-
-	// A third observe with no change must not re-emit.
-	rs.observe(sink, sess, sess.Claude, time.Now(), statustune.Default())
-	sink.Close()
-
-	evs := readEvents(t, histDir)
-	spawns := eventsOfType(evs, history.EventSubagentSpawn)
-	stops := eventsOfType(evs, history.EventSubagentStop)
-	if len(spawns) != 1 {
-		t.Fatalf("got %d spawn events, want exactly 1: %+v", len(spawns), spawns)
-	}
-	if spawns[0].AgentType != "Explore" || spawns[0].Description != "map the auth code" || spawns[0].ToolUseID != "toolu_a" {
-		t.Errorf("spawn metadata = %+v", spawns[0])
-	}
-	if len(stops) != 1 || stops[0].ToolUseID != "toolu_a" {
-		t.Errorf("got %d stop events, want 1 for toolu_a: %+v", len(stops), stops)
-	}
-}
-
-func TestObserveFanoutKeepsCountWhenTranscriptUnreadable(t *testing.T) {
-	dir := t.TempDir()
-	tpath := filepath.Join(dir, "t.jsonl")
-	writeLines(t, tpath, taskUse("toolu_a", "Explore", "map the auth code")) // 1 in-flight
-
-	histDir := t.TempDir()
-	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
-	rs := newReconcileState()
-	sess := &state.Session{PID: 1, Agent: "claude", CWD: "/home/u/proj",
-		Claude: &state.AgentInfo{SessionID: "s1", Transcript: tpath}}
-
-	rs.observe(sink, sess, sess.Claude, time.Now(), statustune.Default())
-	if sess.Claude.InFlightSubagents != 1 {
-		t.Fatalf("setup: in-flight = %d, want 1", sess.Claude.InFlightSubagents)
-	}
-
-	// The transcript becomes unreadable (rotated/removed mid-session): transcript.Tasks
-	// returns an error, so the count must stay at its last-known value rather than
-	// flap to 0.
-	sess.Claude.Transcript = filepath.Join(dir, "gone.jsonl")
-	rs.observe(sink, sess, sess.Claude, time.Now(), statustune.Default())
-	if sess.Claude.InFlightSubagents != 1 {
-		t.Errorf("after unreadable transcript, in-flight = %d, want last-known 1 (not flapped to 0)", sess.Claude.InFlightSubagents)
-	}
-	sink.Close()
-}
+// Subagent fanout detection moved to internal/fanout (the Observer), which has
+// its own thorough tests; observe() now just delegates to it. The old tail-based
+// TestObserveFanout* tests were removed with the tail-based code they exercised.
 
 func assistantUsageModelLine(model string, in, out int64) string {
 	return `{"type":"assistant","message":{"role":"assistant","model":"` + model +
@@ -147,12 +74,12 @@ func TestObserveUsageEmitsOneSamplePerModel(t *testing.T) {
 
 	histDir := t.TempDir()
 	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
-	rs := newReconcileState()
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()))
 	sess := &state.Session{PID: 7, Agent: "claude", CWD: "/home/u/proj",
 		Claude: &state.AgentInfo{SessionID: "s7", Transcript: tpath}}
 
 	// First observe primes the usage cursor to EOF — no sample for the baseline.
-	rs.observe(sink, sess, sess.Claude, time.Now(), statustune.Default())
+	rs.observe(sink, sess, sess.Claude, time.Now())
 
 	// Two models accrue tokens while we watch.
 	f, _ := os.OpenFile(tpath, os.O_APPEND|os.O_WRONLY, 0o644)
@@ -161,7 +88,7 @@ func TestObserveUsageEmitsOneSamplePerModel(t *testing.T) {
 	f.WriteString(assistantUsageModelLine("claude-opus-4-8", 20, 8) + "\n")
 	f.Close()
 
-	rs.observe(sink, sess, sess.Claude, time.Now(), statustune.Default())
+	rs.observe(sink, sess, sess.Claude, time.Now())
 	sink.Close()
 
 	samples := eventsOfType(readEvents(t, histDir), history.EventUsageSample)
@@ -187,19 +114,19 @@ func TestObserveLabelEmitsOnChangeOnly(t *testing.T) {
 
 	histDir := t.TempDir()
 	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
-	rs := newReconcileState()
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()))
 	// pid 424242 has no ~/.claude/sessions file, so label.RawName falls to the
 	// wezterm window title — the name we control here.
 	sess := &state.Session{PID: 424242, Agent: "claude", CWD: "/home/u/proj",
 		Wezterm: &state.WeztermInfo{WindowTitle: "first-name"},
 		Claude:  &state.AgentInfo{SessionID: "s1", Transcript: tpath}}
 
-	rs.observe(sink, sess, sess.Claude, time.Now(), statustune.Default()) // emit "first-name"
-	rs.observe(sink, sess, sess.Claude, time.Now(), statustune.Default()) // unchanged → no emit
+	rs.observe(sink, sess, sess.Claude, time.Now()) // emit "first-name"
+	rs.observe(sink, sess, sess.Claude, time.Now()) // unchanged → no emit
 
-	sess.Wezterm.WindowTitle = "second-name"                              // user renamed the session
-	rs.observe(sink, sess, sess.Claude, time.Now(), statustune.Default()) // emit "second-name"
-	rs.observe(sink, sess, sess.Claude, time.Now(), statustune.Default()) // unchanged → no emit
+	sess.Wezterm.WindowTitle = "second-name"        // user renamed the session
+	rs.observe(sink, sess, sess.Claude, time.Now()) // emit "second-name"
+	rs.observe(sink, sess, sess.Claude, time.Now()) // unchanged → no emit
 	sink.Close()
 
 	labels := eventsOfType(readEvents(t, histDir), history.EventSessionLabel)
@@ -259,19 +186,19 @@ func TestObserveUsagePrimesThenSamples(t *testing.T) {
 
 	histDir := t.TempDir()
 	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
-	rs := newReconcileState()
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()))
 	sess := &state.Session{PID: 1, Agent: "claude", CWD: "/home/u/proj",
 		Claude: &state.AgentInfo{SessionID: "s1", Transcript: tpath}}
 
 	// First observe primes the usage cursor to EOF — no sample for the backlog.
-	rs.observe(sink, sess, sess.Claude, time.Now(), statustune.Default())
+	rs.observe(sink, sess, sess.Claude, time.Now())
 
 	// New usage accrues while we watch.
 	f, _ := os.OpenFile(tpath, os.O_APPEND|os.O_WRONLY, 0o644)
 	f.WriteString(`{"type":"assistant","message":{"role":"assistant","content":[],"usage":{"input_tokens":120,"output_tokens":34}}}` + "\n")
 	f.Close()
 
-	rs.observe(sink, sess, sess.Claude, time.Now(), statustune.Default())
+	rs.observe(sink, sess, sess.Claude, time.Now())
 	sink.Close()
 
 	samples := eventsOfType(readEvents(t, histDir), history.EventUsageSample)

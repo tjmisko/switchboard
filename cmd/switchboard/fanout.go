@@ -4,33 +4,28 @@ import (
 	"os"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/fanout"
 	"github.com/tjmisko/switchboard/internal/history"
 	"github.com/tjmisko/switchboard/internal/label"
 	"github.com/tjmisko/switchboard/internal/state"
-	"github.com/tjmisko/switchboard/internal/statustune"
 	"github.com/tjmisko/switchboard/internal/transcript"
 )
 
-// Bits recording which fanout events we have already emitted for a Task id.
-const (
-	spawnEmitted uint8 = 1 << iota
-	stopEmitted
-)
-
 // reconcileState is the per-session bookkeeping the reconciler carries ACROSS
-// ticks to derive fanout (subagent spawn/stop) and usage (token) events from the
-// transcript. It cannot live on the store snapshot — it is daemon-internal
-// cursor state (which Task ids we have already reported, how far into the
-// transcript we have summed usage). Keyed by pid; pruned when a session dies.
+// ticks. The usage (token) and label cursors are daemon-internal, keyed by pid,
+// and pruned when a session dies. Subagent fanout detection is delegated to the
+// Observer, which owns InFlightSubagents and the subagent_spawn/stop events and
+// keys its own durable state by session-id (so it survives a daemon restart or a
+// `claude --resume` rather than re-emitting historical spawns).
 type reconcileState struct {
-	tasks       map[int]map[string]uint8 // pid -> toolUseID -> spawn/stop bits
-	usageOffset map[int]int64            // pid -> transcript bytes already summed for usage
-	labels      map[int]string           // pid -> last-emitted session label (change dedup)
+	fanout      *fanout.Observer
+	usageOffset map[int]int64  // pid -> transcript bytes already summed for usage
+	labels      map[int]string // pid -> last-emitted session label (change dedup)
 }
 
-func newReconcileState() *reconcileState {
+func newReconcileState(obs *fanout.Observer) *reconcileState {
 	return &reconcileState{
-		tasks:       map[int]map[string]uint8{},
+		fanout:      obs,
 		usageOffset: map[int]int64{},
 		labels:      map[int]string{},
 	}
@@ -40,14 +35,14 @@ func newReconcileState() *reconcileState {
 // usage_sample events for one claude session. It runs inside the reconcile Apply
 // (under the store lock); sink.Record is non-blocking, and the transcript reads
 // are bounded — the same I/O profile as the status self-heals in the same loop.
-func (rs *reconcileState) observe(sink *history.Sink, sess *state.Session, c *state.AgentInfo, now time.Time, tun statustune.Tuning) {
+func (rs *reconcileState) observe(sink *history.Sink, sess *state.Session, c *state.AgentInfo, now time.Time) {
 	// The session label is derived from disk/window title, not the transcript, so
 	// it is tracked even before the transcript exists.
 	rs.observeLabel(sink, sess, c, now)
 	if c.Transcript == "" {
 		return
 	}
-	rs.observeFanout(sink, sess, c, now, tun)
+	rs.observeFanout(sink, sess, c, now)
 	rs.observeUsage(sink, sess, c, now)
 }
 
@@ -71,45 +66,21 @@ func (rs *reconcileState) observeLabel(sink *history.Sink, sess *state.Session, 
 	})
 }
 
-// observeFanout diffs the Task set against what we have already reported, emits
-// spawn/stop for the new transitions, and refreshes the in-flight count (the S
-// dimension behind the delegating status). A spawn carries the agent type and
-// description; a stop links back by tool_use_id.
-func (rs *reconcileState) observeFanout(sink *history.Sink, sess *state.Session, c *state.AgentInfo, now time.Time, tun statustune.Tuning) {
-	tasks, err := transcript.Tasks(c.Transcript, tun.TailBytes)
-	if err != nil {
-		return // leave the last-known count rather than guess
+// observeFanout delegates subagent fanout detection to the Observer — the single
+// source of truth for InFlightSubagents and the subagent_spawn/stop events — and
+// records whatever events it returns. The Observer reads the authoritative
+// per-session subagents/ metadata dir (immune to the transcript tail's scroll-out)
+// plus a forward cursor, so a multi-agent fan-out or a long-running subagent whose
+// spawn and result straddle the 128 KiB window is no longer lost. The same
+// Reconcile is invoked from the SubagentStart/Stop hook for hook-speed updates;
+// the Observer's durable per-session state dedups across both triggers.
+func (rs *reconcileState) observeFanout(sink *history.Sink, sess *state.Session, c *state.AgentInfo, now time.Time) {
+	if rs.fanout == nil {
+		return
 	}
-	seen := rs.tasks[sess.PID]
-	if seen == nil {
-		seen = map[string]uint8{}
-		rs.tasks[sess.PID] = seen
+	for _, ev := range rs.fanout.Reconcile(sess, c, now) {
+		sink.Record(ev)
 	}
-	inflight := 0
-	for _, tk := range tasks {
-		if !tk.Done {
-			inflight++
-		}
-		bits := seen[tk.ID]
-		if bits&spawnEmitted == 0 {
-			sink.Record(history.Event{
-				Ts: now, Type: history.EventSubagentSpawn,
-				SessionID: c.SessionID, PID: sess.PID, Agent: sess.Agent, CWD: sess.CWD,
-				ToolUseID: tk.ID, AgentType: tk.AgentType, Description: tk.Description,
-			})
-			bits |= spawnEmitted
-		}
-		if tk.Done && bits&stopEmitted == 0 {
-			sink.Record(history.Event{
-				Ts: now, Type: history.EventSubagentStop,
-				SessionID: c.SessionID, PID: sess.PID, Agent: sess.Agent, CWD: sess.CWD,
-				ToolUseID: tk.ID, AgentType: tk.AgentType,
-			})
-			bits |= stopEmitted
-		}
-		seen[tk.ID] = bits
-	}
-	c.InFlightSubagents = inflight
 }
 
 // observeUsage samples the token delta since the last offset and emits one
@@ -149,13 +120,9 @@ func (rs *reconcileState) observeUsage(sink *history.Sink, sess *state.Session, 
 }
 
 // prune drops cursor state for pids no longer tracked, so the maps do not grow
-// without bound as sessions come and go.
+// without bound as sessions come and go. The Observer's per-session state is
+// pruned against the set of live session-ids (it is keyed by session-id, not pid).
 func (rs *reconcileState) prune(m map[int]*state.Session) {
-	for pid := range rs.tasks {
-		if _, ok := m[pid]; !ok {
-			delete(rs.tasks, pid)
-		}
-	}
 	for pid := range rs.usageOffset {
 		if _, ok := m[pid]; !ok {
 			delete(rs.usageOffset, pid)
@@ -165,5 +132,14 @@ func (rs *reconcileState) prune(m map[int]*state.Session) {
 		if _, ok := m[pid]; !ok {
 			delete(rs.labels, pid)
 		}
+	}
+	if rs.fanout != nil {
+		live := map[string]bool{}
+		for _, sess := range m {
+			if sess.Claude != nil && sess.Claude.SessionID != "" {
+				live[sess.Claude.SessionID] = true
+			}
+		}
+		rs.fanout.Prune(live)
 	}
 }
