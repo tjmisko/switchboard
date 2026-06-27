@@ -227,6 +227,33 @@ func TestReconcile_toolResultCompletesViaCursor(t *testing.T) {
 	}
 }
 
+func TestReconcile_tagsBackgroundFromParentToolUse(t *testing.T) {
+	e := newEnv(t)
+	obs := NewObserver(e.historyDir)
+	now := time.Now()
+
+	// First sight primes the cursor to EOF (empty dir, empty transcript). The
+	// backgrounded tool_use and the subagent's dir entry then both land, so the
+	// cursor learns run_in_background BEFORE the dir scan emits the spawn.
+	obs.Reconcile(e.sess, e.c, now)
+	appendLine(t, e.transcript, `{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_bg","name":"Agent","input":{"subagent_type":"general-purpose","run_in_background":true}}]}}`)
+	writeSub(t, e.subdir, "bg1", metaClassic(1, "toolu_bg"), "")
+	ev := obs.Reconcile(e.sess, e.c, now)
+
+	var spawn *history.Event
+	for i := range ev {
+		if ev[i].Type == history.EventSubagentSpawn && ev[i].AgentID == "bg1" {
+			spawn = &ev[i]
+		}
+	}
+	if spawn == nil {
+		t.Fatalf("expected a spawn for bg1; got %+v", ev)
+	}
+	if !spawn.Background {
+		t.Fatalf("spawn should be tagged Background (run_in_background tool_use); got %+v", *spawn)
+	}
+}
+
 func TestReconcile_noopsWithoutSessionOrTranscript(t *testing.T) {
 	obs := NewObserver(t.TempDir())
 	now := time.Now()

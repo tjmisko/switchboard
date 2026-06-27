@@ -80,9 +80,10 @@ type Event struct {
 	// its stop on the subagents that have one. AgentType is kept at the minimal
 	// tier (it names the agent kind, not your work); Description is scrubbed (it is
 	// the task content).
-	AgentID   string `json:"agent_id,omitempty"`    // stable subagent id (agent-<id>.*); the universal correlation key
-	ToolUseID string `json:"tool_use_id,omitempty"` // links a spawn to its stop (absent on teammates/grandchildren)
-	AgentType string `json:"agent_type,omitempty"`  // e.g. "Explore", "general-purpose"
+	AgentID    string `json:"agent_id,omitempty"`    // stable subagent id (agent-<id>.*); the universal correlation key
+	ToolUseID  string `json:"tool_use_id,omitempty"` // links a spawn to its stop (absent on teammates/grandchildren)
+	AgentType  string `json:"agent_type,omitempty"`  // e.g. "Explore", "general-purpose"
+	Background bool   `json:"background,omitempty"`  // the fanout was launched run_in_background (best-effort; from the parent tool_use)
 
 	// Usage payload (usage_sample): tokens accrued since the previous sample.
 	// Model names the model the tokens were spent on (e.g. "claude-opus-4-8"),

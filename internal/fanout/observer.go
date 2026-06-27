@@ -144,7 +144,8 @@ func (o *Observer) Reconcile(sess *state.Session, c *state.AgentInfo, now time.T
 		}
 		if !ss.spawned[s.AgentID] {
 			ss.spawned[s.AgentID] = true
-			events = append(events, o.spawnEvent(sess, c, s, now))
+			bg := s.ToolUseID != "" && ss.background[s.ToolUseID]
+			events = append(events, o.spawnEvent(sess, c, s, now, bg))
 		}
 		// Completion, most-authoritative first: the subagent's own jsonl reached a
 		// terminal entry (universal — every subagent has one), else its tool_result
@@ -189,7 +190,7 @@ func (o *Observer) Prune(live map[string]bool) {
 	}
 }
 
-func (o *Observer) spawnEvent(sess *state.Session, c *state.AgentInfo, s transcript.Subagent, now time.Time) history.Event {
+func (o *Observer) spawnEvent(sess *state.Session, c *state.AgentInfo, s transcript.Subagent, now time.Time, background bool) history.Event {
 	// Date the spawn at the real spawn time (meta/jsonl mtime), not reconcile-now,
 	// so a backfilled span is not mis-ordered after its own stop (G9). Clamp into
 	// the past-but-not-future window.
@@ -201,6 +202,7 @@ func (o *Observer) spawnEvent(sess *state.Session, c *state.AgentInfo, s transcr
 		Ts: ts, Type: history.EventSubagentSpawn,
 		SessionID: c.SessionID, PID: sess.PID, Agent: sess.Agent, CWD: sess.CWD,
 		AgentID: s.AgentID, ToolUseID: s.ToolUseID, AgentType: s.AgentType, Description: s.Description,
+		Background: background,
 	}
 }
 

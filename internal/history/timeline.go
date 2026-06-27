@@ -62,6 +62,7 @@ type LabelSpan struct {
 // full-tier. (A3.)
 type SubagentSpan struct {
 	AgentType   string    `json:"agent_type,omitempty"`
+	Background  bool      `json:"background,omitempty"`
 	AgentID     string    `json:"agent_id,omitempty"`
 	ToolUseID   string    `json:"tool_use_id,omitempty"`
 	Description string    `json:"description,omitempty"`
@@ -294,7 +295,7 @@ func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
 				b.openSubs = map[string]*SubagentSpan{}
 			}
 			b.openSubs[eventAgentKey(ev)] = &SubagentSpan{
-				AgentType: ev.AgentType, AgentID: ev.AgentID, ToolUseID: ev.ToolUseID, Description: ev.Description, Start: ev.Ts,
+				AgentType: ev.AgentType, Background: ev.Background, AgentID: ev.AgentID, ToolUseID: ev.ToolUseID, Description: ev.Description, Start: ev.Ts,
 			}
 			b.absorb(ev)
 		case EventSubagentStop:
