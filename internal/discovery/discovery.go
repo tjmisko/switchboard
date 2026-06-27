@@ -1,8 +1,9 @@
-// Package discovery scans /proc for coding-agent sessions (Claude Code and
-// Codex; see Classify). We poll once a second
-// rather than subscribing to netlink CN_PROC because /proc scans are cheap
-// (~200-500 procfs entries, kernel-side memory) and avoid needing
-// CAP_NET_ADMIN. Latency is bounded by the tick interval.
+// Package discovery scans the OS process source (osproc.Source — /proc on Linux,
+// libproc on macOS) for coding-agent sessions (Claude Code and Codex; see
+// Classify). We poll once a second rather than subscribing to a kernel process-
+// event stream because a process-table scan is cheap (~200-500 entries,
+// kernel-side memory) and needs no extra capability. Latency is bounded by the
+// tick interval.
 package discovery
 
 import (
@@ -11,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tjmisko/switchboard/internal/proc"
+	"github.com/tjmisko/switchboard/internal/osproc"
 )
 
 // backgroundSubcommands are `claude <verb> …` invocations that are NOT
@@ -28,13 +29,13 @@ var backgroundSubcommands = map[string]struct{}{
 	"mcp":    {},
 }
 
-// IsClaude returns true if the given /proc snapshot is an interactive Claude
+// IsClaude returns true if the given process snapshot is an interactive Claude
 // Code session. We match on comm == "claude" AND exe under
 // ~/.local/share/claude/ (handles both the released binary and dev builds
 // installed elsewhere; the exe check is cheap insurance against name
 // collisions), AND reject background subcommand invocations (see
 // backgroundSubcommands) — those are processes, not sessions.
-func IsClaude(p proc.Info) bool {
+func IsClaude(p osproc.Info) bool {
 	if p.Comm != "claude" {
 		return false
 	}
@@ -58,8 +59,8 @@ func isBackgroundSubcommand(args []string) bool {
 	return ok
 }
 
-// Agent identifies a supported coding-agent CLI discovered in /proc. AgentNone
-// (the empty value) means "not a tracked interactive session".
+// Agent identifies a supported coding-agent CLI discovered in the process table.
+// AgentNone (the empty value) means "not a tracked interactive session".
 type Agent string
 
 const (
@@ -68,11 +69,11 @@ const (
 	AgentCodex  Agent = "codex"
 )
 
-// Classify reports which interactive coding-agent session a /proc snapshot is,
+// Classify reports which interactive coding-agent session a process snapshot is,
 // or AgentNone when it is neither Claude Code nor Codex. It is the single
 // predicate the scanner filters on, so adding an agent is a matter of extending
 // this switch. The returned value's string matches state.AgentKind*.
-func Classify(p proc.Info) Agent {
+func Classify(p osproc.Info) Agent {
 	switch {
 	case IsClaude(p):
 		return AgentClaude
@@ -99,11 +100,11 @@ var codexNonInteractiveSubcommands = map[string]struct{}{
 	"archive": {}, "unarchive": {}, "delete": {}, "execpolicy": {}, "app": {},
 }
 
-// IsCodex returns true if the /proc snapshot is an interactive Codex CLI
+// IsCodex returns true if the process snapshot is an interactive Codex CLI
 // session: comm == "codex" with an argv[1] that is not a non-interactive
 // subcommand (see codexNonInteractiveSubcommands). No exe-path check — codex is
 // not installed under a distinctive directory the way claude is.
-func IsCodex(p proc.Info) bool {
+func IsCodex(p osproc.Info) bool {
 	if p.Comm != "codex" {
 		return false
 	}
@@ -125,18 +126,47 @@ func codexIsInteractive(args []string) bool {
 	return !nonInteractive
 }
 
-// procSource is the seam between the scanner and /proc. The default
-// implementation calls the proc package directly; tests inject a fake so the
-// seen-set state machine can be exercised without a live /proc.
+// procSource is the narrow seam between the scanner and the OS process layer:
+// list pids cheaply, then Read only the unseen ones. The runtime implementation
+// adapts an osproc.Source (osprocSource); tests inject a fake so the seen-set
+// state machine can be exercised without a live process table.
 type procSource interface {
 	AllPIDs() ([]int, error)
-	Read(pid int) (proc.Info, error)
+	Read(pid int) (osproc.Info, error)
 }
 
-type realProcSource struct{}
+// pidLister is the optional fast-path an osproc.Source may provide to list pids
+// cheaply (no per-pid exe/cwd/tty reads). The Linux source implements it; a
+// Source that does not is driven from Enumerate. It is deliberately NOT part of
+// the neutral osproc.Source contract — discovery upgrades to it when present and
+// degrades gracefully when absent, so a new backend drops in either way.
+type pidLister interface {
+	AllPIDs() ([]int, error)
+}
 
-func (realProcSource) AllPIDs() ([]int, error)         { return proc.AllPIDs() }
-func (realProcSource) Read(pid int) (proc.Info, error) { return proc.Read(pid) }
+// osprocSource adapts an osproc.Source to the scanner's narrow procSource seam.
+// AllPIDs uses the cheap pidLister fast-path when the underlying Source provides
+// it, and otherwise derives the pid list from a full Enumerate — preserving the
+// "enumerate cheaply, Read only the unseen" hot path on Linux while keeping
+// discovery functional over any Source.
+type osprocSource struct{ src osproc.Source }
+
+func (a osprocSource) AllPIDs() ([]int, error) {
+	if l, ok := a.src.(pidLister); ok {
+		return l.AllPIDs()
+	}
+	infos, err := a.src.Enumerate()
+	if err != nil {
+		return nil, err
+	}
+	pids := make([]int, len(infos))
+	for i := range infos {
+		pids[i] = infos[i].PID
+	}
+	return pids, nil
+}
+
+func (a osprocSource) Read(pid int) (osproc.Info, error) { return a.src.Read(pid) }
 
 type Scanner struct {
 	mu   sync.Mutex
@@ -144,20 +174,22 @@ type Scanner struct {
 	src  procSource
 }
 
-func New() *Scanner {
-	return &Scanner{seen: make(map[int]struct{}), src: realProcSource{}}
+// New builds a Scanner over the given OS process source. The darwin backend
+// drops in here unchanged — discovery only ever touches osproc.Source.
+func New(src osproc.Source) *Scanner {
+	return &Scanner{seen: make(map[int]struct{}), src: osprocSource{src: src}}
 }
 
 // newWithSource builds a Scanner over an injected procSource. Test-only seam;
-// runtime callers use New, which wires the real /proc-backed source.
+// runtime callers use New, which wires the osproc-backed adapter.
 func newWithSource(src procSource) *Scanner {
 	return &Scanner{seen: make(map[int]struct{}), src: src}
 }
 
-// Run polls /proc every interval and invokes onAppeared for any new claude
-// PID. Returns when ctx is cancelled. Death is *not* reported here — that's
-// the procwatch package's job, fed by pidfds.
-func (s *Scanner) Run(ctx context.Context, interval time.Duration, onAppeared func(proc.Info)) error {
+// Run polls the process source every interval and invokes onAppeared for any
+// new agent PID. Returns when ctx is cancelled. Death is *not* reported here —
+// that is the osproc.Source watcher's job, fed by pidfds (Linux) / kqueue (macOS).
+func (s *Scanner) Run(ctx context.Context, interval time.Duration, onAppeared func(osproc.Info)) error {
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
 	s.scanOnce(onAppeared)
@@ -180,7 +212,7 @@ func (s *Scanner) Forget(pid int) {
 	s.mu.Unlock()
 }
 
-func (s *Scanner) scanOnce(onAppeared func(proc.Info)) {
+func (s *Scanner) scanOnce(onAppeared func(osproc.Info)) {
 	pids, err := s.src.AllPIDs()
 	if err != nil {
 		return
