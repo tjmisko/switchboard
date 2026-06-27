@@ -19,6 +19,7 @@ func TestPrefix_appendsCanonicalWhenUnprefixed(t *testing.T) {
 		want        string
 	}{
 		{"switchboard adds sb", "switchboard", "status-fix", "sb-status-fix"},
+		{"switchboard-dashboard adds sb-dash", "switchboard-dashboard", "timeline", "sb-dash-timeline"},
 		{"arachne adds arachne", "Arachne", "assess", "arachne-assess"},
 		{"sspi adds sspi", "sspi-data-webapp", "cleanup", "sspi-cleanup"},
 		{"fallback sanitizes basename", "My_Cool.Repo", "notes", "my-cool-repo-notes"},
@@ -42,6 +43,8 @@ func TestPrefix_leavesAlreadyPrefixedNamesAlone(t *testing.T) {
 		{"canonical sb prefix", "switchboard", "sb-foo"},
 		{"alias switch counts", "switchboard", "switch-foo"},
 		{"alias switchboard counts", "switchboard", "switchboard-foo"},
+		{"sb-dash canonical prefix", "switchboard-dashboard", "sb-dash-foo"},
+		{"sb-dash alias switchboard-dashboard counts", "switchboard-dashboard", "switchboard-dashboard-foo"},
 		{"bare canonical", "switchboard", "sb"},
 		{"sspi alias", "sspi-data-webapp", "sspi-cleanup"},
 		{"sspi-data longer alias", "sspi-data-webapp", "sspi-data-cleanup"},
@@ -185,6 +188,7 @@ func TestFullForDir_returnsFullElseTitleCasedBasename(t *testing.T) {
 		{"seeded switchboard full", "/irrelevant/switchboard", "Switchboard"},
 		{"seeded arachne full", "/irrelevant/arachne", "Arachne"},
 		{"seeded sspi full", "/irrelevant/sspi-data-webapp", "SSPI Data Webapp"},
+		{"seeded switchboard-dashboard full", "/irrelevant/switchboard-dashboard", "Switchboard Dashboard"},
 		{"unknown title-cases the basename", "/irrelevant/my-cool-repo", "My Cool Repo"},
 		{"unknown sanitizes mixed separators", "/irrelevant/Brand_New.thing", "Brand New Thing"},
 	}
@@ -216,6 +220,7 @@ func TestFullForAbbrev_resolvesKnownElseEchoesAbbrev(t *testing.T) {
 		{"known sb -> Switchboard", "sb", "Switchboard"},
 		{"known arachne -> Arachne", "arachne", "Arachne"},
 		{"known sspi -> SSPI Data Webapp", "sspi", "SSPI Data Webapp"},
+		{"known sb-dash -> Switchboard Dashboard", "sb-dash", "Switchboard Dashboard"},
 		{"unknown abbrev echoes itself", "zzz", "zzz"},
 		{"empty maps to empty", "", ""},
 	}

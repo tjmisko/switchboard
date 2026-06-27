@@ -56,6 +56,7 @@ func DefaultConfig() Config {
 		{Match: []string{"arachne"}, Canonical: "arachne", Full: "Arachne", Aliases: []string{"arachne"}},
 		{Match: []string{"sspi-data-webapp"}, Canonical: "sspi", Full: "SSPI Data Webapp", Aliases: []string{"sspi", "sspi-data", "sspi-data-webapp"}},
 		{Match: []string{"switchboard"}, Canonical: "sb", Full: "Switchboard", Aliases: []string{"switchboard", "switch", "sb"}},
+		{Match: []string{"switchboard-dashboard"}, Canonical: "sb-dash", Full: "Switchboard Dashboard", Aliases: []string{"switchboard-dashboard", "sb-dash"}},
 	}}
 }
 
