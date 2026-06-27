@@ -197,7 +197,7 @@ func TestObserveLabelEmitsOnChangeOnly(t *testing.T) {
 	rs.observe(sink, sess, sess.Claude, time.Now(), statustune.Default()) // emit "first-name"
 	rs.observe(sink, sess, sess.Claude, time.Now(), statustune.Default()) // unchanged → no emit
 
-	sess.Wezterm.WindowTitle = "second-name" // user renamed the session
+	sess.Wezterm.WindowTitle = "second-name"                              // user renamed the session
 	rs.observe(sink, sess, sess.Claude, time.Now(), statustune.Default()) // emit "second-name"
 	rs.observe(sink, sess, sess.Claude, time.Now(), statustune.Default()) // unchanged → no emit
 	sink.Close()

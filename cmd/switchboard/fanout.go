@@ -141,8 +141,8 @@ func (rs *reconcileState) observeUsage(sink *history.Sink, sess *state.Session, 
 		sink.Record(history.Event{
 			Ts: now, Type: history.EventUsageSample,
 			SessionID: c.SessionID, PID: sess.PID, Agent: sess.Agent, CWD: sess.CWD,
-			Model:        model,
-			TokIn:        u.InputTokens, TokOut: u.OutputTokens,
+			Model: model,
+			TokIn: u.InputTokens, TokOut: u.OutputTokens,
 			TokCacheRead: u.CacheReadTokens, TokCacheCreate: u.CacheCreationTokens,
 		})
 	}

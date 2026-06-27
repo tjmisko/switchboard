@@ -14,7 +14,7 @@ type autoFake struct {
 	pane      *PaneRef
 }
 
-func (f *autoFake) Name() string   { return f.name }
+func (f *autoFake) Name() string    { return f.name }
 func (f *autoFake) Available() bool { return f.available }
 func (f *autoFake) Locate(_ context.Context, _ string) (*PaneRef, error) {
 	return f.pane, nil

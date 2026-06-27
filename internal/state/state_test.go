@@ -77,8 +77,8 @@ func TestSnapshotOrder_unresolvedWorkspaceGoesLastByStartedAt(t *testing.T) {
 	store := New("")
 	seed(store,
 		&Session{PID: 1, StartedAt: ts(5), Hyprland: ws(2)},
-		&Session{PID: 2, StartedAt: ts(40)},                       // no hyprland at all
-		&Session{PID: 3, StartedAt: ts(10), Hyprland: ws(1)},      // resolved
+		&Session{PID: 2, StartedAt: ts(40)},                                            // no hyprland at all
+		&Session{PID: 3, StartedAt: ts(10), Hyprland: ws(1)},                           // resolved
 		&Session{PID: 4, StartedAt: ts(15), Hyprland: &HyprlandInfo{Address: "0xabc"}}, // hyprland but no workspace id
 	)
 	got := order(store.Snapshot())

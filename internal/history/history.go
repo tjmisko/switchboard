@@ -40,8 +40,8 @@ const (
 	EventUsageSample   = "usage_sample"   // token usage accrued since the last sample
 	// v2 — session names, model/cost, focus & attention.
 	EventSessionLabel = "session_label" // the session's name/label changed (Label set)
-	EventFocus        = "focus"          // window focus moved (SessionID = focused agent, empty = focus left all agents)
-	EventActivity     = "activity"       // user went idle / active (global; To = idle|active)
+	EventFocus        = "focus"         // window focus moved (SessionID = focused agent, empty = focus left all agents)
+	EventActivity     = "activity"      // user went idle / active (global; To = idle|active)
 )
 
 // Detail tiers. Minimal records only what a timeline needs (ids, status, timing,
