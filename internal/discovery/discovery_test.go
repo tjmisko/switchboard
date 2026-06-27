@@ -75,6 +75,59 @@ func TestIsClaude(t *testing.T) {
 	}
 }
 
+// claudeExeValid is the only OS-dependent part of IsClaude. Testing it with an
+// explicit goos exercises the darwin branch on a Linux host and proves the macOS
+// broadening does NOT loosen Linux matching: the native-installer / Homebrew /
+// npm layouts (…/bin/claude, no /claude/ directory) are accepted on darwin but
+// rejected on linux, while the /claude/ dev-build path and a masked exe are
+// accepted on both, and claude-impostor is rejected on both.
+func TestClaudeExeValid(t *testing.T) {
+	tests := []struct {
+		name       string
+		exe        string
+		linux, mac bool
+	}{
+		{"masked exe", "", true, true},
+		{"dev build under /claude/", "/home/u/.local/share/claude/claude", true, true},
+		{"impostor", "/usr/bin/claude-impostor", false, false},
+		{"native installer ~/.local/bin/claude", "/Users/u/.local/bin/claude", false, true},
+		{"~/.claude/bin/claude", "/Users/u/.claude/bin/claude", false, true},
+		{"homebrew /opt/homebrew/bin/claude", "/opt/homebrew/bin/claude", false, true},
+		{"npm global node_modules", "/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli/claude", false, true},
+		{"bare relative exe", "claude", false, true},
+		{"node is not claude", "/usr/local/bin/node", false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := claudeExeValid(tt.exe, "linux"); got != tt.linux {
+				t.Errorf("claudeExeValid(%q, linux) = %v, want %v", tt.exe, got, tt.linux)
+			}
+			if got := claudeExeValid(tt.exe, "darwin"); got != tt.mac {
+				t.Errorf("claudeExeValid(%q, darwin) = %v, want %v", tt.exe, got, tt.mac)
+			}
+		})
+	}
+}
+
+// IsClaude on darwin accepts the macOS native-install layout (~/.local/bin/claude,
+// no /claude/ directory) while still rejecting non-claude processes. Asserted via
+// the GOOS-parametric core so it runs on the Linux host.
+func TestIsClaudeDarwinLayout(t *testing.T) {
+	macClaude := osproc.Info{Comm: "claude", Exe: "/Users/u/.local/bin/claude"}
+	if !(macClaude.Comm == "claude" && !isBackgroundSubcommand(macClaude.Args) && claudeExeValid(macClaude.Exe, "darwin")) {
+		t.Errorf("darwin native-install claude not accepted: %+v", macClaude)
+	}
+	// A darwin daemon subcommand at the same path is still not a session.
+	macDaemon := osproc.Info{Comm: "claude", Exe: "/Users/u/.local/bin/claude", Args: []string{"/Users/u/.local/bin/claude", "daemon", "run"}}
+	if isBackgroundSubcommand(macDaemon.Args) == false {
+		t.Errorf("darwin daemon subcommand should be filtered: %+v", macDaemon)
+	}
+	// A non-claude comm is rejected regardless of exe.
+	if IsClaude(osproc.Info{Comm: "node", Exe: "/Users/u/.local/bin/claude"}) {
+		t.Errorf("comm=node must not classify as claude")
+	}
+}
+
 // IsCodex — codex is a single binary whose subcommand is argv[1]; the bare
 // invocation, a leading flag, a positional prompt, resume, and fork are
 // interactive sessions, while exec/app-server/mcp/utility verbs are not.

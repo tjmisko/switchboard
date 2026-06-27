@@ -8,6 +8,7 @@ package discovery
 
 import (
 	"context"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -30,11 +31,12 @@ var backgroundSubcommands = map[string]struct{}{
 }
 
 // IsClaude returns true if the given process snapshot is an interactive Claude
-// Code session. We match on comm == "claude" AND exe under
-// ~/.local/share/claude/ (handles both the released binary and dev builds
-// installed elsewhere; the exe check is cheap insurance against name
-// collisions), AND reject background subcommand invocations (see
-// backgroundSubcommands) — those are processes, not sessions.
+// Code session. The primary, cheap filter is comm == "claude" (the binary runs
+// under its own name on both Linux and macOS — it is a native signed binary, not
+// node, since claude v2.1.113). Background subcommand invocations (see
+// backgroundSubcommands) are rejected — those are processes, not sessions. The
+// exe check (claudeExeValid) is cheap insurance against name collisions and is
+// the only OS-dependent part of the predicate.
 func IsClaude(p osproc.Info) bool {
 	if p.Comm != "claude" {
 		return false
@@ -42,10 +44,35 @@ func IsClaude(p osproc.Info) bool {
 	if isBackgroundSubcommand(p.Args) {
 		return false
 	}
-	if p.Exe == "" {
-		return true // benefit of the doubt — kernel masked exe (rare)
+	return claudeExeValid(p.Exe, runtime.GOOS)
+}
+
+// claudeExeValid reports whether exe is a plausible claude binary path for the
+// given GOOS. A masked (empty) exe is accepted on both platforms — the comm gate
+// already matched and the kernel sometimes hides exe.
+//
+// Linux keeps the original, tighter rule: the exe must sit under a /claude/
+// directory (the dev build at ~/.local/share/claude/claude and the released
+// versioned payload both do). This rejects /usr/bin/claude-impostor and a stray
+// /usr/local/bin/claude, so Linux precision is unchanged by the macOS broadening.
+//
+// macOS additionally accepts a /claude basename, because the native installer
+// puts the binary at ~/.local/bin/claude — NOT under a /claude/ directory — and
+// the Homebrew (/opt/homebrew/bin/claude) and npm (…/claude-code/…/claude)
+// launchers also resolve to a …/bin/claude file. A bare "claude" (relative exec)
+// is accepted too. The basename rule still rejects claude-impostor, which does
+// not end in /claude.
+func claudeExeValid(exe, goos string) bool {
+	if exe == "" {
+		return true // kernel masked the exe (rare); comm already matched
 	}
-	return strings.Contains(p.Exe, "/claude/")
+	if strings.Contains(exe, "/claude/") {
+		return true
+	}
+	if goos == "darwin" {
+		return exe == "claude" || strings.HasSuffix(exe, "/claude")
+	}
+	return false
 }
 
 // isBackgroundSubcommand reports whether argv is a `claude <verb> …` invocation
