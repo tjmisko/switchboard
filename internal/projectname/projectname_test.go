@@ -176,3 +176,111 @@ func TestLoad_missingFileFallsBackToDefaults(t *testing.T) {
 		t.Errorf("missing-file Canonical = %q, want sb", got)
 	}
 }
+
+func TestFullForDir_returnsFullElseTitleCasedBasename(t *testing.T) {
+	cfg := DefaultConfig()
+	cases := []struct {
+		name, dir, want string
+	}{
+		{"seeded switchboard full", "/irrelevant/switchboard", "Switchboard"},
+		{"seeded arachne full", "/irrelevant/arachne", "Arachne"},
+		{"seeded sspi full", "/irrelevant/sspi-data-webapp", "SSPI Data Webapp"},
+		{"unknown title-cases the basename", "/irrelevant/my-cool-repo", "My Cool Repo"},
+		{"unknown sanitizes mixed separators", "/irrelevant/Brand_New.thing", "Brand New Thing"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := FullForDir(cfg, c.dir); got != c.want {
+				t.Errorf("FullForDir(%q) = %q, want %q", c.dir, got, c.want)
+			}
+		})
+	}
+}
+
+func TestFullForDir_knownRuleWithoutFullFallsBackToTitleCasedBasename(t *testing.T) {
+	// A rule with an abbrev but no pretty name should not echo the abbrev — it
+	// falls back to a title-cased basename, which reads better on a dashboard.
+	cfg := Config{Rules: []ProjectRule{
+		{Match: []string{"widget"}, Canonical: "wg", Aliases: []string{"wg"}},
+	}}
+	if got := FullForDir(cfg, "/irrelevant/widget"); got != "Widget" {
+		t.Errorf("FullForDir(no-full rule) = %q, want Widget", got)
+	}
+}
+
+func TestFullForAbbrev_resolvesKnownElseEchoesAbbrev(t *testing.T) {
+	cfg := DefaultConfig()
+	cases := []struct {
+		name, abbrev, want string
+	}{
+		{"known sb -> Switchboard", "sb", "Switchboard"},
+		{"known arachne -> Arachne", "arachne", "Arachne"},
+		{"known sspi -> SSPI Data Webapp", "sspi", "SSPI Data Webapp"},
+		{"unknown abbrev echoes itself", "zzz", "zzz"},
+		{"empty maps to empty", "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := FullForAbbrev(cfg, c.abbrev); got != c.want {
+				t.Errorf("FullForAbbrev(%q) = %q, want %q", c.abbrev, got, c.want)
+			}
+		})
+	}
+}
+
+func TestFullForAbbrev_knownRuleWithoutFullEchoesAbbrev(t *testing.T) {
+	cfg := Config{Rules: []ProjectRule{
+		{Match: []string{"widget"}, Canonical: "wg", Aliases: []string{"wg"}},
+	}}
+	if got := FullForAbbrev(cfg, "wg"); got != "wg" {
+		t.Errorf("FullForAbbrev(no-full rule) = %q, want wg", got)
+	}
+}
+
+func TestSetFullAndLoad_roundTrip(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "projects.json")
+	root := "/home/u/projects/widget"
+
+	if err := setFullIn(cfgPath, root, "Widget Factory"); err != nil {
+		t.Fatalf("setFullIn: %v", err)
+	}
+	if got := FullForDir(loadFrom(cfgPath), root); got != "Widget Factory" {
+		t.Errorf("after SetFull, FullForDir = %q, want Widget Factory", got)
+	}
+
+	// Setting an abbrev afterwards must preserve the pretty name (the two fields
+	// are edited independently), and a Full-only entry must never erase the abbrev.
+	if err := setAbbrevIn(cfgPath, root, "wf"); err != nil {
+		t.Fatalf("setAbbrevIn: %v", err)
+	}
+	cfg := loadFrom(cfgPath)
+	if got := cfg.ruleForRoot(root, "widget").Canonical; got != "wf" {
+		t.Errorf("after SetAbbrev, Canonical = %q, want wf", got)
+	}
+	if got := FullForDir(cfg, root); got != "Widget Factory" {
+		t.Errorf("SetAbbrev clobbered Full: FullForDir = %q, want Widget Factory", got)
+	}
+	// The reverse lookup the timeline uses resolves through the loaded user rule.
+	if got := FullForAbbrev(cfg, "wf"); got != "Widget Factory" {
+		t.Errorf("FullForAbbrev(wf) = %q, want Widget Factory", got)
+	}
+}
+
+func TestSetFull_preservesExistingAbbrev(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "projects.json")
+	root := "/home/u/projects/widget"
+
+	if err := setAbbrevIn(cfgPath, root, "wf"); err != nil {
+		t.Fatalf("setAbbrevIn: %v", err)
+	}
+	if err := setFullIn(cfgPath, root, "Widget Factory"); err != nil {
+		t.Fatalf("setFullIn: %v", err)
+	}
+	cfg := loadFrom(cfgPath)
+	if got := cfg.ruleForRoot(root, "widget").Canonical; got != "wf" {
+		t.Errorf("SetFull clobbered abbrev: Canonical = %q, want wf", got)
+	}
+	if got := FullForDir(cfg, root); got != "Widget Factory" {
+		t.Errorf("FullForDir = %q, want Widget Factory", got)
+	}
+}

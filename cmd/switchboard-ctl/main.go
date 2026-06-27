@@ -374,14 +374,17 @@ func cmdHook(c *rpc.Client, event, agent string) {
 	_ = c.Recv(&resp)
 }
 
-// cmdName resolves or edits project abbreviations. Subcommands:
+// cmdName resolves or edits project abbreviations and pretty display names.
+// Subcommands:
 //
-//	resolve --cwd <dir> --name <name>   print the prefixed, de-duplicated name
-//	abbrev  --cwd <dir>                  print the project's canonical abbrev
-//	set     <dir> <abbrev>               persist an abbrev for the dir's git root
+//	resolve  --cwd <dir> --name <name>   print the prefixed, de-duplicated name
+//	abbrev   --cwd <dir>                 print the project's canonical abbrev
+//	full     --cwd <dir>                 print the project's pretty display name
+//	set      <dir> <abbrev>              persist an abbrev for the dir's git root
+//	set-full --cwd <dir> --name <full>   persist a pretty display name for it
 func cmdName(args []string) {
 	if len(args) == 0 {
-		fail("name requires a subcommand: resolve|abbrev|set")
+		fail("name requires a subcommand: resolve|abbrev|full|set|set-full")
 	}
 	switch args[0] {
 	case "resolve":
@@ -395,6 +398,11 @@ func cmdName(args []string) {
 		cwd := fs.String("cwd", "", "project directory (default: current)")
 		_ = fs.Parse(args[1:])
 		fmt.Println(projectname.CanonicalForDir(projectname.Load(), dirOrCwd(*cwd)))
+	case "full":
+		fs := flag.NewFlagSet("name full", flag.ExitOnError)
+		cwd := fs.String("cwd", "", "project directory (default: current)")
+		_ = fs.Parse(args[1:])
+		fmt.Println(projectname.FullForDir(projectname.Load(), dirOrCwd(*cwd)))
 	case "set":
 		rest := args[1:]
 		if len(rest) < 2 {
@@ -405,8 +413,21 @@ func cmdName(args []string) {
 			fail("name set: %v", err)
 		}
 		fmt.Printf("%s -> %s\n", root, projectname.CanonicalForDir(projectname.Load(), root))
+	case "set-full":
+		fs := flag.NewFlagSet("name set-full", flag.ExitOnError)
+		cwd := fs.String("cwd", "", "project directory (default: current)")
+		name := fs.String("name", "", "pretty display name (e.g. \"Switchboard\")")
+		_ = fs.Parse(args[1:])
+		if strings.TrimSpace(*name) == "" {
+			fail("usage: name set-full --cwd <dir> --name <full>")
+		}
+		root := projectname.ProjectRoot(dirOrCwd(*cwd))
+		if err := projectname.SetFull(root, *name); err != nil {
+			fail("name set-full: %v", err)
+		}
+		fmt.Printf("%s -> %s\n", root, projectname.FullForDir(projectname.Load(), root))
 	default:
-		fail("unknown name subcommand %q (resolve|abbrev|set)", args[0])
+		fail("unknown name subcommand %q (resolve|abbrev|full|set|set-full)", args[0])
 	}
 }
 
@@ -454,8 +475,9 @@ commands:
                             else — only if all are green — working sessions;
                             repeated presses visit each member in turn;
                             no-op if any session is unknown (grey)
-  name <sub>              project abbreviations: resolve --cwd --name,
-                            abbrev --cwd, or set <dir> <abbrev>
+  name <sub>              project names: resolve --cwd --name, abbrev --cwd,
+                            full --cwd, set <dir> <abbrev>, or
+                            set-full --cwd --name <full> (pretty display name)
   hook <event>            forward Claude Code hook enrichment (stdin = JSON)
   codex-hook <event>      forward Codex hook enrichment (stdin = JSON)
   activity idle|active    report a global user-activity edge for the delegation
