@@ -53,6 +53,10 @@ func cmdTimeline(args []string) {
 		fail("read %s: %v", *dir, err)
 	}
 	lanes := history.BuildSwimlanes(events, end)
+	// Reattribute parent "working" time that overlaps a launched subagent to
+	// "dormant" (the subagent carries the compute) before summarizing or encoding,
+	// so the swimlanes, by_status, and attention metrics all agree.
+	history.MarkDelegationDormant(lanes)
 	summary := history.Summarize(lanes, events)
 	totals := history.AggregateTotals(events)
 	// The global user-activity timeline (idle/active), bounded to the lanes' span,
@@ -244,6 +248,8 @@ func block(status string, live, colorOn bool) string {
 		switch status {
 		case "working", "delegating":
 			return "w"
+		case "dormant":
+			return "d"
 		case "idle":
 			return "i"
 		case "permission":
@@ -269,7 +275,7 @@ func block(status string, live, colorOn bool) string {
 }
 
 func statusOrder(m map[string]time.Duration) []string {
-	order := []string{"working", "delegating", "idle", "permission", "suspended", ""}
+	order := []string{"working", "delegating", "dormant", "idle", "permission", "suspended", ""}
 	var out []string
 	seen := map[string]bool{}
 	for _, st := range order {

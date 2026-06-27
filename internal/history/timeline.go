@@ -13,6 +13,7 @@ const (
 	statusWorking    = "working"
 	statusDelegating = "delegating"
 	statusSuspended  = "suspended"
+	statusDormant    = "dormant"
 )
 
 // Activity stream values (EventActivity.To): the user's global idle/active state
@@ -22,9 +23,11 @@ const (
 	activityActive = "active"
 )
 
-// isActive reports whether a status counts as agent work for the attention
-// stats: the main thread working, or delegating (a teammate working by proxy).
-// Idle (your turn), permission (waiting on you), and suspended (paused) do not.
+// isActive reports whether a status counts as the parent thread's own agent work
+// for the attention stats: the main thread working, or delegating (a teammate
+// working by proxy). Idle (your turn), permission (waiting on you), suspended
+// (paused), and dormant (the parent waiting on a subagent it launched — the
+// subagent carries the compute, see Summarize) do not.
 func isActive(status string) bool {
 	return status == statusWorking || status == statusDelegating
 }
@@ -409,11 +412,12 @@ func clampFocus(spans []FocusSpan, lo, hi time.Time) []FocusSpan {
 //     long was something happening for me." ≤ real elapsed time.
 //   - AttentionPerSession (B): Σ over sessions of active time. Rewards
 //     parallelism (3 sessions working 1h = 3h).
-//   - AttentionFanout (C): Σ active time × (1 + subagents). The total agent
-//     compute directed, counting teammates. Approximate in this phase — the
-//     subagent count is sampled at each opening transition, so Tasks launched
-//     mid-interval (no status edge) are undercounted until Phase 4 wires
-//     subagent_spawn/stop events.
+//   - AttentionFanout (C): Σ over sessions of parent-own work + every subagent
+//     run (parallel subagents each count). The total agent compute directed,
+//     counting teammates. Derived from the real subagent_spawn/stop spans — while
+//     a subagent runs the parent is "dormant" (waiting on it), so the parent's
+//     overlapping time is removed from its own work and the subagent span is
+//     credited instead. Compute is reattributed parent→subagent, never lost.
 //
 // The delegation figures (C3) split agent-active time by whether you were
 // attending it — focused on that session while active at the keyboard:
@@ -446,7 +450,7 @@ type Summary struct {
 // same events given to BuildSwimlanes (the per-lane focus spans come off `lanes`).
 func Summarize(lanes []Swimlane, events []Event) Summary {
 	s := Summary{Sessions: len(lanes), ByStatus: map[string]time.Duration{}}
-	var active []Interval
+	var unionActive []span
 	for _, lane := range lanes {
 		if s.From.IsZero() || (!lane.Start.IsZero() && lane.Start.Before(s.From)) {
 			s.From = lane.Start
@@ -455,26 +459,39 @@ func Summarize(lanes []Swimlane, events []Event) Summary {
 			s.To = lane.End
 		}
 		for _, iv := range lane.Intervals {
-			d := iv.Dur()
-			if d <= 0 {
-				continue
-			}
-			s.ByStatus[iv.Status] += d
-			if isActive(iv.Status) {
-				s.AttentionPerSession += d
-				s.AttentionFanout += time.Duration(int64(d) * int64(1+iv.Subagents))
-				active = append(active, iv)
+			if d := iv.Dur(); d > 0 {
+				s.ByStatus[iv.Status] += d
 			}
 		}
+		// Credit subagents as working compute. parentNet is the parent's own work
+		// with any subagent overlap removed (that overlap reads as "dormant"), so
+		// adding the subagent spans back never double-counts. This is robust to the
+		// MarkDelegationDormant pass not having run — it subtracts the overlap here
+		// regardless — while by_status reflects "dormant" only once that pass has.
+		subs := subagentSpans(lane)
+		parentNet := subtractSpans(activeSpans(lane), subs)
+		var rawSubDur time.Duration
+		for _, sp := range subs {
+			rawSubDur += sp.end.Sub(sp.start)
+		}
+		s.ByStatus[statusWorking] += rawSubDur
+
+		agentActive := mergeSpans(append(append([]span(nil), parentNet...), subs...))
+		s.AttentionPerSession += totalDur(agentActive)
+		// C (fanout): parent-own work + every subagent run; parallel subagents each
+		// count, so this uses the raw (un-merged) subagent total.
+		s.AttentionFanout += totalDur(parentNet) + rawSubDur
+		unionActive = append(unionActive, agentActive...)
 	}
-	s.AttentionUnion = unionDuration(active)
+	s.AttentionUnion = totalDur(mergeSpans(unionActive))
 
 	// Delegation metrics (C3): user-active is a global timeline; focus and
-	// agent-active are per-lane. attendedMask = focused-on-this-session ∧ active.
+	// agent-active are per-lane. agent-active includes the lane's subagents (they
+	// are work happening on your behalf). attendedMask = focused-on-this ∧ active.
 	userActive := userActiveSpans(events, s.From, s.To)
 	var allFocus []span
 	for _, lane := range lanes {
-		agentActive := activeSpans(lane)
+		agentActive := mergeSpans(append(activeSpans(lane), subagentSpans(lane)...))
 		focus := focusToSpans(lane.Focus)
 		allFocus = append(allFocus, focus...)
 		attendedMask := intersectSpans(focus, userActive)
@@ -559,29 +576,6 @@ func AggregatePlanWindow(events []Event, from, to time.Time) PlanWindow {
 	return pw
 }
 
-// unionDuration is the total wall-clock covered by the intervals, counting
-// overlaps once (the merge behind AttentionUnion).
-func unionDuration(intervals []Interval) time.Duration {
-	if len(intervals) == 0 {
-		return 0
-	}
-	iv := append([]Interval(nil), intervals...)
-	sort.Slice(iv, func(i, j int) bool { return iv[i].Start.Before(iv[j].Start) })
-	var total time.Duration
-	curStart, curEnd := iv[0].Start, iv[0].End
-	for _, x := range iv[1:] {
-		if x.Start.After(curEnd) {
-			total += curEnd.Sub(curStart)
-			curStart, curEnd = x.Start, x.End
-			continue
-		}
-		if x.End.After(curEnd) {
-			curEnd = x.End
-		}
-	}
-	return total + curEnd.Sub(curStart)
-}
-
 // span is a half-open [start, end) time interval, the unit of the interval
 // algebra (merge/intersect/subtract) behind the delegation metrics.
 type span struct {
@@ -597,6 +591,68 @@ func activeSpans(lane Swimlane) []span {
 			out = append(out, span{iv.Start, iv.End})
 		}
 	}
+	return out
+}
+
+// subagentSpans is a lane's launched-subagent runs as spans (raw — parallel
+// subagents are kept distinct, not merged).
+func subagentSpans(lane Swimlane) []span {
+	var out []span
+	for _, sp := range lane.Subagents {
+		if sp.End.After(sp.Start) {
+			out = append(out, span{sp.Start, sp.End})
+		}
+	}
+	return out
+}
+
+// MarkDelegationDormant reattributes each lane's "working" time that overlaps one
+// of the lane's own subagent runs to "dormant": while a launched subagent does the
+// work, the parent is effectively waiting on it, not computing. The subagent span
+// itself is the credited working compute (see Summarize). Call this after
+// BuildSwimlanes and before Summarize / JSON encoding so the swimlane intervals,
+// by_status, and the attention metrics all agree. Lanes are mutated in place;
+// calling it twice is a no-op (only "working" intervals are ever resliced).
+func MarkDelegationDormant(lanes []Swimlane) {
+	for i := range lanes {
+		subs := mergeSpans(subagentSpans(lanes[i]))
+		if len(subs) == 0 {
+			continue
+		}
+		var out []Interval
+		for _, iv := range lanes[i].Intervals {
+			if iv.Status != statusWorking {
+				out = append(out, iv)
+				continue
+			}
+			out = append(out, splitWorkingByDormancy(iv, subs)...)
+		}
+		lanes[i].Intervals = out
+	}
+}
+
+// splitWorkingByDormancy slices one working interval against the (merged, sorted)
+// subagent spans: portions overlapping a subagent run become "dormant", the rest
+// stay "working". The interval's sampled Subagents count rides along on each piece.
+// Pieces are emitted in time order.
+func splitWorkingByDormancy(iv Interval, subs []span) []Interval {
+	var out []Interval
+	emit := func(start, end time.Time, status string) {
+		if end.After(start) {
+			out = append(out, Interval{Status: status, Start: start, End: end, Subagents: iv.Subagents})
+		}
+	}
+	cur := iv.Start
+	for _, sp := range subs {
+		os, oe := maxTime(iv.Start, sp.start), minTime(iv.End, sp.end)
+		if !oe.After(os) {
+			continue // this subagent does not overlap the interval
+		}
+		emit(cur, os, statusWorking) // parent working before the subagent
+		emit(os, oe, statusDormant)  // parent waiting on the subagent
+		cur = oe
+	}
+	emit(cur, iv.End, statusWorking) // parent working after the last subagent
 	return out
 }
 

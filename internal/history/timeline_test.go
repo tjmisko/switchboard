@@ -180,9 +180,11 @@ func TestSummarizeAttentionStats(t *testing.T) {
 	if s.AttentionPerSession != 20*time.Second {
 		t.Errorf("attention B (per-session) = %v, want 20s", s.AttentionPerSession)
 	}
-	// C: 10s×1 (no subagents) + 10s×(1+2) = 10 + 30 = 40s.
-	if s.AttentionFanout != 40*time.Second {
-		t.Errorf("attention C (fanout) = %v, want 40s", s.AttentionFanout)
+	// C (fanout): no real subagent runs here, so it equals the parent's own work.
+	// The sampled Subagents count no longer inflates fanout — real subagent_spawn/
+	// stop spans are credited instead (see TestSummarizeCreditsSubagentsAsWorking).
+	if s.AttentionFanout != 20*time.Second {
+		t.Errorf("attention C (fanout) = %v, want 20s", s.AttentionFanout)
 	}
 	// Single session, so union == per-session.
 	if s.AttentionUnion != 20*time.Second {
@@ -438,6 +440,104 @@ func TestBuildSwimlanesSubagentUnpairedStopDropped(t *testing.T) {
 	lanes := BuildSwimlanes(evs, ts(99))
 	if len(lanes[0].Subagents) != 0 {
 		t.Errorf("orphan stop should yield no spans, got %+v", lanes[0].Subagents)
+	}
+}
+
+// --- delegation dormancy + subagent crediting ---------------------------
+
+func TestMarkDelegationDormant(t *testing.T) {
+	// Parent works 0-30; a subagent runs 10-20. The overlapping middle becomes
+	// "dormant" (parent waiting on the subagent), bracketed by working.
+	evs := []Event{
+		{Ts: ts(0), Type: EventSessionStart, PID: 1, SessionID: "s1"},
+		tr(1, "s1", 0, "", "working", 0),
+		{Ts: ts(10), Type: EventSubagentSpawn, PID: 1, ToolUseID: "t1", AgentType: "Explore"},
+		{Ts: ts(20), Type: EventSubagentStop, PID: 1, ToolUseID: "t1"},
+		{Ts: ts(30), Type: EventSessionEnd, PID: 1, SessionID: "s1"},
+	}
+	lanes := BuildSwimlanes(evs, ts(30))
+	MarkDelegationDormant(lanes)
+	want := []Interval{
+		{Status: "working", Start: ts(0), End: ts(10)},
+		{Status: "dormant", Start: ts(10), End: ts(20)},
+		{Status: "working", Start: ts(20), End: ts(30)},
+	}
+	got := lanes[0].Intervals
+	if len(got) != len(want) {
+		t.Fatalf("intervals = %+v, want %d", got, len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("interval %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+	// Idempotent: a second pass leaves the dormant interval alone.
+	MarkDelegationDormant(lanes)
+	if len(lanes[0].Intervals) != len(want) {
+		t.Errorf("second pass changed intervals: %+v", lanes[0].Intervals)
+	}
+}
+
+func TestSummarizeCreditsSubagentsAsWorking(t *testing.T) {
+	// Parent works 0-30 with a subagent running 10-20. The parent's middle reads
+	// as dormant; the subagent run is credited as the working compute instead.
+	evs := []Event{
+		{Ts: ts(0), Type: EventSessionStart, PID: 1, SessionID: "s1"},
+		tr(1, "s1", 0, "", "working", 0),
+		{Ts: ts(10), Type: EventSubagentSpawn, PID: 1, ToolUseID: "t1", AgentType: "Explore"},
+		{Ts: ts(20), Type: EventSubagentStop, PID: 1, ToolUseID: "t1"},
+		{Ts: ts(30), Type: EventSessionEnd, PID: 1, SessionID: "s1"},
+	}
+	lanes := BuildSwimlanes(evs, ts(30))
+	MarkDelegationDormant(lanes)
+	s := Summarize(lanes, evs)
+
+	if got := s.ByStatus["dormant"]; got != 10*time.Second {
+		t.Errorf("dormant = %v, want 10s", got)
+	}
+	if got := s.ByStatus["working"]; got != 30*time.Second {
+		t.Errorf("working = %v, want 30s (20s parent + 10s subagent credited)", got)
+	}
+	// fanout = parent-own 20s + subagent 10s = 30s (the overlap is not double-counted).
+	if s.AttentionFanout != 30*time.Second {
+		t.Errorf("fanout = %v, want 30s", s.AttentionFanout)
+	}
+	// the session was active across the whole 0-30 (parent or subagent).
+	if s.AttentionPerSession != 30*time.Second {
+		t.Errorf("per-session = %v, want 30s", s.AttentionPerSession)
+	}
+	if s.AttentionUnion != 30*time.Second {
+		t.Errorf("union = %v, want 30s", s.AttentionUnion)
+	}
+	// no focus/activity → all agent-active (incl. the subagent) reads as delegated.
+	if s.DelegatedActive != 30*time.Second {
+		t.Errorf("delegated = %v, want 30s", s.DelegatedActive)
+	}
+}
+
+func TestSummarizeFanoutCountsParallelSubagents(t *testing.T) {
+	// Two subagents run in parallel over 10-20 while the parent (working 0-30) is
+	// dormant. Fanout counts both (40s); per-session/union see one 0-30 span (30s).
+	evs := []Event{
+		{Ts: ts(0), Type: EventSessionStart, PID: 1, SessionID: "s1"},
+		tr(1, "s1", 0, "", "working", 0),
+		{Ts: ts(10), Type: EventSubagentSpawn, PID: 1, ToolUseID: "a", AgentType: "Explore"},
+		{Ts: ts(10), Type: EventSubagentSpawn, PID: 1, ToolUseID: "b", AgentType: "general-purpose"},
+		{Ts: ts(20), Type: EventSubagentStop, PID: 1, ToolUseID: "a"},
+		{Ts: ts(20), Type: EventSubagentStop, PID: 1, ToolUseID: "b"},
+		{Ts: ts(30), Type: EventSessionEnd, PID: 1, SessionID: "s1"},
+	}
+	lanes := BuildSwimlanes(evs, ts(30))
+	MarkDelegationDormant(lanes)
+	s := Summarize(lanes, evs)
+	if s.AttentionFanout != 40*time.Second {
+		t.Errorf("fanout = %v, want 40s (parent 20s + two parallel subagents 10s each)", s.AttentionFanout)
+	}
+	if s.AttentionPerSession != 30*time.Second {
+		t.Errorf("per-session = %v, want 30s (one active span)", s.AttentionPerSession)
+	}
+	if s.AttentionUnion != 30*time.Second {
+		t.Errorf("union = %v, want 30s", s.AttentionUnion)
 	}
 }
 
