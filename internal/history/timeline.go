@@ -96,7 +96,7 @@ type Swimlane struct {
 	Intervals []Interval `json:"intervals"`
 
 	// v2 enrichments (all omitempty — additive to the existing contract).
-	Labels    []LabelSpan    `json:"labels,omitempty"`
+	Labels []LabelSpan `json:"labels,omitempty"`
 	// Names is the slug-only subsequence of Labels: each stretch the session
 	// carried a `/name`-style slug, in order, so a consumer can render the name
 	// changing over time without the noise of the default ("Claude Code") and the
