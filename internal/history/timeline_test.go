@@ -124,6 +124,34 @@ func TestBuildSwimlanesCanonicalNamePrefersSlug(t *testing.T) {
 	}
 }
 
+// Names is the slug-only span history: as the session is renamed with `/name`,
+// each slug becomes its own span, so a consumer can show the name changing over
+// time without the default and the auto-generated prose titles Labels also keeps.
+func TestBuildSwimlanesNamesTracksSlugChangesOverTime(t *testing.T) {
+	evs := []Event{
+		{Ts: ts(0), Type: EventSessionStart, PID: 1, SessionID: "s1"},
+		{Ts: ts(1), Type: EventSessionLabel, PID: 1, SessionID: "s1", Label: "Claude Code"},
+		{Ts: ts(2), Type: EventSessionLabel, PID: 1, SessionID: "s1", Label: "Refactoring the sink"},
+		{Ts: ts(3), Type: EventSessionLabel, PID: 1, SessionID: "s1", Label: "sink-refactor"},
+		{Ts: ts(6), Type: EventSessionLabel, PID: 1, SessionID: "s1", Label: "sink-async-rewrite"},
+		tr(1, "s1", 7, "idle", "working", 0),
+	}
+	lanes := BuildSwimlanes(evs, ts(10))
+	names := lanes[0].Names
+	if len(names) != 2 {
+		t.Fatalf("Names = %+v, want 2 slug spans (the prose/default filtered out)", names)
+	}
+	if names[0].Label != "sink-refactor" || !names[0].Start.Equal(ts(3)) || !names[0].End.Equal(ts(6)) {
+		t.Errorf("first slug span = %+v, want sink-refactor [3,6]", names[0])
+	}
+	if names[1].Label != "sink-async-rewrite" || !names[1].Start.Equal(ts(6)) || !names[1].End.Equal(ts(10)) {
+		t.Errorf("second slug span = %+v, want sink-async-rewrite [6,10]", names[1])
+	}
+	if lanes[0].Name != "sink-async-rewrite" {
+		t.Errorf("Name = %q, want the latest slug", lanes[0].Name)
+	}
+}
+
 // With no slug ever set, the canonical Name falls back to the most recent label
 // of any shape rather than going blank.
 func TestBuildSwimlanesCanonicalNameFallsBackToLatestLabel(t *testing.T) {

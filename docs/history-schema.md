@@ -205,7 +205,8 @@ additive to the original `{window, lanes, summary, totals}`:
     "name": "sb-invest",                                                     // one canonical display name: the /name slug wins over the auto title
     "start": "…", "end": "…",
     "intervals": [{ "status": "working", "start": "…", "end": "…", "subagents": 0 }],
-    "labels":    [{ "label": "sb-invest", "start": "…", "end": "…" }],       // name over time (A1)
+    "labels":    [{ "label": "sb-invest", "start": "…", "end": "…" }],       // every name change over time, incl. default + auto titles (A1)
+    "names":     [{ "label": "sb-invest", "start": "…", "end": "…" }],       // slug-only subsequence of labels — the /name history to render as spans
     "subagents": [{ "agent_type": "Explore", "tool_use_id": "…",
                     "description": "…", "start": "…", "end": "…" }],         // launched subagents (A3)
     "focus":     [{ "start": "…", "end": "…" }],                            // this session held OS focus (C1)

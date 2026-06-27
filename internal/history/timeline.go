@@ -97,6 +97,12 @@ type Swimlane struct {
 
 	// v2 enrichments (all omitempty — additive to the existing contract).
 	Labels    []LabelSpan    `json:"labels,omitempty"`
+	// Names is the slug-only subsequence of Labels: each stretch the session
+	// carried a `/name`-style slug, in order, so a consumer can render the name
+	// changing over time without the noise of the default ("Claude Code") and the
+	// long auto-generated titles that Labels also records. Empty until the first
+	// slug is set. Name is the last of these.
+	Names     []LabelSpan    `json:"names,omitempty"`
 	Subagents []SubagentSpan `json:"subagents,omitempty"`
 	Focus     []FocusSpan    `json:"focus,omitempty"`
 
@@ -310,33 +316,43 @@ func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
 		if id := done[i].SessionID; id != "" {
 			done[i].Focus = clampFocus(focusBySession[id], done[i].Start, done[i].End)
 		}
+		done[i].Names = slugSpans(done[i])
 		done[i].Name = canonicalLaneName(done[i])
 	}
 	return done
 }
 
-// canonicalLaneName picks the single best display name for a lane from its label
-// history. A session is typically named in stages: the default ("Claude Code"),
-// then the long auto-generated title Claude writes to the window
-// ("Debug agents not recording data"), then the short slug you set with `/name`
-// ("debug-agents-data-recording"). The slug is the name you chose, so the most
-// recent slug-shaped label wins; absent any slug, the most recent label of any
-// shape is used; absent any label, "" (the consumer falls back to project/pid).
-func canonicalLaneName(lane Swimlane) string {
-	var lastAny, lastSlug string
+// slugSpans is the slug-only subsequence of a lane's label spans — the stretches
+// it carried a `/name`-style slug, in order. A session is typically named in
+// stages: the default ("Claude Code"), then the long auto-generated title Claude
+// writes to the window ("Debug agents not recording data"), then the short slug
+// you set with `/name` ("debug-agents-data-recording"). Keeping just the slugs
+// lets a consumer render the name as it changed without that noise. Spans are
+// left as-is (not coalesced): a `/name` persists as the session's name until the
+// next change, so consecutive slug spans are already distinct names.
+func slugSpans(lane Swimlane) []LabelSpan {
+	var out []LabelSpan
 	for _, ls := range lane.Labels {
-		if ls.Label == "" {
-			continue
-		}
-		lastAny = ls.Label
 		if isSlug(ls.Label) {
-			lastSlug = ls.Label
+			out = append(out, ls)
 		}
 	}
-	if lastSlug != "" {
-		return lastSlug
+	return out
+}
+
+// canonicalLaneName picks the single best display name for a lane: the most
+// recent slug (the name you chose with `/name`), else the most recent label of
+// any shape, else "" (the consumer falls back to project/pid).
+func canonicalLaneName(lane Swimlane) string {
+	if n := len(lane.Names); n > 0 {
+		return lane.Names[n-1].Label
 	}
-	return lastAny
+	for i := len(lane.Labels) - 1; i >= 0; i-- {
+		if lane.Labels[i].Label != "" {
+			return lane.Labels[i].Label
+		}
+	}
+	return ""
 }
 
 // isSlug reports whether s looks like a `/name` slug rather than a prose title:
