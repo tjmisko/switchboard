@@ -11,6 +11,7 @@ import (
 
 	"github.com/tjmisko/switchboard/internal/durfmt"
 	"github.com/tjmisko/switchboard/internal/history"
+	"github.com/tjmisko/switchboard/internal/projectname"
 )
 
 // planWindowHours is the width of the rolling plan-usage window (Anthropic's
@@ -78,6 +79,14 @@ func cmdTimeline(args []string) {
 	}
 
 	if *asJSON {
+		// Enrich each lane with the project's pretty display name for the dashboard.
+		// The history package is a dependency-light leaf and must not import
+		// projectname, so the reverse abbrev->full lookup happens here, off the
+		// stored abbreviation, before encoding. (#33)
+		pcfg := projectname.Load()
+		for i := range lanes {
+			lanes[i].ProjectFull = projectname.FullForAbbrev(pcfg, lanes[i].Project)
+		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(struct {

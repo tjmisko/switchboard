@@ -85,6 +85,12 @@ type Swimlane struct {
 	PID       int    `json:"pid"`
 	Agent     string `json:"agent,omitempty"`
 	Project   string `json:"project,omitempty"`
+	// ProjectFull is the pretty, human-readable project display name (e.g.
+	// "Switchboard") to Project's terse abbreviation (e.g. "sb"). The history
+	// package stays a dependency-light leaf and never derives this — it is a plain
+	// pass-through field a consumer (cmd/switchboard-ctl) populates from the
+	// projectname config before encoding, keyed off Project. Empty otherwise.
+	ProjectFull string `json:"project_full,omitempty"`
 	// Name is the one canonical display name for the lane, picked from its label
 	// history by canonicalLaneName: the short slug you gave it (`/name`) wins over
 	// the long auto-generated title, so a consumer can render a single title
@@ -96,7 +102,7 @@ type Swimlane struct {
 	Intervals []Interval `json:"intervals"`
 
 	// v2 enrichments (all omitempty — additive to the existing contract).
-	Labels    []LabelSpan    `json:"labels,omitempty"`
+	Labels []LabelSpan `json:"labels,omitempty"`
 	// Names is the slug-only subsequence of Labels: each stretch the session
 	// carried a `/name`-style slug, in order, so a consumer can render the name
 	// changing over time without the noise of the default ("Claude Code") and the
