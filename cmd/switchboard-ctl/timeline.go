@@ -30,9 +30,9 @@ const planWindowHours = 5
 func cmdTimeline(args []string) {
 	fs := flag.NewFlagSet("timeline", flag.ExitOnError)
 	dir := fs.String("dir", history.DefaultDir(), "activity-log directory")
-	day := fs.String("day", "", "single UTC day (YYYY-MM-DD; default today)")
-	since := fs.String("since", "", "range start UTC day (YYYY-MM-DD)")
-	until := fs.String("until", "", "range end UTC day, inclusive (YYYY-MM-DD)")
+	day := fs.String("day", "", "single local day (YYYY-MM-DD; default today)")
+	since := fs.String("since", "", "range start local day (YYYY-MM-DD)")
+	until := fs.String("until", "", "range end local day, inclusive (YYYY-MM-DD)")
 	width := fs.Int("width", 48, "swimlane bar width in columns")
 	asJSON := fs.Bool("json", false, "emit the swimlanes + summary as JSON")
 	noColor := fs.Bool("no-color", false, "disable ANSI color")

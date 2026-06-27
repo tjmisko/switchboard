@@ -16,7 +16,7 @@ import (
 // immediately, so it is safe to call from the daemon's hot path (it is invoked
 // while the state lock is held) — a slow or full disk drops events rather than
 // stalling the daemon. The goroutine owns the open day-file, rotates it at the
-// UTC day boundary, and prunes old files on each rotation.
+// local day boundary, and prunes old files on each rotation.
 //
 // A disabled Sink (history opt-out) is a valid zero-cost value: Record/Close are
 // no-ops and no goroutine or file is created.

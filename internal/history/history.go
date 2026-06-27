@@ -6,7 +6,7 @@
 // the journald decision log (statustune.Decision), written to a place
 // Switchboard owns so retention is bounded and the data is query-shaped rather
 // than grep-only. The store is deliberately simple — one JSON event per line,
-// one file per UTC day — so it stays zero-dependency and portable (no cgo), and
+// one file per local day — so it stays zero-dependency and portable (no cgo), and
 // a torn final line costs one event, not the store.
 //
 //   - Event is the atom (a transition, a session_start/end, a suspend/resume,

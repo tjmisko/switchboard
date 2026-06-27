@@ -70,14 +70,14 @@ func historyDir(args []string) string {
 func cmdHistoryTail(args []string) {
 	fs := flag.NewFlagSet("history tail", flag.ExitOnError)
 	dir := fs.String("dir", history.DefaultDir(), "activity-log directory")
-	day := fs.String("day", "", "UTC day to read (YYYY-MM-DD; default today)")
+	day := fs.String("day", "", "local day to read (YYYY-MM-DD; default today)")
 	n := fs.Int("n", 20, "number of most-recent events to show")
 	asJSON := fs.Bool("json", false, "emit raw JSON events")
 	_ = fs.Parse(args)
 
 	d := *day
 	if d == "" {
-		d = time.Now().UTC().Format("2006-01-02")
+		d = time.Now().Format("2006-01-02") // local day, matching how files partition
 	}
 	evs, err := history.ReadDay(*dir, d)
 	if err != nil {
@@ -190,7 +190,7 @@ func cmdHistoryStat(args []string) {
 func cmdHistoryPurge(args []string) {
 	fs := flag.NewFlagSet("history purge", flag.ExitOnError)
 	dir := fs.String("dir", history.DefaultDir(), "activity-log directory")
-	before := fs.String("before", "", "delete day-files strictly older than this UTC day (YYYY-MM-DD)")
+	before := fs.String("before", "", "delete day-files strictly older than this local day (YYYY-MM-DD)")
 	all := fs.Bool("all", false, "delete the entire log")
 	_ = fs.Parse(args)
 
@@ -199,7 +199,7 @@ func cmdHistoryPurge(args []string) {
 	}
 	var cutoff time.Time
 	if *before != "" {
-		t, err := time.ParseInLocation("2006-01-02", *before, time.UTC)
+		t, err := time.ParseInLocation("2006-01-02", *before, time.Local)
 		if err != nil {
 			fail("--before %q: want YYYY-MM-DD", *before)
 		}
