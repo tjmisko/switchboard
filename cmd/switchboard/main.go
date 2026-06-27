@@ -17,6 +17,7 @@ import (
 
 	"github.com/tjmisko/switchboard/internal/detect"
 	"github.com/tjmisko/switchboard/internal/discovery"
+	"github.com/tjmisko/switchboard/internal/fanout"
 	"github.com/tjmisko/switchboard/internal/history"
 	"github.com/tjmisko/switchboard/internal/mapping"
 	"github.com/tjmisko/switchboard/internal/osproc"
@@ -55,6 +56,12 @@ func main() {
 	sink := history.NewSink(histCfg)
 	defer sink.Close()
 	log.Printf("history: enabled=%t detail=%s dir=%s", sink.Enabled(), histCfg.Detail, sink.Dir())
+
+	// One fanout Observer is the single source of truth for subagent detection,
+	// shared by the reconcile loop and the SubagentStart/Stop hook handler (one
+	// writer, two triggers). It seeds its per-session seen-set from the same history
+	// dir the sink writes, so a daemon restart does not re-emit historical spawns.
+	fanoutObs := fanout.NewObserver(sink.Dir())
 
 	// tun holds every status-color knob (statustune.Tuning). It is built once here
 	// and threaded into both decision sites — the RPC hook gate and the reconciler
@@ -116,11 +123,12 @@ func main() {
 		}
 	}()
 	go runWMLoop(ctx, store, resolver, manager, sink)
-	go runReconciler(ctx, store, resolver, manager, stack, *reconcileInterval, tun, sink)
+	go runReconciler(ctx, store, resolver, manager, stack, *reconcileInterval, tun, sink, fanoutObs)
 
 	server := rpc.New(store, *socketPath, term, manager)
 	server.SetTuning(tun)
 	server.SetHistory(sink)
+	server.SetFanout(fanoutObs)
 	if err := os.MkdirAll(filepath.Dir(*socketPath), 0o755); err != nil {
 		log.Fatalf("mkdir socket dir: %v", err)
 	}
@@ -212,10 +220,10 @@ func handleWMEvent(ctx context.Context, store *state.Store, resolver *mapping.Re
 // Catches anything missed by event-driven updates (e.g. a session whose
 // mapping was incomplete when first created, the initial focus state, or a
 // hyprctl race).
-func runReconciler(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, interval time.Duration, tun statustune.Tuning, sink *history.Sink) {
+func runReconciler(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, interval time.Duration, tun statustune.Tuning, sink *history.Sink, obs *fanout.Observer) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
-	rstate := newReconcileState()
+	rstate := newReconcileState(obs)
 	reconcileOnce(ctx, store, resolver, manager, stack, tun, sink, rstate)
 	for {
 		select {
@@ -258,7 +266,7 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 			// delegation, and emit fanout (subagent spawn/stop) + usage (token)
 			// history events derived from the same read. Claude-only.
 			if c := sess.Claude; c != nil {
-				rstate.observe(sink, sess, c, now, tun)
+				rstate.observe(sink, sess, c, now)
 			}
 		}
 		// Re-sync focus against the active window (the backstop for any focus event

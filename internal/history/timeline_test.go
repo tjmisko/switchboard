@@ -471,6 +471,37 @@ func TestBuildSwimlanesSubagentUnpairedStopDropped(t *testing.T) {
 	}
 }
 
+func TestBuildSwimlanesSubagentSpansPairByAgentID(t *testing.T) {
+	// agent_id is the universal key. The first subagent carries BOTH agent_id and
+	// tool_use_id on its spawn but its stop carries only agent_id (the real shape:
+	// the SubagentStop hook reports agent_id, not the tool_use_id) — so pairing
+	// must key on agent_id, not tool_use_id. The second subagent carries no
+	// agent_id at all (an older record): it must still pair via the ToolUseID
+	// fallback.
+	evs := []Event{
+		{Ts: ts(0), Type: EventSessionStart, PID: 1, SessionID: "s1"},
+		{Ts: ts(5), Type: EventSubagentSpawn, PID: 1, AgentID: "a1", ToolUseID: "t1", AgentType: "Explore", Description: "search"},
+		{Ts: ts(15), Type: EventSubagentStop, PID: 1, AgentID: "a1"},                                  // stop carries only agent_id
+		{Ts: ts(10), Type: EventSubagentSpawn, PID: 1, ToolUseID: "t2", AgentType: "general-purpose"}, // no agent_id → ToolUseID fallback
+		{Ts: ts(25), Type: EventSubagentStop, PID: 1, ToolUseID: "t2"},
+		{Ts: ts(30), Type: EventSessionEnd, PID: 1, SessionID: "s1"},
+	}
+	lanes := BuildSwimlanes(evs, ts(99))
+	got := lanes[0].Subagents
+	want := []SubagentSpan{
+		{AgentType: "Explore", AgentID: "a1", ToolUseID: "t1", Description: "search", Start: ts(5), End: ts(15)},
+		{AgentType: "general-purpose", ToolUseID: "t2", Start: ts(10), End: ts(25)},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("subagents = %+v, want %d (sorted by start)", got, len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("subagent %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
 // --- delegation dormancy + subagent crediting ---------------------------
 
 func TestMarkDelegationDormant(t *testing.T) {

@@ -56,10 +56,14 @@ type LabelSpan struct {
 }
 
 // SubagentSpan is one launched subagent's lifetime, paired from a subagent_spawn
-// and its matching subagent_stop by tool_use_id. A span still open at the lane's
-// end is capped there. AgentType is minimal-safe; Description is full-tier. (A3.)
+// and its matching subagent_stop by eventAgentKey (the subagent's agent_id, or
+// its tool_use_id for older events that predate agent_id). A span still open at
+// the lane's end is capped there. AgentType is minimal-safe; Description is
+// full-tier. (A3.)
 type SubagentSpan struct {
 	AgentType   string    `json:"agent_type,omitempty"`
+	Background  bool      `json:"background,omitempty"`
+	AgentID     string    `json:"agent_id,omitempty"`
 	ToolUseID   string    `json:"tool_use_id,omitempty"`
 	Description string    `json:"description,omitempty"`
 	Start       time.Time `json:"start"`
@@ -130,7 +134,7 @@ type laneBuilder struct {
 	curLabel      string    // the session's current name (A1)
 	curLabelStart time.Time // when the current label span opened
 
-	openSubs map[string]*SubagentSpan // tool_use_id → still-running subagent (A3)
+	openSubs map[string]*SubagentSpan // eventAgentKey → still-running subagent (A3)
 }
 
 // newLaneBuilder opens a fresh lane at an event's instant, seeding its identity.
@@ -191,8 +195,9 @@ func (b *laneBuilder) closeLabel(t time.Time) {
 //
 // Beyond the status intervals it also derives, per lane: the session-name spans
 // (session_label), the launched-subagent spans (subagent_spawn↔stop by
-// tool_use_id), the accumulated token usage + recomputed cost (usage_sample),
-// and the spans the session held window focus (the global focus stream).
+// eventAgentKey — agent_id, or tool_use_id for older events), the accumulated
+// token usage + recomputed cost (usage_sample), and the spans the session held
+// window focus (the global focus stream).
 func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
 	evs := append([]Event(nil), events...)
 	sort.SliceStable(evs, func(i, j int) bool { return evs[i].Ts.Before(evs[j].Ts) })
@@ -289,18 +294,19 @@ func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
 			if b.openSubs == nil {
 				b.openSubs = map[string]*SubagentSpan{}
 			}
-			b.openSubs[ev.ToolUseID] = &SubagentSpan{
-				AgentType: ev.AgentType, ToolUseID: ev.ToolUseID, Description: ev.Description, Start: ev.Ts,
+			b.openSubs[eventAgentKey(ev)] = &SubagentSpan{
+				AgentType: ev.AgentType, Background: ev.Background, AgentID: ev.AgentID, ToolUseID: ev.ToolUseID, Description: ev.Description, Start: ev.Ts,
 			}
 			b.absorb(ev)
 		case EventSubagentStop:
 			if b == nil {
 				continue
 			}
-			if sp, ok := b.openSubs[ev.ToolUseID]; ok {
+			key := eventAgentKey(ev)
+			if sp, ok := b.openSubs[key]; ok {
 				sp.End = ev.Ts
 				b.lane.Subagents = append(b.lane.Subagents, *sp)
-				delete(b.openSubs, ev.ToolUseID)
+				delete(b.openSubs, key)
 			}
 		}
 	}
@@ -614,6 +620,18 @@ func activeSpans(lane Swimlane) []span {
 		}
 	}
 	return out
+}
+
+// eventAgentKey is the correlation key that pairs a subagent_spawn with its
+// subagent_stop: the subagent's stable AgentID (the <id> in agent-<id>.*, the
+// only key universal across teammates and grandchildren — which carry no
+// tool_use_id), falling back to ToolUseID for older events recorded before
+// agent_id was captured.
+func eventAgentKey(ev Event) string {
+	if ev.AgentID != "" {
+		return ev.AgentID
+	}
+	return ev.ToolUseID
 }
 
 // subagentSpans is a lane's launched-subagent runs as spans (raw — parallel

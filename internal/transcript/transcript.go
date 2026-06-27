@@ -144,6 +144,11 @@ type entry struct {
 		// Usage is the per-assistant-message token accounting Claude Code records;
 		// UsageSince sums it to track plan consumption. Absent on user/system entries.
 		Usage *Usage `json:"usage"`
+		// StopReason is the assistant message's terminal reason ("end_turn",
+		// "tool_use", "max_tokens", …); subagentDone reads it to tell a finished
+		// subagent transcript (end_turn) from one still mid-turn. Absent on
+		// user/system entries.
+		StopReason string `json:"stop_reason"`
 	} `json:"message"`
 }
 
@@ -163,6 +168,11 @@ type block struct {
 	Input struct {
 		Description  string `json:"description"`
 		SubagentType string `json:"subagent_type"`
+		// RunInBackground is set when the main thread launched the subagent in the
+		// background (Agent/Task input run_in_background:true) — a fanout whose
+		// parent tool_result may land long after the spawn, so the subagents/ dir
+		// (SubagentsForTranscript) is the more reliable completion signal for it.
+		RunInBackground bool `json:"run_in_background"`
 	} `json:"input"`
 }
 
@@ -409,6 +419,7 @@ type Task struct {
 	ID          string // the tool_use id (links spawn to stop)
 	AgentType   string // subagent_type from the Task input (e.g. "Explore")
 	Description string // the human description from the Task input
+	Background  bool   // run_in_background from the Task input (a background fanout)
 	Done        bool   // its tool_result has landed
 }
 
@@ -421,7 +432,10 @@ func Tasks(path string, maxBytes int64) ([]Task, error) {
 	if err != nil {
 		return nil, err
 	}
-	type meta struct{ agentType, description string }
+	type meta struct {
+		agentType, description string
+		background             bool
+	}
 	launched := map[string]meta{}
 	var order []string
 	done := map[string]bool{}
@@ -433,7 +447,7 @@ func Tasks(path string, maxBytes int64) ([]Task, error) {
 					if _, seen := launched[b.ID]; !seen {
 						order = append(order, b.ID)
 					}
-					launched[b.ID] = meta{b.Input.SubagentType, b.Input.Description}
+					launched[b.ID] = meta{b.Input.SubagentType, b.Input.Description, b.Input.RunInBackground}
 				}
 			case "tool_result":
 				if b.ToolUseID != "" {
@@ -445,7 +459,7 @@ func Tasks(path string, maxBytes int64) ([]Task, error) {
 	tasks := make([]Task, 0, len(order))
 	for _, id := range order {
 		m := launched[id]
-		tasks = append(tasks, Task{ID: id, AgentType: m.agentType, Description: m.description, Done: done[id]})
+		tasks = append(tasks, Task{ID: id, AgentType: m.agentType, Description: m.description, Background: m.background, Done: done[id]})
 	}
 	return tasks, nil
 }

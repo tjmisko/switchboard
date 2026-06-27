@@ -345,6 +345,8 @@ func cmdHook(c *rpc.Client, event, agent string) {
 	sessionID := ""
 	transcript := ""
 	toolName := ""
+	agentID := ""
+	agentType := ""
 	if body, err := io.ReadAll(os.Stdin); err == nil && len(body) > 0 {
 		var payload struct {
 			SessionID      string `json:"session_id"`
@@ -354,11 +356,21 @@ func cmdHook(c *rpc.Client, event, agent string) {
 			// itself completes (see rpc.clearsPermission); absent on other events,
 			// which just disables that fast path.
 			ToolName string `json:"tool_name"`
+			// SubagentStart/Stop carry the subagent's identity. The wire form is
+			// snake_case (verified against the 2.1.195 binary); the camelCase
+			// fallbacks tolerate a build that reuses the dir-style key. Best-effort —
+			// the daemon only uses them to TRIGGER a dir re-scan, keyed off agent_id.
+			AgentID      string `json:"agent_id"`
+			AgentType    string `json:"agent_type"`
+			AgentIDAlt   string `json:"agentId"`
+			AgentTypeAlt string `json:"agentType"`
 		}
 		if json.Unmarshal(body, &payload) == nil {
 			sessionID = payload.SessionID
 			transcript = payload.TranscriptPath
 			toolName = payload.ToolName
+			agentID = firstNonEmpty(payload.AgentID, payload.AgentIDAlt)
+			agentType = firstNonEmpty(payload.AgentType, payload.AgentTypeAlt)
 		}
 	}
 	_ = c.Send(rpc.Request{
@@ -368,10 +380,23 @@ func cmdHook(c *rpc.Client, event, agent string) {
 		SessionID:  sessionID,
 		Transcript: transcript,
 		ToolName:   toolName,
+		AgentID:    agentID,
+		AgentType:  agentType,
 		Agent:      agent,
 	})
 	var resp rpc.Response
 	_ = c.Recv(&resp)
+}
+
+// firstNonEmpty returns the first non-empty string, for tolerating snake_case vs
+// camelCase hook payload keys (e.g. agent_id vs agentId).
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // cmdName resolves or edits project abbreviations and pretty display names.

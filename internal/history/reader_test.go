@@ -91,6 +91,47 @@ func TestReadRangeSpansDaysAndFilters(t *testing.T) {
 	}
 }
 
+func TestPriorSubagentStateByAgentIDExcludesOtherSessions(t *testing.T) {
+	dir := t.TempDir()
+	writeDay(t, dir, "2026-06-25",
+		`{"ts":"2026-06-25T10:00:00Z","type":"subagent_spawn","session_id":"s1","agent_id":"a1"}`,
+		`{"ts":"2026-06-25T10:05:00Z","type":"subagent_stop","session_id":"s1","agent_id":"a1"}`,
+	)
+	writeDay(t, dir, "2026-06-26",
+		`{"ts":"2026-06-26T10:00:00Z","type":"subagent_spawn","session_id":"s1","agent_id":"a2"}`,    // spawned, not yet stopped
+		`{"ts":"2026-06-26T10:01:00Z","type":"subagent_spawn","session_id":"s1","tool_use_id":"t3"}`, // older event → keyed by tool_use_id
+		`{"ts":"2026-06-26T10:02:00Z","type":"subagent_spawn","session_id":"s2","agent_id":"b1"}`,    // a DIFFERENT session — must be excluded
+	)
+
+	spawned, stopped, err := PriorSubagentState(dir, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(spawned) != 3 || !spawned["a1"] || !spawned["a2"] || !spawned["t3"] {
+		t.Errorf("spawned = %v, want exactly {a1,a2,t3} (agent_id, plus tool_use_id fallback)", spawned)
+	}
+	if spawned["b1"] {
+		t.Errorf("spawned must exclude the other session's b1: %v", spawned)
+	}
+	if len(stopped) != 1 || !stopped["a1"] {
+		t.Errorf("stopped = %v, want exactly {a1}", stopped)
+	}
+}
+
+func TestPriorSubagentStateEmptySessionIsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	writeDay(t, dir, "2026-06-26",
+		`{"ts":"2026-06-26T10:00:00Z","type":"subagent_spawn","session_id":"s1","agent_id":"a1"}`,
+	)
+	spawned, stopped, err := PriorSubagentState(dir, "")
+	if err != nil {
+		t.Fatalf("empty session id should not error: %v", err)
+	}
+	if len(spawned) != 0 || len(stopped) != 0 {
+		t.Errorf("empty session id should yield empty sets, got spawned=%v stopped=%v", spawned, stopped)
+	}
+}
+
 func TestDaysSortedOldestFirst(t *testing.T) {
 	dir := t.TempDir()
 	writeDay(t, dir, "2026-06-27", "{}")

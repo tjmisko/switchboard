@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/fanout"
 	"github.com/tjmisko/switchboard/internal/history"
 	"github.com/tjmisko/switchboard/internal/proc"
 	"github.com/tjmisko/switchboard/internal/state"
@@ -56,6 +57,14 @@ type Request struct {
 	// fast path and falls back to the transcript check.
 	ToolName string `json:"tool_name,omitempty"`
 
+	// AgentID/AgentType identify the subagent on a SubagentStart/SubagentStop hook.
+	// AgentID is the stable agent-<id> the subagents/ dir and the hook share (the
+	// universal key); AgentType names the kind. They are best-effort context — the
+	// hook's job is only to TRIGGER a fanout re-scan, which is keyed off the dir, so
+	// neither is required for correctness. Empty on every non-subagent event.
+	AgentID   string `json:"agent_id,omitempty"`
+	AgentType string `json:"agent_type,omitempty"`
+
 	// Activity carries the global user-activity edge — set when Cmd == "activity".
 	// It is session-less: "idle" when an idle daemon (e.g. hypridle) sees no input
 	// for its timeout, "active" when input resumes. Exactly those two values are
@@ -76,6 +85,7 @@ type Server struct {
 	wm         wm.Manager
 	tun        statustune.Tuning
 	hist       *history.Sink
+	fanout     *fanout.Observer
 }
 
 func New(store *state.Store, socketPath string, term terminal.Locator, manager wm.Manager) *Server {
@@ -90,6 +100,12 @@ func (s *Server) SetTuning(t statustune.Tuning) { s.tun = t }
 // SetHistory wires the activity-log sink the hook handler records transitions to.
 // Call once at startup before Serve. A nil sink (the default) records nothing.
 func (s *Server) SetHistory(h *history.Sink) { s.hist = h }
+
+// SetFanout wires the subagent fanout Observer that a SubagentStart/Stop hook
+// triggers an immediate re-scan on (single source of truth, shared with the
+// reconcile loop). Call once at startup before Serve. A nil Observer (the default)
+// disables the hook-speed trigger, leaving the reconcile tick to pick fanouts up.
+func (s *Server) SetFanout(o *fanout.Observer) { s.fanout = o }
 
 // Serve listens on the socket path and accepts connections until ctx is done.
 // The socket file is removed on startup (in case of unclean shutdown) and on
@@ -397,6 +413,21 @@ func (s *Server) handleHook(req Request) {
 		}
 		if req.SessionID != "" && info.SessionID == "" {
 			info.SessionID = req.SessionID
+		}
+		// SubagentStart/Stop: trigger an immediate fanout re-scan so the in-flight
+		// count and the spawn/stop history update at hook speed instead of waiting for
+		// the next reconcile tick. The Observer is the single writer and re-derives
+		// everything from the authoritative subagents/ dir — the hook only triggers
+		// (it carries no tool_use_id and must not mutate the counter), so a duplicate
+		// or out-of-order hook is harmless. statusFromHookEvent returns "" for these,
+		// so the main thread's status is untouched; the delegating edge follows from
+		// the refreshed InFlightSubagents.
+		if s.fanout != nil && (req.Event == "SubagentStart" || req.Event == "SubagentStop") {
+			for _, ev := range s.fanout.Reconcile(sess, info, time.Now()) {
+				if s.hist != nil {
+					s.hist.Record(ev)
+				}
+			}
 		}
 	})
 }

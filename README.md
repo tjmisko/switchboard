@@ -218,12 +218,22 @@ Status colors come from Claude Code hooks. Without them, sessions still appear
   "UserPromptSubmit":  [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook UserPromptSubmit",  "timeout": 2 }] }],
   "PostToolUse":       [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook PostToolUse",       "timeout": 2 }] }],
   "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook PermissionRequest", "timeout": 2 }] }],
-  "Stop":              [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook Stop",              "timeout": 2 }] }]
+  "Stop":              [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook Stop",              "timeout": 2 }] }],
+  "SubagentStart":     [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook SubagentStart",     "timeout": 2 }] }],
+  "SubagentStop":      [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook SubagentStop",       "timeout": 2 }] }]
 }
 ```
 
 The forwarder is fire-and-forget; a broken hook can never corrupt state or
 block Claude Code.
+
+`SubagentStart`/`SubagentStop` are **optional** — they make subagent-fanout
+detection real-time by triggering an immediate re-scan instead of waiting for the
+next reconcile tick. Fanouts are still detected without them (the daemon scans
+the authoritative `subagents/` metadata directory every tick), so these two only
+reduce the latency on the `delegating` chip and the "N agents" count. The hook is
+a pure trigger; the daemon's Observer remains the single source of truth, so a
+duplicated or dropped subagent hook can never miscount.
 
 ## Codex hooks (optional status enrichment)
 

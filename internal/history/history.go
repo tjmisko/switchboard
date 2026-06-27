@@ -72,11 +72,18 @@ type Event struct {
 	Subagents int    `json:"subagents,omitempty"`   // S: subagents in flight at the edge
 	DurPrevMs int64  `json:"dur_prev_ms,omitempty"` // how long `from` was held (the closed interval)
 
-	// Subagent payload (subagent_spawn / subagent_stop). AgentType is kept at the
-	// minimal tier (it names the agent kind, not your work); Description is
-	// scrubbed (it is the task content).
-	ToolUseID string `json:"tool_use_id,omitempty"` // links a spawn to its stop
-	AgentType string `json:"agent_type,omitempty"`  // e.g. "Explore", "general-purpose"
+	// Subagent payload (subagent_spawn / subagent_stop). AgentID is the subagent's
+	// stable identity — the <id> in its agent-<id>.meta.json/.jsonl filename, also
+	// the SubagentStart/Stop hook's agent_id — and is the only key universal across
+	// every subagent (teammates and grandchildren carry no tool_use_id). It is the
+	// correlation/dedup key; ToolUseID is kept for back-compat and pairs a spawn to
+	// its stop on the subagents that have one. AgentType is kept at the minimal
+	// tier (it names the agent kind, not your work); Description is scrubbed (it is
+	// the task content).
+	AgentID    string `json:"agent_id,omitempty"`    // stable subagent id (agent-<id>.*); the universal correlation key
+	ToolUseID  string `json:"tool_use_id,omitempty"` // links a spawn to its stop (absent on teammates/grandchildren)
+	AgentType  string `json:"agent_type,omitempty"`  // e.g. "Explore", "general-purpose"
+	Background bool   `json:"background,omitempty"`  // the fanout was launched run_in_background (best-effort; from the parent tool_use)
 
 	// Usage payload (usage_sample): tokens accrued since the previous sample.
 	// Model names the model the tokens were spent on (e.g. "claude-opus-4-8"),
