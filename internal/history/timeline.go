@@ -78,10 +78,16 @@ type FocusSpan struct {
 // session's name history, its launched subagents, the spans it held focus, and
 // its token usage + recomputed dollar cost.
 type Swimlane struct {
-	SessionID string     `json:"session_id,omitempty"`
-	PID       int        `json:"pid"`
-	Agent     string     `json:"agent,omitempty"`
-	Project   string     `json:"project,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
+	PID       int    `json:"pid"`
+	Agent     string `json:"agent,omitempty"`
+	Project   string `json:"project,omitempty"`
+	// Name is the one canonical display name for the lane, picked from its label
+	// history by canonicalLaneName: the short slug you gave it (`/name`) wins over
+	// the long auto-generated title, so a consumer can render a single title
+	// without re-deriving it. Empty when the session was never labelled, leaving
+	// the consumer to fall back to project/agent/pid.
+	Name      string     `json:"name,omitempty"`
 	Start     time.Time  `json:"start"`
 	End       time.Time  `json:"end"`
 	Intervals []Interval `json:"intervals"`
@@ -157,11 +163,16 @@ func (b *laneBuilder) closeLabel(t time.Time) {
 }
 
 // BuildSwimlanes replays an event stream into per-session swimlanes. Events are
-// grouped by pid, with a fresh lane begun at each session_start (so pid reuse
-// within the window splits into distinct lanes rather than merging). A lane
-// still open at the end of the stream is closed at `end` — pass `now` for a live
-// day so a running session's last interval extends to the present; pass the
-// window's upper bound otherwise. Events need not be pre-sorted.
+// grouped by pid. A fresh lane begins at each session_start whose pid has no lane
+// currently open — so genuine pid reuse (death emits session_end, which closes
+// the lane, then a new process reuses the pid) splits into distinct lanes. A
+// session_start for a pid whose lane is still open is a rediscovery artifact (a
+// daemon restart re-scans the running processes and re-emits session_start for
+// each) and continues the existing lane rather than orphaning the live session
+// into a second, label-less lane. A lane still open at the end of the stream is
+// closed at `end` — pass `now` for a live day so a running session's last
+// interval extends to the present; pass the window's upper bound otherwise.
+// Events need not be pre-sorted.
 //
 // Beyond the status intervals it also derives, per lane: the session-name spans
 // (session_label), the launched-subagent spans (subagent_spawn↔stop by
@@ -193,7 +204,14 @@ func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
 		switch ev.Type {
 		case EventSessionStart:
 			if b != nil {
-				finish(b, ev.Ts)
+				// A session_start for a pid whose lane is still open (no
+				// session_end has closed it ⇒ the process never died) is a
+				// rediscovery artifact: a daemon restart re-scans the running
+				// processes and re-emits session_start. Splitting here would
+				// orphan the live session into a second, label-less lane, so
+				// treat it as a continuation of the same lane instead.
+				b.absorb(ev)
+				continue
 			}
 			open[ev.PID] = newLaneBuilder(ev)
 		case EventTransition:
@@ -289,8 +307,51 @@ func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
 		if id := done[i].SessionID; id != "" {
 			done[i].Focus = clampFocus(focusBySession[id], done[i].Start, done[i].End)
 		}
+		done[i].Name = canonicalLaneName(done[i])
 	}
 	return done
+}
+
+// canonicalLaneName picks the single best display name for a lane from its label
+// history. A session is typically named in stages: the default ("Claude Code"),
+// then the long auto-generated title Claude writes to the window
+// ("Debug agents not recording data"), then the short slug you set with `/name`
+// ("debug-agents-data-recording"). The slug is the name you chose, so the most
+// recent slug-shaped label wins; absent any slug, the most recent label of any
+// shape is used; absent any label, "" (the consumer falls back to project/pid).
+func canonicalLaneName(lane Swimlane) string {
+	var lastAny, lastSlug string
+	for _, ls := range lane.Labels {
+		if ls.Label == "" {
+			continue
+		}
+		lastAny = ls.Label
+		if isSlug(ls.Label) {
+			lastSlug = ls.Label
+		}
+	}
+	if lastSlug != "" {
+		return lastSlug
+	}
+	return lastAny
+}
+
+// isSlug reports whether s looks like a `/name` slug rather than a prose title:
+// non-empty, no whitespace, and only lowercase letters, digits, and the
+// separators a slug uses ('-', '_', '.'). Prose titles ("Debug agents not
+// recording data") have spaces and capitals and so are rejected.
+func isSlug(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // buildFocusSpans replays the global focus stream into per-session spans. A focus

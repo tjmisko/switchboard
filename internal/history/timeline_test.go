@@ -74,6 +74,71 @@ func TestBuildSwimlanesSplitsOnPidReuse(t *testing.T) {
 	}
 }
 
+// A daemon restart re-scans the still-running processes and re-emits a
+// session_start for each — with no session_end in between, since the process
+// never died. That redundant session_start must continue the live lane, not
+// split it into a second, label-less lane. (Mirrors the real failure: a session
+// alive across a restart lost its name and its post-restart activity.)
+func TestBuildSwimlanesContinuesAcrossDaemonRestart(t *testing.T) {
+	evs := []Event{
+		{Ts: ts(0), Type: EventSessionStart, PID: 1, Agent: "claude", Project: "sb"},
+		tr(1, "s1", 2, "idle", "working", 0),
+		{Ts: ts(4), Type: EventSessionLabel, PID: 1, SessionID: "s1", Label: "my-name"},
+		// daemon restarts here: rediscovery session_start, no preceding session_end.
+		{Ts: ts(10), Type: EventSessionStart, PID: 1, Agent: "claude", Project: "sb"},
+		tr(1, "s2", 12, "working", "idle", 0), // new session_id after the restart
+	}
+	lanes := BuildSwimlanes(evs, ts(20))
+	if len(lanes) != 1 {
+		t.Fatalf("session alive across a daemon restart should stay one lane, got %d", len(lanes))
+	}
+	l := lanes[0]
+	if !l.Start.Equal(ts(0)) || !l.End.Equal(ts(20)) {
+		t.Errorf("merged lane should span the whole window: start=%v end=%v", l.Start, l.End)
+	}
+	if len(l.Labels) != 1 || l.Labels[0].Label != "my-name" {
+		t.Fatalf("merged lane should keep its pre-restart label, got %+v", l.Labels)
+	}
+	if !l.Labels[0].Start.Equal(ts(4)) || !l.Labels[0].End.Equal(ts(20)) {
+		t.Errorf("label span should run from when it was set to the lane end: %+v", l.Labels[0])
+	}
+}
+
+// A session is named in stages — default, then Claude's long window title, then
+// the short `/name` slug. The lane's canonical Name should be the slug (the name
+// you chose), not the prose title, even though the title is also a label span.
+func TestBuildSwimlanesCanonicalNamePrefersSlug(t *testing.T) {
+	evs := []Event{
+		{Ts: ts(0), Type: EventSessionStart, PID: 1, SessionID: "s1", Project: "sb"},
+		{Ts: ts(1), Type: EventSessionLabel, PID: 1, SessionID: "s1", Label: "Claude Code"},
+		{Ts: ts(2), Type: EventSessionLabel, PID: 1, SessionID: "s1", Label: "Debug agents not recording data"},
+		{Ts: ts(3), Type: EventSessionLabel, PID: 1, SessionID: "s1", Label: "debug-agents-data-recording"},
+		tr(1, "s1", 4, "idle", "working", 0),
+	}
+	lanes := BuildSwimlanes(evs, ts(10))
+	if len(lanes) != 1 {
+		t.Fatalf("got %d lanes, want 1", len(lanes))
+	}
+	if lanes[0].Name != "debug-agents-data-recording" {
+		t.Errorf("canonical name = %q, want the /name slug", lanes[0].Name)
+	}
+}
+
+// With no slug ever set, the canonical Name falls back to the most recent label
+// of any shape rather than going blank.
+func TestBuildSwimlanesCanonicalNameFallsBackToLatestLabel(t *testing.T) {
+	evs := []Event{
+		{Ts: ts(0), Type: EventSessionStart, PID: 1, SessionID: "s1"},
+		{Ts: ts(1), Type: EventSessionLabel, PID: 1, SessionID: "s1", Label: "Claude Code"},
+		{Ts: ts(2), Type: EventSessionLabel, PID: 1, SessionID: "s1", Label: "Reviewing the API surface"},
+		tr(1, "s1", 3, "idle", "working", 0),
+	}
+	lanes := BuildSwimlanes(evs, ts(10))
+	if lanes[0].Name != "Reviewing the API surface" {
+		t.Errorf("canonical name = %q, want the most recent label", lanes[0].Name)
+	}
+}
+
 func TestBuildSwimlanesSuspendResume(t *testing.T) {
 	evs := []Event{
 		{Ts: ts(0), Type: EventSessionStart, PID: 1},

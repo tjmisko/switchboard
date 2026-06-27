@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// DayPath is the file an event for the given UTC day is written to.
+// DayPath is the file an event for the given local day is written to.
 func DayPath(dir, day string) string {
 	return filepath.Join(dir, day+".jsonl")
 }
@@ -47,7 +47,7 @@ func ReadDay(dir, day string) ([]Event, error) {
 	return evs, sc.Err()
 }
 
-// Days returns the UTC day keys present in dir, oldest-first.
+// Days returns the local day keys present in dir, oldest-first.
 func Days(dir string) ([]string, error) {
 	files, err := listDayFiles(dir)
 	if err != nil {
@@ -73,9 +73,20 @@ func ReadRange(dir string, from, to time.Time) ([]Event, error) {
 	}
 	var out []Event
 	for _, day := range days {
-		// Skip whole files outside the range (the file's day is its lower bound).
-		d, _ := time.ParseInLocation("2006-01-02", day, time.UTC)
-		if !to.IsZero() && !d.Before(to.UTC().Truncate(24*time.Hour).AddDate(0, 0, 1)) {
+		// Skip whole files that cannot overlap [from, to). The file is named for a
+		// local day, but pad a day on each side before skipping: an event can land
+		// near a boundary, and the dir may still hold legacy UTC-named files whose
+		// contents are offset from their name by the zone offset. Events are filtered
+		// to the exact window below regardless, so the pad only governs which files
+		// are opened, never which events are returned.
+		d, err := time.ParseInLocation("2006-01-02", day, time.Local)
+		if err != nil {
+			continue
+		}
+		if !to.IsZero() && !d.Before(to.AddDate(0, 0, 1)) {
+			continue
+		}
+		if !from.IsZero() && d.AddDate(0, 0, 2).Before(from) {
 			continue
 		}
 		evs, err := ReadDay(dir, day)

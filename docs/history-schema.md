@@ -15,9 +15,13 @@
 $XDG_STATE_HOME/switchboard/history/2026-06-26.jsonl   (→ ~/.local/state/switchboard/history/…)
 ```
 
-One **append-only JSON-per-line** file per **UTC day**. State, not cache:
-losing a day is permanent (unlike `state.json`, which the daemon rebuilds from
-`/proc`). Override the directory with the daemon's `-history-dir` flag.
+One **append-only JSON-per-line** file per **local calendar day** (the file is
+named for the day in your machine's timezone, so a day-file lines up with your
+wall-clock day rather than rolling mid-evening at UTC midnight). State, not
+cache: losing a day is permanent (unlike `state.json`, which the daemon rebuilds
+from `/proc`). Override the directory with the daemon's `-history-dir` flag.
+Readers select files by name but filter on each event's own timestamp, so a
+directory holding a mix of local- and legacy UTC-named files reads correctly.
 
 Day-partitioning gives free time-range pruning, trivial retention (delete old
 files), and bounded file sizes. A crash mid-append costs at most the final
@@ -97,7 +101,10 @@ minimal log still labels each event by project.
 All fields except `ts`/`type` are `omitempty`, so a line stays small and a reader
 tolerates older/newer shapes. **Group a session's events by `session_id`** when
 present (stable across PID reuse), falling back to `pid` for the pre-hook
-`session_start` (which has no id yet).
+`session_start` (which has no id yet). A `session_start` for a pid whose lane is
+still open (no intervening `session_end`) is a daemon-restart rediscovery — the
+process never died — and continues the existing lane rather than starting a new
+one; genuine pid reuse is preceded by a `session_end`.
 
 ### Event types
 
@@ -195,6 +202,7 @@ additive to the original `{window, lanes, summary, totals}`:
   "window": "2026-06-26",
   "lanes": [{
     "session_id": "…", "pid": 4821, "agent": "claude", "project": "sb",
+    "name": "sb-invest",                                                     // one canonical display name: the /name slug wins over the auto title
     "start": "…", "end": "…",
     "intervals": [{ "status": "working", "start": "…", "end": "…", "subagents": 0 }],
     "labels":    [{ "label": "sb-invest", "start": "…", "end": "…" }],       // name over time (A1)

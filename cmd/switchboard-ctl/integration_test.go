@@ -22,7 +22,8 @@ func TestTimelineEndToEnd(t *testing.T) {
 
 	// Recent, so the session lands in both today's window and the rolling 5h
 	// plan window. A 10-minute span gives the delegation math room to split.
-	now := time.Now().UTC()
+	// Local clock so the day-file key (local) matches the queried --day.
+	now := time.Now()
 	t0 := now.Add(-12 * time.Minute)
 	day := t0.Format("2006-01-02")
 	at := func(min, sec int) time.Time {

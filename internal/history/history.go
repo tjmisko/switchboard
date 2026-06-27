@@ -108,9 +108,21 @@ func DefaultDir() string {
 	return filepath.Join(home, ".local", "state", "switchboard", "history")
 }
 
-// dayKey is the UTC day a timestamp partitions into (the day-file basename).
+// dayKey is the local calendar day a timestamp partitions into (the day-file
+// basename). Local, not UTC, so a day-file lines up with your wall-clock day:
+// "today" is the day you are living and the evening does not spill into
+// tomorrow's file. Readers tolerate a directory holding a mix of local- and
+// legacy UTC-named files by filtering on each event's own timestamp.
 func dayKey(ts time.Time) string {
-	return ts.UTC().Format("2006-01-02")
+	return ts.Local().Format("2006-01-02")
+}
+
+// dayStart is local midnight of t — the instant the file dayKey(t) names begins.
+// It is the canonical lower bound for a day-file, used for range/retention math
+// so the comparisons line up exactly with how dayKey partitions.
+func dayStart(t time.Time) time.Time {
+	y, m, d := t.Local().Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, time.Local)
 }
 
 // HeldMs is how long a status was held — the DurPrevMs of the interval a

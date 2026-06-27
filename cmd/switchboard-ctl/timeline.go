@@ -94,12 +94,14 @@ func cmdTimeline(args []string) {
 	}
 }
 
-// resolveWindow turns the day/since/until flags into a [from, to) UTC window and
-// a human label. Precedence: an explicit --since/--until range, else --day, else
-// today. `to` is exclusive (start of the day after the last).
+// resolveWindow turns the day/since/until flags into a [from, to) local window
+// and a human label. Days are local calendar days (matching how history
+// partitions its files), so a date here means the day you lived, not a UTC day
+// that rolls mid-evening. Precedence: an explicit --since/--until range, else
+// --day, else today. `to` is exclusive (start of the day after the last).
 func resolveWindow(day, since, until string) (from, to time.Time, label string) {
 	parse := func(s string) time.Time {
-		t, err := time.ParseInLocation("2006-01-02", s, time.UTC)
+		t, err := time.ParseInLocation("2006-01-02", s, time.Local)
 		if err != nil {
 			fail("bad date %q: want YYYY-MM-DD", s)
 		}
@@ -111,7 +113,7 @@ func resolveWindow(day, since, until string) (from, to time.Time, label string) 
 		if since == "" {
 			from = time.Time{}
 		}
-		end := time.Now().UTC()
+		end := time.Now()
 		if until != "" {
 			end = parse(until).AddDate(0, 0, 1)
 		}
@@ -120,7 +122,8 @@ func resolveWindow(day, since, until string) (from, to time.Time, label string) 
 		d := parse(day)
 		return d, d.AddDate(0, 0, 1), day
 	default:
-		today := time.Now().UTC().Truncate(24 * time.Hour)
+		now := time.Now()
+		today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 		return today, today.AddDate(0, 0, 1), today.Format("2006-01-02")
 	}
 }
@@ -146,9 +149,13 @@ func renderSwimlanes(w *os.File, label string, lanes []history.Swimlane, s histo
 		if len(id) > 8 {
 			id = id[:8]
 		}
+		name := lane.Name
+		if name == "" {
+			name = lane.Project
+		}
 		bar := renderBar(lane, from, to, width, color)
-		fmt.Fprintf(w, "%-10s %-8s %s %s–%s\n",
-			truncate(lane.Project, 10), id, bar,
+		fmt.Fprintf(w, "%-20s %-8s %s %s–%s\n",
+			truncate(name, 20), id, bar,
 			lane.Start.Local().Format("15:04"), lane.End.Local().Format("15:04"))
 	}
 

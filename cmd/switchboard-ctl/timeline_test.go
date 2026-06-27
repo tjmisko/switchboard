@@ -18,10 +18,11 @@ func atSec(sec int) time.Time {
 
 func TestResolveWindowDay(t *testing.T) {
 	from, to, label := resolveWindow("2026-06-26", "", "")
-	if !from.Equal(time.Date(2026, 6, 26, 0, 0, 0, 0, time.UTC)) {
+	// Days are local calendar days, so the window bounds are local midnights.
+	if !from.Equal(time.Date(2026, 6, 26, 0, 0, 0, 0, time.Local)) {
 		t.Errorf("from = %v", from)
 	}
-	if !to.Equal(time.Date(2026, 6, 27, 0, 0, 0, 0, time.UTC)) {
+	if !to.Equal(time.Date(2026, 6, 27, 0, 0, 0, 0, time.Local)) {
 		t.Errorf("to (exclusive next day) = %v", to)
 	}
 	if label != "2026-06-26" {
@@ -31,8 +32,8 @@ func TestResolveWindowDay(t *testing.T) {
 
 func TestResolveWindowRangeUntilInclusive(t *testing.T) {
 	_, to, _ := resolveWindow("", "2026-06-20", "2026-06-26")
-	// until is inclusive → exclusive bound is the next day.
-	if !to.Equal(time.Date(2026, 6, 27, 0, 0, 0, 0, time.UTC)) {
+	// until is inclusive → exclusive bound is the next local day.
+	if !to.Equal(time.Date(2026, 6, 27, 0, 0, 0, 0, time.Local)) {
 		t.Errorf("until should be inclusive; to = %v, want 2026-06-27", to)
 	}
 }
@@ -171,7 +172,7 @@ func TestTimelineJSONPlanWindowFlag(t *testing.T) {
 	dir := t.TempDir()
 	// A recent usage_sample lands in both today's display window and the rolling
 	// 5h plan window. opus input 1M tokens → $5.00.
-	t0 := time.Now().UTC().Add(-time.Minute)
+	t0 := time.Now().Add(-time.Minute)
 	day := t0.Format("2006-01-02")
 	writeDay(t, dir, day, history.Event{
 		Ts: t0, Type: history.EventUsageSample, PID: 1, SessionID: "s1",
@@ -209,7 +210,7 @@ func TestTimelineJSONPlanWindowFlag(t *testing.T) {
 
 func TestTimelineJSONPlanWindowOmittedByDefault(t *testing.T) {
 	dir := t.TempDir()
-	t0 := time.Now().UTC().Add(-time.Minute)
+	t0 := time.Now().Add(-time.Minute)
 	day := t0.Format("2006-01-02")
 	writeDay(t, dir, day, history.Event{
 		Ts: t0, Type: history.EventSessionStart, PID: 1, SessionID: "s1",

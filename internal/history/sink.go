@@ -120,7 +120,7 @@ func (s *Sink) run() {
 	}
 }
 
-// openDay opens (creating) the append-only file for a UTC day.
+// openDay opens (creating) the append-only file for a local day.
 func (s *Sink) openDay(day string) (*os.File, error) {
 	if err := os.MkdirAll(s.dir, 0o755); err != nil {
 		return nil, err
@@ -162,7 +162,8 @@ func (s *Sink) prune(now time.Time) {
 	pruneDir(s.dir, s.cfg.RetainDays, s.cfg.MaxBytes, now)
 }
 
-// dayFile is a parsed day-file: its path, the UTC date it partitions, and size.
+// dayFile is a parsed day-file: its path, the local date it partitions (local
+// midnight), and size.
 type dayFile struct {
 	path string
 	date time.Time
@@ -185,7 +186,7 @@ func listDayFiles(dir string) ([]dayFile, error) {
 		if !ok {
 			continue
 		}
-		date, err := time.ParseInLocation("2006-01-02", base, time.UTC)
+		date, err := time.ParseInLocation("2006-01-02", base, time.Local)
 		if err != nil {
 			continue
 		}
@@ -209,9 +210,9 @@ func pruneDir(dir string, retainDays int, maxBytes int64, now time.Time) {
 	today := dayKey(now)
 
 	if retainDays > 0 {
-		cutoff := now.UTC().AddDate(0, 0, -retainDays)
+		cutoff := dayStart(now).AddDate(0, 0, -retainDays)
 		for _, f := range files {
-			if f.date.Before(cutoff.Truncate(24 * time.Hour)) {
+			if f.date.Before(cutoff) {
 				remove(f.path)
 			}
 		}
@@ -246,7 +247,7 @@ func remove(path string) bool {
 }
 
 // Purge deletes day-files. With a zero `before` it removes the whole log;
-// otherwise it removes files strictly older than that UTC day. Returns the
+// otherwise it removes files strictly older than that local day. Returns the
 // number of files removed. Used by `switchboard-ctl history purge`.
 func Purge(dir string, before time.Time) (int, error) {
 	files, err := listDayFiles(dir)
@@ -258,7 +259,7 @@ func Purge(dir string, before time.Time) (int, error) {
 	}
 	removed := 0
 	for _, f := range files {
-		if !before.IsZero() && !f.date.Before(before.UTC().Truncate(24*time.Hour)) {
+		if !before.IsZero() && !f.date.Before(dayStart(before)) {
 			continue
 		}
 		if err := os.Remove(f.path); err != nil {

@@ -43,8 +43,10 @@ func TestSinkWritesEventsPartitionedByDay(t *testing.T) {
 	dir := t.TempDir()
 	s := NewSink(Config{Enabled: true, Detail: DetailFull, Dir: dir})
 
-	day1 := time.Date(2026, 6, 26, 23, 59, 0, 0, time.UTC)
-	day2 := day1.Add(2 * time.Minute) // crosses into 2026-06-27 UTC
+	// Local, since files partition by local calendar day; straddling local
+	// midnight keeps the assertion deterministic on any machine timezone.
+	day1 := time.Date(2026, 6, 26, 23, 59, 0, 0, time.Local)
+	day2 := day1.Add(2 * time.Minute) // crosses into 2026-06-27 local
 	s.Record(Event{Ts: day1, Type: EventSessionStart, PID: 1, Agent: "claude"})
 	s.Record(Event{Ts: day1, Type: EventTransition, PID: 1, From: "idle", To: "working"})
 	s.Record(Event{Ts: day2, Type: EventTransition, PID: 1, From: "working", To: "idle"})
@@ -69,7 +71,7 @@ func TestMinimalTierScrubsSensitiveFields(t *testing.T) {
 		Enabled: true, Detail: DetailMinimal, Dir: dir,
 		ResolveProject: func(cwd string) string { return "sb" },
 	})
-	ts := time.Date(2026, 6, 26, 12, 0, 0, 0, time.UTC)
+	ts := time.Date(2026, 6, 26, 12, 0, 0, 0, time.Local)
 	s.Record(Event{
 		Ts: ts, Type: EventTransition, PID: 1, From: "permission", To: "working",
 		CWD: "/home/u/Projects/secret", Pending: "AskUserQuestion", Reason: "tool-name match",
@@ -91,7 +93,7 @@ func TestMinimalTierScrubsSensitiveFields(t *testing.T) {
 func TestMinimalTierScrubsDescriptionButKeepsAgentTypeAndTokens(t *testing.T) {
 	dir := t.TempDir()
 	s := NewSink(Config{Enabled: true, Detail: DetailMinimal, Dir: dir})
-	ts := time.Date(2026, 6, 26, 12, 0, 0, 0, time.UTC)
+	ts := time.Date(2026, 6, 26, 12, 0, 0, 0, time.Local)
 	s.Record(Event{
 		Ts: ts, Type: EventSubagentSpawn, PID: 1,
 		AgentType: "Explore", Description: "refactor the auth module",
@@ -117,7 +119,7 @@ func TestMinimalTierScrubsDescriptionButKeepsAgentTypeAndTokens(t *testing.T) {
 func TestFullTierKeepsSensitiveFields(t *testing.T) {
 	dir := t.TempDir()
 	s := NewSink(Config{Enabled: true, Detail: DetailFull, Dir: dir})
-	ts := time.Date(2026, 6, 26, 12, 0, 0, 0, time.UTC)
+	ts := time.Date(2026, 6, 26, 12, 0, 0, 0, time.Local)
 	s.Record(Event{Ts: ts, Type: EventTransition, CWD: "/home/u/proj", Pending: "Bash"})
 	s.Close()
 
@@ -135,7 +137,7 @@ func TestPruneByRetainDays(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	now := time.Date(2026, 6, 26, 12, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 6, 26, 12, 0, 0, 0, time.Local)
 	pruneDir(dir, 5, 0, now) // keep 5 days
 
 	if _, err := os.Stat(filepath.Join(dir, "2026-06-16.jsonl")); !os.IsNotExist(err) {
@@ -156,7 +158,7 @@ func TestPruneByMaxBytesKeepsNewestAndToday(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	now := time.Date(2026, 6, 26, 12, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 6, 26, 12, 0, 0, 0, time.Local)
 	pruneDir(dir, 0, 1500, now) // only ~1.5 files fit
 
 	if _, err := os.Stat(filepath.Join(dir, "2026-06-20.jsonl")); !os.IsNotExist(err) {
@@ -176,7 +178,7 @@ func TestPruneByMaxBytesRemovesOldestUntilUnderCap(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	now := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC) // none of the files is "today"
+	now := time.Date(2026, 6, 30, 12, 0, 0, 0, time.Local) // none of the files is "today"
 	pruneDir(dir, 0, 2500, now)
 
 	// 3000 > 2500 → drop the oldest (06-20) → 2000 ≤ 2500 → stop. The middle file
@@ -199,7 +201,7 @@ func TestPurgeBefore(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	removed, err := Purge(dir, time.Date(2026, 6, 25, 0, 0, 0, 0, time.UTC))
+	removed, err := Purge(dir, time.Date(2026, 6, 25, 0, 0, 0, 0, time.Local))
 	if err != nil {
 		t.Fatal(err)
 	}
