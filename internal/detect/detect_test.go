@@ -1,6 +1,11 @@
 package detect
 
-import "testing"
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 // Forcing the none backends yields an Observe-only stack: both edges are the
 // none backend and Navigate is false while Observe stays true.
@@ -85,6 +90,10 @@ func TestWMDetectionPrecedence(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			// Point XDG_RUNTIME_DIR at an empty dir so the Hyprland disk-discovery
+			// fallback finds nothing — keeps the env-precedence assertions hermetic
+			// on a host that is itself running Hyprland.
+			t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
 			for _, k := range []string{hypr, sway, i3, disp} {
 				t.Setenv(k, tt.env[k])
 			}
@@ -92,5 +101,31 @@ func TestWMDetectionPrecedence(t *testing.T) {
 				t.Errorf("auto WM = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// §2.3 auto-detection must still find Hyprland when $HYPRLAND_INSTANCE_SIGNATURE
+// is absent — a live instance discovered on disk wins, so a daemon (re)started by
+// a fresh user manager with no inherited environment still binds the WM.
+func TestWMDetectionDiscoversHyprlandWithoutEnv(t *testing.T) {
+	xdg := t.TempDir()
+	inst := filepath.Join(xdg, "hypr", "sig0")
+	if err := os.MkdirAll(inst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A live lock (this process's PID) marks the instance as the current session.
+	lock := fmt.Sprintf("%d\n127.0.0.1\nHyprland\n", os.Getpid())
+	if err := os.WriteFile(filepath.Join(inst, "hyprland.lock"), []byte(lock), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inst, ".socket.sock"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_RUNTIME_DIR", xdg)
+	for _, k := range []string{"HYPRLAND_INSTANCE_SIGNATURE", "SWAYSOCK", "I3SOCK", "DISPLAY"} {
+		t.Setenv(k, "")
+	}
+	if got := detectWMAuto().Name(); got != "hyprland" {
+		t.Errorf("auto WM = %q, want hyprland (discovered without env)", got)
 	}
 }

@@ -2,7 +2,6 @@ package wm
 
 import (
 	"context"
-	"os"
 	"strings"
 
 	"github.com/tjmisko/switchboard/internal/hyprland"
@@ -19,7 +18,14 @@ func NewHyprland() *Hyprland { return &Hyprland{} }
 
 func (*Hyprland) Name() string { return "hyprland" }
 
-func (*Hyprland) Available() bool { return os.Getenv("HYPRLAND_INSTANCE_SIGNATURE") != "" }
+// Available reports whether Hyprland is reachable. It routes through
+// hyprland.InstanceSignature so it stays true after a user-manager restart wipes
+// $HYPRLAND_INSTANCE_SIGNATURE (the signature is then discovered on disk from the
+// live instance's lock file).
+func (*Hyprland) Available() bool {
+	_, err := hyprland.InstanceSignature()
+	return err == nil
+}
 
 func (*Hyprland) Clients(ctx context.Context) ([]Window, error) {
 	cs, err := hyprland.Clients(ctx)
