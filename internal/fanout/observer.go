@@ -148,11 +148,17 @@ func (o *Observer) Reconcile(sess *state.Session, c *state.AgentInfo, now time.T
 			events = append(events, o.spawnEvent(sess, c, s, now, bg))
 		}
 		// Completion, most-authoritative first: the subagent's own jsonl reached a
-		// terminal entry (universal — every subagent has one), else its tool_result
-		// landed (classic fanouts only), else a hard cap on a quiescent transcript
-		// force-closes a stalled/aborted subagent so in-flight can never leak.
+		// terminal entry (universal — every subagent has one), else its parent
+		// tool_result landed, else a hard cap on a quiescent transcript force-closes a
+		// stalled/aborted subagent so in-flight can never leak.
 		done := s.Done
-		if !done && s.ToolUseID != "" && ss.resultDone[s.ToolUseID] {
+		// The parent tool_result is the real completion only for a FOREGROUND fanout.
+		// A run_in_background fanout gets an immediate "Spawned successfully"
+		// tool_result ~1s after launch that is NOT completion, so its resultDone must
+		// be ignored — a background fanout completes via its jsonl terminal (s.Done)
+		// or the stale cap, never the spawn-ack. (Without this guard every background
+		// fanout stops ~1s after it starts.)
+		if !done && s.ToolUseID != "" && !ss.background[s.ToolUseID] && ss.resultDone[s.ToolUseID] {
 			done = true
 		}
 		if !done && !s.ModTime.IsZero() && now.Sub(s.ModTime) > o.staleCap {

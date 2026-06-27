@@ -254,6 +254,41 @@ func TestReconcile_tagsBackgroundFromParentToolUse(t *testing.T) {
 	}
 }
 
+func TestReconcile_backgroundIgnoresSpawnAckResult(t *testing.T) {
+	// Regression: a run_in_background fanout gets an immediate "Spawned
+	// successfully" tool_result that is NOT completion. The Observer must NOT treat
+	// that as done — it would stop every background agent ~1s after it starts.
+	e := newEnv(t)
+	obs := NewObserver(e.historyDir)
+	now := time.Now()
+
+	obs.Reconcile(e.sess, e.c, now) // prime cursor to EOF (empty)
+
+	// The backgrounded tool_use AND its immediate spawn-ack tool_result both land,
+	// and the subagent's dir entry appears — but its jsonl is still running.
+	appendLine(t, e.transcript, `{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_bg","name":"Agent","input":{"subagent_type":"Explore","run_in_background":true}}]}}`)
+	appendLine(t, e.transcript, `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bg","content":"Spawned successfully. agent_id: bg1"}]}}`)
+	writeSub(t, e.subdir, "bg1", metaClassic(1, "toolu_bg"), "") // running, NOT terminal
+
+	ev := obs.Reconcile(e.sess, e.c, now)
+	if hasEvent(ev, history.EventSubagentStop, "bg1") {
+		t.Fatalf("background fanout must NOT stop on its spawn-ack tool_result; got %+v", ev)
+	}
+	if e.c.InFlightSubagents != 1 {
+		t.Fatalf("background fanout should still be in flight; inflight = %d, want 1", e.c.InFlightSubagents)
+	}
+
+	// It genuinely finishes: jsonl reaches end_turn -> now it stops.
+	writeSub(t, e.subdir, "bg1", metaClassic(1, "toolu_bg"), "end_turn")
+	ev = obs.Reconcile(e.sess, e.c, now)
+	if !hasEvent(ev, history.EventSubagentStop, "bg1") {
+		t.Fatalf("a finished background fanout (jsonl end_turn) should stop; got %+v", ev)
+	}
+	if e.c.InFlightSubagents != 0 {
+		t.Fatalf("inflight = %d, want 0", e.c.InFlightSubagents)
+	}
+}
+
 func TestReconcile_noopsWithoutSessionOrTranscript(t *testing.T) {
 	obs := NewObserver(t.TempDir())
 	now := time.Now()
