@@ -23,7 +23,6 @@ Switchboard derives a session's color from two independent sources:
    user prompts, assistant messages, tool results, and the
    `[Request interrupted by user]` marker. Every entry is timestamped by Claude
    Code when it is written.
-
 Hooks are **lossy**: some real transitions fire no hook at all. The two that bite
 us (`cmd/switchboard/main.go`, `selfHealStuckStatus`):
 
@@ -65,7 +64,7 @@ against (the transcript entry).
 ### The fix: anchor `StatusSince` to the transcript
 
 `transcript.AnchorTime` returns the timestamp of the newest turn entry in the
-tail. For an edge **into working/permission**, `handleHook` dates the transition
+tail. For an edge **into working**, `handleHook` dates the transition
 from that, falling back to wall-clock `now` only when the tail holds no
 timestamped entry. This puts `StatusSince` on the **same event stream, sampled at
 the same causal point**, as the signals the reconciler later compares against it,
@@ -78,7 +77,7 @@ makes the recovery non-flapping (a healed edge re-stamps `StatusSince`, so the
 triggering entry can't re-fire it). Keeping the gate and fixing the value it
 compares against preserves that property while closing the race at its source.
 
-## 2.1 The opposite direction: the flush-ordering race (into idle)
+## 2.1 The opposite direction: the flush-ordering race (into idle, into permission)
 
 The transcript anchor is exactly **wrong** for an edge **into idle** (`Stop` /
 `SessionStart`), because the two streams race the other way. A `Stop` hook fires
@@ -102,17 +101,44 @@ the chip. It then latches green until the next `Stop` — which flaps the same w
 The non-flapping guarantee (§2) is defeated because the triggering entry is *newer*
 than the anchored `StatusSince`, not older.
 
-The race-free anchor for an idle edge is wall-clock `now`: a `Stop` can only fire
-**after** the turn truly ended, so the turn's own messages — all dated before
-`now` — cannot re-trigger, while a genuine resumption (an orchestrator woken by a
-teammate) is dated after `now` and still does. `transcript.AnchorSince` folds both
-directions into one policy:
+The **permission edge races the same way** — with a worse cost, because the
+false exit there is a missed-RED, the most expensive error in the model
+(status-color-state-model.md §4 #1). The `PermissionRequest` hook fires the
+instant the pending `tool_use` is generated, but the blocked turn's own earlier
+entries — its thinking and text blocks, and the pending `tool_use`'s assistant
+message itself — are flushed to the `.jsonl` a beat later, dated at generation
+time:
+
+```
+T0     Claude writes a user tool_result                     (on disk, ts = T0)
+T0+17s Claude generates the turn's thinking + text          (ts = T0+17s…28s, NOT yet flushed)
+T0+35s Claude generates the AskUserQuestion tool_use        (ts = T0+35s, NOT yet flushed)
+T0+35s Claude fires PermissionRequest → daemon: red, AnchorTime sees only T0 → StatusSince = T0
+T0+36s Claude flushes the thinking/text/tool_use lines      (now on disk, ts > T0)
+T0+40s reconcile tick: ResolveKind finds assistant entries after StatusSince
+       → "turn resumed" → permission→working — GREEN while the prompt still waits
+```
+
+This is exactly the 2026-07-22 zettel episode (session `f4aff00a`): red for 5 s,
+then `rule=case9-approve-resume` released it on the prompt's own late-flushed
+pre-prompt entries, and the chip sat green for the 7½ minutes the AskUserQuestion
+actually waited. The telltale in the journal is an `age=` **older than the
+prompt itself** (`age=40s` on a 5 s-old red chip): the anchor had pulled
+`StatusSince` back past entries that belong to the blocked turn.
+
+The race-free anchor for an idle **or permission** edge is wall-clock `now`: the
+hook can only fire **after** its cause (the turn ending; the prompt being
+raised), so every entry of the turn so far — whenever it flushes — is dated
+at-or-before `now` and cannot re-trigger, while a genuine later signal (a
+teammate resumption; a post-approval assistant message) is dated after `now` and
+still does. `transcript.AnchorSince` folds all three directions into one policy —
+anchor-back is now the *exception*, reserved for the one edge that needs it:
 
 ```go
 now := time.Now()
-info.StatusSince = transcript.AnchorSince(info.Transcript, now, status == state.StatusIdle, s.tun.TailBytes)
-// into working/permission → anchor to the triggering entry (§2, the skew fix)
-// into idle               → wall-clock now            (the flush-race fix)
+info.StatusSince = transcript.AnchorSince(info.Transcript, now, status == state.StatusWorking, s.tun.TailBytes)
+// into working           → anchor to the triggering entry (§2, the skew fix — H1)
+// into idle / permission → wall-clock now         (the flush-race fix — H7, H8)
 ```
 
 ---
@@ -128,6 +154,7 @@ info.StatusSince = transcript.AnchorSince(info.Transcript, now, status == state.
 | **H5-teammate-resume-after-idle** | orchestrator idle, teammate lands a result | `idle` | tool_result after the chip went idle | resume → **working**. |
 | **H6-delegating-quiet-transcript** | idle main thread, subagents in flight | `idle` | (nothing written) | promote → **delegating** from the subagent count, even with a stale mtime the activity pre-gate would skip. |
 | **H7-stop-final-message-flush-race** | `Stop` → orange, then the turn's own final assistant message flushes late | `idle` | assistant message dated before the `Stop` lands on disk after it | stay **idle** (§2.1). The idle edge anchors `StatusSince` to wall-clock `now`, not to the stale on-disk entry, so the late-flushed message (dated before `now`) is not "activity after idle" — without this the chip re-greened after every `Stop`. |
+| **H8-permission-preprompt-flush-race** | `PermissionRequest` → red, then the blocked turn's own pre-prompt thinking/text and pending `tool_use` flush late | `permission` | assistant entries dated before the hook land on disk after it | stay **red** (§2.1). The permission edge anchors `StatusSince` to wall-clock `now`, so the prompt's own late-flushed turn-mates (dated before `now`) cannot read as "assistant message after the prompt → resolved" — without this the red chip released to green in one tick while the prompt still waited (the 2026-07-22 zettel missed-RED). |
 
 ### Adding a hazard
 

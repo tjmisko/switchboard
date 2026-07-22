@@ -19,9 +19,9 @@ import (
 // Each row models the real two-phase flow:
 //
 //  1. a status hook fires; the daemon dates the transition via the anchoring
-//     policy (transcript.AnchorSince): an edge into working/permission anchors to
-//     the newest transcript entry at that instant (the skew fix), an edge into idle
-//     anchors to wall-clock now (the flush-race fix);
+//     policy (transcript.AnchorSince): an edge into working anchors to the newest
+//     transcript entry at that instant (the skew fix), an edge into idle or
+//     permission anchors to wall-clock now (the flush-race fix);
 //  2. the transcript keeps growing (a later interrupt, a teammate's tool_result,
 //     a `!bash` line, a turn's final assistant message flushed after its Stop, …);
 //  3. a reconcile tick runs selfHealStuckStatus and must land on the right color.
@@ -124,6 +124,29 @@ func TestTimingHazards(t *testing.T) {
 			want:      "idle",
 		},
 		{
+			// The zettel false-green (2026-07-22, session f4aff00a): the same
+			// flush-ordering race as H7, on the INTO-PERMISSION edge — where the cost
+			// is missed-RED, the worst error in the §4 ranking. A turn's pre-prompt
+			// thinking/text (t30s) and the AskUserQuestion tool_use (t40s) are
+			// generated before the PermissionRequest hook but flushed to the .jsonl a
+			// beat AFTER the daemon processes it, so at hook time the newest entry on
+			// disk is an earlier tool_result (t0). Anchoring StatusSince to that stale
+			// entry let the blocked turn's OWN late-flushed assistant entries read as
+			// "assistant message after since → turn resumed" on the next tick, exiting
+			// red to green while the prompt sat unanswered for 7½ more minutes. A
+			// permission edge must anchor to wall-clock now, like idle: every entry of
+			// the prompt's own turn is dated at-or-before hook processing and cannot
+			// prove resolution, while a genuine post-approval assistant message —
+			// generated after the user acted — still can.
+			id:        "H8-permission-preprompt-flush-race",
+			atHook:    []string{tResult(t0)},
+			status:    "permission",
+			hookAt:    t40s,
+			appended:  []string{tAssistant(t30s), tAskToolUse(t40s)},
+			afterHook: 5 * time.Minute,
+			want:      "permission",
+		},
+		{
 			// Delegating is decided from the in-flight-subagent count, not a transcript
 			// read, so it must fire even when the main transcript is quiet (stale mtime)
 			// — the case the activity pre-gate would otherwise skip.
@@ -153,7 +176,7 @@ func TestTimingHazards(t *testing.T) {
 			if h.hookAt != "" {
 				hookNow = mustParseTime(t, h.hookAt)
 			}
-			since := transcript.AnchorSince(atHookPath, hookNow, h.status == "idle", transcript.DefaultTailBytes)
+			since := transcript.AnchorSince(atHookPath, hookNow, h.status == "working", transcript.DefaultTailBytes)
 			reconcileNow := hookNow.Add(h.afterHook)
 
 			// Phase 2: the transcript grows to its reconcile-time tail.
@@ -166,9 +189,15 @@ func TestTimingHazards(t *testing.T) {
 				t.Fatalf("chtimes: %v", err)
 			}
 
-			// Phase 3: a reconcile tick must land on the right color.
+			// Phase 3: a reconcile tick must land on the right color. Both self-heals
+			// run in reconcileOnce's order: stale-attention releases (or holds) a
+			// permission latch, stuck-status recovers the working/idle latches.
 			m := stuckMap(h.status, full, since)
 			m[100].Claude.InFlightSubagents = h.subagents
+			if h.status == "permission" {
+				m[100].Claude.PendingTool = "AskUserQuestion"
+			}
+			selfHealStaleAttention(m, reconcileNow, testTune, nil)
 			selfHealStuckStatus(m, reconcileNow, testTune, nil)
 
 			if got := m[100].Claude.Status; got != h.want {
@@ -182,6 +211,14 @@ func TestTimingHazards(t *testing.T) {
 // (and dates) just before firing UserPromptSubmit.
 func tUserText(ts, s string) string {
 	return `{"type":"user","timestamp":"` + ts + `","message":{"role":"user","content":[{"type":"text","text":"` + s + `"}]}}`
+}
+
+// tAskToolUse is the assistant entry carrying the AskUserQuestion tool_use — the
+// record whose creation fires the PermissionRequest hook. It is an assistant
+// entry, so if it (or any same-turn sibling) lands after StatusSince it reads as
+// resolution — the H8 hazard.
+func tAskToolUse(ts string) string {
+	return `{"type":"assistant","timestamp":"` + ts + `","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_ask","name":"AskUserQuestion","input":{}}]}}`
 }
 
 // mustParseTime parses an RFC3339 fixture timestamp into the wall-clock instant a

@@ -395,18 +395,20 @@ func (s *Server) handleHook(req Request) {
 			}
 			info.Status = status
 			// Date the transition per the anchoring policy (transcript.AnchorSince):
-			// for an edge INTO working/permission, pull StatusSince back to the
-			// transcript entry that triggered this hook, because the hook reaches us
-			// tens-to-hundreds of ms after Claude recorded that entry and a wall-clock
-			// stamp would sit AHEAD of a fast follow-up signal (e.g. an immediate
-			// Ctrl+C), hiding it from the reconciler's hookless recovery. For an edge
-			// INTO idle (Stop/SessionStart), use wall-clock now instead: the completing
-			// turn's own final assistant message is flushed a beat AFTER the Stop hook
-			// yet dated before it, so a transcript anchor would let it read as "activity
-			// after idle" and falsely re-green the chip. Both skew classes are in
-			// docs/timing-hazards.md.
+			// for an edge INTO working, pull StatusSince back to the transcript entry
+			// that triggered this hook, because the hook reaches us tens-to-hundreds
+			// of ms after Claude recorded that entry and a wall-clock stamp would sit
+			// AHEAD of a fast follow-up signal (e.g. an immediate Ctrl+C), hiding it
+			// from the reconciler's hookless recovery. For an edge INTO idle
+			// (Stop/SessionStart) or INTO permission (PermissionRequest), use
+			// wall-clock now instead: the turn's own entries flush a beat AFTER the
+			// hook yet are dated before it — the final assistant message after its
+			// Stop, the pre-prompt thinking/text after its PermissionRequest — so a
+			// transcript anchor would let them read as post-transition signals and
+			// falsely re-green the chip (or release a still-pending red one). All
+			// three skew classes are in docs/timing-hazards.md (H1, H7, H8).
 			now := time.Now()
-			info.StatusSince = transcript.AnchorSince(info.Transcript, now, status == state.StatusIdle, s.tun.TailBytes)
+			info.StatusSince = transcript.AnchorSince(info.Transcript, now, status == state.StatusWorking, s.tun.TailBytes)
 			if status == state.StatusPermission {
 				info.PendingTool = req.ToolName // capture the tool the prompt is for (A2)
 			}

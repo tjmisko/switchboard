@@ -276,9 +276,15 @@ func readTailEntries(path string, maxBytes int64) ([]entry, error) {
 // the prompt, which takes one of two forms in the tail (see resolutionKindOf):
 //
 //   - an assistant message dated after `since` — the blocked turn produced new
-//     output, so the awaited tool was approved and ran (Claude Code withholds the
-//     pending tool_use's assistant message until it resolves, so any assistant
-//     entry newer than `since` postdates the approval);
+//     output, so the awaited tool was approved and ran. This test is sound ONLY
+//     because `since` is sampled at wall-clock hook-processing time
+//     (AnchorSince): every assistant entry of the blocked turn itself — the
+//     pre-prompt thinking/text and the pending tool_use's own message — is
+//     generated before the PermissionRequest hook and so dated at-or-before
+//     `since`, even though it flushes to disk after it (the H8 hazard,
+//     docs/timing-hazards.md). Anchor `since` to the on-disk tail instead and
+//     those late-flushed same-turn entries postdate it, falsely proving
+//     resolution;
 //   - a user interrupt notice ("[Request interrupted by user…") dated after
 //     `since` — the prompt was declined or the turn was Esc-interrupted (neither
 //     fires a clearing hook).
@@ -676,31 +682,39 @@ func AnchorTime(path string, maxBytes int64) (ts time.Time, ok bool) {
 
 // AnchorSince picks the time a status transition should be dated from
 // (StatusSince), given the wall-clock instant `now` the daemon processed the
-// triggering hook and whether the transition is into an idle (turn-ended) state.
-// There are two opposite clock-skew risks, one per direction — see
-// docs/timing-hazards.md:
+// triggering hook and whether the transition is into working. There are two
+// opposite clock-skew risks, one per direction — see docs/timing-hazards.md:
 //
-//   - Into working/permission: the hook reaches us AFTER Claude wrote the entry
-//     that triggered it, so a wall-clock `now` sits ahead of that entry and would
+//   - Into working: the hook reaches us AFTER Claude wrote the entry that
+//     triggered it, so a wall-clock `now` sits ahead of that entry and would
 //     filter a fast follow-up signal (an immediate Ctrl+C after a prompt) as
 //     stale. Pull StatusSince back to the triggering entry (AnchorTime) so a
-//     genuinely-later signal always reads as later, regardless of hook latency.
+//     genuinely-later signal always reads as later, regardless of hook latency
+//     (H1). Nothing here can misread the turn's own content: a working chip is
+//     only ever DEMOTED, and only by the interrupt marker, which the turn never
+//     writes on its own.
 //
-//   - Into idle (Stop/SessionStart): the only signal that should re-activate the
-//     chip is one dated AFTER the turn ended. But the completing turn's OWN final
-//     assistant message is dated before the Stop yet is flushed to the .jsonl a
-//     beat AFTER the Stop hook reaches us — so anchoring to "the newest turn entry
-//     on disk at hook time" can land BEFORE that late-flushed message, which the
-//     reconciler then reads as "activity after idle" and falsely re-greens the
-//     chip (the flush-ordering race). Wall-clock `now` is the race-free anchor: a
-//     Stop can only fire after the turn truly ended, so the turn's own messages —
-//     all dated before `now` — cannot re-trigger, while a genuine resumption dated
-//     after `now` still does.
+//   - Into idle (Stop/SessionStart) and into permission (PermissionRequest): the
+//     only signal that should flip the chip is one dated AFTER the hook's cause
+//     (the turn ending; the prompt being raised). But the turn's OWN entries are
+//     dated at generation and flushed to the .jsonl a beat AFTER the hook reaches
+//     us — the completing turn's final assistant message lands after its Stop,
+//     and the blocked turn's pre-prompt thinking/text (and the pending tool_use
+//     entry itself) land after its PermissionRequest. Anchoring to "the newest
+//     turn entry on disk at hook time" lands BEFORE those late-flushed entries,
+//     which the reconciler then reads as "activity after idle" (falsely
+//     re-greening an ended turn — H7) or "assistant message after the prompt →
+//     resolved" (falsely releasing a still-pending red chip, a missed-RED — H8,
+//     the costliest error in the model). Wall-clock `now` is the race-free
+//     anchor: the hook fires only after its cause, so every entry of the turn so
+//     far — whenever it flushes — is dated at-or-before `now` and cannot
+//     re-trigger, while a genuine later signal (a resumption; a post-approval
+//     assistant message) is dated after `now` and still does.
 //
 // The pull-back never runs `now` backward: it applies only when the anchor is
 // strictly before `now`, and a missing/unreadable transcript falls back to `now`.
-func AnchorSince(path string, now time.Time, intoIdle bool, maxBytes int64) time.Time {
-	if intoIdle {
+func AnchorSince(path string, now time.Time, intoWorking bool, maxBytes int64) time.Time {
+	if !intoWorking {
 		return now
 	}
 	if anchor, ok := AnchorTime(path, maxBytes); ok && anchor.Before(now) {
