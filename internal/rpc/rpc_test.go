@@ -152,6 +152,40 @@ func TestHandleHookLogsTransitions(t *testing.T) {
 	}
 }
 
+// A session that rotates its id under the SAME pid — a /clear or fork: same
+// process, new session_id, new transcript file — must re-key the stored identity
+// to the LIVE session, not freeze it at the first id seen. The transcript path
+// already refreshes on every hook; the session_id must too. If it does not, the
+// transcript field follows the new file while info.SessionID stays pinned to the
+// old id, so reconciler-derived edges and the fanout Observer key off a stale id
+// that diverges from the transcript the daemon is actually reading — the split
+// observed in the wild (a live transcript on one id, reconciler edges labeled
+// with the retired id, on a single pid).
+func TestHandleHookRefreshesSessionIDOnRotation(t *testing.T) {
+	store := state.New("")
+	store.Apply(func(m map[int]*state.Session) {
+		m[42] = &state.Session{PID: 42, CWD: "/home/u/proj", Agent: state.AgentKindClaude}
+	})
+	s := New(store, "", terminal.NewNone(), wm.NewNone())
+
+	// First session on the pid.
+	s.handleHook(Request{Cmd: "hook", Event: "UserPromptSubmit", PID: 42, SessionID: "6605c9cd-1111", Transcript: "/t/6605c9cd.jsonl"})
+	if got := store.Snapshot().Sessions[0].Claude.SessionID; got != "6605c9cd-1111" {
+		t.Fatalf("first session_id = %q, want 6605c9cd-1111", got)
+	}
+
+	// /clear on the same pid: a new session_id and a new transcript file arrive on
+	// the next hook. Both must now describe the live session.
+	s.handleHook(Request{Cmd: "hook", Event: "UserPromptSubmit", PID: 42, SessionID: "36046386-2222", Transcript: "/t/36046386.jsonl"})
+	c := store.Snapshot().Sessions[0].Claude
+	if c.SessionID != "36046386-2222" {
+		t.Errorf("after rotation session_id = %q, want 36046386-2222 (identity must follow the live session, not freeze at the first id)", c.SessionID)
+	}
+	if c.Transcript != "/t/36046386.jsonl" {
+		t.Errorf("after rotation transcript = %q, want /t/36046386.jsonl", c.Transcript)
+	}
+}
+
 // With an enabled history sink, every hook-driven status edge is mirrored into
 // the durable activity log (one transition event per edge, carrying the
 // from/to/agent and the closed interval's length), while a no-op repeat records

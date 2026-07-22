@@ -411,7 +411,17 @@ func (s *Server) handleHook(req Request) {
 				info.PendingTool = req.ToolName // capture the tool the prompt is for (A2)
 			}
 		}
-		if req.SessionID != "" && info.SessionID == "" {
+		// Keep the stored identity on the LIVE session, last-hook-wins — the same
+		// rule info.Transcript already follows above. A session can rotate its id
+		// under a stable pid (a /clear or fork: same process, new session_id, new
+		// transcript file); freezing the id at first-seen (the old `info.SessionID
+		// == ""` guard) let the transcript field follow the new file while the id
+		// stayed pinned to the retired session, so reconciler-derived edges and the
+		// fanout Observer keyed off an id that no longer matched the transcript the
+		// daemon was reading. Refreshing here keeps id and transcript describing the
+		// same session. (--resume is the benign case: new pid, same id — a fresh
+		// AgentInfo, so this simply sets it.)
+		if req.SessionID != "" {
 			info.SessionID = req.SessionID
 		}
 		// SubagentStart/Stop: trigger an immediate fanout re-scan so the in-flight
