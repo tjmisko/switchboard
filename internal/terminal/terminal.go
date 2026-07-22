@@ -29,6 +29,7 @@ type PaneRef struct {
 	PaneID      int    // pane id within the mux's namespace
 	TabID       int
 	WindowID    int
+	Title       string // the pane's OWN title (agent CLIs paint status glyphs here); "" when the backend has no per-pane title
 	WindowTitle string // best-effort join key to the WM window title
 	TTY         string // the controlling tty this pane owns
 	CWD         string // decoded working directory, or "" if unavailable

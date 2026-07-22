@@ -81,6 +81,29 @@ type Tuning struct {
 	// Default delegating (green) for consistency with P4 — work is still happening;
 	// set to idle (orange) if Esc should mean "I want control now."
 	EscWithTeammatesStatus string
+
+	// IdleTitleDemotionEnabled demotes a working (green) chip to idle when the
+	// pane title shows Claude Code's static idle glyph instead of a spinner
+	// frame — the recovery for the silent abort (a prompt interrupted before its
+	// first token fires no hook AND writes no transcript marker; see
+	// docs/timing-hazards.md H9). Off reverts to the old strand-green-forever
+	// behavior. The trade: with broken terminal-title updates a genuinely
+	// working chip can transiently show orange (it re-greens on the turn's next
+	// transcript write via resume-activity).
+	IdleTitleDemotionEnabled bool
+
+	// IdleTitleGrace is how old a working chip must be before an idle-glyph
+	// title may demote it. The glyph flips a beat after the hooks at every edge
+	// (the title still reads idle for a moment after a prompt is submitted), so
+	// too small risks a false demote right after UserPromptSubmit; too large
+	// just delays the H9 recovery.
+	IdleTitleGrace time.Duration
+
+	// IdleTitleGlyphs are the runes that mark a pane title as "agent waiting at
+	// the prompt" when one of them is the title's first rune. Claude Code parks
+	// ✳ while idle and animates braille frames while running; an empty or
+	// unrecognized first rune yields no signal (fail-safe: no demotion).
+	IdleTitleGlyphs string
 }
 
 // Default returns the tuning the daemon ships with: the recommended answers to
@@ -95,6 +118,9 @@ func Default() Tuning {
 		InterruptExitStatus:         statusIdle,
 		DelegatingEnabled:           true,
 		EscWithTeammatesStatus:      statusDelegating,
+		IdleTitleDemotionEnabled:    true,
+		IdleTitleGrace:              15 * time.Second,
+		IdleTitleGlyphs:             "✳",
 	}
 }
 

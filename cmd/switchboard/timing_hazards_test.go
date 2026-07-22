@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/transcript"
 )
 
@@ -12,9 +13,10 @@ import (
 // each pinned as a regression. Status hooks (UserPromptSubmit, Stop, PostToolUse,
 // …) and the transcript are two separate event streams the reconciler has to
 // reconcile, and a fast user action that lands in the gap between a hook and the
-// next exposes clock-ordering races. Every row is a scenario that bit us — or
-// plausibly could — kept executable so a regression flips a chip color and fails
-// the build.
+// next exposes clock-ordering races. (H9 adds a third stream — the pane title —
+// for the one transition that leaves both silent.) Every row is a scenario that
+// bit us — or plausibly could — kept executable so a regression flips a chip
+// color and fails the build.
 //
 // Each row models the real two-phase flow:
 //
@@ -43,6 +45,7 @@ func TestTimingHazards(t *testing.T) {
 		status    string   // the color the hook set
 		hookAt    string   // wall-clock instant the daemon ran the hook (default: newest atHook entry; set later to model a flush lag)
 		subagents int      // teammates in flight at reconcile
+		title     string   // pane title at reconcile (the agent CLI's status glyph); "" = no title signal
 		appended  []string // entries written between the hook and the reconcile
 		stale     bool     // force the file mtime before StatusSince (no fresh write)
 		afterHook time.Duration
@@ -147,6 +150,34 @@ func TestTimingHazards(t *testing.T) {
 			want:      "permission",
 		},
 		{
+			// The silent abort (2026-07-22, session be0d8122): a prompt is submitted
+			// and interrupted (double-Esc) before the first token streams. No Stop
+			// hook fires (interrupts never do) AND no interrupt marker is written
+			// (there was no in-flight response to mark), so BOTH event streams are
+			// silent forever and the chip would stay green until the next manual
+			// prompt. The recovery is a third stream: the pane title, where Claude
+			// Code parks the static idle glyph (✳) while waiting at the prompt and
+			// animates a spinner while a turn runs. A fresh idle-glyph sighting
+			// (TitleAt after the working edge) past the grace window demotes to idle.
+			id:        "H9-instant-interrupt-silent-abort",
+			atHook:    []string{tUserText(t0, "how should this work on mobile?")},
+			status:    "working",
+			title:     "✳ align-project-messaging",
+			afterHook: 5 * time.Minute,
+			want:      "idle",
+		},
+		{
+			// Contrast: the same quiet transcript mid-turn (a slow first inference,
+			// H3's cousin) shows a SPINNER title — the demotion keys on the idle
+			// glyph specifically, never on transcript silence.
+			id:        "H9-spinner-title-holds-green",
+			atHook:    []string{tUserText(t0, "how should this work on mobile?")},
+			status:    "working",
+			title:     "⠐ align-project-messaging",
+			afterHook: 5 * time.Minute,
+			want:      "working",
+		},
+		{
 			// Delegating is decided from the in-flight-subagent count, not a transcript
 			// read, so it must fire even when the main transcript is quiet (stale mtime)
 			// — the case the activity pre-gate would otherwise skip.
@@ -197,11 +228,75 @@ func TestTimingHazards(t *testing.T) {
 			if h.status == "permission" {
 				m[100].Claude.PendingTool = "AskUserQuestion"
 			}
+			if h.title != "" {
+				// The resolver refreshed the pane title on this tick (H9): the title
+				// was sampled after the chip's transition, as a live locate would be.
+				m[100].Agent = state.AgentKindClaude
+				m[100].Wezterm = &state.WeztermInfo{Title: h.title, TitleAt: reconcileNow.Add(-time.Second)}
+			}
 			selfHealStaleAttention(m, reconcileNow, testTune, nil)
 			selfHealStuckStatus(m, reconcileNow, testTune, nil)
 
 			if got := m[100].Claude.Status; got != h.want {
 				t.Errorf("status = %q, want %q", got, h.want)
+			}
+		})
+	}
+}
+
+// TestIdleTitleDemotion pins every guard on the H9 idle-title demotion: the
+// rule must fire only on positive, fresh evidence — a claude session, a title
+// sampled after the chip went working, the idle glyph itself, and a chip old
+// enough to be past the edge lag. Anything less holds the current color, so a
+// terminal without agent titles (or a disabled knob) exactly preserves the old
+// behavior.
+func TestIdleTitleDemotion(t *testing.T) {
+	const t0 = "2026-06-22T10:50:00Z"
+	cases := []struct {
+		name      string
+		agent     string
+		status    string
+		title     string
+		titleAgo  time.Duration // how long before the reconcile the title was sampled; negative = before the working edge
+		age       time.Duration // how long the chip has held its status
+		suspended bool
+		noWezterm bool
+		disabled  bool
+		want      string
+	}{
+		{name: "should demote a working chip when a fresh idle-glyph title outlives the grace",
+			agent: "claude", status: "working", title: "✳ my-session", titleAgo: time.Second, age: time.Minute, want: "idle"},
+		{name: "should hold when the title was sampled before the working edge",
+			agent: "claude", status: "working", title: "✳ my-session", titleAgo: 2 * time.Minute, age: time.Minute, want: "working"},
+		{name: "should hold inside the grace window",
+			agent: "claude", status: "working", title: "✳ my-session", titleAgo: time.Second, age: 5 * time.Second, want: "working"},
+		{name: "should hold for a codex session",
+			agent: "codex", status: "working", title: "✳ my-session", titleAgo: time.Second, age: time.Minute, want: "working"},
+		{name: "should hold while suspended",
+			agent: "claude", status: "working", title: "✳ my-session", titleAgo: time.Second, age: time.Minute, suspended: true, want: "working"},
+		{name: "should hold with no terminal mapping",
+			agent: "claude", status: "working", noWezterm: true, age: time.Minute, want: "working"},
+		{name: "should hold when the knob is off",
+			agent: "claude", status: "working", title: "✳ my-session", titleAgo: time.Second, age: time.Minute, disabled: true, want: "working"},
+		{name: "should not touch an idle chip showing the idle glyph",
+			agent: "claude", status: "idle", title: "✳ my-session", titleAgo: time.Second, age: time.Minute, want: "idle"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeTranscript(t, tUserText(t0, "do the thing"))
+			since := mustParseTime(t, t0)
+			now := since.Add(tc.age)
+			m := stuckMap(tc.status, path, since)
+			m[100].Agent = tc.agent
+			m[100].Suspended = tc.suspended
+			if !tc.noWezterm {
+				m[100].Wezterm = &state.WeztermInfo{Title: tc.title, TitleAt: now.Add(-tc.titleAgo)}
+			}
+			tun := testTune
+			tun.IdleTitleDemotionEnabled = !tc.disabled
+			selfHealStuckStatus(m, now, tun, nil)
+			if got := m[100].Claude.Status; got != tc.want {
+				t.Errorf("status = %q, want %q", got, tc.want)
 			}
 		})
 	}

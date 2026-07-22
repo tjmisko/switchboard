@@ -23,6 +23,12 @@ Switchboard derives a session's color from two independent sources:
    user prompts, assistant messages, tool results, and the
    `[Request interrupted by user]` marker. Every entry is timestamped by Claude
    Code when it is written.
+3. **The pane title** (H9 only) — Claude Code continuously paints its state into
+   the terminal title (spinner frames while running, a static idle glyph at the
+   prompt), re-sampled by the resolver every reconcile tick. The recovery of
+   last resort for the one transition that leaves both streams above silent
+   (§2.2).
+
 Hooks are **lossy**: some real transitions fire no hook at all. The two that bite
 us (`cmd/switchboard/main.go`, `selfHealStuckStatus`):
 
@@ -30,6 +36,11 @@ us (`cmd/switchboard/main.go`, `selfHealStuckStatus`):
   clears — the agent stopped but the chip stays green.
 - **teammate wakeup** fires no `working` hook on the orchestrator, so an `idle`
   (orange) chip stays orange while subagents run.
+- **instant interrupt** (double-Esc right after submitting a prompt, before the
+  first token streams) fires no `Stop` either — and, uniquely, writes **no
+  interrupt marker**: there was no in-flight response to mark, so even the
+  transcript is silent and the marker-based recovery below has nothing to key
+  on. See §2.2 / H9.
 
 The reconciler recovers these *hookless* edges by reading the transcript tail and
 asking: **"did anything happen after the chip last transitioned?"** That question
@@ -141,6 +152,46 @@ info.StatusSince = transcript.AnchorSince(info.Transcript, now, status == state.
 // into idle / permission → wall-clock now         (the flush-race fix — H7, H8)
 ```
 
+## 2.2 The silent abort: no signal in either stream (into working, out of nowhere)
+
+Every hazard above is recoverable because *something* eventually lands in the
+transcript. One reliably reproducible sequence defeats that entirely: **type a
+prompt, then double-tap Esc before the first token streams**. Empirically
+(2026-07-22, session `be0d8122`): the transcript's last entry is the bare user
+prompt — no assistant output ever follows, and **no `[Request interrupted by
+user]` marker is written**, because there was no in-flight response to mark.
+`UserPromptSubmit` latched the chip green; no hook and no transcript entry will
+ever demote it. The chip is stranded green until the user manually prompts
+again.
+
+No amount of hook/transcript reconciliation can recover this — both streams are
+silent — and a no-activity TTL is forbidden (H3: a long busy turn is equally
+silent). The recovery needs a **third event stream** that distinguishes "turn
+running, nothing flushed yet" from "no turn running": the **pane title**.
+Claude Code paints its state into the terminal title continuously — braille
+spinner frames (`⠐`, `⠂`, …) while a turn runs, the static idle glyph (`✳`)
+while it waits at the prompt. The resolver already re-samples every pane's
+title each reconcile tick (`Resolver.Reconcile` → `WeztermInfo.Title`, stamped
+with `TitleAt`).
+
+The demotion rule (`case6-idle-title`, `selfHealStuckStatus`): a `working` chip
+is demoted to `idle` when **all** of
+
+- the session is claude (codex paints no glyph) and not suspended,
+- the title's first rune is an idle glyph (`Tuning.IdleTitleGlyphs`),
+- the title was sampled **after** the chip went working (`TitleAt >
+  StatusSince` — a stale pre-submit `✳` must not demote a fresh turn),
+- the chip is older than `Tuning.IdleTitleGrace` (the title flips a beat after
+  the hooks at every edge).
+
+Fail-safe by construction: the rule keys on **positive evidence of idleness** —
+a spinner frame, a shell title, an empty title, or a backend with no per-pane
+titles (tmux today) yields no signal and preserves the old behavior. If title
+updates are broken and a genuinely working chip is falsely demoted, the turn's
+next transcript write re-greens it via `resume-activity`; the error is
+transient, cheap (§4 #4), and the knob (`IdleTitleDemotionEnabled`) turns the
+whole rule off.
+
 ---
 
 ## 3. The catalog
@@ -155,6 +206,8 @@ info.StatusSince = transcript.AnchorSince(info.Transcript, now, status == state.
 | **H6-delegating-quiet-transcript** | idle main thread, subagents in flight | `idle` | (nothing written) | promote → **delegating** from the subagent count, even with a stale mtime the activity pre-gate would skip. |
 | **H7-stop-final-message-flush-race** | `Stop` → orange, then the turn's own final assistant message flushes late | `idle` | assistant message dated before the `Stop` lands on disk after it | stay **idle** (§2.1). The idle edge anchors `StatusSince` to wall-clock `now`, not to the stale on-disk entry, so the late-flushed message (dated before `now`) is not "activity after idle" — without this the chip re-greened after every `Stop`. |
 | **H8-permission-preprompt-flush-race** | `PermissionRequest` → red, then the blocked turn's own pre-prompt thinking/text and pending `tool_use` flush late | `permission` | assistant entries dated before the hook land on disk after it | stay **red** (§2.1). The permission edge anchors `StatusSince` to wall-clock `now`, so the prompt's own late-flushed turn-mates (dated before `now`) cannot read as "assistant message after the prompt → resolved" — without this the red chip released to green in one tick while the prompt still waited (the 2026-07-22 zettel missed-RED). |
+| **H9-instant-interrupt-silent-abort** | prompt → green, double-Esc before the first token | `working` | **nothing, ever** — no `Stop`, no marker, no entry | demote → **idle** (§2.2). Both event streams are silent, so the recovery keys on the third one: the pane title parked on the idle glyph (`✳`), freshly sampled (`TitleAt` after the edge) and past the grace window. |
+| **H9-spinner-title-holds-green** | the same quiet transcript, but mid-turn (slow first inference) | `working` | (nothing yet) | stay **working** — the title shows a spinner frame, and the demotion keys on the idle glyph specifically, never on transcript silence (H3's cousin). |
 
 ### Adding a hazard
 

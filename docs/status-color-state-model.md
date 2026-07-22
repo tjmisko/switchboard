@@ -470,6 +470,7 @@ governs them:
 | `case15-ttl-backstop` | red exited on the unreadable-transcript TTL | `PermissionDecayTTL` |
 | `case5-delegating` / `case4-drained` | idle↔delegating on subagent count | `DelegatingEnabled` |
 | `resume-activity` / `case6-interrupt` | idle↔working via transcript signal | — |
+| `case6-idle-title` | working→idle on a fresh idle-glyph pane title (the silent abort, timing-hazards H9) | `IdleTitleDemotionEnabled` (+ `IdleTitleGrace`, `IdleTitleGlyphs`) |
 
 **3. Retune and verify.** Change the field in `main.go`'s `Tuning`, rebuild, and
 add a table row to `TestPermissionExit` (reconciler) or the `rpc`/transcript tests

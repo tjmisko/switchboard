@@ -40,6 +40,11 @@ const (
 	// RuleInterrupt — working demoted to idle because the turn was Esc-interrupted
 	// (no Stop hook fires).
 	RuleInterrupt = "case6-interrupt"
+	// RuleIdleTitle — working demoted to idle because the pane title showed the
+	// agent's static idle glyph (waiting at the prompt) on a fresh sample. The
+	// recovery for the silent abort: an interrupt before the first token fires no
+	// hook AND writes no marker (docs/timing-hazards.md H9).
+	RuleIdleTitle = "case6-idle-title"
 )
 
 // KnobHint names the Tuning field that governs a rule's outcome, with a one-line
@@ -66,6 +71,7 @@ var ruleKnobs = map[string]KnobHint{
 	RuleHoldBareResult:    {"", "intentional missed-RED guard: a bare/Task PostToolUse must not clear a pending prompt — there is no knob, and loosening it risks the worst error (a blocked agent shown not-red)"},
 	RuleResumeActivity:    {"", "pure transcript-signal edge (idle→working on fresh activity); not tunable — adjust upstream signal classification in package transcript if it misfires"},
 	RuleInterrupt:         {"", "pure transcript-signal edge (working→idle on an interrupt notice); not tunable — see package transcript"},
+	RuleIdleTitle:         {"IdleTitleDemotionEnabled", "set false to never demote a green chip on an idle pane title; IdleTitleGrace delays it, IdleTitleGlyphs names the glyphs that count as idle"},
 }
 
 // RuleKnob returns the tuning hint for a rule id. An unknown rule yields a zero

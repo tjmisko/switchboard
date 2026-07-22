@@ -12,8 +12,10 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tjmisko/switchboard/internal/detect"
 	"github.com/tjmisko/switchboard/internal/discovery"
@@ -438,6 +440,31 @@ func selfHealStuckStatus(m map[int]*state.Session, now time.Time, tun statustune
 				continue // still delegating; nothing to recover
 			}
 		}
+		// The silent abort (docs/timing-hazards.md H9): a prompt submitted and
+		// interrupted before its first token fires no Stop hook AND writes no
+		// interrupt marker, so neither event stream ever demotes the chip — it
+		// would stay green until the next manual prompt. The recovery is a third
+		// stream: the pane's own title, where Claude Code animates a spinner
+		// while a turn runs and parks the static idle glyph while waiting at the
+		// prompt. The resolver re-samples it (stamping TitleAt) every tick, so a
+		// title that (a) was sampled after the chip went working, (b) shows the
+		// idle glyph, and (c) has had IdleTitleGrace to flip past the edge lag,
+		// proves no turn is running. Runs before the mtime pre-gate below — the
+		// transcript is silent in exactly this failure. Claude-only (codex paints
+		// no glyph), never on a suspended session (frozen title, and the overlay
+		// already de-emphasizes it). A false demote (broken title updates)
+		// self-corrects: the turn's next transcript write re-greens the chip via
+		// resume-activity.
+		if tun.IdleTitleDemotionEnabled && c.Status == state.StatusWorking &&
+			sess.Agent == state.AgentKindClaude && !sess.Suspended &&
+			sess.Wezterm != nil && sess.Wezterm.TitleAt.After(c.StatusSince) &&
+			titleShowsIdleGlyph(sess.Wezterm.Title, tun.IdleTitleGlyphs) &&
+			now.Sub(c.StatusSince) >= tun.IdleTitleGrace {
+			logStuck(sink, sess, c, state.StatusIdle, statustune.RuleIdleTitle, "idle title glyph on a working chip", now)
+			c.Status = state.StatusIdle
+			c.StatusSince = now
+			continue
+		}
 		if c.Status != state.StatusIdle && c.Status != state.StatusWorking {
 			continue
 		}
@@ -477,6 +504,20 @@ func logStuck(sink *history.Sink, sess *state.Session, c *state.AgentInfo, to, r
 		Age: now.Sub(c.StatusSince),
 	}.Log()
 	recordReconcileTransition(sink, sess, c, to, rule, reason, now)
+}
+
+// titleShowsIdleGlyph reports whether a pane title's first rune is one of the
+// configured idle glyphs (the agent parked at its prompt). Anything else — a
+// spinner frame, a shell title, an empty string — is "no signal", never a
+// demotion: the H9 recovery must key on positive evidence of idleness, so a
+// terminal that does not carry agent titles simply leaves the rule inert.
+func titleShowsIdleGlyph(title, glyphs string) bool {
+	title = strings.TrimSpace(title)
+	if title == "" || glyphs == "" {
+		return false
+	}
+	r, _ := utf8.DecodeRuneInString(title)
+	return strings.ContainsRune(glyphs, r)
 }
 
 // permissionExit decides whether — and to which color — a latched "permission"

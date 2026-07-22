@@ -104,6 +104,20 @@ type WeztermInfo struct {
 	TabID       int    `json:"tab_id"`
 	WindowID    int    `json:"window_id"`
 	WindowTitle string `json:"window_title"`
+	// Title is the pane's OWN title — the string the agent CLI paints there
+	// (Claude Code animates a spinner glyph while a turn runs and parks the
+	// static idle glyph while waiting at the prompt). Distinct from WindowTitle,
+	// which follows the window's active pane and could cross-contaminate between
+	// split panes. Kept off the wire (json:"-"): it is a live in-process signal
+	// for the reconciler's idle-title recovery (docs/timing-hazards.md H9), not
+	// part of the frozen state.json contract — and it deliberately does not
+	// survive a daemon restart, because the recovery may only trust a title
+	// sampled after the chip's transition (TitleAt), which a rehydrated zero
+	// value guarantees.
+	Title string `json:"-"`
+	// TitleAt is when Title was last sampled from the terminal (the resolver
+	// re-locates every session each reconcile tick). The freshness gate for H9.
+	TitleAt time.Time `json:"-"`
 }
 
 type HyprlandInfo struct {

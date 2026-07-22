@@ -112,6 +112,8 @@ func weztermInfo(pane *terminal.PaneRef) *state.WeztermInfo {
 		TabID:       pane.TabID,
 		WindowID:    pane.WindowID,
 		WindowTitle: pane.WindowTitle,
+		Title:       pane.Title,
+		TitleAt:     time.Now(),
 	}
 }
 

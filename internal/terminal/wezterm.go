@@ -38,6 +38,7 @@ func (weztermLocator) Locate(ctx context.Context, tty string) (*PaneRef, error) 
 		PaneID:      p.PaneID,
 		TabID:       p.TabID,
 		WindowID:    p.WindowID,
+		Title:       p.Title,
 		WindowTitle: p.WindowTitle,
 		TTY:         p.TTYName,
 		CWD:         decodeCWD(p.CWDURL),
