@@ -106,6 +106,19 @@ still open (no intervening `session_end`) is a daemon-restart rediscovery — th
 process never died — and continues the existing lane rather than starting a new
 one; genuine pid reuse is preceded by a `session_end`.
 
+pid and session are **not 1:1**, in either direction, so grouping by pid is
+wrong both ways:
+
+- One process hosts a **sequence** of sessions — `/clear` or a new conversation
+  in the same pane mints a fresh `session_id` while the pid lives on. A new
+  `session_id` appearing on a pid ends the previous session's lane at that
+  instant; nothing else marks the boundary, because no process died and so no
+  `session_end` is ever written for the earlier session.
+- One session can span **two** processes — resumed into a fresh pane, it keeps
+  its id on a new pid. With no `session_end` between, that is one continuing
+  session and one lane; after a `session_end`, the same id reappearing is a
+  second run and a second lane.
+
 ### Event types
 
 | `type` | When | Key payload |

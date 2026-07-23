@@ -2,6 +2,8 @@ package history
 
 import (
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -123,6 +125,16 @@ type Swimlane struct {
 	TokCacheCreate int64   `json:"tok_cache_create,omitempty"`
 }
 
+// Lane keys namespace the two ways a lane can be identified so the two can never
+// collide: "s:<session-id>" once a hook has supplied an id, and "p:<pid>" for the
+// pre-hook lead-in that session_start opens before any id is known. Every
+// provisional "p:" lane is adopted under an "s:" key by the first identified
+// event on that pid, so a "p:" lane survives to the end only for a process that
+// never fired a hook at all.
+func sessionLaneKey(sessionID string) string { return "s:" + sessionID }
+func pidLaneKey(pid int) string              { return "p:" + strconv.Itoa(pid) }
+func isPIDLaneKey(key string) bool           { return strings.HasPrefix(key, "p:") }
+
 // laneBuilder accumulates one session's intervals as events are replayed.
 type laneBuilder struct {
 	lane       Swimlane
@@ -182,16 +194,31 @@ func (b *laneBuilder) closeLabel(t time.Time) {
 }
 
 // BuildSwimlanes replays an event stream into per-session swimlanes. Events are
-// grouped by pid. A fresh lane begins at each session_start whose pid has no lane
-// currently open — so genuine pid reuse (death emits session_end, which closes
-// the lane, then a new process reuses the pid) splits into distinct lanes. A
-// session_start for a pid whose lane is still open is a rediscovery artifact (a
-// daemon restart re-scans the running processes and re-emits session_start for
-// each) and continues the existing lane rather than orphaning the live session
-// into a second, label-less lane. A lane still open at the end of the stream is
-// closed at `end` — pass `now` for a live day so a running session's last
-// interval extends to the present; pass the window's upper bound otherwise.
-// Events need not be pre-sorted.
+// grouped by **session id**, the identity the schema defines as canonical
+// (history-schema.md: "group a session's events by session_id when present"),
+// falling back to pid only for the pre-hook lead-in — session_start fires at
+// process discovery, before any hook has supplied an id.
+//
+// Grouping by pid instead gets both directions wrong, because pid and session
+// are not 1:1. One process hosts a SEQUENCE of sessions (a /clear or a new
+// conversation in the same pane mints a fresh id), which pid-grouping merges
+// into a single lane that sums their costs and keeps only the last one's name
+// and focus spans; and one session can span TWO processes (resumed in a fresh
+// pane), which pid-grouping splits into two lanes. Both shapes were live in a
+// single day's log (2026-07-22: six pids hosting up to four sessions each, four
+// sessions spanning two pids).
+//
+// So: the provisional pid-keyed lead-in lane is adopted by the first session id
+// seen on that pid, giving the lane its true start; a DIFFERENT session id
+// arriving on a pid closes the previous session's lane at that instant (the old
+// session ended the moment the new one wrote its first event); and a
+// session_end closes the lane and releases the pid. A session that reappears
+// after its lane closed opens a fresh lane, so a resume after a death is two
+// runs, not one.
+//
+// A lane still open at the end of the stream is closed at `end` — pass `now` for
+// a live day so a running session's last interval extends to the present; pass
+// the window's upper bound otherwise. Events need not be pre-sorted.
 //
 // Beyond the status intervals it also derives, per lane: the session-name spans
 // (session_label), the launched-subagent spans (subagent_spawn↔stop by
@@ -202,7 +229,8 @@ func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
 	evs := append([]Event(nil), events...)
 	sort.SliceStable(evs, func(i, j int) bool { return evs[i].Ts.Before(evs[j].Ts) })
 
-	open := map[int]*laneBuilder{}
+	open := map[string]*laneBuilder{}
+	pidLane := map[int]string{} // pid → the lane key it currently feeds
 	var done []Swimlane
 	finish := func(b *laneBuilder, t time.Time) {
 		b.closeInterval(t)
@@ -219,25 +247,74 @@ func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
 		done = append(done, b.lane)
 	}
 
+	// laneKey routes an event to its lane and keeps one pid's sequential sessions
+	// apart. An event with no session id continues whatever lane its pid already
+	// feeds (or opens the provisional lead-in). An event WITH an id either adopts
+	// that provisional lane — re-keying it so the lane starts at session_start
+	// rather than at the first hook — or, when a different session already holds
+	// the pid, closes that one first: the old session ended the instant this one
+	// wrote its first event.
+	laneKey := func(ev Event) string {
+		if ev.SessionID == "" {
+			if k, ok := pidLane[ev.PID]; ok {
+				return k
+			}
+			k := pidLaneKey(ev.PID)
+			pidLane[ev.PID] = k
+			return k
+		}
+		k := sessionLaneKey(ev.SessionID)
+		if cur, ok := pidLane[ev.PID]; ok && cur != k {
+			if b := open[cur]; b != nil {
+				switch {
+				case !isPIDLaneKey(cur):
+					// A different session held this pid; it ends here.
+					finish(b, ev.Ts)
+					delete(open, cur)
+				case open[k] == nil:
+					// The lead-in belongs to this session: re-key it, keeping its start.
+					delete(open, cur)
+					open[k] = b
+				default:
+					// This session is already open on another pid (resumed into a fresh
+					// pane). The lead-in is a rediscovery of it, so drop the duplicate
+					// and let the events continue the session's existing lane.
+					delete(open, cur)
+				}
+			}
+		}
+		pidLane[ev.PID] = k
+		return k
+	}
+
 	for _, ev := range evs {
-		b := open[ev.PID]
+		// The focus and activity streams are GLOBAL, not per-lane: a focus event is
+		// keyed by the session that gained focus rather than by the session the
+		// emitting pid is running, and activity is session-less entirely. They are
+		// replayed separately (buildFocusSpans) and must never take part in lane
+		// routing — a focus event naming another session would otherwise read as
+		// "a different session took this pid" and close a live lane early.
+		if ev.Type == EventFocus || ev.Type == EventActivity {
+			continue
+		}
+		key := laneKey(ev)
+		b := open[key]
 		switch ev.Type {
 		case EventSessionStart:
 			if b != nil {
-				// A session_start for a pid whose lane is still open (no
-				// session_end has closed it ⇒ the process never died) is a
-				// rediscovery artifact: a daemon restart re-scans the running
-				// processes and re-emits session_start. Splitting here would
-				// orphan the live session into a second, label-less lane, so
-				// treat it as a continuation of the same lane instead.
+				// A session_start for a lane that is still open (no session_end has
+				// closed it ⇒ the process never died) is a rediscovery artifact: a
+				// daemon restart re-scans the running processes and re-emits
+				// session_start. Splitting here would orphan the live session into a
+				// second, label-less lane, so treat it as a continuation instead.
 				b.absorb(ev)
 				continue
 			}
-			open[ev.PID] = newLaneBuilder(ev)
+			open[key] = newLaneBuilder(ev)
 		case EventTransition:
 			if b == nil {
 				b = newLaneBuilder(ev)
-				open[ev.PID] = b
+				open[key] = b
 			}
 			b.closeInterval(ev.Ts)
 			b.curStatus = ev.To
@@ -263,11 +340,14 @@ func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
 			}
 			b.absorb(ev)
 			finish(b, ev.Ts)
-			delete(open, ev.PID)
+			delete(open, key)
+			// Release the pid: its process is gone, so the next event to arrive on
+			// this pid belongs to a new lane, not this closed one.
+			delete(pidLane, ev.PID)
 		case EventSessionLabel:
 			if b == nil {
 				b = newLaneBuilder(ev)
-				open[ev.PID] = b
+				open[key] = b
 			}
 			if ev.Label == b.curLabel {
 				continue // already on this name (emitter dedups; defensive)
@@ -278,7 +358,7 @@ func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
 		case EventUsageSample:
 			if b == nil {
 				b = newLaneBuilder(ev)
-				open[ev.PID] = b
+				open[key] = b
 			}
 			b.lane.TokIn += ev.TokIn
 			b.lane.TokOut += ev.TokOut
@@ -289,7 +369,7 @@ func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
 		case EventSubagentSpawn:
 			if b == nil {
 				b = newLaneBuilder(ev)
-				open[ev.PID] = b
+				open[key] = b
 			}
 			if b.openSubs == nil {
 				b.openSubs = map[string]*SubagentSpan{}
@@ -317,7 +397,12 @@ func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
 		if !done[i].Start.Equal(done[j].Start) {
 			return done[i].Start.Before(done[j].Start)
 		}
-		return done[i].PID < done[j].PID
+		if done[i].PID != done[j].PID {
+			return done[i].PID < done[j].PID
+		}
+		// Sessions are no longer 1:1 with pids, so break the remaining tie on the
+		// session id to keep the output order deterministic across map iterations.
+		return done[i].SessionID < done[j].SessionID
 	})
 
 	// Focus (C1): the focus stream is global (keyed by the focused session id, not
