@@ -119,6 +119,24 @@ wrong both ways:
   session and one lane; after a `session_end`, the same id reappearing is a
   second run and a second lane.
 
+#### Reading a pre-2026-07-21 day: ids that "change" at a restart
+
+A live process keeps its `session_id` across a daemon restart — measured over
+the full history, 19 of 19 rediscovery restarts since `55ca6ac` left it
+unchanged. Before that commit ("refresh session id on every hook, not just the
+first") the daemon latched the id **write-once**, so a process that ran `/clear`
+went on reporting its stale id, and a restart — which cleared the latch — made
+the id appear to change *at the restart* when it had really changed earlier.
+That artifact appears 6 times in the log, all at or before the restart that
+deployed the fix (2026-07-21 18:48:47).
+
+Because a lane splits when a new id arrives on a live pid, replaying one of
+those older days splits those six sessions at their restart. This is a known,
+accepted artifact of the old data: the log cannot distinguish it from a real
+`/clear`, and biasing the reader toward "same session" would re-merge genuinely
+distinct sessions — the more common and more expensive error. Days after the
+fix are unaffected.
+
 ### Event types
 
 | `type` | When | Key payload |
