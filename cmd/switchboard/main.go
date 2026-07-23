@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -87,8 +88,8 @@ func main() {
 	// Stale-drop reads through the same osproc.Source the scanner and death-watch
 	// use, so there is exactly one process-reading backend. Runs before the live
 	// scan starts; the scanner re-adds survivors on the first tick.
-	dropStaleSessions(store, procSrc)
 	scanner := discovery.New(procSrc)
+	dropStaleSessions(store, procSrc, sink, scanner.Forget)
 	resolver := mapping.NewResolver(term, manager)
 
 	onAgentAppeared := func(info osproc.Info) {
@@ -102,20 +103,18 @@ func main() {
 		sink.Record(history.Event{Ts: time.Now(), Type: history.EventSessionStart,
 			PID: sess.PID, Agent: sess.Agent, CWD: sess.CWD})
 
+		// The pidfd watch is the FAST path to session_end, not the only one: it lives
+		// in this daemon's memory, so a restart or SIGKILL orphans it and the death it
+		// would have reported is never observed. The reconciler's liveness sweep
+		// backstops that loss (L1) and a registration failure below (L3); both funnel
+		// through endSession, so whichever notices first closes the lane exactly once.
 		if err := procSrc.Watch(ctx, info.PID, func() {
 			log.Printf("%s pid=%d died", kind, info.PID)
 			store.Apply(func(m map[int]*state.Session) {
-				// session_end closes the last interval. Read the session (for its id/
-				// agent/cwd) before deleting it.
-				if s := m[info.PID]; s != nil {
-					sink.Record(history.Event{Ts: time.Now(), Type: history.EventSessionEnd,
-						SessionID: enrichmentID(s), PID: s.PID, Agent: s.Agent, CWD: s.CWD})
-				}
-				delete(m, info.PID)
+				endSession(m, info.PID, sink, scanner.Forget, time.Now())
 			})
-			scanner.Forget(info.PID)
 		}); err != nil {
-			log.Printf("watch pid=%d: %v", info.PID, err)
+			log.Printf("watch pid=%d: %v (liveness sweep will close its lane)", info.PID, err)
 		}
 	}
 
@@ -125,7 +124,7 @@ func main() {
 		}
 	}()
 	go runWMLoop(ctx, store, resolver, manager, sink)
-	go runReconciler(ctx, store, resolver, manager, stack, *reconcileInterval, tun, sink, fanoutObs)
+	go runReconciler(ctx, store, resolver, manager, stack, *reconcileInterval, tun, sink, fanoutObs, scanner.Forget)
 
 	server := rpc.New(store, *socketPath, term, manager)
 	server.SetTuning(tun)
@@ -140,29 +139,112 @@ func main() {
 	}
 }
 
+// endSession closes one session's lane: it records the session_end that bounds
+// the session's last interval, drops the session from the store map, and clears
+// the scanner's seen-set entry so a recycled pid is re-discovered
+// (decisions.md §12). It is the SINGLE writer of session_end, driven by three
+// triggers: the pidfd death-watch (the fast path), the reconciler's liveness
+// sweep (the durable backstop), and the startup stale-drop.
+//
+// Idempotent by map membership: whichever trigger fires first removes the
+// session, so every later trigger finds nothing and records nothing — one death
+// can never produce two session_end events (L5). The caller MUST hold the store
+// lock (i.e. call this inside store.Apply). Reports whether it closed the lane.
+func endSession(m map[int]*state.Session, pid int, sink *history.Sink, forget func(int), now time.Time) bool {
+	s := m[pid]
+	if s == nil {
+		return false // already closed by another trigger
+	}
+	sink.Record(history.Event{Ts: now, Type: history.EventSessionEnd,
+		SessionID: enrichmentID(s), PID: s.PID, Agent: s.Agent, CWD: s.CWD})
+	delete(m, pid)
+	if forget != nil {
+		forget(pid)
+	}
+	return true
+}
+
+// sessionDead reports whether pid is DEFINITIVELY no longer this session's
+// process: either it is gone (osproc.ErrGone), or the pid now belongs to a
+// non-agent process (the kernel recycled it). Both are unambiguous ends.
+//
+// Any other read error reports "not dead". Such an error is transient, or comes
+// from a backend that cannot answer at all (darwin's Read returns ErrUnsupported
+// for every pid) — and a false session_end is far more damaging than closing a
+// lane one tick late: it splits a running session into two lanes and permanently
+// under-counts the second. Liveness is judged ONLY on positive evidence of
+// death, never on inactivity (L4).
+func sessionDead(src osproc.Source, pid int) bool {
+	info, err := src.Read(pid)
+	if errors.Is(err, osproc.ErrGone) {
+		return true
+	}
+	if err != nil {
+		return false // transient / unsupported backend — re-check next tick
+	}
+	return discovery.Classify(info) == discovery.AgentNone
+}
+
+// sweepDeadSessions closes the lane of every tracked session whose process is
+// definitively gone. It is the DURABLE backstop for session_end, and the reason
+// the daemon no longer depends on a death-watch surviving anything.
+//
+// The pidfd watch registered at discovery lives in this daemon's memory: a
+// restart or SIGKILL orphans it, and the death it would have reported is never
+// observed. A watch that failed to register never observes one either. In both
+// cases nothing else would ever drop the session, and the reader stretches its
+// final interval to `now` — the ghost lane this sweep exists to prevent
+// (L1/L3, session-lifecycle-hazards.md). Polling here costs one process read per
+// session per tick and depends on no prior state at all, so it self-heals across
+// a restart within a single reconcile interval.
+//
+// Deleting from a map while ranging it is safe in Go. Runs inside store.Apply.
+func sweepDeadSessions(m map[int]*state.Session, src osproc.Source, sink *history.Sink, forget func(int), now time.Time) {
+	for pid := range m {
+		if !sessionDead(src, pid) {
+			continue
+		}
+		if endSession(m, pid, sink, forget, now) {
+			log.Printf("liveness sweep: pid=%d gone, closed its lane", pid)
+		}
+	}
+}
+
 // dropStaleSessions removes hydrated sessions whose PID is gone or no longer
 // looks like claude. Run once at startup, before any live discovery — the
 // scanner will re-add survivors on the first tick. It reads through the
-// osproc.Source (ErrGone on a missing pid is dropped by the err != nil branch),
-// keeping discovery and stale-drop on a single process-reading backend.
-func dropStaleSessions(store *state.Store, procSrc osproc.Source) {
+// osproc.Source, keeping discovery and stale-drop on a single process-reading
+// backend.
+//
+// A stale session died while this daemon was DOWN, so no death-watch of ours
+// ever existed to observe it. Recording its session_end here is what closes its
+// lane; without it the lane stays open forever and the reader stretches its last
+// interval to `now` — a ghost lane (L2, session-lifecycle-hazards.md).
+func dropStaleSessions(store *state.Store, procSrc osproc.Source, sink *history.Sink, forget func(int)) {
 	now := time.Now()
 	store.Apply(func(m map[int]*state.Session) {
 		for pid := range m {
 			info, err := procSrc.Read(pid)
-			if err != nil || discovery.Classify(info) == discovery.AgentNone {
-				delete(m, pid)
+			if err == nil && discovery.Classify(info) != discovery.AgentNone {
+				// StatusSince is in-memory only (json:"-"), so it loads as zero. Stamp
+				// it to startup time: the attention self-heal compares transcript
+				// resolution times against it, and a zero value would read every old
+				// tool_result as "resolved after" — wrongly demoting a still-pending
+				// prompt that was live across the restart. Startup time keeps such a
+				// chip red until something genuinely resolves after the restart.
+				if info := m[pid].Enrichment(); info != nil {
+					info.StatusSince = now
+				}
 				continue
 			}
-			// StatusSince is in-memory only (json:"-"), so it loads as zero. Stamp
-			// it to startup time: the attention self-heal compares transcript
-			// resolution times against it, and a zero value would read every old
-			// tool_result as "resolved after" — wrongly demoting a still-pending
-			// prompt that was live across the restart. Startup time keeps such a
-			// chip red until something genuinely resolves after the restart.
-			if info := m[pid].Enrichment(); info != nil {
-				info.StatusSince = now
+			// Definitively dead (gone, or the pid recycled to a non-agent): record the
+			// end that closes the lane. A non-definitive read error still drops the
+			// stale entry, exactly as it always has, but must not fabricate an end for
+			// a session that may well still be running.
+			if errors.Is(err, osproc.ErrGone) || err == nil {
+				endSession(m, pid, sink, forget, now)
 			}
+			delete(m, pid)
 		}
 	})
 }
@@ -222,22 +304,22 @@ func handleWMEvent(ctx context.Context, store *state.Store, resolver *mapping.Re
 // Catches anything missed by event-driven updates (e.g. a session whose
 // mapping was incomplete when first created, the initial focus state, or a
 // hyprctl race).
-func runReconciler(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, interval time.Duration, tun statustune.Tuning, sink *history.Sink, obs *fanout.Observer) {
+func runReconciler(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, interval time.Duration, tun statustune.Tuning, sink *history.Sink, obs *fanout.Observer, forget func(int)) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	rstate := newReconcileState(obs)
-	reconcileOnce(ctx, store, resolver, manager, stack, tun, sink, rstate)
+	reconcileOnce(ctx, store, resolver, manager, stack, tun, sink, rstate, forget)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			reconcileOnce(ctx, store, resolver, manager, stack, tun, sink, rstate)
+			reconcileOnce(ctx, store, resolver, manager, stack, tun, sink, rstate, forget)
 		}
 	}
 }
 
-func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, tun statustune.Tuning, sink *history.Sink, rstate *reconcileState) {
+func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, tun statustune.Tuning, sink *history.Sink, rstate *reconcileState, forget func(int)) {
 	// Re-publish capabilities every tick: the terminal locator is self-redetecting
 	// (detect.NewAuto), so a terminal that came up after the daemon flips
 	// terminal/navigate from their boot-race "none" values without a restart.
@@ -245,12 +327,16 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 	active, _ := manager.ActiveWindow(ctx)
 	now := time.Now()
 	store.Apply(func(m map[int]*state.Session) {
+		// Close the lanes of any session whose process is gone, BEFORE the per-tick
+		// work below — a dead session earns none of it.
+		sweepDeadSessions(m, stack.OSProc, sink, forget, now)
 		for _, sess := range m {
 			resolver.Reconcile(ctx, sess)
-			// Refresh job-control suspension (Ctrl-Z). On ErrGone the procwatch
-			// death callback will drop the session shortly; leave the last-known
-			// value until then rather than flapping. A change is logged to history
-			// as a suspend/resume edge (it greys/un-greys the chip in a timeline).
+			// Refresh job-control suspension (Ctrl-Z). On ErrGone the sweep above has
+			// already dropped the session, so this only ever sees a live pid; leave
+			// the last-known value on any other read error rather than flapping. A
+			// change is logged to history as a suspend/resume edge (it greys/un-greys
+			// the chip in a timeline).
 			if st, err := proc.State(sess.PID); err == nil {
 				susp := proc.Suspended(st)
 				if susp != sess.Suspended {

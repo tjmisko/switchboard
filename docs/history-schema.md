@@ -113,7 +113,7 @@ one; genuine pid reuse is preceded by a `session_end`.
 | `session_start` | a `claude`/`codex` process is discovered | `pid`, `agent` (no `session_id` yet) |
 | `transition` | any status edge — hook-driven *or* reconciler self-heal | `from`, `to`, `dur_prev_ms`, `rule`, `subagents` |
 | `suspend` / `resume` | the process is Ctrl-Z'd / resumed | bounds a greyed-out span |
-| `session_end` | the process dies | closes the last interval |
+| `session_end` | the process is observed gone — by the pidfd death-watch, the reconciler's liveness sweep, or the startup stale-drop (one writer, three triggers; see `session-lifecycle-hazards.md`) | closes the last interval |
 | `subagent_spawn` | a `Task`/`Agent` subagent is launched (seen in the main transcript) | `tool_use_id`, `agent_type`, `description` |
 | `subagent_stop` | that subagent's result lands | `tool_use_id`, `agent_type` |
 | `usage_sample` | tokens accrued since the last sample (each reconcile tick), one per model | `tok_in`, `tok_out`, `tok_cache_read`, `tok_cache_create`, `model` |
