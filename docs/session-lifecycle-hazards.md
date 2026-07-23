@@ -191,13 +191,30 @@ the store map*, and each removes the session under the store lock. Whichever
 fires first deletes it; the others find nothing and record nothing. Map
 membership is the dedup, exactly as it is for the recycled-pid seen-set (L5).
 
-**F3 — Reader hardening (not implemented; optional).** Independently of the
-source fix, either (a) group by `session_id` where present, per
-`history-schema.md`, so a resumed session's split pid-lanes merge and the twin's
-`session_end` caps the ghost; and/or (b) have the ctl pass the live-pid set into
-`BuildSwimlanes` so a lane whose pid is provably dead caps its final interval at
-last-observed activity rather than at `now`. These would bound the blast radius
-of any *future* missed end but do not, by themselves, fix the cause — F1/F2 do.
+**F3 — Reader grouping, by `session_id` (implemented).** `BuildSwimlanes` now
+groups by session id, the identity `history-schema.md` already defined as
+canonical, falling back to pid only for the pre-hook `session_start` lead-in.
+This does not fix the ghost — F1/F2 do — but it fixes the *attribution* bugs the
+ghost investigation surfaced, which were live in the same day's log: six pids
+hosting up to four sequential sessions each were being merged into one lane with
+their costs summed and only the last one's name and focus spans kept, while four
+resumed sessions were split across two lanes. On 2026-07-22 that was 20 pid-lanes
+standing in for 28 real sessions; regrouping yields 38 lanes over the full day
+with total cost and tokens exactly conserved.
+
+Two rules make it work, and both are load-bearing:
+
+- the provisional pid-keyed lead-in is **adopted** by the first session id seen
+  on that pid, so a lane still starts at its `session_start`;
+- the **global** focus and activity streams are excluded from lane routing
+  entirely. A focus event is keyed by the session that *gained* focus, not by
+  the session its emitting pid is running, so letting it route would read as
+  "a different session took this pid" and close a live lane early.
+
+A remaining option, not implemented: have the ctl pass the live-pid set into
+`BuildSwimlanes` so a lane whose pid is provably dead caps at last-observed
+activity rather than `now`. That would bound the blast radius of any *future*
+missed end, but F1/F2 remove the cause.
 
 ### Accuracy note — dating the late `session_end`
 

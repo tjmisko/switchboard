@@ -79,6 +79,10 @@ func TestBuildSwimlanesSplitsOnPidReuse(t *testing.T) {
 // never died. That redundant session_start must continue the live lane, not
 // split it into a second, label-less lane. (Mirrors the real failure: a session
 // alive across a restart lost its name and its post-restart activity.)
+//
+// The session keeps its id across the restart: the process never died, and the
+// id is re-read from the hooks it keeps firing. See the sibling test below for
+// the case where the id genuinely changes.
 func TestBuildSwimlanesContinuesAcrossDaemonRestart(t *testing.T) {
 	evs := []Event{
 		{Ts: ts(0), Type: EventSessionStart, PID: 1, Agent: "claude", Project: "sb"},
@@ -86,7 +90,7 @@ func TestBuildSwimlanesContinuesAcrossDaemonRestart(t *testing.T) {
 		{Ts: ts(4), Type: EventSessionLabel, PID: 1, SessionID: "s1", Label: "my-name"},
 		// daemon restarts here: rediscovery session_start, no preceding session_end.
 		{Ts: ts(10), Type: EventSessionStart, PID: 1, Agent: "claude", Project: "sb"},
-		tr(1, "s2", 12, "working", "idle", 0), // new session_id after the restart
+		tr(1, "s1", 12, "working", "idle", 0), // same session, still running
 	}
 	lanes := BuildSwimlanes(evs, ts(20))
 	if len(lanes) != 1 {
@@ -101,6 +105,103 @@ func TestBuildSwimlanesContinuesAcrossDaemonRestart(t *testing.T) {
 	}
 	if !l.Labels[0].Start.Equal(ts(4)) || !l.Labels[0].End.Equal(ts(20)) {
 		t.Errorf("label span should run from when it was set to the lane end: %+v", l.Labels[0])
+	}
+}
+
+// One process hosts a SEQUENCE of sessions: `/clear` (or a new conversation in
+// the same pane) mints a fresh session id while the pid lives on. Those are two
+// distinct sessions and must be two lanes — grouping by pid merged them into
+// one, which summed their costs and kept only the last one's name.
+//
+// The previous session ends the instant the new one writes its first event;
+// nothing else marks that boundary, since no process died and so no session_end
+// is ever written for the first session.
+func TestBuildSwimlanesSplitsSequentialSessionsOnOnePid(t *testing.T) {
+	evs := []Event{
+		{Ts: ts(0), Type: EventSessionStart, PID: 1, Agent: "claude", Project: "sb"},
+		tr(1, "s1", 2, "idle", "working", 0),
+		{Ts: ts(4), Type: EventSessionLabel, PID: 1, SessionID: "s1", Label: "first-name"},
+		{Ts: ts(6), Type: EventUsageSample, PID: 1, SessionID: "s1", Model: "claude-opus-4-8", TokIn: 1000},
+		// /clear at ts(10): same pid, brand-new session id.
+		tr(1, "s2", 10, "idle", "working", 0),
+		{Ts: ts(12), Type: EventSessionLabel, PID: 1, SessionID: "s2", Label: "second-name"},
+		{Ts: ts(14), Type: EventUsageSample, PID: 1, SessionID: "s2", Model: "claude-opus-4-8", TokIn: 500},
+	}
+	lanes := BuildSwimlanes(evs, ts(20))
+	if len(lanes) != 2 {
+		t.Fatalf("two sessions on one pid should yield 2 lanes, got %d", len(lanes))
+	}
+	first, second := lanes[0], lanes[1]
+	if first.SessionID != "s1" || second.SessionID != "s2" {
+		t.Fatalf("lanes mis-keyed: %q, %q", first.SessionID, second.SessionID)
+	}
+	// The first lane keeps the session_start lead-in and ends where s2 begins.
+	if !first.Start.Equal(ts(0)) || !first.End.Equal(ts(10)) {
+		t.Errorf("first lane = %v..%v, want ts(0)..ts(10)", first.Start, first.End)
+	}
+	if !second.Start.Equal(ts(10)) || !second.End.Equal(ts(20)) {
+		t.Errorf("second lane = %v..%v, want ts(10)..ts(20)", second.Start, second.End)
+	}
+	// Each keeps its OWN name and its OWN tokens — the merge lost both.
+	if first.Name != "first-name" || second.Name != "second-name" {
+		t.Errorf("names = %q, %q, want first-name, second-name", first.Name, second.Name)
+	}
+	if first.TokIn != 1000 || second.TokIn != 500 {
+		t.Errorf("tok_in = %d, %d, want 1000, 500 (not summed onto one lane)", first.TokIn, second.TokIn)
+	}
+}
+
+// The other direction: one session can span TWO pids. A session resumed into a
+// fresh pane keeps its id on a new process, and grouping by pid split that into
+// two lanes — one of which, having never been closed, was the shape that
+// stretched to `now` as a ghost. Same id with no session_end between is one
+// continuing session, so it is one lane.
+func TestBuildSwimlanesMergesOneSessionAcrossPids(t *testing.T) {
+	evs := []Event{
+		{Ts: ts(0), Type: EventSessionStart, PID: 1, Agent: "claude", Project: "sb"},
+		tr(1, "s1", 2, "idle", "working", 0),
+		{Ts: ts(4), Type: EventSessionLabel, PID: 1, SessionID: "s1", Label: "my-name"},
+		// resumed into a new pane at ts(10): new pid, same session id, no session_end.
+		{Ts: ts(10), Type: EventSessionStart, PID: 2, Agent: "claude", Project: "sb"},
+		tr(2, "s1", 12, "working", "idle", 0),
+	}
+	lanes := BuildSwimlanes(evs, ts(20))
+	if len(lanes) != 1 {
+		t.Fatalf("one session resumed on a second pid should stay 1 lane, got %d", len(lanes))
+	}
+	l := lanes[0]
+	if l.SessionID != "s1" {
+		t.Errorf("lane session id = %q, want s1", l.SessionID)
+	}
+	if !l.Start.Equal(ts(0)) || !l.End.Equal(ts(20)) {
+		t.Errorf("lane = %v..%v, want ts(0)..ts(20)", l.Start, l.End)
+	}
+	if l.Name != "my-name" {
+		t.Errorf("lane name = %q, want it kept across the pid change", l.Name)
+	}
+}
+
+// A session that is resumed AFTER its process died is two separate runs: the
+// session_end closes the first lane, and the same id reappearing opens a fresh
+// one. (Contrast with the merge above, where nothing closed the first lane.)
+func TestBuildSwimlanesResumeAfterDeathIsTwoLanes(t *testing.T) {
+	evs := []Event{
+		{Ts: ts(0), Type: EventSessionStart, PID: 1, SessionID: "s1"},
+		tr(1, "s1", 2, "idle", "working", 0),
+		{Ts: ts(6), Type: EventSessionEnd, PID: 1, SessionID: "s1"},
+		// resumed later in a new process, same session id.
+		{Ts: ts(10), Type: EventSessionStart, PID: 2, SessionID: "s1"},
+		tr(2, "s1", 12, "idle", "working", 0),
+	}
+	lanes := BuildSwimlanes(evs, ts(20))
+	if len(lanes) != 2 {
+		t.Fatalf("a resume after death should be 2 runs, got %d lanes", len(lanes))
+	}
+	if !lanes[0].End.Equal(ts(6)) {
+		t.Errorf("first run should end at its session_end ts(6), got %v", lanes[0].End)
+	}
+	if !lanes[1].Start.Equal(ts(10)) || !lanes[1].End.Equal(ts(20)) {
+		t.Errorf("second run = %v..%v, want ts(10)..ts(20)", lanes[1].Start, lanes[1].End)
 	}
 }
 
