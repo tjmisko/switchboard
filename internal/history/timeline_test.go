@@ -81,8 +81,9 @@ func TestBuildSwimlanesSplitsOnPidReuse(t *testing.T) {
 // alive across a restart lost its name and its post-restart activity.)
 //
 // The session keeps its id across the restart: the process never died, and the
-// id is re-read from the hooks it keeps firing. See the sibling test below for
-// the case where the id genuinely changes.
+// id is re-read from the hooks it keeps firing. That is the empirical norm —
+// across the full history, 19 of 19 rediscovery restarts since 55ca6ac left the
+// id unchanged. See the sibling test for the case where it does change.
 func TestBuildSwimlanesContinuesAcrossDaemonRestart(t *testing.T) {
 	evs := []Event{
 		{Ts: ts(0), Type: EventSessionStart, PID: 1, Agent: "claude", Project: "sb"},
@@ -105,6 +106,52 @@ func TestBuildSwimlanesContinuesAcrossDaemonRestart(t *testing.T) {
 	}
 	if !l.Labels[0].Start.Equal(ts(4)) || !l.Labels[0].End.Equal(ts(20)) {
 		t.Errorf("label span should run from when it was set to the lane end: %+v", l.Labels[0])
+	}
+}
+
+// The same restart shape, but with the id CHANGING across it — which splits into
+// two lanes. Pinned explicitly because it is the shape the pre-F3 version of the
+// test above used, and it must not become accidental behavior.
+//
+// Two lanes is right for the CURRENT daemon, and was not always. Before 55ca6ac
+// ("refresh session id on every hook, not just the first") the daemon latched a
+// session id write-once: a process that ran `/clear` kept reporting its stale id,
+// and a restart — which cleared the latch — made the id appear to change at the
+// restart when it had really changed earlier. That artifact fired 6 times across
+// the whole history, all at or before the restart that deployed 55ca6ac; in the
+// 19 rediscovery restarts since, the id never changed once. So an id change
+// observed now is a real one, and splitting is correct.
+//
+// The residual cost: replaying a PRE-55ca6ac day still splits those six sessions
+// at their restart. The log cannot distinguish the old artifact from a real
+// `/clear`, and biasing toward "same session" would re-merge genuinely distinct
+// ones — the more common and more expensive error.
+func TestBuildSwimlanesSplitsWhenIdChangesAcrossRestart(t *testing.T) {
+	evs := []Event{
+		{Ts: ts(0), Type: EventSessionStart, PID: 1, Agent: "claude", Project: "sb"},
+		tr(1, "s1", 2, "idle", "working", 0),
+		{Ts: ts(4), Type: EventSessionLabel, PID: 1, SessionID: "s1", Label: "my-name"},
+		// daemon restarts here; the pid is alive, so no session_end precedes this.
+		{Ts: ts(10), Type: EventSessionStart, PID: 1, Agent: "claude", Project: "sb"},
+		tr(1, "s2", 12, "working", "idle", 0), // a genuinely different session
+	}
+	lanes := BuildSwimlanes(evs, ts(20))
+	if len(lanes) != 2 {
+		t.Fatalf("a changed session id across a restart should yield 2 lanes, got %d", len(lanes))
+	}
+	first, second := lanes[0], lanes[1]
+	if first.SessionID != "s1" || second.SessionID != "s2" {
+		t.Fatalf("lanes mis-keyed: %q, %q", first.SessionID, second.SessionID)
+	}
+	// The first lane keeps its lead-in and its name, and ends where s2 begins.
+	if !first.Start.Equal(ts(0)) || !first.End.Equal(ts(12)) {
+		t.Errorf("first lane = %v..%v, want ts(0)..ts(12)", first.Start, first.End)
+	}
+	if first.Name != "my-name" {
+		t.Errorf("first lane name = %q, want my-name kept on its own lane", first.Name)
+	}
+	if !second.Start.Equal(ts(12)) || !second.End.Equal(ts(20)) {
+		t.Errorf("second lane = %v..%v, want ts(12)..ts(20)", second.Start, second.End)
 	}
 }
 
