@@ -154,3 +154,94 @@ func TestPickAttention(t *testing.T) {
 		})
 	}
 }
+
+// headlessSess builds a headless (claude -p) session with the given pid,
+// status, and focus flag.
+func headlessSess(pid int, status string, focused bool) state.Session {
+	s := sess(pid, status)
+	s.Headless = true
+	s.Focused = focused
+	return s
+}
+
+func TestPickAttentionShouldNeverTargetHeadlessSessions(t *testing.T) {
+	// The headless session reports "permission", but it has no window to jump
+	// to — the jump must land on an interactive session instead (here the
+	// all-green fallback), never on the headless one.
+	sessions := []state.Session{sess(1, "working"), headlessSess(2, "permission", false)}
+	got := pickAttention(sessions, 0)
+	if got == nil || got.PID != 1 {
+		t.Fatalf("expected pid 1 (headless permission ignored), got %v", got)
+	}
+}
+
+func TestPickAttentionShouldExcludeHeadlessFromAllGreenDenominator(t *testing.T) {
+	// Both interactive sessions are green; the headless one (unknown status)
+	// must not suppress the all-green fallback.
+	sessions := []state.Session{sess(1, "working"), sess(2, "working"), headlessSess(3, "", false)}
+	got := pickAttention(sessions, 0)
+	if got == nil || got.PID != 1 {
+		t.Fatalf("expected pid 1 from the all-green tier, got %v", got)
+	}
+}
+
+func TestCycleTargetPID(t *testing.T) {
+	focused := func(pid int) state.Session {
+		s := sess(pid, "working")
+		s.Focused = true
+		return s
+	}
+	tests := []struct {
+		name      string
+		sessions  []state.Session
+		direction string
+		wantPID   int
+		wantOK    bool
+	}{
+		{
+			name:      "should skip a headless session when cycling next",
+			sessions:  []state.Session{focused(1), headlessSess(2, "", false), sess(3, "working")},
+			direction: "next",
+			wantPID:   3,
+			wantOK:    true,
+		},
+		{
+			name:      "should skip a headless session when cycling prev",
+			sessions:  []state.Session{sess(1, "working"), headlessSess(2, "", false), focused(3)},
+			direction: "prev",
+			wantPID:   1,
+			wantOK:    true,
+		},
+		{
+			name:      "should report no target when every session is headless",
+			sessions:  []state.Session{headlessSess(1, "", false), headlessSess(2, "", false)},
+			direction: "next",
+			wantOK:    false,
+		},
+		{
+			name:      "should pick the first navigable session when nothing is focused",
+			sessions:  []state.Session{headlessSess(1, "", false), sess(2, "working")},
+			direction: "next",
+			wantPID:   2,
+			wantOK:    true,
+		},
+		{
+			name:      "should wrap within the navigable ring",
+			sessions:  []state.Session{sess(1, "working"), headlessSess(2, "", false), focused(3)},
+			direction: "next",
+			wantPID:   1,
+			wantOK:    true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pid, ok := cycleTargetPID(tt.sessions, tt.direction)
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %t, want %t", ok, tt.wantOK)
+			}
+			if ok && pid != tt.wantPID {
+				t.Fatalf("pid = %d, want %d", pid, tt.wantPID)
+			}
+		})
+	}
+}

@@ -182,6 +182,11 @@ func cmdPick(c *rpc.Client) {
 	snap := mustList(c)
 	cfg := projectname.Load()
 	for _, s := range snap.Sessions {
+		// Headless runs (claude -p) have no window to jump to; offering them in
+		// the picker would only produce a failed focus.
+		if s.Headless {
+			continue
+		}
 		label := sblabel.Chip(cfg, s)
 		ws := "-"
 		if s.Hyprland != nil && s.Hyprland.Workspace != "" {
@@ -199,18 +204,39 @@ func cmdPick(c *rpc.Client) {
 // determined by the focused session; if none is focused, "next" picks the
 // first session and "prev" picks the last.
 func cmdCycle(c *rpc.Client, direction string) {
+	if direction != "next" && direction != "up" && direction != "prev" && direction != "down" {
+		fail("cycle direction must be next|prev (got %q)", direction)
+	}
 	snap := mustList(c)
-	if len(snap.Sessions) == 0 {
+	pid, ok := cycleTargetPID(snap.Sessions, direction)
+	if !ok {
 		return
 	}
+	cmdFocus(c, fmt.Sprintf("%d", pid))
+}
+
+// cycleTargetPID picks the session the cycle lands on. The ring is the
+// navigable (non-headless) sessions in snapshot order — headless claude -p
+// runs sit in the bar for visibility but have no window, so scrolling skips
+// them. Returns false when the ring is empty.
+func cycleTargetPID(sessions []state.Session, direction string) (int, bool) {
+	var ring []state.Session
+	for _, s := range sessions {
+		if !s.Headless {
+			ring = append(ring, s)
+		}
+	}
+	if len(ring) == 0 {
+		return 0, false
+	}
 	idx := -1
-	for i, s := range snap.Sessions {
+	for i, s := range ring {
 		if s.Focused {
 			idx = i
 			break
 		}
 	}
-	n := len(snap.Sessions)
+	n := len(ring)
 	var target int
 	switch direction {
 	case "next", "up":
@@ -219,16 +245,14 @@ func cmdCycle(c *rpc.Client, direction string) {
 		} else {
 			target = (idx + 1) % n
 		}
-	case "prev", "down":
+	default: // "prev", "down"
 		if idx < 0 {
 			target = n - 1
 		} else {
 			target = (idx - 1 + n) % n
 		}
-	default:
-		fail("cycle direction must be next|prev (got %q)", direction)
 	}
-	cmdFocus(c, fmt.Sprintf("%d", snap.Sessions[target].PID))
+	return ring[target].PID, true
 }
 
 // cmdAttention jumps to a session that needs the user. Priority mirrors the
@@ -302,7 +326,14 @@ func pickAttention(sessions []state.Session, focusedPID int) *state.Session {
 // when nothing needs attention.
 func topAttentionTier(sessions []state.Session) []*state.Session {
 	var permission, idle, working []*state.Session
+	// Headless claude -p runs are never attention targets (nothing to focus)
+	// and do not count against the all-green fallback's denominator.
+	considered := 0
 	for i := range sessions {
+		if sessions[i].Headless {
+			continue
+		}
+		considered++
 		switch sessionStatus(sessions[i]) {
 		case "permission":
 			permission = append(permission, &sessions[i])
@@ -318,7 +349,7 @@ func topAttentionTier(sessions []state.Session) []*state.Session {
 	if len(idle) > 0 {
 		return idle
 	}
-	if len(working) > 0 && len(working) == len(sessions) {
+	if len(working) > 0 && len(working) == considered {
 		return working
 	}
 	return nil

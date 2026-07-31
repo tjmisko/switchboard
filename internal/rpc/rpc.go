@@ -36,6 +36,11 @@ import (
 // yet" so the client can present an actionable message.
 var ErrNavigateUnsupported = errors.New("navigate unsupported on this stack (Observe-only)")
 
+// ErrHeadlessSession is returned by focus when the selected session is a
+// non-interactive `claude -p` run — it is tracked and visible, but there is no
+// window or pane to land on.
+var ErrHeadlessSession = errors.New("headless session (claude -p) has no window to focus")
+
 type Request struct {
 	Cmd      string `json:"cmd"`
 	Selector string `json:"selector,omitempty"`
@@ -213,6 +218,9 @@ func (s *Server) focus(ctx context.Context, selector string) error {
 	target := pickSession(snap.Sessions, selector)
 	if target == nil {
 		return fmt.Errorf("no session matches %q", selector)
+	}
+	if target.Headless {
+		return ErrHeadlessSession
 	}
 
 	// Best-effort, backend-agnostic: raise the WM window if we have its ref, and
