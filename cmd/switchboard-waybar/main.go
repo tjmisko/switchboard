@@ -120,6 +120,12 @@ func renderSlot(snap state.Snapshot, slot int, availPx float64, metrics barlayou
 	if s.Suspended {
 		classes = append(classes, "suspended")
 	}
+	// Headless claude -p runs are visible but not navigable; the class lets the
+	// bar CSS render them inert (no fill, muted text) so they don't read as
+	// clickable chips.
+	if s.Headless {
+		classes = append(classes, "headless")
+	}
 	return waybarOutput{
 		Text:    labels[slot],
 		Tooltip: sessionTooltip(cfg, s, time.Now()),
@@ -198,6 +204,9 @@ func sessionTooltip(cfg projectname.Config, s state.Session, now time.Time) stri
 	}
 	if s.Suspended {
 		statusText += " · suspended"
+	}
+	if s.Headless {
+		statusText += " · headless (claude -p)"
 	}
 
 	ws := "-"
