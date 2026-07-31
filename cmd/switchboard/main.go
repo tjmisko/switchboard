@@ -94,9 +94,15 @@ func main() {
 
 	onAgentAppeared := func(info osproc.Info) {
 		kind := discovery.Classify(info)
-		log.Printf("%s pid=%d cwd=%s tty=%s discovered", kind, info.PID, info.CWD, info.TTY)
+		headless := kind == discovery.AgentClaude && discovery.IsHeadless(info)
+		suffix := ""
+		if headless {
+			suffix = " headless"
+		}
+		log.Printf("%s pid=%d cwd=%s tty=%s discovered%s", kind, info.PID, info.CWD, info.TTY, suffix)
 		sess := resolver.Resolve(ctx, info)
 		sess.Agent = string(kind)
+		sess.Headless = headless
 		store.Apply(func(m map[int]*state.Session) { m[sess.PID] = &sess })
 		// session_start bounds the session's first interval. The session id is not
 		// known until the first hook fires, so this event carries only pid/agent/cwd.

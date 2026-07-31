@@ -23,6 +23,11 @@ type Session struct {
 	// SIGSTOP). Renderers grey such chips out. Omitted when false so the common
 	// case stays off the wire.
 	Suspended bool `json:"suspended,omitempty"`
+	// Headless marks a non-interactive `claude -p`/SDK run (see
+	// discovery.IsHeadless). It appears in bars for visibility but has no TUI
+	// to navigate to, so renderers style it inert and focus/cycle/pick skip
+	// it. Omitted when false.
+	Headless bool `json:"headless,omitempty"`
 
 	// Agent names the coding-agent CLI that owns this session: "claude" or
 	// "codex" (the AgentKind* constants). Set at discovery from the process. It

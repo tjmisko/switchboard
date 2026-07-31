@@ -111,6 +111,26 @@ func Classify(p osproc.Info) Agent {
 	}
 }
 
+// IsHeadless reports whether a discovered claude process is a non-interactive
+// print/SDK run: `claude -p …` / `claude --print …`. Such processes are real
+// sessions — they write transcripts and registry files (whose entrypoint reads
+// "sdk-cli" instead of "cli") — so they stay discovered and visible, but there
+// is no TUI window or pane behind them. The daemon tags them Headless so
+// renderers can style them inert and navigation (focus/cycle/pick) skips them.
+// Interactive sessions never pass -p/--print, so argv is a reliable
+// discriminator at discovery time.
+func IsHeadless(p osproc.Info) bool {
+	if len(p.Args) < 2 {
+		return false
+	}
+	for _, arg := range p.Args[1:] {
+		if arg == "-p" || arg == "--print" {
+			return true
+		}
+	}
+	return false
+}
+
 // codexNonInteractiveSubcommands are `codex <verb> …` invocations that are NOT
 // interactive TUI sessions. Codex is a single `codex` binary whose subcommand is
 // argv[1]; unlike claude, most of its surface is non-session — a headless

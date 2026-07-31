@@ -360,3 +360,26 @@ func TestScannerOverOsprocSourceEnumerateFallback(t *testing.T) {
 		t.Fatalf("enumerate-fallback scan fired %v, want [200]", fired)
 	}
 }
+
+func TestIsHeadless(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{"should mark claude -p as headless", []string{"claude", "-p", "--model", "haiku"}, true},
+		{"should mark claude --print as headless", []string{"claude", "--print"}, true},
+		{"should mark -p headless anywhere in argv", []string{"claude", "--model", "haiku", "-p"}, true},
+		{"should keep a bare claude interactive", []string{"claude"}, false},
+		{"should keep claude --resume interactive", []string{"claude", "--resume"}, false},
+		{"should keep a positional prompt interactive", []string{"claude", "fix the tests"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			info := osproc.Info{Comm: "claude", Args: tt.args}
+			if got := IsHeadless(info); got != tt.want {
+				t.Fatalf("IsHeadless(%v) = %t, want %t", tt.args, got, tt.want)
+			}
+		})
+	}
+}
