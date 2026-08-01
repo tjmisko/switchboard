@@ -144,10 +144,15 @@ type Swimlane struct {
 	// evidence for (the start of that final interval), so a consumer can render
 	// both the raw lane and the trustworthy part of it; SuspectReason is the
 	// human-readable why. Start/End/Intervals are never modified by the check.
-	// All omitempty, so the v2 envelope stays additive.
+	//
+	// All three drop out of a clean lane, so the v2 envelope stays additive.
+	// SuspectSince needs `omitzero`, not `omitempty`: omitempty has no effect on a
+	// struct value, so the zero time would serialize as "0001-01-01T00:00:00Z" on
+	// EVERY lane — a year-1 timestamp in the contract a dashboard consumes, and
+	// truthy to any consumer testing the field for presence.
 	Suspect       bool      `json:"suspect,omitempty"`
 	SuspectReason string    `json:"suspect_reason,omitempty"`
-	SuspectSince  time.Time `json:"suspect_since,omitempty"`
+	SuspectSince  time.Time `json:"suspect_since,omitzero"`
 
 	// closedByBound records that BuildSwimlanes closed this lane at the caller's
 	// `end` because the stream never did — the precondition for Suspect. Tracked

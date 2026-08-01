@@ -286,8 +286,13 @@ func renderSuspect(w *os.File, lanes []history.Swimlane, s history.Summary, susp
 		return
 	}
 	fmt.Fprintf(w, "\nsuspect (excluded from the totals above)\n")
-	fmt.Fprintf(w, "  %-26s %d lane%s, %s\n", "unclosed past the cap",
-		s.SuspectLanes, plural(s.SuspectLanes), durfmt.Compact(s.SuspectDuration))
+	// A lane under the cap can still carry a phantom subagent span, so the lane
+	// line is conditional the same way the span line is — "0 lanes, 0s" under a
+	// heading that says something was excluded reads as a bug in the check.
+	if suspect.Lanes > 0 {
+		fmt.Fprintf(w, "  %-26s %d lane%s, %s\n", "unclosed past the cap",
+			s.SuspectLanes, plural(s.SuspectLanes), durfmt.Compact(s.SuspectDuration))
+	}
 	if suspect.Subagents > 0 {
 		fmt.Fprintf(w, "  %-26s %d\n", "phantom subagent spans", suspect.Subagents)
 	}

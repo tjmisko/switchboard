@@ -1,6 +1,7 @@
 package history
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -434,4 +435,35 @@ func TestFlagSuspectLanesIgnoresALaneClosedByItsSuccessor(t *testing.T) {
 			t.Error("the successor lane, unclosed and stretched ~10h to the bound, should be flagged")
 		}
 	})
+}
+
+func TestSwimlaneJSON_shouldOmitSuspectFieldsEntirelyWhenTheLaneIsClean(t *testing.T) {
+	// The --json envelope is the contract a dashboard consumes, and the check is
+	// meant to be purely additive. `omitempty` does nothing for a struct value, so
+	// this pins the one field that needs `omitzero`: without it every clean lane on
+	// every day carries "suspect_since":"0001-01-01T00:00:00Z", which is both a
+	// nonsense timestamp and truthy to a consumer testing the field for presence.
+	raw, err := json.Marshal(Swimlane{SessionID: "clean", PID: 42})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"suspect", "suspect_reason", "suspect_since"} {
+		if strings.Contains(string(raw), field) {
+			t.Errorf("clean lane emitted %q: %s", field, raw)
+		}
+	}
+}
+
+func TestSwimlaneJSON_shouldEmitSuspectSinceWhenTheLaneIsFlagged(t *testing.T) {
+	raw, err := json.Marshal(Swimlane{
+		SessionID:    "ghost",
+		Suspect:      true,
+		SuspectSince: time.Date(2026, 7, 22, 10, 28, 9, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"suspect_since":"2026-07-22T10:28:09Z"`) {
+		t.Errorf("flagged lane lost its suspect_since: %s", raw)
+	}
 }
