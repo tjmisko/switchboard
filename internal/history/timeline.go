@@ -70,6 +70,19 @@ type SubagentSpan struct {
 	Description string    `json:"description,omitempty"`
 	Start       time.Time `json:"start"`
 	End         time.Time `json:"end"`
+
+	// Suspect marks a span whose End is the lane's bound rather than an observed
+	// subagent_stop, and which ran implausibly long for a bounded unit of work —
+	// see FlagSuspectLanes. The span is still emitted in full; it is simply not
+	// credited as compute. SuspectReason is the human-readable why.
+	Suspect       bool   `json:"suspect,omitempty"`
+	SuspectReason string `json:"suspect_reason,omitempty"`
+
+	// closedByBound records that finish() capped this span at the lane's end bound
+	// because no subagent_stop ever paired with its spawn. Unexported: it is a
+	// within-process fact about how the span was derived, consumed only by
+	// FlagSuspectLanes, which runs before anything encodes.
+	closedByBound bool
 }
 
 // FocusSpan is one stretch during which this session's window held OS focus,
@@ -123,6 +136,26 @@ type Swimlane struct {
 	TokOut         int64   `json:"tok_out,omitempty"`
 	TokCacheRead   int64   `json:"tok_cache_read,omitempty"`
 	TokCacheCreate int64   `json:"tok_cache_create,omitempty"`
+
+	// Suspect and friends are the trailing-interval plausibility post-check
+	// (suspect.go). Suspect means this lane's length is an artifact of the end
+	// bound rather than of anything observed — no session_end closed it and its
+	// final interval ran past the cap. SuspectSince is the last instant there was
+	// evidence for (the start of that final interval), so a consumer can render
+	// both the raw lane and the trustworthy part of it; SuspectReason is the
+	// human-readable why. Start/End/Intervals are never modified by the check.
+	// All omitempty, so the v2 envelope stays additive.
+	Suspect       bool      `json:"suspect,omitempty"`
+	SuspectReason string    `json:"suspect_reason,omitempty"`
+	SuspectSince  time.Time `json:"suspect_since,omitempty"`
+
+	// closedByBound records that BuildSwimlanes closed this lane at the caller's
+	// `end` because the stream never did — the precondition for Suspect. Tracked
+	// explicitly rather than inferred by comparing End against the bound, so a
+	// session that genuinely ended in the same nanosecond as the bound is not
+	// misread. Unexported: consumed only by FlagSuspectLanes, in-process, before
+	// anything encodes.
+	closedByBound bool
 }
 
 // Lane keys namespace the two ways a lane can be identified so the two can never
@@ -147,6 +180,11 @@ type laneBuilder struct {
 	curLabelStart time.Time // when the current label span opened
 
 	openSubs map[string]*SubagentSpan // eventAgentKey → still-running subagent (A3)
+
+	// closedByBound is set just before the end-of-stream close, so finish() can
+	// stamp the lane (and the subagent spans it has to cap) with the fact that
+	// their end is the caller's bound and not an observed event.
+	closedByBound bool
 }
 
 // newLaneBuilder opens a fresh lane at an event's instant, seeding its identity.
@@ -237,12 +275,19 @@ func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
 		b.closeLabel(t)
 		for id, sp := range b.openSubs {
 			sp.End = t
+			// A span still open here never saw its subagent_stop. When the LANE itself
+			// is being capped at the caller's bound, that end is synthesized and the
+			// plausibility post-check needs to know; when the lane is closing on an
+			// observed event (its session_end, or the next session taking its pid) the
+			// span is bounded by evidence and is not marked.
+			sp.closedByBound = b.closedByBound
 			b.lane.Subagents = append(b.lane.Subagents, *sp)
 			delete(b.openSubs, id)
 		}
 		sort.SliceStable(b.lane.Subagents, func(i, j int) bool {
 			return b.lane.Subagents[i].Start.Before(b.lane.Subagents[j].Start)
 		})
+		b.lane.closedByBound = b.closedByBound
 		b.lane.End = t
 		done = append(done, b.lane)
 	}
@@ -390,7 +435,12 @@ func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
 			}
 		}
 	}
+	// Every lane still open at end-of-stream is closed at the caller's bound. That
+	// close is inference, not observation — nothing in the log said the session
+	// stopped there — so mark it before capping: FlagSuspectLanes keys on exactly
+	// this flag to tell a bound-stretched lane from one a real session_end closed.
 	for _, b := range open {
+		b.closedByBound = true
 		finish(b, end)
 	}
 	sort.SliceStable(done, func(i, j int) bool {
@@ -556,11 +606,27 @@ type Summary struct {
 	AttendedActive          time.Duration `json:"attended_active"`
 	DelegatedActive         time.Duration `json:"delegated_active"`
 	DelegationEffectiveness float64       `json:"delegation_effectiveness"`
+
+	// SuspectLanes / SuspectDuration report the trailing-interval post-check
+	// (suspect.go): how many lanes were flagged, and how much lane wall-clock every
+	// figure above therefore EXCLUDES. Keeping the subtraction visible is the whole
+	// point — the difference between "the day had 14h of ghost attention silently
+	// baked in" and "the day had 14h of attention, with 14h more excluded from 3
+	// suspect lanes". Both are zero on a clean day.
+	SuspectLanes    int           `json:"suspect_lanes"`
+	SuspectDuration time.Duration `json:"suspect_duration"`
 }
 
 // Summarize folds swimlanes into a Summary. The events stream supplies the global
 // user-activity (idle/active) timeline behind the delegation metrics; pass the
 // same events given to BuildSwimlanes (the per-lane focus spans come off `lanes`).
+//
+// Every duration total below is held to each lane's TRUSTED window — the lane up
+// to trustedEnd, which is its End normally and the start of its suspect trailing
+// interval once FlagSuspectLanes has flagged one. So run FlagSuspectLanes first if
+// you want the guard's subtraction; without it nothing changes and the totals are
+// exactly what they always were. From/To still bracket the lanes in full: the
+// window a dashboard draws is not the window it counts.
 func Summarize(lanes []Swimlane, events []Event) Summary {
 	s := Summary{Sessions: len(lanes), ByStatus: map[string]time.Duration{}}
 	var unionActive []span
@@ -571,8 +637,13 @@ func Summarize(lanes []Swimlane, events []Event) Summary {
 		if lane.End.After(s.To) {
 			s.To = lane.End
 		}
+		trust := trustedEnd(lane)
+		if lane.Suspect {
+			s.SuspectLanes++
+			s.SuspectDuration += lane.End.Sub(trust)
+		}
 		for _, iv := range lane.Intervals {
-			if d := iv.Dur(); d > 0 {
+			if d := minTime(iv.End, trust).Sub(iv.Start); d > 0 {
 				s.ByStatus[iv.Status] += d
 			}
 		}
@@ -581,8 +652,8 @@ func Summarize(lanes []Swimlane, events []Event) Summary {
 		// adding the subagent spans back never double-counts. This is robust to the
 		// MarkDelegationDormant pass not having run — it subtracts the overlap here
 		// regardless — while by_status reflects "dormant" only once that pass has.
-		subs := subagentSpans(lane)
-		parentNet := subtractSpans(activeSpans(lane), subs)
+		subs := clipSpans(subagentSpans(lane), trust)
+		parentNet := subtractSpans(clipSpans(activeSpans(lane), trust), subs)
 		var rawSubDur time.Duration
 		for _, sp := range subs {
 			rawSubDur += sp.end.Sub(sp.start)
@@ -604,8 +675,9 @@ func Summarize(lanes []Swimlane, events []Event) Summary {
 	userActive := userActiveSpans(events, s.From, s.To)
 	var allFocus []span
 	for _, lane := range lanes {
-		agentActive := mergeSpans(append(activeSpans(lane), subagentSpans(lane)...))
-		focus := focusToSpans(lane.Focus)
+		trust := trustedEnd(lane)
+		agentActive := mergeSpans(clipSpans(append(activeSpans(lane), subagentSpans(lane)...), trust))
+		focus := clipSpans(focusToSpans(lane.Focus), trust)
 		allFocus = append(allFocus, focus...)
 		attendedMask := intersectSpans(focus, userActive)
 		s.AttendedActive += totalDur(intersectSpans(agentActive, attendedMask))
@@ -721,9 +793,17 @@ func eventAgentKey(ev Event) string {
 
 // subagentSpans is a lane's launched-subagent runs as spans (raw — parallel
 // subagents are kept distinct, not merged).
+//
+// A span FlagSuspectLanes flagged is skipped: its End is the lane's bound rather
+// than an observed subagent_stop, so its length is synthesized. It stays on the
+// lane for the operator to see, but it must not be credited as compute here nor
+// reattribute the parent's real work to dormancy in MarkDelegationDormant.
 func subagentSpans(lane Swimlane) []span {
 	var out []span
 	for _, sp := range lane.Subagents {
+		if sp.Suspect {
+			continue
+		}
 		if sp.End.After(sp.Start) {
 			out = append(out, span{sp.Start, sp.End})
 		}
@@ -965,6 +1045,25 @@ func subtractSpans(a, b []span) []span {
 		}
 		if cur.Before(x.end) {
 			out = append(out, span{cur, x.end})
+		}
+	}
+	return out
+}
+
+// clipSpans truncates every span at hi, dropping any that falls empty. It is how
+// the aggregates are held to a lane's trusted window: a zero hi (a lane with no
+// end at all) clips nothing.
+func clipSpans(in []span, hi time.Time) []span {
+	if hi.IsZero() {
+		return in
+	}
+	var out []span
+	for _, x := range in {
+		if x.end.After(hi) {
+			x.end = hi
+		}
+		if x.end.After(x.start) {
+			out = append(out, x)
 		}
 	}
 	return out
