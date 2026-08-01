@@ -272,6 +272,25 @@ func TestTimelineSuspectPostCheck(t *testing.T) {
 		}
 	})
 
+	t.Run("should attribute the stretch to now when an open-ended range reaches the present", func(t *testing.T) {
+		dir, day, _ := setup(t)
+		out := captureStdout(t, func() {
+			cmdTimeline([]string{"--dir", dir, "--since", day, "--json"})
+		})
+		var env envelope
+		if err := json.Unmarshal([]byte(out), &env); err != nil {
+			t.Fatalf("unmarshal envelope: %v\n%s", err, out)
+		}
+		if len(env.Lanes) != 1 || !env.Lanes[0].Suspect {
+			t.Fatalf("lane not flagged:\n%s", out)
+		}
+		// `--since X` with no `--until` ends at wall-clock now, not a midnight, so
+		// this is a live-day ghost and must not be excused as a midnight crossing.
+		if !strings.Contains(env.Lanes[0].SuspectReason, "stretched to now") {
+			t.Errorf("reason = %q, want it to name `now` for an open-ended range", env.Lanes[0].SuspectReason)
+		}
+	})
+
 	t.Run("should flag nothing when the suspect cap is disabled", func(t *testing.T) {
 		dir, day, _ := setup(t)
 		out := captureStdout(t, func() {

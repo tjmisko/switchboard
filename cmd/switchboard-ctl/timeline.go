@@ -62,7 +62,13 @@ func cmdTimeline(args []string) {
 	// provider read the same flag and the same aggregates. It annotates and never
 	// deletes: a suspect lane is the live symptom of a session_end the daemon
 	// missed, and hiding it would hide the hole. (docs/session-lifecycle-hazards.md §5)
-	suspect := flagSuspectLanes(lanes, end, to.After(now), *suspectCap)
+	// `end` is a wall clock for any window that reaches the present — today's live
+	// day, where `to` is a future midnight the clamp above pulls back to `now`, and
+	// an open-ended --since range, where resolveWindow already returned `now`.
+	// Every other window ends on a calendar boundary, which is a materially
+	// different reason for a lane to look long. (See flagSuspectLanes.)
+	liveBound := to.After(now) || (*since != "" && *until == "")
+	suspect := flagSuspectLanes(lanes, end, liveBound, *suspectCap)
 	// Reattribute parent "working" time that overlaps a launched subagent to
 	// "dormant" (the subagent carries the compute) before summarizing or encoding,
 	// so the swimlanes, by_status, and attention metrics all agree.
@@ -122,14 +128,15 @@ func cmdTimeline(args []string) {
 // stdout. A cap of 0 disables the check entirely (the escape hatch for a working
 // pattern the default is miscalibrated for).
 //
-// clampedToNow says whether `end` is wall-clock `now` (a live day, still running)
-// or the window's own upper bound (a closed day, or a --since/--until range). The
-// distinction goes into every reason string: a lane stretched to a window bound
-// may simply have run across midnight, with its session_end sitting in the next
-// day's file, which is an accepted false positive of a day-partitioned query.
-func flagSuspectLanes(lanes []history.Swimlane, end time.Time, clampedToNow bool, cap time.Duration) history.SuspectReport {
+// liveBound says whether `end` is a wall clock (a window reaching the present) or
+// a calendar boundary (a closed day, or a bounded --since/--until range). The
+// distinction goes into every reason string: a lane stretched to a calendar
+// boundary may simply have run across midnight, with its session_end sitting in
+// the next day's file, which is an accepted false positive of a day-partitioned
+// query rather than a symptom of a lost death.
+func flagSuspectLanes(lanes []history.Swimlane, end time.Time, liveBound bool, cap time.Duration) history.SuspectReport {
 	bound := history.BoundWindow
-	if clampedToNow {
+	if liveBound {
 		bound = history.BoundNow
 	}
 	policy := history.DefaultSuspectPolicy(end, bound)
