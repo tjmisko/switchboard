@@ -129,7 +129,7 @@ func main() {
 			log.Printf("scanner: %v", err)
 		}
 	}()
-	go runWMLoop(ctx, store, resolver, manager, sink)
+	go runWMLoop(ctx, store, resolver, manager, sink, procSrc, scanner.Forget)
 	go runReconciler(ctx, store, resolver, manager, stack, *reconcileInterval, tun, sink, fanoutObs, scanner.Forget)
 
 	server := rpc.New(store, *socketPath, term, manager)
@@ -148,9 +148,13 @@ func main() {
 // endSession closes one session's lane: it records the session_end that bounds
 // the session's last interval, drops the session from the store map, and clears
 // the scanner's seen-set entry so a recycled pid is re-discovered
-// (decisions.md §12). It is the SINGLE writer of session_end, driven by three
+// (decisions.md §12). It is the SINGLE writer of session_end, driven by four
 // triggers: the pidfd death-watch (the fast path), the reconciler's liveness
-// sweep (the durable backstop), and the startup stale-drop.
+// sweep (the durable backstop), the startup stale-drop, and the WM's
+// window-closed event. Nothing else may remove a session from the store map —
+// a bare delete writes no end, so the lane can only ever close at the reader's
+// bound, and the sweep can never see the pid again because it only ranges the
+// map (L7).
 //
 // Idempotent by map membership: whichever trigger fires first removes the
 // session, so every later trigger finds nothing and records nothing — one death
@@ -255,7 +259,7 @@ func dropStaleSessions(store *state.Store, procSrc osproc.Source, sink *history.
 	})
 }
 
-func runWMLoop(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, sink *history.Sink) {
+func runWMLoop(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, sink *history.Sink, src osproc.Source, forget func(int)) {
 	for ctx.Err() == nil {
 		events, err := manager.Subscribe(ctx)
 		if err != nil {
@@ -268,7 +272,7 @@ func runWMLoop(ctx context.Context, store *state.Store, resolver *mapping.Resolv
 			}
 		}
 		for evt := range events {
-			handleWMEvent(ctx, store, resolver, evt, sink)
+			handleWMEvent(ctx, store, resolver, evt, sink, src, forget)
 		}
 		// channel closed (connection EOF or ctx cancel) — loop will retry
 	}
@@ -277,16 +281,34 @@ func runWMLoop(ctx context.Context, store *state.Store, resolver *mapping.Resolv
 // handleWMEvent reacts to a neutral window event. Addresses arrive already
 // normalized to Clients() form (the wm seam owns the Hyprland 0x quirk), so the
 // daemon compares them directly against sess.Hyprland.Address.
-func handleWMEvent(ctx context.Context, store *state.Store, resolver *mapping.Resolver, evt wm.Event, sink *history.Sink) {
+func handleWMEvent(ctx context.Context, store *state.Store, resolver *mapping.Resolver, evt wm.Event, sink *history.Sink, src osproc.Source, forget func(int)) {
 	switch evt.Kind {
 	case wm.EventWindowClosed:
-		// Drop any session living in the closed window. Covers the "user closed
-		// the terminal while claude was running" case.
+		// A session's window went away — the "user closed the terminal while claude
+		// was running" case. That is strong evidence the session is over (closing the
+		// terminal SIGHUPs the shell), but it is NOT positive evidence the process
+		// died, and this branch used to answer it with a bare delete: the session left
+		// the store with no session_end written and no Forget called, putting it
+		// permanently out of reach of the liveness sweep, which can only range the
+		// store map. A fourth session-removal path bypassing the single-writer
+		// invariant, and a ghost factory F1 structurally could not reach (L7).
+		//
+		// So apply the same two rules as everywhere else: close the lane through
+		// endSession when the pid is definitively gone, and otherwise leave the
+		// session tracked. A process not yet reaped is closed by the pidfd watch or by
+		// the next sweep within one reconcile interval; a process that genuinely
+		// outlived its window (detached, or a stale window mapping) keeps its lane,
+		// which is what L4 demands — liveness is never inferred from a proxy signal.
+		now := time.Now()
 		store.Apply(func(m map[int]*state.Session) {
 			for pid, sess := range m {
-				if sess.Hyprland != nil && sess.Hyprland.Address == evt.Address {
-					delete(m, pid)
+				if sess.Hyprland == nil || sess.Hyprland.Address != evt.Address {
+					continue
 				}
+				if !sessionDead(src, pid) {
+					continue
+				}
+				endSession(m, pid, sink, forget, now)
 			}
 		})
 	case wm.EventFocusChanged:
