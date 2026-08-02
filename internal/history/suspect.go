@@ -37,8 +37,8 @@ const (
 	BoundWindow EndBound = "window bound"
 )
 
-// DefaultSuspectTrailingCap is how long an UNCLOSED lane's final status interval
-// may run before the reader stops believing it.
+// DefaultSuspectTrailingCap is how long an UNCLOSED lane may go without emitting
+// anything before the reader stops believing its trailing interval.
 //
 // Calibrated by replaying every day-file in the corpus (31 days, 651 lanes)
 // through BuildSwimlanes at end = next local midnight and measuring the trailing
@@ -53,14 +53,22 @@ const (
 // 4h sits in the empty band between those two populations: ~1.65x headroom over
 // the observed legitimate maximum, and it catches all three 2026-07-22 lanes.
 //
-// The threshold errs LOW on purpose. Because the check only annotates, a false
-// positive costs one misleading badge on a live idle lane, while a false negative
-// costs a silently wrong headline number. But it must not go below the observed
-// legitimate ceiling: a cap of 30m — or anything under ~2h30m — would flag
+// Both error directions cost a wrong number, so the threshold is NOT free to err
+// low. Summarize holds every total to the trusted end, so a false positive
+// silently UNDERCOUNTS real work just as a false negative silently inflates it —
+// there is no "it only shows a badge" side of this trade. What keeps the cap
+// defensible is the empty band above: it must not go below the observed
+// legitimate ceiling, since a cap of 30m — or anything under ~2h30m — would flag
 // genuinely-live idle sessions, the dashboard's single most common state, and an
 // overnight unattended delegation run (exactly what the dashboard exists to
 // measure) legitimately shows a multi-hour trailing interval. A cap of 12h would
 // clear the entire observed ghost class and leave the reported bug unfixed.
+//
+// The gap is measured from the last EVIDENCE the lane emitted, not from its final
+// interval's start (see laneEvidence), which removes the largest false-positive
+// class this cap would otherwise have to absorb on its own: a session that is
+// still reporting usage is never silent, however long its current status has been
+// held.
 const DefaultSuspectTrailingCap = 4 * time.Hour
 
 // DefaultSuspectSubagentCap is the same check for a subagent span the reader had
@@ -128,10 +136,18 @@ func (r SuspectReport) Any() bool { return r.Lanes > 0 || r.Subagents > 0 }
 //     End against the bound, so a session that genuinely died in the same
 //     nanosecond as the bound is not misread. It is what makes the check
 //     zero-false-positive for every properly-closed lane, however long it ran.
-//  2. its FINAL interval is at least LaneCap. A ghost is not "a long lane" — it is
-//     "one enormous synthesized final interval". The 2026-07-22 twins prove the
-//     distinction: pid 11569 ran 4h2m53s and was entirely legitimate, because its
-//     final interval was 3m16s and a real session_end closed it.
+//
+//  2. it has been SILENT for at least LaneCap — nothing routed to the lane, and no
+//     new status interval opened, in that whole stretch. A ghost is not "a long
+//     lane" but "a long silence the reader papered over". The 2026-07-22 twins
+//     prove the distinction: pid 11569 ran 4h2m53s and was entirely legitimate,
+//     because its final interval was 3m16s and a real session_end closed it.
+//
+//     Silence is measured from laneEvidence, not from the final interval's start,
+//     because usage_sample (and label/subagent events) accrue onto a lane without
+//     bounding an interval. A session holding one "working" status for six hours
+//     while reporting usage throughout is loud, not silent, and must not be
+//     flagged — Summarize would subtract every hour of it.
 //
 // Calling it twice is idempotent for a given policy: it only ever sets flags.
 func FlagSuspectLanes(lanes []Swimlane, p SuspectPolicy) SuspectReport {
@@ -149,14 +165,20 @@ func FlagSuspectLanes(lanes []Swimlane, p SuspectPolicy) SuspectReport {
 		}
 		if p.LaneCap > 0 && len(lane.Intervals) > 0 {
 			last := lane.Intervals[len(lane.Intervals)-1]
-			if d := last.Dur(); d >= p.LaneCap {
+			// The gap is measured from the last EVIDENCE, not from the interval start.
+			// They are the same instant for a ghost — nothing was ever heard from it
+			// again — but a live session reporting token usage inside a long-running
+			// status interval is observed well after that interval opened, and
+			// measuring from the interval start would read it as hours of silence.
+			since := laneEvidence(*lane, last)
+			if d := lane.End.Sub(since); d >= p.LaneCap {
 				lane.Suspect = true
 				// SuspectSince is the last instant the session was actually observed:
 				// everything from here to lane.End is the stretch. Start/End/Intervals are
 				// left intact so a consumer can still compute either number.
-				lane.SuspectSince = last.Start
-				lane.SuspectReason = fmt.Sprintf("unclosed lane stretched to %s: final %s interval %s >= %s cap",
-					p.Bound, statusLabel(last.Status), roundSec(d), roundSec(p.LaneCap))
+				lane.SuspectSince = since
+				lane.SuspectReason = fmt.Sprintf("unclosed lane stretched to %s: %s since the last evidence, in a %s interval, >= %s cap",
+					p.Bound, roundSec(d), statusLabel(last.Status), roundSec(p.LaneCap))
 				rep.Lanes++
 				rep.Duration += lane.End.Sub(lane.SuspectSince)
 			}
@@ -182,6 +204,25 @@ func FlagSuspectLanes(lanes []Swimlane, p SuspectPolicy) SuspectReport {
 		}
 	}
 	return rep
+}
+
+// laneEvidence is the last instant a lane was demonstrably alive: the later of
+// its final interval's start and the last event routed to it. The two differ
+// only for events that accrue onto a lane without bounding an interval —
+// usage_sample above all — which is exactly the signal that separates a session
+// still doing work from one nothing has been heard from.
+//
+// Clamped to lane.End so a stray event past the caller's bound cannot produce a
+// negative gap (which would read as "no silence at all" and skip the check).
+func laneEvidence(lane Swimlane, last Interval) time.Time {
+	since := last.Start
+	if lane.lastEvidence.After(since) {
+		since = lane.lastEvidence
+	}
+	if since.After(lane.End) {
+		return lane.End
+	}
+	return since
 }
 
 // trustedEnd is the last instant of a lane there is evidence for: its End

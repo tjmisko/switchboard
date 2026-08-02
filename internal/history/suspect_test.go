@@ -58,7 +58,7 @@ func TestFlagSuspectLanesPredicate(t *testing.T) {
 			end:        at(15, 8, 42),
 			bound:      BoundNow,
 			want:       true,
-			wantReason: `final "working" interval 4h40m33s >= 4h0m0s cap`,
+			wantReason: `4h40m33s since the last evidence, in a "working" interval, >= 4h0m0s cap`,
 		},
 		{
 			// The ghost's real twin: the same session, resumed in a fresh pane, which
@@ -114,7 +114,7 @@ func TestFlagSuspectLanesPredicate(t *testing.T) {
 			end:        at(14, 0, 0),
 			bound:      BoundNow,
 			want:       true,
-			wantReason: `interval 4h0m0s >= 4h0m0s cap`,
+			wantReason: `4h0m0s since the last evidence`,
 		},
 		{
 			name: "should not flag a lane when its final interval falls one nanosecond short of the cap",
@@ -289,6 +289,86 @@ func TestSummarizeExcludesTheSuspectTail(t *testing.T) {
 		// To still brackets the lanes in full — the window drawn is not the window counted.
 		if !after.To.Equal(end) {
 			t.Errorf("summary.To = %v, want the lane's real end %v", after.To, end)
+		}
+	})
+}
+
+// Proof of life inside a long status interval.
+//
+// usage_sample, session_label, subagent_spawn and subagent_stop accrue onto a
+// lane WITHOUT opening or closing an interval, so a session can be demonstrably
+// alive well inside a status interval that never ends. The gap the check
+// measures therefore runs from the last evidence, not from the interval's start
+// — otherwise the single shape this tool exists to measure, a long unattended
+// run that keeps reporting usage, reads as hours of silence and has its work
+// subtracted from every total.
+func TestFlagSuspectLanesUsesTheLastEvidenceNotTheIntervalStart(t *testing.T) {
+	const pid, sid = 991, "live-0000-4000-8000-000000000000"
+	// One "working" interval opening at 08:00 and never closing, with the session
+	// reporting token usage every two hours inside it.
+	live := func(samples ...time.Time) []Event {
+		evs := []Event{
+			{Ts: at(8, 0, 0), Type: EventSessionStart, PID: pid, Agent: "claude", Project: "ar"},
+			{Ts: at(8, 0, 0), Type: EventTransition, PID: pid, SessionID: sid, To: "working"},
+		}
+		for _, ts := range samples {
+			evs = append(evs, Event{Ts: ts, Type: EventUsageSample, PID: pid, SessionID: sid,
+				Model: "claude-sonnet-4-5", TokIn: 1000, TokOut: 500})
+		}
+		return evs
+	}
+
+	t.Run("should not flag a session still reporting usage inside its final interval", func(t *testing.T) {
+		end := at(13, 30, 0) // 5h30m after the interval opened — past the 4h cap
+		events := live(at(9, 0, 0), at(11, 0, 0), at(13, 0, 0))
+		lanes := BuildSwimlanes(events, end)
+		rep := FlagSuspectLanes(lanes, DefaultSuspectPolicy(end, BoundNow))
+
+		if lanes[0].Suspect || rep.Lanes != 0 {
+			t.Fatalf("flagged a session that reported usage 30m ago: %s", lanes[0].SuspectReason)
+		}
+		// …and its work is credited in full, which is the number the flag would have zeroed.
+		MarkDelegationDormant(lanes)
+		if got, want := Summarize(lanes, events).ByStatus["working"], 5*time.Hour+30*time.Minute; got != want {
+			t.Errorf("working = %v, want the observed %v", got, want)
+		}
+	})
+
+	t.Run("should date the stretch from the last evidence when a session goes quiet mid-interval", func(t *testing.T) {
+		// Alive at 09:00, then silent. The gap 09:00→15:00 is 6h, past the cap, so it
+		// IS a ghost — but only the hours after 09:00 are inference.
+		end := at(15, 0, 0)
+		events := live(at(9, 0, 0))
+		lanes := BuildSwimlanes(events, end)
+		FlagSuspectLanes(lanes, DefaultSuspectPolicy(end, BoundNow))
+
+		if !lanes[0].Suspect {
+			t.Fatal("a session silent for 6h should be flagged")
+		}
+		if !lanes[0].SuspectSince.Equal(at(9, 0, 0)) {
+			t.Errorf("SuspectSince = %v, want the last usage sample at 09:00 — not the 08:00 interval start",
+				lanes[0].SuspectSince.Format("15:04:05"))
+		}
+		MarkDelegationDormant(lanes)
+		// The hour it was provably working is kept; only the silence is subtracted.
+		if got, want := Summarize(lanes, events).ByStatus["working"], time.Hour; got != want {
+			t.Errorf("working = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("should still flag a ghost whose last evidence predates its final transition", func(t *testing.T) {
+		// The 2026-07-22 shape: the usage sample lands at 10:21, BEFORE the 10:28
+		// transition that opens the stretched interval, so the interval start is
+		// still the last evidence and the detector must be unchanged.
+		end := at(15, 8, 42)
+		lanes := BuildSwimlanes(ghostEvents(), end)
+		FlagSuspectLanes(lanes, DefaultSuspectPolicy(end, BoundNow))
+
+		if !lanes[0].Suspect {
+			t.Fatal("the primary ghost fixture must still flag")
+		}
+		if !lanes[0].SuspectSince.Equal(at(10, 28, 9)) {
+			t.Errorf("SuspectSince = %v, want the 10:28:09 transition", lanes[0].SuspectSince.Format("15:04:05"))
 		}
 	})
 }

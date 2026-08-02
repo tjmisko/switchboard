@@ -161,6 +161,17 @@ type Swimlane struct {
 	// misread. Unexported: consumed only by FlagSuspectLanes, in-process, before
 	// anything encodes.
 	closedByBound bool
+
+	// lastEvidence is the instant of the last event this lane was observed to
+	// emit. Most events also open or close an interval, so for them this is just
+	// the final interval's start — but usage_sample, session_label,
+	// subagent_spawn and subagent_stop accrue onto the lane WITHOUT bounding an
+	// interval, so a session can prove it is alive well inside a status interval
+	// that never ends. FlagSuspectLanes measures its gap from here rather than
+	// from the interval start, which is what keeps a live session that is still
+	// reporting token usage from being read as a ghost. Unexported for the same
+	// reason as closedByBound.
+	lastEvidence time.Time
 }
 
 // Lane keys namespace the two ways a lane can be identified so the two can never
@@ -190,11 +201,28 @@ type laneBuilder struct {
 	// stamp the lane (and the subagent spans it has to cap) with the fact that
 	// their end is the caller's bound and not an observed event.
 	closedByBound bool
+
+	// lastEvidence is the latest instant any event routed to this lane was seen,
+	// carried onto the lane by finish(). See Swimlane.lastEvidence.
+	lastEvidence time.Time
+}
+
+// observe records that the session was demonstrably alive at t. Called for every
+// event that routes to this lane; the max is what FlagSuspectLanes reads.
+//
+// Focus events deliberately do NOT reach this: they are replayed on a separate,
+// global stream, and a window holding focus proves the WINDOW is alive, not the
+// agent process inside it — conflating the two is the exact mistake the
+// window-closed branch of the daemon used to make.
+func (b *laneBuilder) observe(t time.Time) {
+	if t.After(b.lastEvidence) {
+		b.lastEvidence = t
+	}
 }
 
 // newLaneBuilder opens a fresh lane at an event's instant, seeding its identity.
 func newLaneBuilder(ev Event) *laneBuilder {
-	b := &laneBuilder{curStart: ev.Ts, lane: Swimlane{PID: ev.PID, Start: ev.Ts}}
+	b := &laneBuilder{curStart: ev.Ts, lane: Swimlane{PID: ev.PID, Start: ev.Ts}, lastEvidence: ev.Ts}
 	b.absorb(ev)
 	return b
 }
@@ -293,6 +321,7 @@ func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
 			return b.lane.Subagents[i].Start.Before(b.lane.Subagents[j].Start)
 		})
 		b.lane.closedByBound = b.closedByBound
+		b.lane.lastEvidence = b.lastEvidence
 		b.lane.End = t
 		done = append(done, b.lane)
 	}
@@ -349,6 +378,14 @@ func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
 		}
 		key := laneKey(ev)
 		b := open[key]
+		// Anything routed to an open lane is proof the session was alive at this
+		// instant, whether or not it bounds an interval. Recorded before the switch
+		// so the cases that `continue` early (a rediscovery session_start, a
+		// deduplicated label) still count as evidence. A lane this event is about to
+		// CREATE is seeded by newLaneBuilder instead.
+		if b != nil {
+			b.observe(ev.Ts)
+		}
 		switch ev.Type {
 		case EventSessionStart:
 			if b != nil {
