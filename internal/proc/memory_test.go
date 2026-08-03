@@ -41,12 +41,14 @@ func TestParseSmapsRollup(t *testing.T) {
 	tests := []struct {
 		name        string
 		rollup      string
+		wantRss     int64 // 0 means "no Rss line in this fixture"
 		wantPss     int64
 		wantSwapPss int64
 	}{
 		{
 			name:        "should return pss and swap pss in bytes when the rollup is a live kernel's output",
 			rollup:      liveRollup,
+			wantRss:     448896 * 1024,
 			wantPss:     423629 * 1024,
 			wantSwapPss: 53968 * 1024,
 		},
@@ -56,6 +58,7 @@ func TestParseSmapsRollup(t *testing.T) {
 			// SwapPss line to overwrite the wrong value.
 			name:        "should report swap pss as zero when an older kernel omits the line",
 			rollup:      "Rss:\t515312 kB\nPss:\t440078 kB\nSwap:\t53968 kB\n",
+			wantRss:     515312 * 1024,
 			wantPss:     440078 * 1024,
 			wantSwapPss: 0,
 		},
@@ -96,6 +99,12 @@ func TestParseSmapsRollup(t *testing.T) {
 			}
 			if got.SwapPss != tt.wantSwapPss {
 				t.Errorf("SwapPss = %d bytes, want %d", got.SwapPss, tt.wantSwapPss)
+			}
+			// Rss is carried "for reference" and nothing downstream reads it,
+			// which is exactly why it needs an exact assertion: a kB/byte slip
+			// on this field alone would otherwise reach no test.
+			if got.Rss != tt.wantRss {
+				t.Errorf("Rss = %d bytes, want %d", got.Rss, tt.wantRss)
 			}
 		})
 	}
