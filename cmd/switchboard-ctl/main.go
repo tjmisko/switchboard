@@ -547,7 +547,8 @@ commands:
                             behind each, e.g. diagnose --around 14:32 red stuck.
                             Reads the journal (or --file); needs no daemon.
   history <sub>           the durable activity log (opt-in): path, tail, stat,
-                            purge. Reads the on-disk files; needs no daemon.
+                            purge, calibrate. Reads the on-disk files; needs no
+                            daemon.
   timeline [flags]        render the activity log as per-session swimlanes plus
                             attention stats, e.g. timeline --day 2026-06-26.
                             --json emits the structured data; needs no daemon.
