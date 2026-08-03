@@ -225,8 +225,10 @@ definitions (all reported) are:
 
 `--json` emits the stable envelope a GUI dashboard consumes. **Durations are
 nanoseconds** (Go `time.Duration`), token counts are raw, and `cost_usd` /
-`delegation_effectiveness` are floats. Every v2 field is `omitempty` — purely
-additive to the original `{window, lanes, summary, totals}`:
+`delegation_effectiveness` are floats. Every v2 field on a lane is `omitempty`
+(`omitzero` for `suspect_since`) — purely additive to the original
+`{window, lanes, summary, totals}`; the two `summary.suspect_*` counters are
+always present and read `0` on a clean day:
 
 ```jsonc
 {
@@ -239,10 +241,14 @@ additive to the original `{window, lanes, summary, totals}`:
     "labels":    [{ "label": "sb-invest", "start": "…", "end": "…" }],       // every name change over time, incl. default + auto titles (A1)
     "names":     [{ "label": "sb-invest", "start": "…", "end": "…" }],       // slug-only subsequence of labels — the /name history to render as spans
     "subagents": [{ "agent_type": "Explore", "tool_use_id": "…",
-                    "description": "…", "start": "…", "end": "…" }],         // launched subagents (A3)
+                    "description": "…", "start": "…", "end": "…",
+                    "suspect": true,                                        // no subagent_stop ever paired, span past the 2h cap (L8)
+                    "suspect_reason": "unpaired subagent stretched to now: span 10h4m2s >= 2h0m0s cap" }],
     "focus":     [{ "start": "…", "end": "…" }],                            // this session held OS focus (C1)
     "cost_usd": 10.5, "tok_in": 2000000, "tok_out": 100000,                 // per-lane usage + recomputed cost (A2)
-    "tok_cache_read": 0, "tok_cache_create": 0
+    "tok_cache_read": 0, "tok_cache_create": 0,
+    "suspect": true, "suspect_since": "…",                                  // the lane's tail is inference, not observation (L8)
+    "suspect_reason": "unclosed lane stretched to now: 6h12m3s since the last evidence, in a \"working\" interval, >= 4h0m0s cap"
   }],
   "summary": {
     "from": "…", "to": "…", "sessions": 1,
@@ -251,7 +257,9 @@ additive to the original `{window, lanes, summary, totals}`:
     "prompt_active": 240000000000,     // focused-on-an-agent ∧ user-active
     "attended_active": 240000000000,   // agent-active ∧ (focused ∧ user-active) — supervising
     "delegated_active": 360000000000,  // agent-active ∧ ¬(focused ∧ user-active) — true delegation
-    "delegation_effectiveness": 0.6    // delegated / (delegated + attended), in [0,1]
+    "delegation_effectiveness": 0.6,   // delegated / (delegated + attended), in [0,1]
+    "suspect_lanes": 1,                // lanes the post-check flagged (always present; 0 on a clean day)
+    "suspect_duration": 22323000000000 // synthesized wall-clock every figure above already excludes
   },
   "totals": { "tok_in": 2000000, "tok_out": 100000, "tok_cache_read": 0,
               "tok_cache_create": 0, "subagents": 1, "cost_usd": 10.5 },
@@ -276,6 +284,57 @@ focus∧active overlay. Absent when there are no `activity` events in range.
 cost/token total — the self-computed dollar half of the dashboard's plan gauge;
 the official utilization **%** comes from a separate cached file the dashboard
 reads, never from this producer.
+
+**`suspect` (L8)** marks a lane whose *length* is an artifact of the end bound
+rather than of anything observed: nothing ever bounded it — no `session_end`, no
+successor session on its pid — so the reader had to close it at the caller's
+bound, and it had then been silent for at least the cap (4h; `--suspect-cap`
+retunes it, `--suspect-cap 0` disables the check). `suspect_since` is the last
+instant an event was recorded for the lane, so everything from there to `end` is
+synthesized; `suspect_reason` names the bound (`now` for a window reaching the
+present, `window bound` for a closed day) and the interval that was stretched.
+The same pair rides on a `subagents[]` entry whose `subagent_stop` never arrived.
+The check only annotates — nothing is dropped, truncated, or reordered, and
+`start`/`end`/`intervals` are byte-identical either way — so the lane still draws
+in full and a consumer can render both the raw span and the trustworthy part of
+it. `docs/session-lifecycle-hazards.md` §4 has the calibration and the one
+accepted false positive (a session that ran across midnight, whose `session_end`
+lives in the next day's file).
+
+All five fields — three on the lane, two on a subagent span — are absent from a
+clean lane, which is what keeps the addition purely additive to v2. Four of them
+drop out on `omitempty`; `suspect_since` needs `omitzero`, because `omitempty` is
+a no-op on a struct value and a clean lane therefore briefly emitted
+`"suspect_since": "0001-01-01T00:00:00Z"` — a year-1 timestamp in the contract,
+and truthy to any consumer that tests the field for presence.
+
+**The existing `summary` figures changed meaning when this landed, and the schema
+does not say so.** `by_status`, `attention_union`, `attention_per_session`,
+`attention_fanout` and the three delegation figures now count each lane only up
+to its `suspect_since` — a flagged lane's tail is excluded from every duration in
+`summary`, and a flagged subagent span is not credited as compute at all. So a
+consumer that upgrades without noticing sees totals *drop* with no field added or
+removed to explain it. `suspect_duration` is the reconciling figure: the total
+wall-clock the post-check declared synthesized (Σ over flagged lanes of
+`end − suspect_since`), i.e. exactly what every other figure now leaves out. How
+far any one figure falls depends on what those tails held — an idle tail never
+counted toward attention in the first place — so treat `suspect_duration` as the
+bound on the difference, and show it next to a total rather than hiding it: *"14h
+of attention, with 14h more excluded from 3 suspect lanes"* is the report worth
+having. `from`/`to` still bracket the lanes in full (the window a dashboard draws
+is not the window it counts), and `totals` is event-counted, so tokens and cost
+are untouched.
+
+**Ordering matters to a producer.** `FlagSuspectLanes` must run *after*
+`BuildSwimlanes`, which records the unclosed-at-the-bound fact the check keys on,
+and *before* `MarkDelegationDormant` and `Summarize`, which both read the flags —
+`Summarize` holds every total to `suspect_since`, and `MarkDelegationDormant`
+skips a flagged span instead of reattributing the parent's real work to
+`dormant`. Out of order, the envelope ships flags and aggregates that contradict
+each other: a lane marked `suspect` whose synthesized hours are still baked into
+`attention_union`. `switchboard-ctl timeline` calls it on the line after
+`BuildSwimlanes`, so the text renderer, `--json`, and every dashboard provider
+read one set of flags and one set of aggregates.
 
 ## Inspecting / managing it
 
