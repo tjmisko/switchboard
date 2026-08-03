@@ -51,3 +51,84 @@ their pin as a permanent guard.
   not yet carry.
 - **PRESERVE (unchanged guards):** #4, #5, #9, #10, #12 — intended behavior,
   pins remain as permanent regression guards.
+
+## Memory sampling — the lock budget, measured (2026-08-03)
+
+Per-session memory sampling reads `/proc` for every live session on every
+reconcile tick. The question that decided its shape was not "is this fast
+enough?" but **"where does the time land?"** — `Store.Apply` holds an exclusive
+write lock across its whole callback *and* the `snapshotLocked()` that follows,
+so a millisecond spent inside it is a millisecond every RPC reader (waybar,
+claude-tui, `ctl`) and every inbound hook spends blocked. The rest of the tick's
+per-session work is microseconds; this would not have been.
+
+Measured on this machine (`SWITCHBOARD_LIVE_MEMORY=1 go test ./cmd/switchboard
+-run LiveCost -v`), 4 live claude sessions throughout, in two regimes that turned
+out to differ by far more than expected:
+
+| | quiet machine | under memory pressure |
+|---|---|---|
+| conditions | 400 procs, PSI avg10 0.63, 4.5 GB avail | 434–443 procs, PSI avg10 7.7–8.9, 2.7–3.1 GB avail |
+| `ParentMap` (the process-table scan) | 4.5 ms | 10.3 – 16.5 ms |
+| **full sampling pass, outside the lock** | **14.0 ms** | **54.5 – 96.5 ms** |
+| per-session `TreeMemory` (the shape *not* used) | 24.8 ms | 121 – 140 ms |
+| **added lock-hold, inside `store.Apply`** | **833 ns** | **491 – 837 ns** |
+
+**The sampling cost is not stable — it degrades ~7× under memory pressure**,
+which is precisely when the reading is most wanted. `smaps_rollup` is answered by
+walking the target's VMA list, so it gets slower exactly as the system starts
+thrashing. The quiet-machine figures match the estimates this work was planned
+against (4–6 ms / 10–20 ms); the loaded figures are 3–5× them. Anything sizing
+this feature should use the loaded column. The lock-hold, by contrast, is
+**invariant** across both regimes — it does no I/O — which is the point.
+
+Three things follow.
+
+**The structure is the whole result.** Sampling runs before the lock is taken,
+against the pid set of the last published snapshot; only a map lookup, two field
+assignments, and a non-blocking `sink.Record` happen inside `Apply`. That moves
+milliseconds per session out of the critical section and leaves sub-microsecond
+behind — the added lock-hold is four to five orders of magnitude smaller than the
+work it schedules. Had this followed the `proc.State` precedent of reading inside
+the loop, a 5-second tick would have held the exclusive write lock for 14 ms at
+rest and up to a tenth of a second under pressure, blocking every bar repaint,
+every `ctl` call, and every inbound hook for the duration.
+
+**One `ParentMap` per tick, not per session.** The scan is roughly a third of a
+pass, so paying it per session is most of the bill: the naive shape measured
+24.8 ms against 14.0 ms quiet, and 121–140 ms against 54.5–96.5 ms loaded. It is
+also more *correct* — every process is attributed to exactly one tree even if the
+kernel reparents it mid-tick.
+
+**Full PSS was affordable; the RSS fallback was NOT needed.** The interview's
+plan B (PSS for the agent, cheap RSS for the tree walk) is unnecessary and was
+not implemented. `smaps_rollup` costs ~0.25 ms per process at rest and
+~1.1–2.0 ms under pressure, and it scales with the *target's* VMA count rather
+than with the size of the machine — a 3.5 GB 30-process tree dominates a
+1-process 190 MB one — but all of it is outside the lock, so the accurate measure
+is the one that ships. PSS is what makes the figures summable across sessions
+without double-counting shared pages, which is the property the whole surface
+rests on; trading it away to save time in a section that is not contended would
+have been a bad trade. Keeping `SwapPss` separate earned its keep too: a live
+session was observed at 486 MB PSS with a further 192 MB in swap, which an
+RSS-only reading would have reported as simply gone.
+
+The unlocked cost is still not free — ~0.3% of one core at rest and ~1–2% under
+pressure, at a 5 s tick. If that ever needs to come down, the lever is sampling
+**cadence** (every Nth tick), not precision: the per-read cost is the kernel's
+VMA walk and cannot be reduced without giving up PSS.
+
+### Retention follows the volume
+
+A sample per live session per tick is ~12× the line volume of everything else
+the log records — ~11.8 MB/day against the 1.0 MB actually written on the busiest
+recorded day (2026-07-22: 66 lanes, 54.8 live session-hours). Retention is
+size-bounded *before* it is age-bounded (`pruneDir` trims oldest-first on total
+size, and `retain_days` only rules on what survives), so the old 100 MB default
+would have quietly turned a configured 90-day retention into about ten days,
+with nothing logged and nothing to notice. That corpus is load-bearing — the
+suspect caps in `suspect.go` were calibrated by replaying a month of it — so the
+default cap now scales with what is being recorded: 2 GB with memory sampling on,
+100 MB without, an explicitly configured `max_bytes` always winning either way.
+The effective cap is logged at startup beside `history: enabled=…`, because a
+multi-gigabyte disk commitment should never be made silently.
