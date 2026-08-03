@@ -373,6 +373,98 @@ func TestFlagSuspectLanesUsesTheLastEvidenceNotTheIntervalStart(t *testing.T) {
 	})
 }
 
+// The ghost-lane guard, pinned.
+//
+// memory_sample is the one per-session event that is NOT evidence a session is
+// alive. It fires unconditionally every reconcile tick, and a hung, idle, or
+// Ctrl-Z'd process still holds its pages — which is precisely the population this
+// check exists to catch. If a sample reached observe(), every live pid would look
+// demonstrably alive forever and the post-check would be hollowed out: the
+// 2026-07-22 shape would sail through unflagged, and Summarize would credit its
+// stretched hours in full.
+//
+// So the assertion is EQUALITY, not "still flags": a lane carrying memory samples
+// throughout its silence must be flagged identically to one carrying none — same
+// verdict, same SuspectSince, same reason, same excluded duration.
+func TestFlagSuspectLanesIgnoresMemorySamples(t *testing.T) {
+	const pid, sid = 771, "hung-0000-4000-8000-000000000000"
+	end := at(15, 0, 0)
+	// Discovered at 08:00, went to work, and was never heard from again — 7h of
+	// silence against a 4h cap.
+	silent := []Event{
+		{Ts: at(8, 0, 0), Type: EventSessionStart, PID: pid, Agent: "claude", Project: "sb"},
+		{Ts: at(8, 0, 0), Type: EventTransition, PID: pid, SessionID: sid, To: "working"},
+	}
+	// The same session, with the sampler running the whole time: a process that
+	// hung at 08:00 still reports its pages every tick until 14:55.
+	sampled := append([]Event(nil), silent...)
+	for m := 5; m <= 7*60-5; m += 5 {
+		sampled = append(sampled, Event{
+			Ts: at(8, 0, 0).Add(time.Duration(m) * time.Minute), Type: EventMemorySample,
+			PID: pid, SessionID: sid, Agent: "claude", Project: "sb",
+			MemAgentPssBytes: 450 << 20, MemTreePssBytes: 658 << 20, MemTreeProcs: 7,
+			SysAvailBytes: 3 << 30, SysPsiSomeAvg10: 0.2, SysPsiSomeTotalUs: int64(556_000_000 + m*100),
+		})
+	}
+
+	t.Run("should flag a silent lane identically whether or not it carried memory samples", func(t *testing.T) {
+		bare := BuildSwimlanes(silent, end)
+		withMem := BuildSwimlanes(sampled, end)
+
+		// A sample must not create a lane, nor split one: usage_sample DOES open a
+		// lane when none is held, and routing memory the same way would mint a
+		// second, statusless lane for every sampled session.
+		if len(bare) != 1 || len(withMem) != 1 {
+			t.Fatalf("lanes = %d bare / %d sampled, want exactly 1 each", len(bare), len(withMem))
+		}
+		bareRep := FlagSuspectLanes(bare, DefaultSuspectPolicy(end, BoundNow))
+		memRep := FlagSuspectLanes(withMem, DefaultSuspectPolicy(end, BoundNow))
+
+		if !bare[0].Suspect {
+			t.Fatal("the control lane must flag; the fixture is miscalibrated")
+		}
+		if !withMem[0].Suspect {
+			t.Fatalf("a lane sampled every 5m through 7h of silence was NOT flagged — memory_sample reached lastEvidence, and every live pid now looks alive forever")
+		}
+		if !withMem[0].SuspectSince.Equal(bare[0].SuspectSince) {
+			t.Errorf("SuspectSince = %v with samples, %v without — the samples moved the last-evidence instant",
+				withMem[0].SuspectSince.Format("15:04:05"), bare[0].SuspectSince.Format("15:04:05"))
+		}
+		if withMem[0].SuspectReason != bare[0].SuspectReason {
+			t.Errorf("reason = %q with samples, %q without", withMem[0].SuspectReason, bare[0].SuspectReason)
+		}
+		if memRep != bareRep {
+			t.Errorf("report = %+v with samples, %+v without", memRep, bareRep)
+		}
+		// …and the whole stretch stays out of the totals, the number the flag protects.
+		if got, want := Summarize(withMem, sampled).ByStatus["working"], time.Duration(0); got != want {
+			t.Errorf("working = %v, want %v — the samples bought the ghost credit for its silence", got, want)
+		}
+	})
+
+	t.Run("should not close a live lane when a memory sample carries a different session id on its pid", func(t *testing.T) {
+		// A sample routed through laneKey would read as "a different session took
+		// this pid" and end the running session's lane at that instant. Nothing but
+		// the skip prevents it, because the sampler stamps whatever id the pid
+		// currently reports and a /clear can move that id under it.
+		events := []Event{
+			{Ts: at(8, 0, 0), Type: EventSessionStart, PID: pid, Agent: "claude"},
+			{Ts: at(8, 0, 0), Type: EventTransition, PID: pid, SessionID: sid, To: "working"},
+			{Ts: at(9, 0, 0), Type: EventMemorySample, PID: pid, SessionID: "some-other-session",
+				MemAgentPssBytes: 1 << 20, MemTreePssBytes: 1 << 20},
+			{Ts: at(10, 0, 0), Type: EventSessionEnd, PID: pid, SessionID: sid},
+		}
+		lanes := BuildSwimlanes(events, end)
+		if len(lanes) != 1 {
+			t.Fatalf("got %d lanes, want 1 — a memory sample split the lane on its session id", len(lanes))
+		}
+		if !lanes[0].End.Equal(at(10, 0, 0)) {
+			t.Errorf("lane End = %v, want the session_end at 10:00 — the sample closed the lane early",
+				lanes[0].End.Format("15:04:05"))
+		}
+	})
+}
+
 // The subagent half, one level down. A spawn with no matching stop is capped at
 // the lane's bound by exactly the same logic that produced the three 4h46m
 // phantom bars on 2026-07-22.
