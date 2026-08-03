@@ -1118,8 +1118,11 @@ func TestBuildMemorySessionsKeysBySessionNotPid(t *testing.T) {
 		return Event{Ts: ts(sec), Type: EventMemorySample, PID: 7, SessionID: sid,
 			MemAgentPssBytes: agent, MemTreePssBytes: tree}
 	}
-	// One pid, two sequential sessions (a /clear mid-stream) — plus a sample with
-	// no id at all, which cannot be attributed to either.
+	// One pid, two sequential sessions (a /clear mid-stream), plus a sample from
+	// before either was identified. The id-less stretch is real data — a session
+	// emits samples from discovery, but only gets its id at its first hook — so
+	// it lands in its own pid-keyed bucket rather than being dropped or folded
+	// into a neighbour it may not belong to.
 	evs := []Event{
 		mem(0, "first", 100, 100),
 		mem(10, "first", 200, 200),
@@ -1128,14 +1131,44 @@ func TestBuildMemorySessionsKeysBySessionNotPid(t *testing.T) {
 		{Ts: ts(40), Type: EventMemorySample, PID: 7, MemAgentPssBytes: 999, MemTreePssBytes: 999},
 	}
 	got := BuildMemorySessions(evs, nil)
-	if len(got) != 2 {
-		t.Fatalf("got %d records, want 2 (one per session on the shared pid): %+v", len(got), got)
+	if len(got) != 3 {
+		t.Fatalf("got %d records, want 3 (two identified sessions + the pre-hook stretch): %+v", len(got), got)
 	}
-	if got[0].SessionID != "first" || got[1].SessionID != "second" {
-		t.Errorf("records = %s, %s — want them ordered by first sample", got[0].SessionID, got[1].SessionID)
+	if got[0].SessionID != "first" || got[1].SessionID != "second" || got[2].SessionID != "pid:7" {
+		t.Errorf("records = %s, %s, %s — want them ordered by first sample, with the unidentified one keyed by pid",
+			got[0].SessionID, got[1].SessionID, got[2].SessionID)
 	}
 	if got[0].PeakAgentBytes != 200 || got[1].PeakAgentBytes != 400 {
 		t.Errorf("peaks = %d / %d, want 200 / 400 — the two sessions were merged on their shared pid",
 			got[0].PeakAgentBytes, got[1].PeakAgentBytes)
+	}
+	if got[2].PeakAgentBytes != 999 {
+		t.Errorf("pre-hook peak = %d, want 999 — an unidentified sample must not be discarded",
+			got[2].PeakAgentBytes)
+	}
+}
+
+// A session emits samples from the moment it is discovered, but only receives
+// its id at its first agent hook. Dropping id-less samples therefore discarded
+// every reading from a session that had not been prompted yet — measured on a
+// live machine, 100% of them, including a long-idle session sitting on a
+// gigabyte, which is the reading most worth having.
+func TestBuildMemorySessionsKeepsSamplesFromBeforeTheFirstHook(t *testing.T) {
+	evs := []Event{
+		{Ts: ts(0), Type: EventMemorySample, PID: 42, Project: "sb",
+			MemAgentPssBytes: 500, MemTreePssBytes: 900, MemTreeProcs: 3},
+		{Ts: ts(10), Type: EventMemorySample, PID: 42, Project: "sb",
+			MemAgentPssBytes: 700, MemTreePssBytes: 1100, MemTreeProcs: 3},
+	}
+	got := BuildMemorySessions(evs, nil)
+	if len(got) != 1 {
+		t.Fatalf("got %d records, want 1: %+v", len(got), got)
+	}
+	if got[0].SessionID != "pid:42" {
+		t.Errorf("session id = %q, want %q — the pid fallback keeps the two id namespaces apart",
+			got[0].SessionID, "pid:42")
+	}
+	if got[0].PeakAgentBytes != 700 || got[0].PeakTreeBytes != 1100 {
+		t.Errorf("peaks = %d / %d, want 700 / 1100", got[0].PeakAgentBytes, got[0].PeakTreeBytes)
 	}
 }

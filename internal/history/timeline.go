@@ -718,17 +718,38 @@ type PressurePoint struct {
 // A session with no samples in range (or none left after clipping) is omitted
 // rather than emitted as a row of zeroes: the consumer keys these by session id
 // and an absent entry already means "nothing known".
+// memoryKey attributes a sample to a session: its id when it has one, else
+// "pid:<pid>".
+//
+// The fallback is load-bearing, not defensive. A session's id arrives from its
+// first agent hook, and the sampler starts the moment the process is discovered,
+// so every session emits samples before it is identified — a session discovered
+// at daemon start and then left idle can go a long time carrying no id at all.
+// Keying on the id alone silently discarded all of it, which is precisely
+// backwards: an idle session sitting on a gigabyte is the reading most worth
+// keeping. Measured on a live machine, that dropped 100% of samples.
+//
+// pid is not a session identity — one pid hosts a sequence of sessions, so a
+// /clear mints a new id on the same process — and the "pid:" prefix keeps the
+// two namespaces from colliding. What lands in a pid bucket is only ever the
+// pre-identification stretch, which does belong to whatever session was running
+// then. The same shape as the rest of the contract: group by session_id when
+// present, fall back to pid, which is also what the dashboard's laneIdentity
+// produces for an unidentified lane, so the two still join.
+func memoryKey(ev Event) string {
+	if ev.SessionID != "" {
+		return ev.SessionID
+	}
+	return "pid:" + strconv.Itoa(ev.PID)
+}
+
 func BuildMemorySessions(events []Event, lanes []Swimlane) []MemorySession {
 	bySession := map[string][]Event{}
 	for _, ev := range events {
-		// A sample with no session id cannot be attributed: memory is keyed by
-		// session throughout, and pid is not an identity (one pid hosts a sequence
-		// of sessions). In practice the sampler only fires for an identified
-		// session, so this drops nothing real.
-		if ev.Type != EventMemorySample || ev.SessionID == "" {
+		if ev.Type != EventMemorySample {
 			continue
 		}
-		bySession[ev.SessionID] = append(bySession[ev.SessionID], ev)
+		bySession[memoryKey(ev)] = append(bySession[memoryKey(ev)], ev)
 	}
 	tails := suspectTails(lanes)
 
