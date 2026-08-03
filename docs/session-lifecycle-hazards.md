@@ -13,7 +13,8 @@
 >
 > The catalog lives in `cmd/switchboard/session_lifecycle_test.go`
 > (`TestSessionLifecycleHazards` and its siblings); every `Ln-…` id below maps to
-> a row or a test there.
+> a row or a test there. The reader-side backstop of §4 is tested next to its
+> implementation, in `internal/history/suspect_test.go`.
 
 ---
 
@@ -30,13 +31,15 @@ places (`cmd/switchboard/main.go`):
    `procSrc.Watch(ctx, pid, cb)`; `cb` records `session_end` and deletes the
    session from the store. This is the **only** writer of `session_end`.
 
-The reader (`history.BuildSwimlanes`) groups events **by pid** and closes each
-lane at the first of: its `session_end`, or — for a lane still open when the
-event stream ends — the caller's `end` bound. For today's live day the ctl
-clamps that bound to **`now`** (`cmd/switchboard-ctl/timeline.go`, "extend a
-running session to the present"). So a lane with no `session_end` does not merely
-stop at its last event — its **final interval is stretched to `now`**, whatever
-color that interval happened to be.
+The reader (`history.BuildSwimlanes`) groups events by **`session_id`** (see F3
+below; it grouped by pid when this class was first investigated) and closes each
+lane at the first of: its `session_end`, the next session claiming its pid, or —
+for a lane still open when the event stream ends — the caller's `end` bound. For
+today's live day the ctl clamps that bound to **`now`**
+(`cmd/switchboard-ctl/timeline.go`, "extend a running session to the present").
+So a lane with no `session_end` does not merely stop at its last event — its
+**final interval is stretched to `now`**, whatever color that interval happened
+to be.
 
 That stretch is correct for a genuinely-live idle session (it *is* idle, up to
 now). It is a **ghost** when the session is actually dead and the death was
@@ -138,6 +141,28 @@ stretched final interval, not activity. Because two of the three end in an
 inflate `effective time gained`, the `force multiplier`, `attention_union`, and
 `by_status` totals — every duration-derived number for the day.
 
+### The subagent half of the same episode
+
+The issue title reads two ways — "three 4-hour sessions" and "three 4-hour
+*subagent* sessions" — and both were literally true, inside the same episode, by
+two different mechanisms. Session `4a9af989` spawned four Arachne teammates at
+10:22 on pid 3407477. One (`averify-f72`) stopped at 10:23:27 on the same pid and
+paired cleanly. The other three stopped at 10:57:52 / 11:04:12 / 11:04:12 — by
+which time the session had resumed on pid **11569**. With the reader grouping
+lanes by pid, those three `subagent_stop` events routed to the *new* pid's lane,
+where `openSubs` held no matching `agent_id`; they were silently dropped, and the
+spawns left open on the old lane were capped by `finish()` at the same `end`:
+
+| agent_id | real duration | rendered |
+|---|---|---|
+| `averify-f71-065ee92469bd5e64` | 41m52s | **4h46m21s** |
+| `averify-f73-88343a493c7fcb76` | 35m32s | **4h46m1s** |
+| `averify-f74-347c6c9435d4067c` | 41m22s | **4h45m52s** |
+
+F3 (session-id grouping) fixes the *pairing*; the post-check in §4 bounds the
+residue, since a spawn whose stop is genuinely missing still has nothing to pair
+with. `TestBuildSwimlanesPairsSubagentsAcrossAResumedPid` pins the shape.
+
 A secondary amplifier: `BuildSwimlanes` groups **by pid**, while
 `history-schema.md` states the reader should *"group a session's events by
 `session_id` when present."* Had the two same-`session_id` lanes been merged, the
@@ -211,10 +236,22 @@ Two rules make it work, and both are load-bearing:
   the session its emitting pid is running, so letting it route would read as
   "a different session took this pid" and close a live lane early.
 
-A remaining option, not implemented: have the ctl pass the live-pid set into
-`BuildSwimlanes` so a lane whose pid is provably dead caps at last-observed
-activity rather than `now`. That would bound the blast radius of any *future*
-missed end, but F1/F2 remove the cause.
+**F4 — the window-closed path goes through `endSession` too.** `handleWMEvent`'s
+`wm.EventWindowClosed` branch was a *fourth* way a session left the store, and
+the only one that wrote no `session_end`: a bare `delete(m, pid)` with no
+`Forget`. That put the session permanently out of reach of F1, which can only
+range the store map — a ghost factory the sweep structurally could not see. It
+now applies the same two rules as every other removal path: `endSession` when
+`sessionDead` reports the pid definitively gone, and otherwise **leave the
+session tracked**. A closed window is strong evidence a session is over but not
+positive evidence its process died; a process that outlived its window (detached,
+or a stale mapping) keeps its lane, and the pidfd watch or the next sweep closes
+it within one reconcile interval. (L7.)
+
+A remaining option, still not implemented: have the ctl pass the live-pid set
+into `BuildSwimlanes` so a lane whose pid is provably dead caps at last-observed
+activity rather than `now`. F1/F2/F4 remove the cause, and §4 bounds what escapes
+them without needing a liveness probe at read time.
 
 ### Accuracy note — dating the late `session_end`
 
@@ -229,7 +266,118 @@ the test.
 
 ---
 
-## 4. The catalog
+## 4. The backstop: the trailing-interval post-check
+
+§3 closes every path by which the daemon can fail to *observe* a death. It cannot
+close the paths by which an observed death fails to *survive* the trip to the
+log, and those are real and by design:
+
+- `history.Sink.Record` is non-blocking and **drops** on a full 512-event buffer
+  rather than block the daemon (`sink.go`, "buffer full — drop rather than block").
+  A dropped `session_end` is unrecoverable at the source.
+- `history.Reader` **skips a torn line** (a crash mid-append). A torn
+  `session_end` is indistinguishable from one that was never written.
+- `sessionDead` returns false on any non-`ErrGone` error (L4c, deliberate), so a
+  persistently unreadable pid is never swept.
+
+Empirically the class is still reachable: `2026-07-31.jsonl` pid 599441 has
+exactly one event ever — a `session_start` at 15:02:02 — on a day where 40+
+sibling headless runs in the same minute-range all got clean start/end pairs.
+
+So the reader must be able to say *"this lane's length is inference"* without
+help from the daemon. `internal/history/suspect.go` does exactly that.
+
+### The contract
+
+**It flags. It never drops, truncates, or reorders anything.** The bug being
+fixed is bad inference from missing data; deleting data to fix it would be the
+same mistake pointing the other way, and it would hide the daemon-side hole a
+suspect lane is the live symptom of. `Start`, `End`, and `Intervals` come out
+byte-identical; three additive `omitempty` fields are added:
+
+| field | meaning |
+|---|---|
+| `suspect` | this lane's length is an artifact of the end bound |
+| `suspect_since` | the last instant there was evidence for — the start of the offending final interval |
+| `suspect_reason` | the human-readable why, naming the bound and the interval |
+
+**The predicate is a conjunction, and both halves are load-bearing.**
+
+1. **The lane is unclosed** — no `session_end` and no successor session bounded
+   it, so `BuildSwimlanes` had to close it at the caller's bound. Tracked with an
+   explicit flag set at the close, *not* by comparing `End` against the bound, so
+   a session that genuinely died in the same nanosecond as the bound is not
+   misread. This is what makes the check zero-false-positive for every
+   properly-closed lane, however long it ran.
+2. **Its final interval is at least the cap.** A ghost is not "a long lane" — it
+   is "one enormous synthesized final interval". The 2026-07-22 twins prove the
+   distinction: pid 11569 ran 4h2m53s and was entirely legitimate, because its
+   final interval was 3m16s and a real `session_end` closed it.
+
+**The aggregates are held to the trusted window.** `Summarize` counts each lane
+only up to `suspect_since`, and reports what it left out as `summary.suspect_lanes`
+/ `summary.suspect_duration`. That is the difference between *"the day had 14h of
+ghost attention silently baked in"* and *"the day had 14h of attention, with 14h
+more excluded from 3 suspect lanes"*. The lane still draws in full.
+
+**The same check applies one level down.** A `subagent_spawn` with no matching
+`subagent_stop` is capped by `finish()` by identical logic — the mechanism behind
+the three 4h46m phantom bars in §2.1. A flagged span keeps its place on the lane
+but is no longer credited as compute, and no longer reattributes the parent's
+real work to `dormant` in `MarkDelegationDormant`.
+
+### The thresholds
+
+Both are named constants with the calibration in a comment above them, derived by
+replaying the whole corpus (31 day-files, 651 lanes) at `end` = next local
+midnight:
+
+| | legitimate population | ghost population | cap |
+|---|---|---|---|
+| lane trailing interval | max **2h25m25s** (a real idle session, $52.83); everything else under 1h5m | min **8h57m58s** in the repaired corpus, **4h35m56s** in the 2026-07-22 pre-repair file | **4h** |
+| subagent span | 204 paired spans, max **1h28m53s** | all 25 reader-capped spans **10h4m+**; the 07-22 phantoms 4h45m52s–4h46m21s | **2h** |
+
+Each cap sits in the empty band between the two populations. Note the subagent cap
+is deliberately *higher* than the "2× the fanout Observer's 30m `DefaultStaleCap`"
+rule of thumb would suggest — real spans demonstrably run past an hour.
+
+Failure modes of a wrong lane cap:
+
+- **Too low** (30m, or anything under ~2h30m): flags genuinely-live idle sessions,
+  the dashboard's most common state, and understates exactly the long unattended
+  delegation the dashboard exists to measure. The badge becomes noise you learn to
+  ignore, which is strictly worse than no badge.
+- **Too high** (12h): a ghost inside one day-file is bounded by ~24h, so the whole
+  observed class lives below it. The 2026-07-22 episode goes unflagged and every
+  duration-derived number for the day stays inflated — the reported bug, unfixed.
+
+Because the check only annotates, a false positive costs one misleading badge
+while a false negative costs a silently wrong headline number. That asymmetry
+argues for erring low — but not below the observed legitimate ceiling, hence 4h
+rather than 3h. `switchboard-ctl timeline --suspect-cap` retunes it without a
+rebuild; `--suspect-cap 0` disables the check entirely.
+
+### Known, accepted false positive
+
+A `--day` query for a *past* day bounds lanes at the next local midnight, which is
+never clamped by `now`. A session that ran 18:00 → 02:00 has its `session_end` in
+the **following** day's file, so the first day sees a 6h trailing interval and
+flags it. The reason string says `window bound` rather than `now` precisely so
+the two are distinguishable in a log line and in the UI. A session that crosses
+midnight later than 20:00 stays under the cap and is not flagged.
+
+### Where it runs
+
+`cmd/switchboard-ctl/timeline.go`, on the line after `BuildSwimlanes` and before
+`MarkDelegationDormant` and `Summarize` — so the text renderer, `--json`, and
+every dashboard provider read the same flag and the same aggregates. The text
+renderer marks a flagged bar with `!` and prints a `suspect` block under the
+summary; each flagged lane also gets one `log.Printf` line on stderr, so
+`switchboard-ctl timeline` surfaces a ghost with no GUI in the loop.
+
+---
+
+## 5. The catalog
 
 | id | scenario | the OS says | daemon/reader must |
 |----|----------|-------------|--------------------|
@@ -241,6 +389,8 @@ the test.
 | **L4c-unreadable-is-not-a-death** *(contrast)* | a transient read failure, or the darwin backend that cannot answer for any pid | `ErrUnsupported` | **do nothing** — a fabricated `session_end` would split a running session into two lanes. Re-check next tick. |
 | **L5-no-double-end** | both the sweep and a late pidfd callback observe the same death | `ErrGone` to both | exactly **one** `session_end`; whichever deletes the session first wins, every later trigger no-ops. |
 | **L6-ghost-lane-bounded** *(the 2026-07-22 shape)* | a session stops at T, but nothing closes its lane | — | with no `session_end` `BuildSwimlanes` stretches the lane to `now` (the ghost, pinned as the before-state); with the `session_end` the fix emits, both the lane **and its final interval** end at T. |
+| **L7-window-closed-bare-delete** | the WM reports the window hosting a session closed | `ErrGone` (or not: detached process, stale mapping) | route through `endSession` when the pid is definitively gone; otherwise **leave the session tracked** for the watch/sweep. Never a bare `delete` — that writes no end and hides the pid from F1 forever. |
+| **L8-suspect-trailing-interval** *(reader-side backstop)* | the death WAS observed but its `session_end` never reached the log — a dropped `Sink.Record`, a torn line | — | `FlagSuspectLanes` marks the lane, `Summarize` holds every total to `suspect_since` and reports `suspect_duration`. The lane is still drawn in full: flag, never drop. |
 
 L6 also pins the *resume* shape that produced the three observed ghosts: one
 `session_id` running on pid A, then resumed on pid B, where only B's death was
@@ -256,6 +406,7 @@ When a new lifecycle scenario surfaces:
    expected lane end).
 2. Add the matching row to the table above with a one-line "why it's tricky".
 3. If it exposes a new way the death signal is lost (not just a new shape of an
-   existing one), extend §2.
+   existing one), extend §2 — and if it is a way an *observed* death fails to
+   reach the log, check whether §4's post-check already bounds it.
 
 The test is the source of truth; this document is its index.

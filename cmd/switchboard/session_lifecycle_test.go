@@ -9,6 +9,7 @@ import (
 	"github.com/tjmisko/switchboard/internal/history"
 	"github.com/tjmisko/switchboard/internal/osproc"
 	"github.com/tjmisko/switchboard/internal/state"
+	"github.com/tjmisko/switchboard/internal/wm"
 )
 
 // A running catalog of session-LIFECYCLE hazards, each pinned as a regression.
@@ -64,6 +65,14 @@ func (f fakeProcSource) Stop(int)                                 {}
 func trackedSession(pid int, sid string) *state.Session {
 	return &state.Session{PID: pid, Agent: "claude", CWD: "/home/u/proj",
 		Claude: &state.AgentInfo{SessionID: sid}}
+}
+
+// windowedSession is a tracked session mapped to a WM window, so a window-closed
+// event can find it by address.
+func windowedSession(pid int, sid, address string) *state.Session {
+	s := trackedSession(pid, sid)
+	s.Hyprland = &state.HyprlandInfo{Address: address}
+	return s
 }
 
 func TestSessionLifecycleHazards(t *testing.T) {
@@ -210,6 +219,129 @@ func TestEndSessionEmitsExactlyOncePerDeath(t *testing.T) {
 	if ends := eventsOfType(readEvents(t, histDir), history.EventSessionEnd); len(ends) != 1 {
 		t.Fatalf("got %d session_end events for one death, want exactly 1", len(ends))
 	}
+}
+
+// L7: the WM's window-closed event was a fourth way a session left the store,
+// and the only one that wrote no session_end. A bare `delete(m, pid)` there put
+// the session permanently out of reach of the liveness sweep — which can only
+// range the store map — so nothing could ever close its lane and it ghosted to
+// the reader's bound. It has to go through endSession like every other removal.
+//
+// The contrast row matters just as much: a closed window is not positive evidence
+// that a process died (it may be detached, or the mapping stale). Ending a live
+// session here would split a running session into two lanes, the exact failure
+// sessionDead exists to prevent (L4).
+func TestWindowClosedClosesTheLaneOnlyWhenTheProcessIsGone(t *testing.T) {
+	const address = "0xdeadbeef"
+
+	rows := []struct {
+		name    string
+		state   procState
+		wantEnd bool
+	}{
+		{
+			name:    "should record a session_end when the window hosting a dead process closes",
+			state:   procGone,
+			wantEnd: true,
+		},
+		{
+			name:    "should keep tracking a session when its process outlived the closed window",
+			state:   procAlive,
+			wantEnd: false,
+		},
+		{
+			name:    "should keep tracking a session when the closed window's pid cannot be read",
+			state:   procUnreadable,
+			wantEnd: false,
+		},
+	}
+
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			const pid, otherPID = 5150, 5151
+			histDir := t.TempDir()
+			sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
+			store := state.New(filepath.Join(t.TempDir(), "state.json"))
+			store.Apply(func(m map[int]*state.Session) {
+				m[pid] = windowedSession(pid, "sid-closed", address)
+				// A dead session in a DIFFERENT window: this event says nothing about it.
+				m[otherPID] = windowedSession(otherPID, "sid-other", "0xcafe")
+			})
+			src := fakeProcSource{st: map[int]procState{pid: row.state, otherPID: procGone}}
+
+			var forgotten []int
+			handleWMEvent(context.Background(), store, nil,
+				wm.Event{Kind: wm.EventWindowClosed, Address: address},
+				sink, src, func(p int) { forgotten = append(forgotten, p) })
+			sink.Close()
+
+			ends := eventsOfType(readEvents(t, histDir), history.EventSessionEnd)
+			if got := len(ends) == 1; got != row.wantEnd {
+				t.Fatalf("got %d session_end events, wantEnd=%v", len(ends), row.wantEnd)
+			}
+			store.Apply(func(m map[int]*state.Session) {
+				if _, tracked := m[pid]; tracked == row.wantEnd {
+					t.Errorf("session tracked=%v after the window closed, want tracked=%v", tracked, !row.wantEnd)
+				}
+				if _, tracked := m[otherPID]; !tracked {
+					t.Error("a session in another window was dropped by this event")
+				}
+			})
+			if !row.wantEnd {
+				if len(forgotten) != 0 {
+					t.Errorf("forgot %v; a session that may still be running must be left alone", forgotten)
+				}
+				return
+			}
+			if ends[0].SessionID != "sid-closed" || ends[0].PID != pid {
+				t.Errorf("session_end = %+v, want it to close sid-closed/pid %d", ends[0], pid)
+			}
+			if len(forgotten) != 1 || forgotten[0] != pid {
+				t.Errorf("forgot %v, want the scanner to forget pid %d so a recycled pid is re-discovered", forgotten, pid)
+			}
+		})
+	}
+}
+
+// L8: the reader-side backstop. Even with every producer path closed, a
+// session_end can still be lost downstream — Sink.Record drops on a full buffer
+// by design, and a torn line at a crash is indistinguishable from a missing one.
+// So the reader must be able to say "this lane's length is inference" without
+// help from the daemon. The post-check flags it and holds the aggregates to the
+// last observed instant; the lane itself is always still rendered in full.
+func TestSuspectPostCheckBoundsALaneWhoseEndWasLost(t *testing.T) {
+	t.Run("should flag a lane and exclude its stretched tail when its session_end never reached the log", func(t *testing.T) {
+		const pid = 3407477
+		base := time.Date(2026, 7, 22, 10, 14, 50, 0, time.Local)
+		lastSeen := base.Add(13*time.Minute + 19*time.Second) // 10:28:09
+		now := base.Add(4*time.Hour + 53*time.Minute + 52*time.Second)
+
+		events := []history.Event{
+			{Ts: base, Type: history.EventSessionStart, PID: pid, Agent: "claude"},
+			{Ts: base.Add(13 * time.Second), Type: history.EventTransition, PID: pid, SessionID: "4a9af989", To: "idle"},
+			{Ts: lastSeen, Type: history.EventTransition, PID: pid, SessionID: "4a9af989", From: "idle", To: "working"},
+		}
+
+		lanes := history.BuildSwimlanes(events, now)
+		report := history.FlagSuspectLanes(lanes, history.DefaultSuspectPolicy(now, history.BoundNow))
+		if report.Lanes != 1 || !lanes[0].Suspect {
+			t.Fatalf("report = %+v, lane suspect = %v; want the ghost flagged", report, lanes[0].Suspect)
+		}
+		if !lanes[0].SuspectSince.Equal(lastSeen) {
+			t.Errorf("SuspectSince = %v, want the last observed instant %v", lanes[0].SuspectSince, lastSeen)
+		}
+		// Flagged, never deleted: the operator still sees the whole bar.
+		if !lanes[0].End.Equal(now) {
+			t.Errorf("lane End = %v, want the raw bound %v", lanes[0].End, now)
+		}
+		s := history.Summarize(lanes, events)
+		if s.ByStatus["working"] != 0 {
+			t.Errorf("working = %v, want the stretched tail excluded from the totals", s.ByStatus["working"])
+		}
+		if want := now.Sub(lastSeen); s.SuspectDuration != want {
+			t.Errorf("SuspectDuration = %v, want %v reported rather than silently dropped", s.SuspectDuration, want)
+		}
+	})
 }
 
 // L6: the ghost itself, at the reader. A lane with no session_end is stretched to

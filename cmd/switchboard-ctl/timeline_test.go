@@ -208,6 +208,150 @@ func TestTimelineJSONPlanWindowFlag(t *testing.T) {
 	}
 }
 
+// The ctl is the seam where the post-check runs, between BuildSwimlanes and
+// everything that derives a number from it — so the flag has to reach --json, the
+// text renderer, and every dashboard provider identically. These pin that seam.
+//
+// A --day query for a PAST day bounds the lanes at the next local midnight, which
+// is never clamped by `now`; that is the "window bound" half of the reason string.
+func TestTimelineSuspectPostCheck(t *testing.T) {
+	// A ghost on a closed day: discovered, went to work, never seen again, no
+	// session_end. Its lane is stretched from 08:00 to the next midnight (16h).
+	setup := func(t *testing.T) (dir, day string, startedAt time.Time) {
+		t.Helper()
+		dir = t.TempDir()
+		d := time.Now().AddDate(0, 0, -7)
+		day = d.Format("2006-01-02")
+		startedAt = time.Date(d.Year(), d.Month(), d.Day(), 8, 0, 0, 0, time.Local)
+		writeDay(t, dir, day,
+			history.Event{Ts: startedAt, Type: history.EventSessionStart, PID: 4242, Agent: "claude"},
+			history.Event{Ts: startedAt, Type: history.EventTransition, PID: 4242, SessionID: "ghost-1", To: "working"},
+		)
+		return dir, day, startedAt
+	}
+
+	type envelope struct {
+		Lanes   []history.Swimlane `json:"lanes"`
+		Summary history.Summary    `json:"summary"`
+	}
+
+	t.Run("should carry the suspect flag and its reason into the JSON envelope when no session_end closed a lane", func(t *testing.T) {
+		dir, day, startedAt := setup(t)
+		out := captureStdout(t, func() {
+			cmdTimeline([]string{"--dir", dir, "--day", day, "--json"})
+		})
+		var env envelope
+		if err := json.Unmarshal([]byte(out), &env); err != nil {
+			t.Fatalf("unmarshal envelope: %v\n%s", err, out)
+		}
+		if len(env.Lanes) != 1 {
+			t.Fatalf("got %d lanes, want 1\n%s", len(env.Lanes), out)
+		}
+		lane := env.Lanes[0]
+		if !lane.Suspect {
+			t.Fatalf("lane not flagged:\n%s", out)
+		}
+		if !strings.Contains(lane.SuspectReason, "window bound") {
+			t.Errorf("reason = %q, want it to name the window bound for a closed-day query", lane.SuspectReason)
+		}
+		if !lane.SuspectSince.Equal(startedAt) {
+			t.Errorf("suspect_since = %v, want the last observed instant %v", lane.SuspectSince, startedAt)
+		}
+		// Annotated, not truncated: the lane still runs to the bound so the operator
+		// can see exactly what the daemon believed.
+		if want := startedAt.Add(16 * time.Hour); !lane.End.Equal(want) {
+			t.Errorf("lane end = %v, want the untouched bound %v", lane.End, want)
+		}
+		if env.Summary.SuspectLanes != 1 || env.Summary.SuspectDuration != 16*time.Hour {
+			t.Errorf("summary suspect = %d lanes / %v, want 1 / 16h", env.Summary.SuspectLanes, env.Summary.SuspectDuration)
+		}
+		// …and the 16 stretched hours are out of the headline numbers.
+		if env.Summary.AttentionUnion != 0 || env.Summary.ByStatus["working"] != 0 {
+			t.Errorf("attention_union = %v, working = %v, want the suspect tail excluded from both",
+				env.Summary.AttentionUnion, env.Summary.ByStatus["working"])
+		}
+	})
+
+	t.Run("should attribute the stretch to now when an open-ended range reaches the present", func(t *testing.T) {
+		dir, day, _ := setup(t)
+		out := captureStdout(t, func() {
+			cmdTimeline([]string{"--dir", dir, "--since", day, "--json"})
+		})
+		var env envelope
+		if err := json.Unmarshal([]byte(out), &env); err != nil {
+			t.Fatalf("unmarshal envelope: %v\n%s", err, out)
+		}
+		if len(env.Lanes) != 1 || !env.Lanes[0].Suspect {
+			t.Fatalf("lane not flagged:\n%s", out)
+		}
+		// `--since X` with no `--until` ends at wall-clock now, not a midnight, so
+		// this is a live-day ghost and must not be excused as a midnight crossing.
+		if !strings.Contains(env.Lanes[0].SuspectReason, "stretched to now") {
+			t.Errorf("reason = %q, want it to name `now` for an open-ended range", env.Lanes[0].SuspectReason)
+		}
+	})
+
+	t.Run("should flag nothing when the suspect cap is disabled", func(t *testing.T) {
+		dir, day, _ := setup(t)
+		out := captureStdout(t, func() {
+			cmdTimeline([]string{"--dir", dir, "--day", day, "--json", "--suspect-cap", "0"})
+		})
+		var env envelope
+		if err := json.Unmarshal([]byte(out), &env); err != nil {
+			t.Fatalf("unmarshal envelope: %v\n%s", err, out)
+		}
+		if env.Lanes[0].Suspect || env.Summary.SuspectLanes != 0 {
+			t.Errorf("check ran with --suspect-cap 0:\n%s", out)
+		}
+		if env.Summary.ByStatus["working"] != 16*time.Hour {
+			t.Errorf("working = %v, want the full unchecked 16h back", env.Summary.ByStatus["working"])
+		}
+	})
+}
+
+func TestRenderSwimlanesMarksSuspectLanes(t *testing.T) {
+	t.Run("should mark the bar and print the reason when a lane is suspect", func(t *testing.T) {
+		lanes := []history.Swimlane{{
+			SessionID: "ghost-123456", PID: 4242, Name: "debug-paused-agent-pump",
+			Start: atSec(0), End: atSec(20),
+			Intervals: []history.Interval{{Status: "working", Start: atSec(0), End: atSec(20)}},
+			Suspect:   true, SuspectSince: atSec(0),
+			SuspectReason: `unclosed lane stretched to now: final "working" interval 4h53m52s >= 4h0m0s cap`,
+		}}
+		summary := history.Summary{From: atSec(0), To: atSec(20), Sessions: 1,
+			ByStatus: map[string]time.Duration{}, SuspectLanes: 1, SuspectDuration: 4*time.Hour + 53*time.Minute}
+		report := history.SuspectReport{Lanes: 1, Duration: summary.SuspectDuration}
+
+		out := captureStdout(t, func() {
+			renderSwimlanes(os.Stdout, "2026-07-22", lanes, summary, history.Totals{}, report, 8, false)
+		})
+
+		if !strings.Contains(out, "wwwwwwww!") {
+			t.Errorf("suspect bar is not marked with '!':\n%s", out)
+		}
+		if !strings.Contains(out, "suspect (excluded from the totals above)") {
+			t.Errorf("no suspect section:\n%s", out)
+		}
+		if !strings.Contains(out, `final "working" interval 4h53m52s`) {
+			t.Errorf("the reason is not surfaced:\n%s", out)
+		}
+	})
+
+	t.Run("should print no suspect section when nothing was flagged", func(t *testing.T) {
+		lanes := []history.Swimlane{{
+			SessionID: "clean-1", PID: 7, Start: atSec(0), End: atSec(20),
+			Intervals: []history.Interval{{Status: "working", Start: atSec(0), End: atSec(20)}},
+		}}
+		summary := history.Summary{From: atSec(0), To: atSec(20), Sessions: 1, ByStatus: map[string]time.Duration{}}
+		out := captureStdout(t, func() {
+			renderSwimlanes(os.Stdout, "2026-07-22", lanes, summary, history.Totals{}, history.SuspectReport{}, 8, false)
+		})
+		if strings.Contains(out, "suspect") || strings.Contains(out, "!") {
+			t.Errorf("clean day should carry no suspect noise:\n%s", out)
+		}
+	})
+}
+
 func TestTimelineJSONPlanWindowOmittedByDefault(t *testing.T) {
 	dir := t.TempDir()
 	t0 := time.Now().Add(-time.Minute)
