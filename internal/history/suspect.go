@@ -42,7 +42,11 @@ const (
 //
 // Calibrated by replaying every day-file in the corpus (31 days, 651 lanes)
 // through BuildSwimlanes at end = next local midnight and measuring the trailing
-// interval of every lane that had no session_end:
+// interval of every lane that had no session_end. Those figures predate the
+// switch to measuring SILENCE rather than interval length; re-running the same
+// replay over 33 days confirms the two coincide on this corpus — the largest
+// legitimate lane measures 2h25m25s by interval and 2h25m21s by silence, and no
+// lane changes which side of the cap it falls on — so the band below still holds:
 //
 //   - the largest LEGITIMATE trailing interval anywhere is 2h25m25s (a real idle
 //     session that had burned $52.83), with 2h22m47s ($27.67) right behind it;
