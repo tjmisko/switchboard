@@ -8,9 +8,11 @@
 > versioning rules below.
 >
 > The canonical example is [`internal/state/testdata/state.golden.json`](../internal/state/testdata/state.golden.json),
-> pinned by `TestStateGoldenRoundTrips` in `internal/state/golden_test.go`. The
-> Go source of truth is the `Snapshot`/`Session` structs in
-> `internal/state/state.go`.
+> pinned by `TestStateGoldenRoundTrips` (the fixture re-encodes byte-for-byte)
+> and `TestStateGoldenPinsCanonicalSnapshot` (the fixture matches
+> `canonicalSnapshot()`, so a **new optional field cannot go silently unpinned**)
+> in `internal/state/golden_test.go`. The Go source of truth is the
+> `Snapshot`/`Session` structs in `internal/state/state.go`.
 
 ## How it is written
 
@@ -302,9 +304,14 @@ re-locates the pane by `tty` at request time.
   optional blocks are **omitted** entirely (never `null`) when unresolved.
   `claude.session_id`/`transcript` are omitted when empty; `claude.status` is
   present-but-`""` before the first status hook.
-- The golden fixture + `TestStateGoldenRoundTrips` is the tripwire: any change
-  to field name, order, type, or omitempty behavior breaks that test, forcing a
-  deliberate `UPDATE_GOLDEN=1` regen and a review of this document.
+- The golden fixture is the tripwire: any change to field name, order, type, or
+  omitempty behavior breaks `TestStateGoldenRoundTrips`, forcing a deliberate
+  `UPDATE_GOLDEN=1` regen and a review of this document. **Adding an optional
+  field also means setting it in `canonicalSnapshot()`** — round-tripping the
+  fixture against itself cannot see a field the fixture never carried, so
+  `TestStateGoldenPinsCanonicalSnapshot` is the test that fails until the
+  fixture is regenerated. Every optional field must be set on at least one
+  session there, with the minimal session left bare to pin the absence side.
 
 The ⚠ items above are tracked characterization quirks; each has a pin-then-fix
 entry in `docs/decisions.md` (Phase 0.9).
