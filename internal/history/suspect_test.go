@@ -211,6 +211,17 @@ func TestFlagSuspectLanesPredicate(t *testing.T) {
 
 // The threshold is a calibrated constant, not a magic number: pin the default so
 // a change to it is a deliberate, reviewed edit rather than a silent drift.
+//
+// The two figures below are re-derived by
+//
+//	switchboard-ctl history calibrate [--dir D]
+//
+// which replays a real corpus and prints the two populations each cap sits
+// between, the empty band between them, and how many samples the cap would get
+// wrong in each direction (Calibrate, calibrate.go). This test deliberately does
+// NOT call it: the analysis needs a month of somebody's activity log, which the
+// repo does not carry, so the constants are pinned outright here and the command
+// is the argument you run by hand before proposing to move one.
 func TestSuspectCapDefaults(t *testing.T) {
 	if DefaultSuspectTrailingCap != 4*time.Hour {
 		t.Errorf("DefaultSuspectTrailingCap = %v, want 4h (see the calibration comment)", DefaultSuspectTrailingCap)

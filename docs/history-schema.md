@@ -285,10 +285,19 @@ switchboard-ctl history tail [--day D] [-n N]       # most recent events (--json
 switchboard-ctl history stat                        # event counts, size, date range
 switchboard-ctl history purge --before YYYY-MM-DD   # delete old day-files
 switchboard-ctl history purge --all                 # delete everything
+switchboard-ctl history calibrate                   # re-derive the suspect caps
 ```
 
 All read the files directly — no daemon connection — so they work whether or not
 the daemon is running, and `jq`/`grep`/`tail -f` work on the raw `.jsonl` too.
+
+`calibrate` is the maintainer's tool behind the two constants in `suspect.go`. It
+replays every complete day-file at that day's next local midnight, splits the
+lanes the reader had to close into the ones the corpus proves outlived the bound
+and the ones nothing is ever heard from again, does the same for subagent spans
+(paired vs. capped), and prints the empty band between each pair along with how
+many samples the current cap would get wrong in either direction. It is advisory:
+nothing in CI runs it, and moving a cap stays a deliberate edit.
 
 ## Stability
 
