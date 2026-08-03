@@ -16,9 +16,11 @@ var goldenPath = filepath.Join("testdata", "state.golden.json")
 
 // canonicalSnapshot is the schema example: a fully-populated claude session
 // (every optional block present, every AgentInfo field set), a codex session on
-// the Observe tier (the additive "agent"/"codex" fields), and one minimal
-// session (all optional blocks omitted, only the always-present fields). All
-// timestamps are fixed and UTC so encode/decode is deterministic.
+// the Observe tier (the additive "agent"/"codex" fields, plus the mem_* pair to
+// pin that memory is agent-agnostic), and one minimal session (all optional
+// blocks omitted, only the always-present fields — it is what pins the
+// omitempty ABSENCE of the optional fields). All timestamps are fixed and UTC
+// so encode/decode is deterministic.
 func canonicalSnapshot() Snapshot {
 	return Snapshot{
 		Sessions: []Session{
@@ -30,6 +32,11 @@ func canonicalSnapshot() Snapshot {
 				Focused:   true,
 				Suspended: true,
 				Agent:     AgentKindClaude,
+				// mem_agent_bytes / mem_tree_bytes: Pss+SwapPss for the agent
+				// process alone and for its whole tree. Tree > agent whenever
+				// subagents are in flight; the difference is what the children cost.
+				MemAgentBytes: 461373440,
+				MemTreeBytes:  674234368,
 				Wezterm: &WeztermInfo{
 					MuxPID:      4790,
 					MuxSocket:   "/run/user/1000/wezterm/gui-sock-4790",
@@ -55,12 +62,14 @@ func canonicalSnapshot() Snapshot {
 				},
 			},
 			{
-				PID:       4999,
-				CWD:       "/home/tjmisko/Projects/api",
-				TTY:       "/dev/pts/7",
-				StartedAt: time.Date(2026, 5, 28, 9, 2, 0, 0, time.UTC),
-				Focused:   false,
-				Agent:     AgentKindCodex,
+				PID:           4999,
+				CWD:           "/home/tjmisko/Projects/api",
+				TTY:           "/dev/pts/7",
+				StartedAt:     time.Date(2026, 5, 28, 9, 2, 0, 0, time.UTC),
+				Focused:       false,
+				Agent:         AgentKindCodex,
+				MemAgentBytes: 298844160,
+				MemTreeBytes:  298844160,
 				Codex: &AgentInfo{
 					SessionID:  "0199736b-b713-74e2-99a2-f015a1c42816",
 					Transcript: "/home/tjmisko/.codex/sessions/2026/05/28/rollout-2026-05-28T09-02-00-0199736b-b713-74e2-99a2-f015a1c42816.jsonl",

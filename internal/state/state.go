@@ -35,6 +35,18 @@ type Session struct {
 	// renderer reads status. Omitted only when the kind is not yet known.
 	Agent string `json:"agent,omitempty"`
 
+	// MemAgentBytes is the live resident cost of the agent process alone:
+	// Pss + SwapPss from /proc/<pid>/smaps_rollup, refreshed each reconcile tick.
+	// PSS charges shared pages to their sharers in fractions, so summing across
+	// sessions never double-counts. Omitted rather than zero when a reading
+	// failed or the backend cannot take one — 0 would mean "measured, and empty".
+	MemAgentBytes int64 `json:"mem_agent_bytes,omitempty"`
+	// MemTreeBytes is the same measure summed over the agent process and every
+	// descendant — the session's whole process tree, the only unit that captures
+	// subagent work (subagents have no PIDs of their own). Subtract
+	// MemAgentBytes for what the children cost. Same absence semantics.
+	MemTreeBytes int64 `json:"mem_tree_bytes,omitempty"`
+
 	Wezterm  *WeztermInfo  `json:"wezterm,omitempty"`
 	Hyprland *HyprlandInfo `json:"hyprland,omitempty"`
 	// Claude and Codex are the per-agent enrichment blocks; they share one shape
