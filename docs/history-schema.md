@@ -35,13 +35,26 @@ files), and bounded file sizes. A crash mid-append costs at most the final
 {
   "enabled": true,        // default false — nothing is written when off
   "detail": "minimal",    // "minimal" (default) | "full"
+  "memory": true,         // default true — per-session memory sampling
   "retain_days": 90,      // delete day-files older than this; 0 = unlimited
-  "max_bytes": 104857600  // trim oldest day-files past this total; 0 = unlimited
+  "max_bytes": 2147483648 // trim oldest day-files past this total; 0 = unlimited
 }
 ```
 
-The daemon logs `history: enabled=… detail=… dir=…` at startup. Recording is
-**local only** — Switchboard never transmits the log.
+`memory` gates per-session memory sampling independently of `enabled`, because it
+is the one stream whose volume is worth opting out of on its own — it is roughly
+12× everything else the log records. Turning it off leaves the rest untouched.
+
+**`max_bytes` has two defaults, and which one applies depends on `memory`**: 2 GB
+with sampling on, 100 MB with it off. Retention is size-bounded *before* it is
+age-bounded — `pruneDir` trims oldest-first on total size and `retain_days` only
+rules on what survives — so leaving the smaller default in place would quietly
+turn a configured 90-day retention into about ten. An explicitly configured
+`max_bytes` always wins over both.
+
+The daemon logs `history: enabled=… detail=… memory=… retain_days=… max_bytes=…
+dir=…` at startup, so the effective cap is never a silent multi-gigabyte
+commitment. Recording is **local only** — Switchboard never transmits the log.
 
 ## Privacy tiers
 
