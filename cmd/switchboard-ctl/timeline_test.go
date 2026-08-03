@@ -291,6 +291,61 @@ func TestTimelineSuspectPostCheck(t *testing.T) {
 		}
 	})
 
+	// --suspect-cap is the operator's whole interface to this check, so it has to
+	// govern both halves. A pattern quiet enough to need a looser lane cap has
+	// subagents quiet with it, and a flag that moved only the lane half would leave
+	// the operator flagged by the half they had no way to reach.
+	t.Run("should loosen the lane half when given a cap above the stretch", func(t *testing.T) {
+		dir, day, _ := setup(t)
+		out := captureStdout(t, func() {
+			cmdTimeline([]string{"--dir", dir, "--day", day, "--json", "--suspect-cap", "20h"})
+		})
+		var env envelope
+		if err := json.Unmarshal([]byte(out), &env); err != nil {
+			t.Fatalf("unmarshal envelope: %v\n%s", err, out)
+		}
+		if env.Lanes[0].Suspect || env.Summary.SuspectLanes != 0 {
+			t.Errorf("16h lane still flagged under a 20h cap:\n%s", out)
+		}
+	})
+
+	t.Run("should loosen the subagent half in proportion when given a non-default cap", func(t *testing.T) {
+		// The same ghost, but with an unpaired subagent spawned three hours before the
+		// bound: over the 2h default, under the 5h that a 10h lane cap scales to.
+		spawnGhost := func(t *testing.T) (dir, day string) {
+			t.Helper()
+			dir, day, startedAt := setup(t)
+			writeDay(t, dir, day,
+				history.Event{Ts: startedAt, Type: history.EventSessionStart, PID: 4242, Agent: "claude"},
+				history.Event{Ts: startedAt, Type: history.EventTransition, PID: 4242, SessionID: "ghost-1", To: "working"},
+				history.Event{Ts: startedAt.Add(13 * time.Hour), Type: history.EventSubagentSpawn,
+					PID: 4242, SessionID: "ghost-1", AgentID: "aphantom-0001"},
+			)
+			return dir, day
+		}
+		spans := func(t *testing.T, args ...string) []history.SubagentSpan {
+			t.Helper()
+			out := captureStdout(t, func() { cmdTimeline(args) })
+			var env envelope
+			if err := json.Unmarshal([]byte(out), &env); err != nil {
+				t.Fatalf("unmarshal envelope: %v\n%s", err, out)
+			}
+			if len(env.Lanes) != 1 || len(env.Lanes[0].Subagents) != 1 {
+				t.Fatalf("want one lane carrying one span:\n%s", out)
+			}
+			return env.Lanes[0].Subagents
+		}
+
+		dir, day := spawnGhost(t)
+		if got := spans(t, "--dir", dir, "--day", day, "--json"); !got[0].Suspect {
+			t.Fatalf("3h unpaired span not flagged at the 2h default: %+v", got[0])
+		}
+		dir, day = spawnGhost(t)
+		if got := spans(t, "--dir", dir, "--day", day, "--json", "--suspect-cap", "10h"); got[0].Suspect {
+			t.Errorf("span still flagged under a 10h cap (5h scaled): %s", got[0].SuspectReason)
+		}
+	})
+
 	t.Run("should flag nothing when the suspect cap is disabled", func(t *testing.T) {
 		dir, day, _ := setup(t)
 		out := captureStdout(t, func() {
