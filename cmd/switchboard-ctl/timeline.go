@@ -40,7 +40,7 @@ func cmdTimeline(args []string) {
 	noColor := fs.Bool("no-color", false, "disable ANSI color")
 	planWindow := fs.Bool("plan-window", false, "include the rolling 5h plan_window cost/token total")
 	suspectCap := fs.Duration("suspect-cap", history.DefaultSuspectTrailingCap,
-		"flag a lane with no session_end whose final interval reaches this (0 disables the post-check)")
+		"flag a lane with no session_end silent this long; the unpaired-subagent cap scales with it (0 disables both)")
 	_ = fs.Parse(args)
 
 	from, to, label := resolveWindow(*day, *since, *until)
@@ -126,7 +126,9 @@ func cmdTimeline(args []string) {
 // each flagged lane on stderr, so `switchboard-ctl timeline` surfaces a ghost
 // without a GUI and a scripted caller sees it even when it only reads the JSON on
 // stdout. A cap of 0 disables the check entirely (the escape hatch for a working
-// pattern the default is miscalibrated for).
+// pattern the default is miscalibrated for); any other cap tunes BOTH halves, via
+// WithLaneCap, since --suspect-cap is the only knob an operator has and a pattern
+// that trips the lane half trips the subagent half with it.
 //
 // liveBound says whether `end` is a wall clock (a window reaching the present) or
 // a calendar boundary (a closed day, or a bounded --since/--until range). The
@@ -134,16 +136,12 @@ func cmdTimeline(args []string) {
 // boundary may simply have run across midnight, with its session_end sitting in
 // the next day's file, which is an accepted false positive of a day-partitioned
 // query rather than a symptom of a lost death.
-func flagSuspectLanes(lanes []history.Swimlane, end time.Time, liveBound bool, cap time.Duration) history.SuspectReport {
+func flagSuspectLanes(lanes []history.Swimlane, end time.Time, liveBound bool, laneCap time.Duration) history.SuspectReport {
 	bound := history.BoundWindow
 	if liveBound {
 		bound = history.BoundNow
 	}
-	policy := history.DefaultSuspectPolicy(end, bound)
-	policy.LaneCap = cap
-	if cap <= 0 {
-		policy.SubagentCap = 0
-	}
+	policy := history.DefaultSuspectPolicy(end, bound).WithLaneCap(laneCap)
 	report := history.FlagSuspectLanes(lanes, policy)
 	if !report.Any() {
 		return report

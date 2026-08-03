@@ -113,6 +113,43 @@ func DefaultSuspectPolicy(end time.Time, bound EndBound) SuspectPolicy {
 	}
 }
 
+// suspectSubagentCapRatio is how much lower the subagent cap sits than the lane
+// cap. It is DERIVED from the two calibrated constants rather than written as a
+// literal 0.5, so the pair cannot drift apart: whatever a re-calibration does to
+// either constant, the scaled policy keeps reproducing the same relationship the
+// calibration comments above argue for.
+const suspectSubagentCapRatio = float64(DefaultSuspectSubagentCap) /
+	float64(DefaultSuspectTrailingCap)
+
+// WithLaneCap rescales BOTH halves of the check around an operator-supplied lane
+// cap, preserving the ratio the defaults encode. Passing
+// DefaultSuspectTrailingCap therefore reproduces DefaultSuspectSubagentCap
+// exactly, and the defaults are unchanged by going through here.
+//
+// Both halves move because the flag exists for the case where the calibration is
+// simply wrong for someone's working pattern, and the two caps ask the same
+// question one level apart: a session that legitimately goes quiet long enough to
+// trip the lane cap is running subagents that legitimately outlive the span cap.
+// Raising only the lane cap would leave that operator flagged anyway, by the half
+// the flag never reached, which reads as the flag not working.
+//
+// The ratio is applied in float64 because the obvious integer form,
+// cap*DefaultSuspectSubagentCap/DefaultSuspectTrailingCap, multiplies two
+// nanosecond counts and overflows int64 for any cap past a few milliseconds.
+//
+// A cap of zero or less disables the check outright, both halves: the escape
+// hatch has to be total, since a half-disabled check still subtracts hours from
+// the totals.
+func (p SuspectPolicy) WithLaneCap(laneCap time.Duration) SuspectPolicy {
+	if laneCap <= 0 {
+		p.LaneCap, p.SubagentCap = 0, 0
+		return p
+	}
+	p.LaneCap = laneCap
+	p.SubagentCap = time.Duration(float64(laneCap) * suspectSubagentCapRatio)
+	return p
+}
+
 // SuspectReport is what a pass of FlagSuspectLanes flagged: how many lanes and
 // subagent spans, and how much lane wall-clock was marked as inference rather
 // than observation (the same figure Summarize reports as SuspectDuration).
