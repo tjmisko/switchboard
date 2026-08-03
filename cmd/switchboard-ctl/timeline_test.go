@@ -316,7 +316,7 @@ func TestRenderSwimlanesMarksSuspectLanes(t *testing.T) {
 			Start: atSec(0), End: atSec(20),
 			Intervals: []history.Interval{{Status: "working", Start: atSec(0), End: atSec(20)}},
 			Suspect:   true, SuspectSince: atSec(0),
-			SuspectReason: `unclosed lane stretched to now: final "working" interval 4h53m52s >= 4h0m0s cap`,
+			SuspectReason: `unclosed lane stretched to now: silent 4h53m52s >= 4h0m0s cap; last status "working"`,
 		}}
 		summary := history.Summary{From: atSec(0), To: atSec(20), Sessions: 1,
 			ByStatus: map[string]time.Duration{}, SuspectLanes: 1, SuspectDuration: 4*time.Hour + 53*time.Minute}
@@ -332,7 +332,7 @@ func TestRenderSwimlanesMarksSuspectLanes(t *testing.T) {
 		if !strings.Contains(out, "suspect (excluded from the totals above)") {
 			t.Errorf("no suspect section:\n%s", out)
 		}
-		if !strings.Contains(out, `final "working" interval 4h53m52s`) {
+		if !strings.Contains(out, `silent 4h53m52s >= 4h0m0s cap`) {
 			t.Errorf("the reason is not surfaced:\n%s", out)
 		}
 	})
