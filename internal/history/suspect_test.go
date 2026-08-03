@@ -58,7 +58,7 @@ func TestFlagSuspectLanesPredicate(t *testing.T) {
 			end:        at(15, 8, 42),
 			bound:      BoundNow,
 			want:       true,
-			wantReason: `4h40m33s since the last evidence, in a "working" interval, >= 4h0m0s cap`,
+			wantReason: `silent 4h40m33s >= 4h0m0s cap; last status "working"`,
 		},
 		{
 			// The ghost's real twin: the same session, resumed in a fresh pane, which
@@ -114,7 +114,7 @@ func TestFlagSuspectLanesPredicate(t *testing.T) {
 			end:        at(14, 0, 0),
 			bound:      BoundNow,
 			want:       true,
-			wantReason: `4h0m0s since the last evidence`,
+			wantReason: `silent 4h0m0s >= 4h0m0s cap`,
 		},
 		{
 			name: "should not flag a lane when its final interval falls one nanosecond short of the cap",
@@ -137,7 +137,7 @@ func TestFlagSuspectLanesPredicate(t *testing.T) {
 			end:        at(23, 59, 59),
 			bound:      BoundNow,
 			want:       true,
-			wantReason: "unknown-status (no transition was ever recorded)",
+			wantReason: "last status unknown (no transition was ever recorded)",
 		},
 		{
 			// A closed day: `end` is the next local midnight, not a wall clock. A
@@ -204,6 +204,55 @@ func TestFlagSuspectLanesPredicate(t *testing.T) {
 			}
 			if report.Lanes != 1 || report.Duration != row.end.Sub(last.Start) {
 				t.Errorf("report = %+v, want 1 lane and %v of excluded time", report, row.end.Sub(last.Start))
+			}
+		})
+	}
+}
+
+// GOLDEN STRING. The reason is an operator-facing sentence with a second
+// producer: switchboard-dashboard's Arachne compiler
+// (internal/arachne/compile.go) synthesizes unclosed lanes from its own inputs
+// and must keep emitting the identical prefix —
+//
+//	unclosed lane stretched to <bound>: silent <d> >= <cap> cap
+//
+// so that the same condition reads the same way whichever side produced it. Only
+// the daemon appends "; last status …"; Arachne's lane is a single synthesized
+// "working" interval, so there the clause would be a constant and it stops at
+// the prefix. Everything else in this file asserts on substrings, which is what
+// lets a rewording drift past unnoticed — this test is the one that fails, and
+// the divergence has to be argued here and in the other repo together.
+func TestSuspectReasonGoldenString(t *testing.T) {
+	rows := []struct {
+		name   string
+		events []Event
+		end    time.Time
+		want   string
+	}{
+		{
+			// The common case: the lane showed a color, so the clause quotes it.
+			name:   "should emit the exact reason when a lane ghosts after a transition",
+			events: ghostEvents(),
+			end:    at(15, 8, 42),
+			want:   `unclosed lane stretched to now: silent 4h40m33s >= 4h0m0s cap; last status "working"`,
+		},
+		{
+			// The lone session_start: no status to quote, so the clause carries its own
+			// explanation instead. This is the shape the old phrasing could not fit —
+			// the label used to land after an article it disagreed with.
+			name:   "should emit the exact reason when a lane ghosts before its first transition",
+			events: []Event{{Ts: at(14, 6, 1), Type: EventSessionStart, PID: 1236334, Agent: "claude"}},
+			end:    at(23, 59, 59),
+			want:   `unclosed lane stretched to now: silent 9h53m58s >= 4h0m0s cap; last status unknown (no transition was ever recorded)`,
+		},
+	}
+
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			lanes := BuildSwimlanes(row.events, row.end)
+			FlagSuspectLanes(lanes, DefaultSuspectPolicy(row.end, BoundNow))
+			if lanes[0].SuspectReason != row.want {
+				t.Errorf("reason =\n\t%q\nwant\n\t%q", lanes[0].SuspectReason, row.want)
 			}
 		})
 	}
