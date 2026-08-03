@@ -132,3 +132,47 @@ default cap now scales with what is being recorded: 2 GB with memory sampling on
 100 MB without, an explicitly configured `max_bytes` always winning either way.
 The effective cap is logged at startup beside `history: enabled=…`, because a
 multi-gigabyte disk commitment should never be made silently.
+
+### End-to-end verification against live sessions (2026-08-03)
+
+Run from a throwaway daemon (`-history-dir`/`-state`/`-socket` all pointed at a
+scratch tree) so it sampled the five real `claude` processes without disturbing
+the installed one. 52 samples per session.
+
+| project | agent peak | tree peak | spawned |
+|---|---|---|---|
+| sb-dash | 629.7 MB | 700.0 MB | 70.3 MB |
+| **arachne** | 653.9 MB | **4.1 GB** | **3.5 GB** |
+| sb-dash | 454.2 MB | 454.2 MB | 0 B |
+| sb-dash | 616.9 MB | 716.6 MB | 99.7 MB |
+| tjmisko | 312.5 MB | 312.5 MB | 0 B |
+
+Machine over the same window: 2.7 GB available at the low-water mark, PSI `some`
+peaking at 6.1%, 2.05 s cumulative stall.
+
+Three things this run established that no unit test could.
+
+**The agent/tree split is the whole point.** One session's *spawned* work peaked
+at 3.5 GB against its own 654 MB — a figure invisible in every pre-existing view,
+since subagents have no pids and nothing else attributes a child process back to
+the session that launched it. Four of the five sessions look unremarkable; the
+fifth is the one that would take the machine down.
+
+**Swap is not optional.** A session read 173 MB resident against 456 MB swapped.
+Measuring RSS — the fallback this work nearly took for the tree walk — would have
+shown that session *shrinking* as the kernel evicted it, i.e. reporting relief at
+exactly the moment pressure was worst. PSS + SwapPss reports 629 MB throughout.
+
+**The ghost-lane guard is untouched, measured rather than argued.** Folding the
+same history twice, once with the 250 memory samples and once with them stripped
+to 5 lines, produced byte-identical suspect verdicts. The envelope contains no
+memory field at all; `timeline --json` still differs run to run only on the
+unquantized `now` bound it already had.
+
+One defect surfaced here and nowhere else: the fold keyed strictly on
+`session_id` and dropped every sample without one, on the assumption that the
+sampler only fires for identified sessions. A session is identified by its first
+agent hook but sampled from process discovery, so all five sessions reported
+nothing — 100% loss, worst for the long-idle sessions whose memory matters most.
+Fixed by falling back to a `pid:<n>` key, which is what the rest of the contract
+already does and what the dashboard's `laneIdentity` independently produces.
