@@ -336,8 +336,29 @@ between adjacent samples — the actual microseconds the machine spent stalled i
 that interval. The raw `avg10` is kept alongside it for a human glance, but it is
 a decaying average that a 5-second sampler can alias straight past a spike, so
 anything deriving a number should use the delta. A kernel built without
-`CONFIG_PSI` omits these fields rather than reporting zero: absent means *not
-measured*, zero means *measured, and no stall*.
+`CONFIG_PSI` omits these fields entirely.
+
+That last distinction is inference rather than proof, and the limit is worth
+knowing: `omitempty` drops a genuine zero too, so *PSI absent* and *PSI present
+and exactly idle* produce identical bytes. Readers recover presence from a
+nonzero reading. The only case this misreads is a freshly booted machine with no
+stall recorded yet — where both answers mean the same thing, so nothing acts on
+the difference. Making it exact would take a pointer or an explicit presence
+flag on the event.
+
+The rule does hold where it can bite: a failed memory reading emits **no
+`memory_sample` at all** rather than a zero one, because a zero tree would read
+as a session that had freed everything.
+
+The series are **bounded at 720 points** each (`DefaultMemSeriesCap`), per
+session and for `pressure`. That is one hour at full 5-second resolution, and it
+strides a whole day down to a point every two minutes. Downsampling keeps the
+first, the last, and the two peak readings, so a hover can never report a
+high-water mark its own series does not reach. Two properties consumers can rely
+on: the scalars are computed from the **full** series before any thinning, so
+bounding never moves a reported number; and `psi_stall_us` is the delta across
+adjacent *emitted* points, so the deltas telescope and thinning redistributes
+stall time rather than losing it.
 
 ### Why memory is not in the timeline envelope
 

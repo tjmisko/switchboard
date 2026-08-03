@@ -123,9 +123,21 @@ type Event struct {
 	// because a 5-second sampler can alias straight past a spike that avg10 would
 	// have shown, while the counter cannot lose one.
 	//
-	// All three are omitempty, so a kernel without CONFIG_PSI writes no PSI
-	// fields at all rather than a row of zeroes: absent means "not measured" and
-	// zero means "measured, and idle", and OOM forensics turns on the difference.
+	// The emitter writes the PSI pair only when the kernel actually reported it,
+	// so a build without CONFIG_PSI leaves both off the line entirely.
+	//
+	// That is inference, not proof, and the limit is worth stating: omitempty
+	// also drops a genuine zero, so "PSI absent" and "PSI present and exactly
+	// idle" are the same bytes. Readers recover presence from a nonzero reading
+	// (see hasPSI in timeline.go). The only case that misreads is a machine
+	// freshly booted with no stall yet, which reports as unmeasured for as long
+	// as that stays true — and there the two answers carry the same meaning, so
+	// nothing downstream can act on the difference. Making it exact on the wire
+	// would take a pointer or an explicit presence flag.
+	//
+	// The absent-is-not-zero rule IS enforced where it can bite: a failed
+	// reading emits no memory_sample at all rather than a zero one, because a
+	// zero tree would read as a session that had freed everything.
 	SysAvailBytes     int64   `json:"sys_avail_bytes,omitempty"`
 	SysPsiSomeAvg10   float64 `json:"sys_psi_some_avg10,omitempty"`
 	SysPsiSomeTotalUs int64   `json:"sys_psi_some_total_us,omitempty"`
