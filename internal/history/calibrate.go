@@ -289,13 +289,12 @@ func (c *Calibration) collectLane(day string, lane Swimlane, seen corpusEvidence
 	if !lane.closedByBound || len(lane.Intervals) == 0 {
 		return
 	}
-	last := lane.Intervals[len(lane.Intervals)-1]
 	s := CalibrationSample{
 		Day:       day,
 		SessionID: lane.SessionID,
 		PID:       lane.PID,
 		Name:      calibrationLaneName(lane),
-		Dur:       lane.End.Sub(laneEvidence(lane, last)),
+		Dur:       lane.End.Sub(laneEvidence(lane)),
 	}
 	if seen.outlivedBound(lane) {
 		c.LaneLegit.Samples = append(c.LaneLegit.Samples, s)
