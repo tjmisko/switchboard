@@ -47,7 +47,7 @@ The daemon logs `history: enabled=… detail=… dir=…` at startup. Recording 
 
 | Tier | Records | Omits |
 |------|---------|-------|
-| `minimal` (default) | `ts`, `type`, `session_id`, `pid`, `agent`, `project` (abbrev), `from`/`to`, `rule`, `subagents`, `dur_prev_ms`, `agent_type`, `tool_use_id`, token counts, `model` | `cwd`, `pending`, `reason`, `description`, `label` |
+| `minimal` (default) | `ts`, `type`, `session_id`, `pid`, `agent`, `project` (abbrev), `from`/`to`, `rule`, `subagents`, `dur_prev_ms`, `agent_type`, `tool_use_id`, token counts, `model`, all `mem_*` and `sys_*` counters | `cwd`, `pending`, `reason`, `description`, `label` |
 | `full` | everything above **plus** `cwd`, `pending`, `reason`, `description`, `label` | — |
 
 The subagent `agent_type` (e.g. `Explore`), token counts, and the usage-sample
@@ -55,6 +55,17 @@ The subagent `agent_type` (e.g. `Explore`), token counts, and the usage-sample
 *which model*, not the content of your work; the subagent `description` (the task
 text) and the session `label` (the session's name, which can reveal what you are
 working on) are scrubbed.
+
+The memory counters are kept at the minimal tier on the same reasoning: they are
+byte and microsecond counts describing *how much*, and carry nothing about what
+the process was doing. This is a deliberate decision, not an inherited one —
+`Sink.scrub` is a blacklist that clears five named content fields, so any new
+numeric field survives the minimal tier by default, and the choice deserves to be
+written down rather than discovered. Note what is **not** recorded: no child
+process names, command lines, or per-process breakdown. The tree is reported as a
+single summed figure plus a process count, which keeps the whole feature inside
+the minimal tier — a per-child breakdown would be content-shaped and would need
+scrubbing.
 
 The minimal tier keeps everything a timeline needs while omitting what reveals
 *what* you are doing (the raw path, the tool a prompt was for). The project
@@ -89,6 +100,17 @@ minimal log still labels each event by project.
 
   // session-label payload (session_label):
   "label": "sb-invest",              // the session's current name (full tier — scrubbed at minimal)
+
+  // memory payload (memory_sample) — an instantaneous gauge, not an accrual:
+  "mem_agent_pss_bytes": 450639872,  // the agent process alone: Pss from smaps_rollup
+  "mem_agent_swap_bytes": 0,         //   …and its SwapPss
+  "mem_tree_pss_bytes": 658374656,   // the process tree (agent + all descendants)
+  "mem_tree_swap_bytes": 157335552,  //   …and its SwapPss
+  "mem_tree_procs": 7,               // how many processes that tree covered
+  // …plus the machine-wide pressure reading taken once for the whole tick:
+  "sys_avail_bytes": 2977546240,     // MemAvailable
+  "sys_psi_some_avg10": 0.0,         // /proc/pressure/memory `some` avg10
+  "sys_psi_some_total_us": 556011549,// `some` total — monotonic since boot
 
   // full tier only:
   "cwd": "/home/u/Projects/switchboard",
@@ -151,6 +173,7 @@ fix are unaffected.
 | `session_label` | the session's name/label changed | `session_id`, `label` (full tier) |
 | `focus` | window focus moved to/away from an agent session (Hyprland) | `session_id` = focused agent session, empty = focus left all agent windows |
 | `activity` | the user went idle / active (global, session-less; from an idle daemon) | `to` = `idle` \| `active` |
+| `memory_sample` | the session's resident cost, sampled every reconcile tick | `mem_agent_*`, `mem_tree_*`, `mem_tree_procs`, `sys_*` |
 
 Fanout (`subagent_*`) is derived by diffing the main transcript's `Task` tool_use
 ↔ `tool_result` pairing across reconcile ticks; no extra hook is required.
@@ -277,12 +300,82 @@ cost/token total — the self-computed dollar half of the dashboard's plan gauge
 the official utilization **%** comes from a separate cached file the dashboard
 reads, never from this producer.
 
+## Memory (`switchboard-ctl memory --json`)
+
+Memory is a **separate surface**, not part of the timeline envelope:
+
+```
+switchboard-ctl memory --json [--day D | --since D --until D] [--dir D]
+```
+
+```jsonc
+{
+  "window": "2026-08-03",
+  "sessions": [{
+    "session_id": "…", "pid": 4821, "agent": "claude", "project": "sb",
+    "peak_agent_bytes": 512180224, "avg_agent_bytes": 431521792,
+    "peak_tree_bytes": 812187648, "avg_tree_bytes": 602931200,
+    "mem": [{ "ts": "…", "agent": 450639872, "tree": 658374656 }]
+  }],
+  "pressure": [{ "ts": "…", "avail_bytes": 2977546240,
+                 "psi_avg10": 0.0, "psi_stall_us": 14320 }]
+}
+```
+
+Bytes throughout; `psi_stall_us` is microseconds. Averages are **time-weighted**
+over each sample's interval, not a mean of samples, so an unevenly-sampled
+session still reports a true average. `tree` minus `agent` is what the session's
+spawned work cost — subagents have no PIDs, so the process tree is the only unit
+that can capture them, and the two buckets are measured separately (never
+subtracted from a third) so shared pages are not double-counted.
+
+`pressure` is machine-wide and therefore **session-less and deduplicated**: the
+`sys_*` fields repeat on every session's sample within a tick, and fold to one
+point per tick. `psi_stall_us` is the **delta** of `sys_psi_some_total_us`
+between adjacent samples — the actual microseconds the machine spent stalled in
+that interval. The raw `avg10` is kept alongside it for a human glance, but it is
+a decaying average that a 5-second sampler can alias straight past a spike, so
+anything deriving a number should use the delta. A kernel built without
+`CONFIG_PSI` omits these fields rather than reporting zero: absent means *not
+measured*, zero means *measured, and no stall*.
+
+### Why memory is not in the timeline envelope
+
+Two deliberate separations, each protecting an existing guarantee:
+
+- **The ghost-lane guard.** `memory_sample` is excluded from lane routing
+  entirely, alongside `focus` and `activity`. A lane's `lastEvidence` is what
+  separates "a session still doing work" from "one nothing has been heard from",
+  and it is fed by events like `usage_sample` because token accrual *is* work. A
+  memory reading is not: the sample fires unconditionally every tick, and a hung,
+  idle, or Ctrl-Z'd process still holds its pages. Routing it onto a lane would
+  make every live pid look demonstrably alive forever and hollow out the
+  trailing-interval post-check that catches lost session deaths.
+- **The consumer's repaint guard.** The dashboard compares raw response text to
+  decide whether to re-render. A live sample series changes those bytes every
+  poll, so memory is served on its own endpoint at its own cadence and read
+  lazily when a tooltip is opened — the same treatment session summaries get.
+  `timeline --json` is byte-for-byte unaffected by this feature.
+
+### Volume
+
+A sample per live session per reconcile tick (~5 s) is roughly **12× the
+line volume of everything else the log records** — measured against the busiest
+recorded day, ~11.8 MB/day against the 1.0 MB it actually wrote. Enabling memory
+sampling therefore raises the default `max_bytes`, because the alternative is
+`pruneDir` silently trimming the store to about ten days: retention is
+size-bounded before it is age-bounded, so `retain_days` would quietly stop
+meaning anything. That corpus is load-bearing — the suspect caps were calibrated
+by replaying a month of it. An explicitly configured `max_bytes` still wins, and
+the effective cap is logged at startup so the disk commitment is never silent.
+
 ## Inspecting / managing it
 
 ```
 switchboard-ctl history path                       # print the directory
 switchboard-ctl history tail [--day D] [-n N]       # most recent events (--json for raw)
 switchboard-ctl history stat                        # event counts, size, date range
+switchboard-ctl memory [--day D] [--json]           # per-session memory + machine pressure
 switchboard-ctl history purge --before YYYY-MM-DD   # delete old day-files
 switchboard-ctl history purge --all                 # delete everything
 ```
