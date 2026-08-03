@@ -281,7 +281,15 @@ func renderCalibrationPopulation(w io.Writer, label string, p history.Population
 // still zero or is not.
 func renderCalibrationVerdict(w io.Writer, name string, v history.Verdict, lower, upper string) {
 	b := v.Band
-	if b.Separated() {
+	if !v.Decidable() {
+		// An absent population is not an overlap. Saying "no threshold separates
+		// these" over a corpus holding zero ghosts would read as the cap being
+		// refuted, when in fact nothing was weighed against it.
+		fmt.Fprintf(w, "  no band: %d %s sample(s), %d %s sample(s) — one of each is needed\n",
+			v.LowerCount, lower, v.UpperCount, upper)
+		fmt.Fprintf(w, "  %s %s: this corpus does not score it\n",
+			name, calibrationDur(v.Threshold))
+	} else if b.Separated() {
 		fmt.Fprintf(w, "  empty band %s … %s (%s wide)\n",
 			calibrationDur(b.Lo), calibrationDur(b.Hi), calibrationDur(b.Width()))
 		fmt.Fprintf(w, "  %s %s sits %.0f%% into it, %.2fx the %s maximum\n",

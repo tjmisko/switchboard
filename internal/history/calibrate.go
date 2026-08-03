@@ -146,7 +146,20 @@ type Verdict struct {
 	Band           Band
 	FalsePositives int // legitimate samples the threshold would flag
 	FalseNegatives int // pathological samples it would let through
+
+	// LowerCount and UpperCount size the two populations the band is drawn between.
+	// They are carried so a caller can tell "the corpus refutes this cap" from "the
+	// corpus has nothing to say about it": Min and Max both read 0s on an empty
+	// population, which makes Separated false and would otherwise render an absent
+	// population as a definitive overlap. See Decidable.
+	LowerCount int
+	UpperCount int
 }
+
+// Decidable reports whether both populations have samples. A band needs one of
+// each to exist at all; scoring a threshold against a corpus that contains no
+// ghosts (a single clean day, say) is not a negative result about the threshold.
+func (v Verdict) Decidable() bool { return v.LowerCount > 0 && v.UpperCount > 0 }
 
 // Calibration is one replay of a corpus: the two lane populations and the two
 // subagent-span populations that the caps sit between.
@@ -185,12 +198,14 @@ func verdict(legit, pathological Population, threshold time.Duration) Verdict {
 		Band:           Band{Lo: legit.Max().Dur, Hi: pathological.Min().Dur},
 		FalsePositives: legit.AtOrAbove(threshold),
 		FalseNegatives: pathological.Below(threshold),
+		LowerCount:     legit.Count(),
+		UpperCount:     pathological.Count(),
 	}
 }
 
-// Calibrate replays every complete day-file in dir through BuildSwimlanes at
-// `end` = that day's next local midnight — the same shape a closed-day
-// `switchboard-ctl timeline --day` query has — and sorts what comes out into the
+// Calibrate replays every complete local day in dir through BuildSwimlanes at
+// `end` = that day's next local midnight — byte-for-byte the read a closed-day
+// `switchboard-ctl timeline --day` query does — and sorts what comes out into the
 // four populations the two caps sit between.
 //
 // `now` is injected rather than read so a test can pin which days count as
@@ -205,14 +220,12 @@ func Calibrate(dir string, now time.Time) (Calibration, error) {
 	// lane needs to know what happened AFTER the day it lives in — a session cut at
 	// midnight is vouched for by the next morning's file, which the day's own replay
 	// cannot see.
-	byDay := make(map[string][]Event, len(days))
 	seen := newCorpusEvidence()
 	for _, day := range days {
 		evs, err := ReadDay(dir, day)
 		if err != nil {
 			return Calibration{}, err
 		}
-		byDay[day] = evs
 		seen.record(evs)
 	}
 
@@ -231,7 +244,24 @@ func Calibrate(dir string, now time.Time) (Calibration, error) {
 			continue
 		}
 		cal.Days = append(cal.Days, day)
-		lanes := BuildSwimlanes(byDay[day], end)
+		// Read the day as a WINDOW, not as a file. ReadRange pads which files it
+		// opens by a day on each side and then filters to [start, end), so an event
+		// that landed in a neighbouring file — near a midnight boundary, or in a
+		// legacy UTC-named file offset from its name — is still seen. Reading the
+		// single day-file instead silently drops those events, and a lane whose
+		// session_end lives one file over then replays as unclosed and falls into the
+		// ghost population. On the 34-day corpus that alone inflated the ghosts from
+		// 3 to 8 and pulled the ghost minimum from 8h57m58s down to 7h0m28s — i.e. it
+		// fabricated exactly the population this tool exists to measure.
+		//
+		// It is also the call `switchboard-ctl timeline --day` makes, which is the
+		// whole point: a calibration that reads differently from the shipped reader is
+		// calibrating something the reader will never see.
+		evs, err := ReadRange(dir, start, end)
+		if err != nil {
+			return Calibration{}, err
+		}
+		lanes := BuildSwimlanes(evs, end)
 		cal.Lanes += len(lanes)
 		for _, lane := range lanes {
 			cal.collectLane(day, lane, seen)
