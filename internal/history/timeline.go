@@ -289,7 +289,10 @@ func (b *laneBuilder) closeLabel(t time.Time) {
 //
 // A lane still open at the end of the stream is closed at `end` — pass `now` for
 // a live day so a running session's last interval extends to the present; pass
-// the window's upper bound otherwise. Events need not be pre-sorted.
+// the window's upper bound otherwise. `end` may lag the newest event (a caller
+// quantizing `now` for a stable render); a lane is still never closed before its
+// own last evidence, so End >= Start holds whatever bound is passed. Events need
+// not be pre-sorted.
 //
 // Beyond the status intervals it also derives, per lane: the session-name spans
 // (session_label), the launched-subagent spans (subagent_spawn↔stop by
@@ -304,6 +307,18 @@ func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
 	pidLane := map[int]string{} // pid → the lane key it currently feeds
 	var done []Swimlane
 	finish := func(b *laneBuilder, t time.Time) {
+		// A lane can never end before the last event it was seen to emit. Against an
+		// unquantized wall clock that is vacuous — `end` is past every event — but a
+		// caller may pass a COARSER bound: switchboard-ctl truncates `now` onto a
+		// grid so a polled render is byte-stable, and a session that started inside
+		// the current quantum would otherwise be closed before it opened, putting a
+		// lane with End < Start on the wire. Clamping here rather than in the caller
+		// keeps the invariant next to the routing rules that decide what counts as
+		// evidence in the first place — the global streams (focus, activity) never
+		// route to a lane, so they can never hold one open past its session.
+		if b.lastEvidence.After(t) {
+			t = b.lastEvidence
+		}
 		b.closeInterval(t)
 		b.closeLabel(t)
 		for id, sp := range b.openSubs {

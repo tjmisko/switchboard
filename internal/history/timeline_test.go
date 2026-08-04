@@ -57,6 +57,30 @@ func TestBuildSwimlanesClampsOpenLaneToEnd(t *testing.T) {
 	}
 }
 
+// A caller may quantize its bound (switchboard-ctl truncates `now` so a polled
+// render is byte-stable), which puts `end` BEHIND a session that started inside
+// the current quantum. The lane must still end at its last evidence rather than
+// before its own start — an End < Start lane is a negative-width bar to every
+// consumer downstream.
+func TestBuildSwimlanesNeverEndsBeforeLastEvidence(t *testing.T) {
+	evs := []Event{
+		{Ts: ts(40), Type: EventSessionStart, PID: 1, SessionID: "s1"},
+		{Ts: ts(45), Type: EventUsageSample, PID: 1, SessionID: "s1", Model: "claude-opus-4-8", TokIn: 100},
+		// no session_end — still running
+	}
+	lanes := BuildSwimlanes(evs, ts(30)) // bound quantized back behind the session
+	if len(lanes) != 1 {
+		t.Fatalf("got %d lanes, want 1", len(lanes))
+	}
+	l := lanes[0]
+	if l.End.Before(l.Start) {
+		t.Fatalf("lane closed before it opened: start %v, end %v", l.Start, l.End)
+	}
+	if !l.End.Equal(ts(45)) {
+		t.Errorf("lane end = %v, want the last evidence %v", l.End, ts(45))
+	}
+}
+
 func TestBuildSwimlanesSplitsOnPidReuse(t *testing.T) {
 	evs := []Event{
 		{Ts: ts(0), Type: EventSessionStart, PID: 1, SessionID: ""},
