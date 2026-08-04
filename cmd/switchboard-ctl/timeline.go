@@ -19,6 +19,28 @@ import (
 // ~5-hour limit window) the --plan-window flag totals cost/tokens over.
 const planWindowHours = 5
 
+// nowQuantum is the grid a live render's `now` is truncated onto.
+//
+// `now` reaches the payload in three places — the clamp on a live day's open end,
+// the rolling plan window, and an open-ended --since range — and BuildSwimlanes
+// closes every running session's last interval at it. Read raw, that put a
+// nanosecond-precision `end` on every live lane, so two back-to-back renders of
+// an unchanged day differed on exactly those lines and nothing else. The
+// dashboard polls /api/timeline every 3s and repaints only when the bytes change,
+// so that churn cost it a full re-parse and re-render on every poll of every live
+// day, forever, for no new information.
+//
+// Truncating — never rounding up, which would extend a lane past the present and
+// inflate the attention totals — onto a grid an order of magnitude coarser than
+// the poll leaves nine polls in ten byte-identical. The staleness it buys that
+// with is invisible at the resolution anything renders: swimlane columns are tens
+// of minutes wide and every clock time in the output is HH:MM.
+const nowQuantum = 30 * time.Second
+
+// timeNow is the wall clock, indirected so a test can pin the instant a render is
+// built from. Production never reassigns it.
+var timeNow = time.Now
+
 // cmdTimeline renders the activity log as a per-session swimlane view plus the
 // summary stats (per-status totals and the three "hours of agent attention"
 // figures). It reads the on-disk log directly — no daemon — and emits text by
@@ -43,10 +65,13 @@ func cmdTimeline(args []string) {
 		"flag a lane with no session_end silent this long; the unpaired-subagent cap scales with it (0 disables both)")
 	_ = fs.Parse(args)
 
-	from, to, label := resolveWindow(*day, *since, *until)
+	// One quantized clock read for the whole render. Everything that needs the
+	// present derives from this single instant, so a poll that finds no new events
+	// reproduces the previous render byte for byte (see nowQuantum).
+	now := timeNow().Truncate(nowQuantum)
+	from, to, label := resolveWindow(now, *day, *since, *until)
 	// Clamp the open-interval end to now, so a running session today extends to
 	// the present rather than the (future) end-of-day bound.
-	now := time.Now()
 	end := to
 	if end.After(now) {
 		end = now
@@ -166,7 +191,12 @@ func flagSuspectLanes(lanes []history.Swimlane, end time.Time, liveBound bool, l
 // partitions its files), so a date here means the day you lived, not a UTC day
 // that rolls mid-evening. Precedence: an explicit --since/--until range, else
 // --day, else today. `to` is exclusive (start of the day after the last).
-func resolveWindow(day, since, until string) (from, to time.Time, label string) {
+//
+// `now` is the caller's single quantized read of the present, used for the two
+// windows that reach it: the open-ended --since range, whose `to` IS the present,
+// and today's date. Taking it as an argument rather than reading the clock again
+// keeps every bound in one render on the same instant.
+func resolveWindow(now time.Time, day, since, until string) (from, to time.Time, label string) {
 	parse := func(s string) time.Time {
 		t, err := time.ParseInLocation("2006-01-02", s, time.Local)
 		if err != nil {
@@ -180,7 +210,7 @@ func resolveWindow(day, since, until string) (from, to time.Time, label string) 
 		if since == "" {
 			from = time.Time{}
 		}
-		end := time.Now()
+		end := now
 		if until != "" {
 			end = parse(until).AddDate(0, 0, 1)
 		}
@@ -189,7 +219,6 @@ func resolveWindow(day, since, until string) (from, to time.Time, label string) 
 		d := parse(day)
 		return d, d.AddDate(0, 0, 1), day
 	default:
-		now := time.Now()
 		today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 		return today, today.AddDate(0, 0, 1), today.Format("2006-01-02")
 	}
