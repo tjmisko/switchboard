@@ -58,7 +58,19 @@ func main() {
 	histCfg.ResolveProject = func(cwd string) string { return projectname.CanonicalForDir(nameCfg, cwd) }
 	sink := history.NewSink(histCfg)
 	defer sink.Close()
-	log.Printf("history: enabled=%t detail=%s dir=%s", sink.Enabled(), histCfg.Detail, sink.Dir())
+	// max_bytes is logged because memory sampling raises its default into the
+	// gigabytes: a disk commitment that large should never be made silently.
+	log.Printf("history: enabled=%t detail=%s memory=%t retain_days=%d max_bytes=%s dir=%s",
+		sink.Enabled(), histCfg.Detail, histCfg.Memory, histCfg.RetainDays,
+		history.HumanBytes(histCfg.MaxBytes), sink.Dir())
+
+	// Per-session memory sampling follows the history opt-in: the durable series
+	// is the point of the reading, so a user who has not opted in pays none of
+	// its /proc cost.
+	var memSampler *memorySampler
+	if histCfg.Enabled && histCfg.Memory {
+		memSampler = newMemorySampler()
+	}
 
 	// One fanout Observer is the single source of truth for subagent detection,
 	// shared by the reconcile loop and the SubagentStart/Stop hook handler (one
@@ -130,7 +142,7 @@ func main() {
 		}
 	}()
 	go runWMLoop(ctx, store, resolver, manager, sink, procSrc, scanner.Forget)
-	go runReconciler(ctx, store, resolver, manager, stack, *reconcileInterval, tun, sink, fanoutObs, scanner.Forget)
+	go runReconciler(ctx, store, resolver, manager, stack, *reconcileInterval, tun, sink, fanoutObs, memSampler, scanner.Forget)
 
 	server := rpc.New(store, *socketPath, term, manager)
 	server.SetTuning(tun)
@@ -332,10 +344,10 @@ func handleWMEvent(ctx context.Context, store *state.Store, resolver *mapping.Re
 // Catches anything missed by event-driven updates (e.g. a session whose
 // mapping was incomplete when first created, the initial focus state, or a
 // hyprctl race).
-func runReconciler(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, interval time.Duration, tun statustune.Tuning, sink *history.Sink, obs *fanout.Observer, forget func(int)) {
+func runReconciler(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, interval time.Duration, tun statustune.Tuning, sink *history.Sink, obs *fanout.Observer, mem *memorySampler, forget func(int)) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
-	rstate := newReconcileState(obs)
+	rstate := newReconcileState(obs, mem)
 	reconcileOnce(ctx, store, resolver, manager, stack, tun, sink, rstate, forget)
 	for {
 		select {
@@ -354,6 +366,11 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 	store.SetCapabilities(stack.Capabilities())
 	active, _ := manager.ActiveWindow(ctx)
 	now := time.Now()
+	// Memory is sampled BEFORE the lock is taken, against the pid set of the last
+	// published snapshot: the reads are milliseconds and Store.Apply blocks every
+	// RPC reader and every hook for as long as it holds. Only the assignment and
+	// the sink.Record below run under the lock. See memorySampler.
+	mem := rstate.sampleMemory(store)
 	store.Apply(func(m map[int]*state.Session) {
 		// Close the lanes of any session whose process is gone, BEFORE the per-tick
 		// work below — a dead session earns none of it.
@@ -376,6 +393,19 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 						SessionID: enrichmentID(sess), PID: sess.PID, Agent: sess.Agent, CWD: sess.CWD})
 				}
 				sess.Suspended = susp
+			}
+			// The session's resident cost, read outside this lock at the top of the
+			// tick. The live fields take whatever the tick has, including a repeated
+			// last-known figure after a failed read (better a stale tooltip than one
+			// that flaps to zero); the log takes only a fresh reading, so a process
+			// that is gone yields NO sample rather than a zero one — a zero would
+			// read as "freed all its memory" and corrupt the peak and average.
+			if reading, ok := mem.Sessions[sess.PID]; ok {
+				sess.MemAgentBytes = reading.Agent.Pss
+				sess.MemTreeBytes = reading.Tree.Pss
+			}
+			if ev, ok := mem.event(sess, now); ok {
+				sink.Record(ev)
 			}
 			// Recompute the S dimension — in-flight subagent Tasks — from the main
 			// transcript so the self-heals (and the wire/tooltip) see current

@@ -74,7 +74,7 @@ func TestObserveUsageEmitsOneSamplePerModel(t *testing.T) {
 
 	histDir := t.TempDir()
 	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
-	rs := newReconcileState(fanout.NewObserver(t.TempDir()))
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
 	sess := &state.Session{PID: 7, Agent: "claude", CWD: "/home/u/proj",
 		Claude: &state.AgentInfo{SessionID: "s7", Transcript: tpath}}
 
@@ -114,7 +114,7 @@ func TestObserveLabelEmitsOnChangeOnly(t *testing.T) {
 
 	histDir := t.TempDir()
 	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
-	rs := newReconcileState(fanout.NewObserver(t.TempDir()))
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
 	// pid 424242 has no ~/.claude/sessions file, so label.RawName falls to the
 	// wezterm window title — the name we control here.
 	sess := &state.Session{PID: 424242, Agent: "claude", CWD: "/home/u/proj",
@@ -186,7 +186,7 @@ func TestObserveUsagePrimesThenSamples(t *testing.T) {
 
 	histDir := t.TempDir()
 	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
-	rs := newReconcileState(fanout.NewObserver(t.TempDir()))
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
 	sess := &state.Session{PID: 1, Agent: "claude", CWD: "/home/u/proj",
 		Claude: &state.AgentInfo{SessionID: "s1", Transcript: tpath}}
 

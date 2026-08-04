@@ -373,7 +373,21 @@ func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
 		// replayed separately (buildFocusSpans) and must never take part in lane
 		// routing — a focus event naming another session would otherwise read as
 		// "a different session took this pid" and close a live lane early.
-		if ev.Type == EventFocus || ev.Type == EventActivity {
+		//
+		// memory_sample joins them, for a different reason that lands in the same
+		// place: it is per-session, but it is not EVIDENCE. observe() below stamps
+		// lastEvidence for everything routed to a lane, and that field is what
+		// separates "a session still doing work" from "one nothing has been heard
+		// from" (see laneEvidence). Token accrual earns it; a memory reading does
+		// not — the sample fires unconditionally every tick, and a hung, idle, or
+		// Ctrl-Z'd process still holds its pages, so routing it would make every
+		// live pid look demonstrably alive forever and hollow out the
+		// trailing-interval post-check that catches lost session deaths. Skipping
+		// the routing entirely also keeps a sample from ever closing a prior
+		// session's lane on a reused pid, and from CREATING a lane the way
+		// usage_sample does below. Memory is folded in its own pass instead
+		// (BuildMemorySessions), keyed by session id.
+		if ev.Type == EventFocus || ev.Type == EventActivity || ev.Type == EventMemorySample {
 			continue
 		}
 		key := laneKey(ev)
@@ -605,6 +619,401 @@ func clampFocus(spans []FocusSpan, lo, hi time.Time) []FocusSpan {
 		if end.After(start) {
 			out = append(out, FocusSpan{Start: start, End: end})
 		}
+	}
+	return out
+}
+
+// Memory (v3) is a SURFACE OF ITS OWN, not part of the timeline envelope, and
+// everything below is a second pass over the same event stream — deliberately
+// not a case in BuildSwimlanes' fold. Two separations, each protecting an
+// existing guarantee (docs/history-schema.md, "Why memory is not in the timeline
+// envelope"):
+//
+//   - the ghost-lane guard: memory_sample never routes to a lane, so it can
+//     never stamp lastEvidence, never close a prior session's lane on a reused
+//     pid, and never create one. See the skip in BuildSwimlanes' fold loop.
+//   - the consumer's repaint guard: the dashboard compares raw response bytes to
+//     decide whether to re-render, and a live sample series changes those bytes
+//     every poll. Memory is therefore served on its own endpoint at its own
+//     cadence, and `timeline --json` is byte-for-byte unaffected by this feature.
+
+// DefaultMemSeriesCap bounds how many points one session's series (and the
+// pressure series) carries. This surface is read lazily when a tooltip is opened,
+// not polled every few seconds, so it does not need aggressive downsampling —
+// but a day of 5-second ticks is ~17k points per session and an unbounded series
+// would put megabytes behind a hover. 720 is one hour at full resolution, and
+// strides a full day down to a point every two minutes: still far more shape than
+// a sparkline can draw. The scalars are computed from the FULL series before any
+// downsampling, so bounding the series never moves a reported number.
+const DefaultMemSeriesCap = 720
+
+// MemorySample is one reading of a session's memory, in bytes. Agent is the
+// agent process alone; Tree is it plus every descendant — the only unit that can
+// capture subagents, which have no pids of their own. Both are Pss + SwapPss: a
+// page pushed out to swap is still memory the session is answerable for, and
+// leaving it out is exactly what loses the evidence in an OOM post-mortem.
+//
+// `Tree - Agent` is what the session's spawned work cost, DERIVED by the
+// consumer. The two buckets are measured separately and never subtracted from a
+// third, so pages a forked child shares with its parent are not double-counted.
+type MemorySample struct {
+	Ts    time.Time `json:"ts"`
+	Agent int64     `json:"agent"`
+	Tree  int64     `json:"tree"`
+}
+
+// MemorySession is one session's memory record: its identity, the scalars a
+// hover shows, and the series behind them. Bytes throughout.
+//
+// The averages are TIME-WEIGHTED over each sample's interval, not a mean of
+// samples, so an unevenly sampled session still reports a true average — a burst
+// of closely spaced readings must not outweigh a level that actually held for an
+// hour.
+type MemorySession struct {
+	SessionID string `json:"session_id"`
+	PID       int    `json:"pid,omitempty"`
+	Agent     string `json:"agent,omitempty"`
+	Project   string `json:"project,omitempty"`
+
+	PeakAgentBytes int64 `json:"peak_agent_bytes"`
+	AvgAgentBytes  int64 `json:"avg_agent_bytes"`
+	PeakTreeBytes  int64 `json:"peak_tree_bytes"`
+	AvgTreeBytes   int64 `json:"avg_tree_bytes"`
+
+	Mem []MemorySample `json:"mem,omitempty"`
+}
+
+// PressurePoint is one machine-wide memory-pressure reading.
+//
+// All three figures are pointers so an unmeasured one stays ABSENT rather than
+// being coerced to zero: a kernel built without CONFIG_PSI reports no pressure at
+// all, and "not measured" and "measured, and no stall" are the two answers OOM
+// forensics most needs to tell apart.
+//
+// PSIStallUs is the DELTA of sys_psi_some_total_us since the previous emitted
+// point — the microseconds the machine actually spent stalled in that interval —
+// not the raw monotonic since-boot counter. The decaying avg10 rides alongside
+// for a human glance, but a 5-second sampler can alias straight past a spike it
+// would have shown, while the counter cannot lose one, so anything deriving a
+// number should use the delta.
+type PressurePoint struct {
+	Ts         time.Time `json:"ts"`
+	AvailBytes *int64    `json:"avail_bytes,omitempty"`
+	PSIAvg10   *float64  `json:"psi_avg10,omitempty"`
+	PSIStallUs *int64    `json:"psi_stall_us,omitempty"`
+}
+
+// BuildMemorySessions folds the memory_sample stream into per-session records,
+// keyed by session id — mirroring buildFocusSpans, and for the same reason: this
+// runs beside the lane fold, never inside it.
+//
+// `lanes` is the output of BuildSwimlanes AFTER FlagSuspectLanes has run, and is
+// used only to clip. A flagged lane has no evidence past its SuspectSince, so the
+// timeline stops crediting it there; a hover that kept drawing the session's
+// memory series past that instant would contradict the bar it annotates. And a
+// suspect lane is precisely where samples DO keep arriving after the evidence
+// stops — a hung or Ctrl-Z'd process still holds its pages — so the clip is
+// load-bearing rather than theoretical. Pass nil to skip clipping entirely.
+//
+// A session with no samples in range (or none left after clipping) is omitted
+// rather than emitted as a row of zeroes: the consumer keys these by session id
+// and an absent entry already means "nothing known".
+// memoryKey attributes a sample to a session: its id when it has one, else
+// "pid:<pid>".
+//
+// The fallback is load-bearing, not defensive. A session's id arrives from its
+// first agent hook, and the sampler starts the moment the process is discovered,
+// so every session emits samples before it is identified — a session discovered
+// at daemon start and then left idle can go a long time carrying no id at all.
+// Keying on the id alone silently discarded all of it, which is precisely
+// backwards: an idle session sitting on a gigabyte is the reading most worth
+// keeping. Measured on a live machine, that dropped 100% of samples.
+//
+// pid is not a session identity — one pid hosts a sequence of sessions, so a
+// /clear mints a new id on the same process — and the "pid:" prefix keeps the
+// two namespaces from colliding. What lands in a pid bucket is only ever the
+// pre-identification stretch, which does belong to whatever session was running
+// then. The same shape as the rest of the contract: group by session_id when
+// present, fall back to pid, which is also what the dashboard's laneIdentity
+// produces for an unidentified lane, so the two still join.
+func memoryKey(ev Event) string {
+	if ev.SessionID != "" {
+		return ev.SessionID
+	}
+	return "pid:" + strconv.Itoa(ev.PID)
+}
+
+func BuildMemorySessions(events []Event, lanes []Swimlane) []MemorySession {
+	bySession := map[string][]Event{}
+	for _, ev := range events {
+		if ev.Type != EventMemorySample {
+			continue
+		}
+		bySession[memoryKey(ev)] = append(bySession[memoryKey(ev)], ev)
+	}
+	tails := suspectTails(lanes)
+
+	out := make([]MemorySession, 0, len(bySession))
+	for id, evs := range bySession {
+		sort.SliceStable(evs, func(i, j int) bool { return evs[i].Ts.Before(evs[j].Ts) })
+		evs = dropInSpans(evs, tails[id])
+		if len(evs) == 0 {
+			continue
+		}
+		rec := MemorySession{SessionID: id, PID: evs[0].PID}
+		for _, ev := range evs {
+			if ev.Agent != "" {
+				rec.Agent = ev.Agent
+			}
+			if ev.Project != "" {
+				rec.Project = ev.Project
+			}
+		}
+		pts := make([]MemorySample, len(evs))
+		for i, ev := range evs {
+			pts[i] = MemorySample{Ts: ev.Ts, Agent: memAgentBytes(ev), Tree: memTreeBytes(ev)}
+		}
+		rec.PeakAgentBytes, rec.PeakTreeBytes = memPeaks(pts)
+		rec.AvgAgentBytes, rec.AvgTreeBytes = memTimeWeightedAvg(pts)
+		rec.Mem = downsampleMem(pts, DefaultMemSeriesCap)
+		out = append(out, rec)
+	}
+	// Deterministic across map iteration: first sample, then id.
+	sort.SliceStable(out, func(i, j int) bool {
+		if !out[i].Mem[0].Ts.Equal(out[j].Mem[0].Ts) {
+			return out[i].Mem[0].Ts.Before(out[j].Mem[0].Ts)
+		}
+		return out[i].SessionID < out[j].SessionID
+	})
+	return out
+}
+
+// memAgentBytes / memTreeBytes are the resident cost of one reading: resident
+// pages plus what has been pushed out to swap.
+func memAgentBytes(ev Event) int64 { return ev.MemAgentPssBytes + ev.MemAgentSwapBytes }
+func memTreeBytes(ev Event) int64  { return ev.MemTreePssBytes + ev.MemTreeSwapBytes }
+
+// suspectTails collects, per session, the stretches of a flagged lane whose
+// length is inference rather than observation: [SuspectSince, End]. Keyed by
+// lane rather than by a single per-session instant because one session id can own
+// two lanes (a second run after a session_end), and clipping the second run at
+// the first one's bound would delete real data.
+func suspectTails(lanes []Swimlane) map[string][]span {
+	out := map[string][]span{}
+	for _, lane := range lanes {
+		if lane.SessionID == "" || !lane.Suspect || lane.SuspectSince.IsZero() {
+			continue
+		}
+		out[lane.SessionID] = append(out[lane.SessionID], span{lane.SuspectSince, lane.End})
+	}
+	return out
+}
+
+// dropInSpans removes events landing inside any of the spans. Both ends are
+// inclusive: a sample AT SuspectSince is already past the last thing observed.
+func dropInSpans(evs []Event, drop []span) []Event {
+	if len(drop) == 0 {
+		return evs
+	}
+	out := make([]Event, 0, len(evs))
+	for _, ev := range evs {
+		inside := false
+		for _, d := range drop {
+			if !ev.Ts.Before(d.start) && !ev.Ts.After(d.end) {
+				inside = true
+				break
+			}
+		}
+		if !inside {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+// memPeaks is the high-water mark of each bucket over the whole (unclipped by
+// downsampling) series.
+func memPeaks(pts []MemorySample) (agent, tree int64) {
+	for _, p := range pts {
+		if p.Agent > agent {
+			agent = p.Agent
+		}
+		if p.Tree > tree {
+			tree = p.Tree
+		}
+	}
+	return agent, tree
+}
+
+// memTimeWeightedAvg averages each bucket by how long its reading stood, which is
+// what an instantaneous gauge sampled on a timer means: a value holds until the
+// next one replaces it. A plain mean would let a burst of closely spaced readings
+// outweigh a level that actually held for an hour.
+//
+// The final reading closes the series and so carries no weight of its own; a lone
+// reading is its own average. Arithmetic goes through float64 because bytes times
+// nanoseconds overflows int64 within seconds.
+func memTimeWeightedAvg(pts []MemorySample) (agent, tree int64) {
+	if len(pts) == 0 {
+		return 0, 0
+	}
+	last := pts[len(pts)-1]
+	if len(pts) == 1 {
+		return last.Agent, last.Tree
+	}
+	var wAgent, wTree, total float64
+	for i := 0; i+1 < len(pts); i++ {
+		dt := pts[i+1].Ts.Sub(pts[i].Ts).Seconds()
+		if dt <= 0 {
+			continue
+		}
+		wAgent += float64(pts[i].Agent) * dt
+		wTree += float64(pts[i].Tree) * dt
+		total += dt
+	}
+	if total <= 0 {
+		return last.Agent, last.Tree // every reading landed on one instant
+	}
+	return int64(wAgent / total), int64(wTree / total)
+}
+
+// downsampleMem bounds a series to roughly `limit` points by keeping every
+// stride'th one, always keeping the first, the last, and the two peaks — so the
+// high-water mark the scalars report is still visible in the series a consumer
+// draws. The result is at most limit+3 points and stays in time order. A limit of
+// 0 (or a series already under it) returns the input untouched.
+func downsampleMem(pts []MemorySample, limit int) []MemorySample {
+	if limit <= 0 || len(pts) <= limit {
+		return pts
+	}
+	stride := (len(pts) + limit - 1) / limit
+	keep := make([]bool, len(pts))
+	for i := 0; i < len(pts); i += stride {
+		keep[i] = true
+	}
+	keep[0] = true
+	keep[len(pts)-1] = true
+	peakAgent, peakTree := memPeaks(pts)
+	seenAgent, seenTree := false, false
+	for i, p := range pts {
+		if !seenAgent && p.Agent == peakAgent {
+			keep[i], seenAgent = true, true
+		}
+		if !seenTree && p.Tree == peakTree {
+			keep[i], seenTree = true, true
+		}
+	}
+	out := make([]MemorySample, 0, limit+3)
+	for i, p := range pts {
+		if keep[i] {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// BuildPressure folds the machine-wide pressure readings out of the memory_sample
+// stream. It is SESSION-LESS: the sys_* fields are read once per reconcile tick
+// and stamped onto every session's sample in that tick, so the raw stream carries
+// one copy per live session and folds to one point per tick.
+//
+// A tick is identified by a reading being byte-identical to the one before it, or
+// landing on the same instant — either is the same observation seen twice, and
+// collapsing two genuinely distinct ticks that happened to read identically loses
+// nothing, since the value and the delta are the same either way.
+//
+// The stall delta is taken over adjacent EMITTED points, after downsampling, so
+// the deltas telescope and bounding the series redistributes stall time rather
+// than losing it. The first point has no predecessor inside the window and
+// reports 0 — no time has elapsed within the window before it.
+func BuildPressure(events []Event) []PressurePoint {
+	var reads []Event
+	for _, ev := range events {
+		if ev.Type != EventMemorySample || !hasPressure(ev) {
+			continue
+		}
+		reads = append(reads, ev)
+	}
+	sort.SliceStable(reads, func(i, j int) bool { return reads[i].Ts.Before(reads[j].Ts) })
+
+	ticks := make([]Event, 0, len(reads))
+	for _, ev := range reads {
+		if n := len(ticks); n > 0 && sameTick(ticks[n-1], ev) {
+			continue
+		}
+		ticks = append(ticks, ev)
+	}
+	ticks = downsampleTicks(ticks, DefaultMemSeriesCap)
+
+	out := make([]PressurePoint, 0, len(ticks))
+	var prevTotal int64
+	havePrev := false
+	for _, ev := range ticks {
+		p := PressurePoint{Ts: ev.Ts}
+		if ev.SysAvailBytes != 0 {
+			avail := ev.SysAvailBytes
+			p.AvailBytes = &avail
+		}
+		if hasPSI(ev) {
+			avg := ev.SysPsiSomeAvg10
+			p.PSIAvg10 = &avg
+			var stall int64
+			// Clamped at 0: the counter is monotonic since boot, so a decrease can
+			// only mean a reboot inside the window, and a negative stall is a lie
+			// either way.
+			if havePrev && ev.SysPsiSomeTotalUs > prevTotal {
+				stall = ev.SysPsiSomeTotalUs - prevTotal
+			}
+			p.PSIStallUs = &stall
+			prevTotal, havePrev = ev.SysPsiSomeTotalUs, true
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// hasPressure reports whether a sample carries any machine-wide reading at all.
+// A sample without one contributes no pressure point rather than a point of nils.
+func hasPressure(ev Event) bool { return ev.SysAvailBytes != 0 || hasPSI(ev) }
+
+// hasPSI reports whether a sample carries a PSI reading.
+//
+// The two counters are the only signal available: every Event field is omitempty,
+// so a kernel with CONFIG_PSI that has genuinely never stalled since boot writes
+// the same bytes as one built without it. That collision is unreachable in
+// practice — sys_psi_some_total_us is a since-boot counter that any real machine
+// has moved off zero — and reading it as "not measured" is the conservative half
+// of the trade: it omits a figure rather than inventing one.
+func hasPSI(ev Event) bool { return ev.SysPsiSomeTotalUs != 0 || ev.SysPsiSomeAvg10 != 0 }
+
+// sameTick reports whether b is the same machine-wide observation as a, seen on
+// another session's sample.
+func sameTick(a, b Event) bool {
+	if a.Ts.Equal(b.Ts) {
+		return true
+	}
+	return a.SysAvailBytes == b.SysAvailBytes &&
+		a.SysPsiSomeAvg10 == b.SysPsiSomeAvg10 &&
+		a.SysPsiSomeTotalUs == b.SysPsiSomeTotalUs
+}
+
+// downsampleTicks bounds the pressure series the same way downsampleMem bounds a
+// session's, keeping the first and last. There is no peak to preserve here: the
+// figure a consumer derives is the stall delta, which telescopes across whatever
+// points survive.
+func downsampleTicks(ticks []Event, limit int) []Event {
+	if limit <= 0 || len(ticks) <= limit {
+		return ticks
+	}
+	stride := (len(ticks) + limit - 1) / limit
+	last := len(ticks) - 1
+	out := make([]Event, 0, limit+1)
+	kept := -1
+	for i := 0; i < len(ticks); i += stride {
+		out, kept = append(out, ticks[i]), i
+	}
+	if kept != last {
+		out = append(out, ticks[last])
 	}
 	return out
 }

@@ -61,6 +61,12 @@ func main() {
 		cmdTimeline(args[1:])
 		return
 	}
+	// memory is the second file-only derivation off the same log (its own surface,
+	// not a section of the timeline envelope), so it dials nothing either.
+	if args[0] == "memory" {
+		cmdMemory(args[1:])
+		return
+	}
 
 	c, err := rpc.Dial(*socketPath)
 	if err != nil {
@@ -552,6 +558,9 @@ commands:
   timeline [flags]        render the activity log as per-session swimlanes plus
                             attention stats, e.g. timeline --day 2026-06-26.
                             --json emits the structured data; needs no daemon.
+  memory [flags]          per-session memory (agent vs whole process tree) plus
+                            machine-wide pressure, e.g. memory --day 2026-08-03.
+                            Its own surface, not part of timeline; needs no daemon.
 
 flags:
   --socket <path>         daemon socket (default: $XDG_RUNTIME_DIR/switchboard.sock)
