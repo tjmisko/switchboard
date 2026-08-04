@@ -113,6 +113,43 @@ func DefaultSuspectPolicy(end time.Time, bound EndBound) SuspectPolicy {
 	}
 }
 
+// suspectSubagentCapRatio is how much lower the subagent cap sits than the lane
+// cap. It is DERIVED from the two calibrated constants rather than written as a
+// literal 0.5, so the pair cannot drift apart: whatever a re-calibration does to
+// either constant, the scaled policy keeps reproducing the same relationship the
+// calibration comments above argue for.
+const suspectSubagentCapRatio = float64(DefaultSuspectSubagentCap) /
+	float64(DefaultSuspectTrailingCap)
+
+// WithLaneCap rescales BOTH halves of the check around an operator-supplied lane
+// cap, preserving the ratio the defaults encode. Passing
+// DefaultSuspectTrailingCap therefore reproduces DefaultSuspectSubagentCap
+// exactly, and the defaults are unchanged by going through here.
+//
+// Both halves move because the flag exists for the case where the calibration is
+// simply wrong for someone's working pattern, and the two caps ask the same
+// question one level apart: a session that legitimately goes quiet long enough to
+// trip the lane cap is running subagents that legitimately outlive the span cap.
+// Raising only the lane cap would leave that operator flagged anyway, by the half
+// the flag never reached, which reads as the flag not working.
+//
+// The ratio is applied in float64 because the obvious integer form,
+// cap*DefaultSuspectSubagentCap/DefaultSuspectTrailingCap, multiplies two
+// nanosecond counts and overflows int64 for any cap past a few milliseconds.
+//
+// A cap of zero or less disables the check outright, both halves: the escape
+// hatch has to be total, since a half-disabled check still subtracts hours from
+// the totals.
+func (p SuspectPolicy) WithLaneCap(laneCap time.Duration) SuspectPolicy {
+	if laneCap <= 0 {
+		p.LaneCap, p.SubagentCap = 0, 0
+		return p
+	}
+	p.LaneCap = laneCap
+	p.SubagentCap = time.Duration(float64(laneCap) * suspectSubagentCapRatio)
+	return p
+}
+
 // SuspectReport is what a pass of FlagSuspectLanes flagged: how many lanes and
 // subagent spans, and how much lane wall-clock was marked as inference rather
 // than observation (the same figure Summarize reports as SuspectDuration).
@@ -174,15 +211,24 @@ func FlagSuspectLanes(lanes []Swimlane, p SuspectPolicy) SuspectReport {
 			// again — but a live session reporting token usage inside a long-running
 			// status interval is observed well after that interval opened, and
 			// measuring from the interval start would read it as hours of silence.
-			since := laneEvidence(*lane, last)
+			since := laneEvidence(*lane)
 			if d := lane.End.Sub(since); d >= p.LaneCap {
 				lane.Suspect = true
 				// SuspectSince is the last instant the session was actually observed:
 				// everything from here to lane.End is the stretch. Start/End/Intervals are
 				// left intact so a consumer can still compute either number.
 				lane.SuspectSince = since
-				lane.SuspectReason = fmt.Sprintf("unclosed lane stretched to %s: %s since the last evidence, in a %s interval, >= %s cap",
-					p.Bound, roundSec(d), statusLabel(last.Status), roundSec(p.LaneCap))
+				// The prefix through the cap comparison is a cross-repo contract: the
+				// dashboard's Arachne compiler synthesizes unclosed lanes of its own and
+				// emits it verbatim, so one condition does not read as two dialects. Only
+				// the trailing status clause is ours — Arachne's lane is a single
+				// synthesized "working" interval, where the clause would be a constant.
+				// The measurement leads because it is what an operator is checking, and
+				// trailing the status gives statusLabel's parenthetical a noun slot to sit
+				// in ("last status unknown (…)") rather than an article it disagrees with
+				// ("a unknown-status interval").
+				lane.SuspectReason = fmt.Sprintf("unclosed lane stretched to %s: silent %s >= %s cap; last status %s",
+					p.Bound, roundSec(d), roundSec(p.LaneCap), statusLabel(last.Status))
 				rep.Lanes++
 				rep.Duration += lane.End.Sub(lane.SuspectSince)
 			}
@@ -216,10 +262,20 @@ func FlagSuspectLanes(lanes []Swimlane, p SuspectPolicy) SuspectReport {
 // usage_sample above all — which is exactly the signal that separates a session
 // still doing work from one nothing has been heard from.
 //
+// The final interval is derived here rather than passed in, because a caller
+// that handed over any OTHER interval would get an answer that is wrong and
+// looks right: an earlier interval's start reads as hours of extra silence, and
+// the lane gets flagged and its work subtracted. A lane with no intervals at all
+// — every interval it opened was zero-length and dropped — falls back to its own
+// Start, the one instant it is known to have existed.
+//
 // Clamped to lane.End so a stray event past the caller's bound cannot produce a
 // negative gap (which would read as "no silence at all" and skip the check).
-func laneEvidence(lane Swimlane, last Interval) time.Time {
-	since := last.Start
+func laneEvidence(lane Swimlane) time.Time {
+	since := lane.Start
+	if n := len(lane.Intervals); n > 0 {
+		since = lane.Intervals[n-1].Start
+	}
 	if lane.lastEvidence.After(since) {
 		since = lane.lastEvidence
 	}
@@ -241,13 +297,18 @@ func trustedEnd(lane Swimlane) time.Time {
 	return lane.End
 }
 
-// statusLabel names a status for a reason string. The empty status is the lead-in
-// before a session's first transition; a lane that ghosts while still in it never
-// showed a color at all (a lone `session_start` and nothing else), which is a
-// materially different report from a stretched "working" or "idle".
+// statusLabel names a status for the trailing clause of a reason string. The
+// empty status is the lead-in before a session's first transition; a lane that
+// ghosts while still in it never showed a color at all (a lone `session_start`
+// and nothing else), which is a materially different report from a stretched
+// "working" or "idle" — hence the parenthetical rather than a bare "unknown",
+// which an operator would read as "the reader lost track of it".
+//
+// Both shapes are written to complete the phrase "last status …", so neither
+// needs an article and the missing-status case can carry its own explanation.
 func statusLabel(status string) string {
 	if status == "" {
-		return `unknown-status (no transition was ever recorded)`
+		return `unknown (no transition was ever recorded)`
 	}
 	return `"` + status + `"`
 }

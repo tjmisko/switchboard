@@ -357,6 +357,13 @@ argues for erring low — but not below the observed legitimate ceiling, hence 4
 rather than 3h. `switchboard-ctl timeline --suspect-cap` retunes it without a
 rebuild; `--suspect-cap 0` disables the check entirely.
 
+One flag retunes **both** caps: `SuspectPolicy.WithLaneCap` scales the subagent
+cap by the ratio the two calibrated defaults already sit at (2h is exactly half
+of 4h), so `--suspect-cap 10h` also lifts the span cap to 5h. A working pattern
+quiet enough to need a looser lane cap has subagents quiet with it, and tuning
+only the lane half would leave the operator flagged by the half the flag never
+reached.
+
 ### Known, accepted false positive
 
 A `--day` query for a *past* day bounds lanes at the next local midnight, which is

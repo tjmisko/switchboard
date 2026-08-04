@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -21,6 +22,7 @@ import (
 //	switchboard-ctl history tail [--day D] [-n N]     show the most recent events
 //	switchboard-ctl history stat                      summarize what is stored
 //	switchboard-ctl history purge [--before D | --all]  delete day-files
+//	switchboard-ctl history calibrate                 re-derive the suspect caps
 func cmdHistory(args []string) {
 	if len(args) == 0 {
 		historyUsage()
@@ -35,6 +37,8 @@ func cmdHistory(args []string) {
 		cmdHistoryStat(args[1:])
 	case "purge":
 		cmdHistoryPurge(args[1:])
+	case "calibrate":
+		cmdHistoryCalibrate(args[1:])
 	default:
 		historyUsage()
 		os.Exit(2)
@@ -50,6 +54,7 @@ usage: switchboard-ctl history <command> [flags]
   stat                              summarize stored events (counts, size, range)
   purge [--before YYYY-MM-DD]       delete day-files older than a date
   purge --all                       delete the entire log
+  calibrate                         re-derive the suspect caps from this corpus
 
 All commands take --dir to override the directory (default $XDG_STATE_HOME/switchboard/history).
 Recording is opt-in: enable it in $XDG_CONFIG_HOME/switchboard/history.json ({"enabled":true}).`))
@@ -211,3 +216,102 @@ func cmdHistoryPurge(args []string) {
 	}
 	fmt.Printf("removed %d day-file(s) from %s\n", removed, *dir)
 }
+
+// cmdHistoryCalibrate re-derives the two suspect caps from whatever corpus is on
+// disk and reports whether the corpus still says what the frozen comment on
+// history.DefaultSuspectTrailingCap claims it says.
+//
+// It is an operator/maintainer tool, not part of any pipeline: the analysis needs
+// a month of real activity log, which the repo cannot carry, so nothing in CI runs
+// it and TestSuspectCapDefaults still pins the constants outright. The output is
+// the argument, not a decision — a drifted band is a reason to go look at the
+// named lanes, not to move a constant.
+func cmdHistoryCalibrate(args []string) {
+	fs := flag.NewFlagSet("history calibrate", flag.ExitOnError)
+	dir := fs.String("dir", history.DefaultDir(), "activity-log directory")
+	_ = fs.Parse(args)
+
+	cal, err := history.Calibrate(*dir, time.Now())
+	if err != nil {
+		fail("read %s: %v", *dir, err)
+	}
+	renderCalibration(os.Stdout, cal)
+}
+
+func renderCalibration(w io.Writer, cal history.Calibration) {
+	fmt.Fprintln(w, cal.Dir)
+	if len(cal.Days) == 0 {
+		fmt.Fprintln(w, "no complete day-files to replay (history may be disabled — see `history path`)")
+		return
+	}
+	fmt.Fprintf(w, "%d complete day(s): %s … %s; %d lane(s) replayed\n",
+		len(cal.Days), cal.Days[0], cal.Days[len(cal.Days)-1], cal.Lanes)
+
+	fmt.Fprintf(w, "\nlanes — silence since the last evidence, for lanes the reader closed at the bound\n")
+	renderCalibrationPopulation(w, "legitimate (the corpus proves the session outlived the bound)", cal.LaneLegit)
+	renderCalibrationPopulation(w, "ghost (nothing is ever heard from it again, in any day-file)", cal.LaneGhost)
+	renderCalibrationVerdict(w, "DefaultSuspectTrailingCap",
+		cal.LaneVerdict(history.DefaultSuspectTrailingCap), "legitimate", "ghost")
+
+	fmt.Fprintf(w, "\nsubagent spans — span length\n")
+	renderCalibrationPopulation(w, "paired (a subagent_stop closed it)", cal.SpanPaired)
+	renderCalibrationPopulation(w, "reader-capped (no subagent_stop ever arrived)", cal.SpanCapped)
+	renderCalibrationVerdict(w, "DefaultSuspectSubagentCap",
+		cal.SpanVerdict(history.DefaultSuspectSubagentCap), "paired", "reader-capped")
+}
+
+// renderCalibrationPopulation prints one population's shape, then names the two
+// samples at its extremes. The identity lines are the point: an extreme nobody can
+// go look at is how the previous calibration became unarguable folklore.
+func renderCalibrationPopulation(w io.Writer, label string, p history.Population) {
+	fmt.Fprintf(w, "  %s\n", label)
+	if p.Count() == 0 {
+		fmt.Fprintf(w, "    count 0\n")
+		return
+	}
+	fmt.Fprintf(w, "    count %-5d min %s   median %s   max %s\n", p.Count(),
+		calibrationDur(p.Min().Dur), calibrationDur(p.Median()), calibrationDur(p.Max().Dur))
+	fmt.Fprintf(w, "    min   %s\n", calibrationSample(p.Min()))
+	fmt.Fprintf(w, "    max   %s\n", calibrationSample(p.Max()))
+}
+
+// renderCalibrationVerdict prints the band and where the frozen constant sits in
+// it. The two error counts are the verdict proper: the band is the argument for a
+// cap, but "how many real samples would this flag" is the thing that is either
+// still zero or is not.
+func renderCalibrationVerdict(w io.Writer, name string, v history.Verdict, lower, upper string) {
+	b := v.Band
+	if !v.Decidable() {
+		// An absent population is not an overlap. Saying "no threshold separates
+		// these" over a corpus holding zero ghosts would read as the cap being
+		// refuted, when in fact nothing was weighed against it.
+		fmt.Fprintf(w, "  no band: %d %s sample(s), %d %s sample(s) — one of each is needed\n",
+			v.LowerCount, lower, v.UpperCount, upper)
+		fmt.Fprintf(w, "  %s %s: this corpus does not score it\n",
+			name, calibrationDur(v.Threshold))
+	} else if b.Separated() {
+		fmt.Fprintf(w, "  empty band %s … %s (%s wide)\n",
+			calibrationDur(b.Lo), calibrationDur(b.Hi), calibrationDur(b.Width()))
+		fmt.Fprintf(w, "  %s %s sits %.0f%% into it, %.2fx the %s maximum\n",
+			name, calibrationDur(v.Threshold), b.Position(v.Threshold)*100,
+			b.Headroom(v.Threshold), lower)
+	} else {
+		fmt.Fprintf(w, "  no empty band: the %s maximum (%s) is not below the %s minimum (%s)\n",
+			lower, calibrationDur(b.Lo), upper, calibrationDur(b.Hi))
+		fmt.Fprintf(w, "  %s %s: no threshold separates these two populations\n",
+			name, calibrationDur(v.Threshold))
+	}
+	fmt.Fprintf(w, "    false positives  %d %s sample(s) at or above it\n", v.FalsePositives, lower)
+	fmt.Fprintf(w, "    false negatives  %d %s sample(s) below it\n", v.FalseNegatives, upper)
+}
+
+// calibrationSample identifies one measured sample well enough to open the
+// day-file and look at it.
+func calibrationSample(s history.CalibrationSample) string {
+	return strings.TrimRight(fmt.Sprintf("%s  %-8s  pid %-8d %s",
+		s.Day, shortID(s.SessionID), s.PID, s.Name), " ")
+}
+
+// calibrationDur rounds to the second, the same resolution the suspect reasons
+// print at — sub-second precision on a multi-hour silence is noise.
+func calibrationDur(d time.Duration) string { return d.Round(time.Second).String() }

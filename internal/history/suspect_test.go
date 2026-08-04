@@ -2,6 +2,7 @@ package history
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -58,7 +59,7 @@ func TestFlagSuspectLanesPredicate(t *testing.T) {
 			end:        at(15, 8, 42),
 			bound:      BoundNow,
 			want:       true,
-			wantReason: `4h40m33s since the last evidence, in a "working" interval, >= 4h0m0s cap`,
+			wantReason: `silent 4h40m33s >= 4h0m0s cap; last status "working"`,
 		},
 		{
 			// The ghost's real twin: the same session, resumed in a fresh pane, which
@@ -114,7 +115,7 @@ func TestFlagSuspectLanesPredicate(t *testing.T) {
 			end:        at(14, 0, 0),
 			bound:      BoundNow,
 			want:       true,
-			wantReason: `4h0m0s since the last evidence`,
+			wantReason: `silent 4h0m0s >= 4h0m0s cap`,
 		},
 		{
 			name: "should not flag a lane when its final interval falls one nanosecond short of the cap",
@@ -137,7 +138,7 @@ func TestFlagSuspectLanesPredicate(t *testing.T) {
 			end:        at(23, 59, 59),
 			bound:      BoundNow,
 			want:       true,
-			wantReason: "unknown-status (no transition was ever recorded)",
+			wantReason: "last status unknown (no transition was ever recorded)",
 		},
 		{
 			// A closed day: `end` is the next local midnight, not a wall clock. A
@@ -209,8 +210,68 @@ func TestFlagSuspectLanesPredicate(t *testing.T) {
 	}
 }
 
+// GOLDEN STRING. The reason is an operator-facing sentence with a second
+// producer: switchboard-dashboard's Arachne compiler
+// (internal/arachne/compile.go) synthesizes unclosed lanes from its own inputs
+// and must keep emitting the identical prefix —
+//
+//	unclosed lane stretched to <bound>: silent <d> >= <cap> cap
+//
+// so that the same condition reads the same way whichever side produced it. Only
+// the daemon appends "; last status …"; Arachne's lane is a single synthesized
+// "working" interval, so there the clause would be a constant and it stops at
+// the prefix. Everything else in this file asserts on substrings, which is what
+// lets a rewording drift past unnoticed — this test is the one that fails, and
+// the divergence has to be argued here and in the other repo together.
+func TestSuspectReasonGoldenString(t *testing.T) {
+	rows := []struct {
+		name   string
+		events []Event
+		end    time.Time
+		want   string
+	}{
+		{
+			// The common case: the lane showed a color, so the clause quotes it.
+			name:   "should emit the exact reason when a lane ghosts after a transition",
+			events: ghostEvents(),
+			end:    at(15, 8, 42),
+			want:   `unclosed lane stretched to now: silent 4h40m33s >= 4h0m0s cap; last status "working"`,
+		},
+		{
+			// The lone session_start: no status to quote, so the clause carries its own
+			// explanation instead. This is the shape the old phrasing could not fit —
+			// the label used to land after an article it disagreed with.
+			name:   "should emit the exact reason when a lane ghosts before its first transition",
+			events: []Event{{Ts: at(14, 6, 1), Type: EventSessionStart, PID: 1236334, Agent: "claude"}},
+			end:    at(23, 59, 59),
+			want:   `unclosed lane stretched to now: silent 9h53m58s >= 4h0m0s cap; last status unknown (no transition was ever recorded)`,
+		},
+	}
+
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			lanes := BuildSwimlanes(row.events, row.end)
+			FlagSuspectLanes(lanes, DefaultSuspectPolicy(row.end, BoundNow))
+			if lanes[0].SuspectReason != row.want {
+				t.Errorf("reason =\n\t%q\nwant\n\t%q", lanes[0].SuspectReason, row.want)
+			}
+		})
+	}
+}
+
 // The threshold is a calibrated constant, not a magic number: pin the default so
 // a change to it is a deliberate, reviewed edit rather than a silent drift.
+//
+// The two figures below are re-derived by
+//
+//	switchboard-ctl history calibrate [--dir D]
+//
+// which replays a real corpus and prints the two populations each cap sits
+// between, the empty band between them, and how many samples the cap would get
+// wrong in each direction (Calibrate, calibrate.go). This test deliberately does
+// NOT call it: the analysis needs a month of somebody's activity log, which the
+// repo does not carry, so the constants are pinned outright here and the command
+// is the argument you run by hand before proposing to move one.
 func TestSuspectCapDefaults(t *testing.T) {
 	if DefaultSuspectTrailingCap != 4*time.Hour {
 		t.Errorf("DefaultSuspectTrailingCap = %v, want 4h (see the calibration comment)", DefaultSuspectTrailingCap)
@@ -218,6 +279,102 @@ func TestSuspectCapDefaults(t *testing.T) {
 	if DefaultSuspectSubagentCap != 2*time.Hour {
 		t.Errorf("DefaultSuspectSubagentCap = %v, want 2h (see the calibration comment)", DefaultSuspectSubagentCap)
 	}
+}
+
+// --suspect-cap is the operator's only knob on this check, so it has to move the
+// whole check. These pin the scaling law rather than the arithmetic: the ratio is
+// whatever the calibrated defaults encode, and a caller who supplies a lane cap
+// gets a subagent cap in the same proportion.
+func TestSuspectPolicyWithLaneCap(t *testing.T) {
+	end := at(15, 0, 0)
+
+	t.Run("should leave both caps at their calibrated defaults when given the default lane cap", func(t *testing.T) {
+		p := DefaultSuspectPolicy(end, BoundNow).WithLaneCap(DefaultSuspectTrailingCap)
+		if p.LaneCap != DefaultSuspectTrailingCap {
+			t.Errorf("LaneCap = %v, want the default %v", p.LaneCap, DefaultSuspectTrailingCap)
+		}
+		if p.SubagentCap != DefaultSuspectSubagentCap {
+			t.Errorf("SubagentCap = %v, want the default %v — scaling must be a no-op at the default",
+				p.SubagentCap, DefaultSuspectSubagentCap)
+		}
+	})
+
+	t.Run("should move both caps in proportion when given a non-default lane cap", func(t *testing.T) {
+		for _, laneCap := range []time.Duration{30 * time.Minute, 10 * time.Hour, 36 * time.Hour} {
+			p := DefaultSuspectPolicy(end, BoundNow).WithLaneCap(laneCap)
+			if p.LaneCap != laneCap {
+				t.Errorf("LaneCap = %v, want %v", p.LaneCap, laneCap)
+			}
+			// The same ratio the defaults sit at, so a loosened cap loosens the subagent
+			// half too instead of leaving the operator flagged by the half they could
+			// not reach. Compared as a ratio rather than against a recomputed duration
+			// because the duration form (laneCap*subCap/laneCap) overflows int64.
+			got := float64(p.SubagentCap) / float64(p.LaneCap)
+			want := float64(DefaultSuspectSubagentCap) / float64(DefaultSuspectTrailingCap)
+			if math.Abs(got-want) > 1e-9 {
+				t.Errorf("SubagentCap/LaneCap = %v for a %v lane cap (subagent cap %v), want the default ratio %v",
+					got, laneCap, p.SubagentCap, want)
+			}
+			if p.SubagentCap >= p.LaneCap {
+				t.Errorf("SubagentCap %v >= LaneCap %v — the subagent half must stay the tighter one",
+					p.SubagentCap, p.LaneCap)
+			}
+		}
+	})
+
+	t.Run("should carry the end bound through untouched", func(t *testing.T) {
+		p := DefaultSuspectPolicy(end, BoundWindow).WithLaneCap(9 * time.Hour)
+		if !p.End.Equal(end) || p.Bound != BoundWindow {
+			t.Errorf("policy = %+v, want End %v / Bound %v preserved", p, end, BoundWindow)
+		}
+	})
+
+	t.Run("should disable both halves when the lane cap is zero or negative", func(t *testing.T) {
+		for _, laneCap := range []time.Duration{0, -time.Hour} {
+			p := DefaultSuspectPolicy(end, BoundNow).WithLaneCap(laneCap)
+			if p.LaneCap != 0 || p.SubagentCap != 0 {
+				t.Errorf("caps = lane %v / subagent %v for %v, want both zeroed — the escape hatch must be total",
+					p.LaneCap, p.SubagentCap, laneCap)
+			}
+			// …and the disabled policy really is a no-op on a lane the default flags.
+			lanes := BuildSwimlanes(ghostEvents(), at(15, 8, 42))
+			if report := FlagSuspectLanes(lanes, DefaultSuspectPolicy(at(15, 8, 42), BoundNow).WithLaneCap(laneCap)); report.Any() {
+				t.Errorf("report = %+v for a %v cap, want the check disabled", report, laneCap)
+			}
+		}
+	})
+}
+
+// The scaled subagent cap has to reach FlagSuspectLanes, not just the struct: a
+// phantom span over the default 2h but under the scaled cap must come back clean.
+func TestFlagSuspectLanesHonoursTheScaledSubagentCap(t *testing.T) {
+	const sid = "s1"
+	end := at(16, 0, 0)
+	// A 3h unpaired span: suspect under the default 2h cap, plausible under the 5h
+	// a 10h lane cap scales to.
+	events := []Event{
+		{Ts: at(10, 0, 0), Type: EventSessionStart, PID: 1, Agent: "claude"},
+		{Ts: at(10, 0, 0), Type: EventTransition, PID: 1, SessionID: sid, To: "working"},
+		{Ts: at(13, 0, 0), Type: EventSubagentSpawn, PID: 1, SessionID: sid, AgentID: "aphantom-0001"},
+	}
+
+	t.Run("should flag the span at the default cap", func(t *testing.T) {
+		lanes := BuildSwimlanes(events, end)
+		if rep := FlagSuspectLanes(lanes, DefaultSuspectPolicy(end, BoundNow)); rep.Subagents != 1 {
+			t.Fatalf("report = %+v, want the 3h span flagged by the 2h default", rep)
+		}
+	})
+
+	t.Run("should clear the span once a loosened lane cap scales the subagent cap past it", func(t *testing.T) {
+		lanes := BuildSwimlanes(events, end)
+		rep := FlagSuspectLanes(lanes, DefaultSuspectPolicy(end, BoundNow).WithLaneCap(10*time.Hour))
+		if rep.Subagents != 0 {
+			t.Errorf("report = %+v, want the 3h span cleared by the 5h scaled cap", rep)
+		}
+		if lanes[0].Subagents[0].Suspect {
+			t.Errorf("span still flagged: %s", lanes[0].Subagents[0].SuspectReason)
+		}
+	})
 }
 
 func TestFlagSuspectLanesDisabled(t *testing.T) {
