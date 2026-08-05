@@ -29,6 +29,7 @@ import (
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/statustune"
+	"github.com/tjmisko/switchboard/internal/terminal"
 	"github.com/tjmisko/switchboard/internal/transcript"
 	"github.com/tjmisko/switchboard/internal/wm"
 )
@@ -399,11 +400,34 @@ func handleWMEvent(ctx context.Context, store *state.Store, resolver *mapping.Re
 // daemon's CPU — and it runs inside store.Apply, holding the lock every RPC
 // reader and every hook queues behind. layoutDebounce exists to ration it.
 func reresolveAll(ctx context.Context, store *state.Store, resolver *mapping.Resolver) {
+	// Enumerate ONCE, outside the lock, exactly as reconcileOnce does. Hoisting
+	// only the reconciler left this path still resolving per-session under the
+	// lock, and a live 12-session box showed it immediately: the 5s spike train
+	// vanished and was replaced by sub-second stalls up to 776ms, fired by the
+	// layout events this path serves. The debounce above rations how often this
+	// runs; this is what makes each run cheap.
+	panes, clients := resolver.Enumerate(ctx)
+	now := time.Now()
 	store.Apply(func(m map[int]*state.Session) {
 		for _, sess := range m {
-			resolver.Reconcile(ctx, sess)
+			resolveSession(ctx, resolver, sess, panes, clients, now)
 		}
 	})
+}
+
+// resolveSession applies a tick's already-fetched enumeration to one session,
+// falling back to the per-session resolve — which does its own I/O — when the
+// terminal backend offers no batch path.
+//
+// It exists so the reconciler and the WM layout path cannot drift apart on the
+// rule that matters: the enumeration happens BEFORE store.Apply, never inside
+// it. They drifted once already.
+func resolveSession(ctx context.Context, resolver *mapping.Resolver, sess *state.Session, panes map[string]terminal.PaneRef, clients []wm.Window, now time.Time) {
+	if panes != nil {
+		resolver.ReconcileFrom(sess, panes, clients, now)
+		return
+	}
+	resolver.Reconcile(ctx, sess)
 }
 
 // runReconciler periodically re-resolves every session's wezterm + hyprland
@@ -458,14 +482,7 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 		// work below — a dead session earns none of it.
 		sweepDeadSessions(m, stack.OSProc, sink, forget, now)
 		for _, sess := range m {
-			// The batch path when the backend offers one, and otherwise the original
-			// per-session resolve — which still does its own I/O under the lock, but
-			// correctness first: no backend regresses just because it cannot batch.
-			if panes != nil {
-				resolver.ReconcileFrom(sess, panes, clients, now)
-			} else {
-				resolver.Reconcile(ctx, sess)
-			}
+			resolveSession(ctx, resolver, sess, panes, clients, now)
 			// Refresh job-control suspension (Ctrl-Z). On ErrGone the sweep above has
 			// already dropped the session, so this only ever sees a live pid; leave
 			// the last-known value on any other read error rather than flapping. A

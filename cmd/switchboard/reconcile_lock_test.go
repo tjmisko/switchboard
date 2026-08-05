@@ -63,7 +63,7 @@ func (l *slowBatchLocator) counts() (snapshots, locates int) {
 // reconcileFixture builds a reconcileOnce call site over fakes, with sessionCount
 // sessions already tracked. Claude enrichment is left nil so the tick does no
 // transcript I/O — this fixture is about the resolve, not the fanout observer.
-func reconcileFixture(t *testing.T, sessionCount int) (*state.Store, *slowBatchLocator, func()) {
+func reconcileFixture(t *testing.T, sessionCount int) (*state.Store, *slowBatchLocator, *mapping.Resolver, func()) {
 	t.Helper()
 
 	panes := make(map[string]terminal.PaneRef, sessionCount)
@@ -89,35 +89,14 @@ func reconcileFixture(t *testing.T, sessionCount int) (*state.Store, *slowBatchL
 		reconcileOnce(context.Background(), store, resolver, manager, stack,
 			statustune.Default(), nil, rstate, func(int) {})
 	}
-	return store, loc, tick
+	return store, loc, resolver, tick
 }
 
-func ttyName(i int) string {
-	return "/dev/pts/" + string(rune('0'+i))
-}
-
-func TestShouldEnumerateTheTerminalOncePerTickWhateverTheSessionCount(t *testing.T) {
-	_, loc, tick := reconcileFixture(t, 8)
-	tick()
-
-	// The whole point of the batch seam: the cost of a tick must not scale with
-	// the number of sessions. Before this change an 8-session box paid 8 terminal
-	// enumerations per tick (times one fork per mux).
-	snapshots, locates := loc.counts()
-	if snapshots != 1 {
-		t.Errorf("terminal enumerated %d times for 8 sessions, want exactly 1", snapshots)
-	}
-	if locates != 0 {
-		t.Errorf("fell back to per-session Locate %d times, want 0 while a batch path exists", locates)
-	}
-}
-
-func TestShouldNotHoldTheStoreLockAcrossTerminalEnumeration(t *testing.T) {
-	store, _, tick := reconcileFixture(t, 8)
-
-	// A reader hammering the store stands in for what actually queued behind this
-	// lock in production: every waybar subscriber, every hook RPC from a live
-	// session, and `switchboard-ctl focus` — the chip click the user feels.
+// measureWorstReaderWait runs work while a goroutine hammers store.Snapshot, and
+// reports the longest a reader was blocked. Those readers stand in for what
+// actually queues behind this lock in production: every waybar subscriber, every
+// hook RPC from a live session, and `switchboard-ctl focus` — the chip click.
+func measureWorstReaderWait(store *state.Store, work func()) time.Duration {
 	stop := make(chan struct{})
 	var mu sync.Mutex
 	worst := time.Duration(0)
@@ -142,13 +121,39 @@ func TestShouldNotHoldTheStoreLockAcrossTerminalEnumeration(t *testing.T) {
 		}
 	}()
 
-	tick()
+	work()
 	close(stop)
 	wg.Wait()
 
 	mu.Lock()
-	got := worst
-	mu.Unlock()
+	defer mu.Unlock()
+	return worst
+}
+
+func ttyName(i int) string {
+	return "/dev/pts/" + string(rune('0'+i))
+}
+
+func TestShouldEnumerateTheTerminalOncePerTickWhateverTheSessionCount(t *testing.T) {
+	_, loc, _, tick := reconcileFixture(t, 8)
+	tick()
+
+	// The whole point of the batch seam: the cost of a tick must not scale with
+	// the number of sessions. Before this change an 8-session box paid 8 terminal
+	// enumerations per tick (times one fork per mux).
+	snapshots, locates := loc.counts()
+	if snapshots != 1 {
+		t.Errorf("terminal enumerated %d times for 8 sessions, want exactly 1", snapshots)
+	}
+	if locates != 0 {
+		t.Errorf("fell back to per-session Locate %d times, want 0 while a batch path exists", locates)
+	}
+}
+
+func TestShouldNotHoldTheStoreLockAcrossTerminalEnumeration(t *testing.T) {
+	store, _, _, tick := reconcileFixture(t, 8)
+
+	got := measureWorstReaderWait(store, tick)
 
 	// Generous: the assertion that matters is that a reader is not blocked for
 	// anything like the enumeration's duration. Before the hoist this test would
@@ -158,6 +163,29 @@ func TestShouldNotHoldTheStoreLockAcrossTerminalEnumeration(t *testing.T) {
 	if got > limit {
 		t.Errorf("a store reader blocked for %v during a tick whose enumeration takes %v; "+
 			"want under %v — the enumeration is being held under the lock again", got, enumDelay, limit)
+	}
+}
+
+func TestShouldNotHoldTheStoreLockAcrossEnumerationOnTheWMLayoutPath(t *testing.T) {
+	store, loc, resolver, _ := reconcileFixture(t, 8)
+
+	got := measureWorstReaderWait(store, func() {
+		reresolveAll(context.Background(), store, resolver)
+	})
+
+	// Found in production, not in a unit test: hoisting only the reconciler left
+	// this path resolving per-session under the lock. On a live 12-session box the
+	// 5s spike train disappeared and was replaced by sub-second stalls up to
+	// 776ms, fired by the layout events this path serves. Both paths must obey the
+	// same rule, so both are pinned.
+	limit := enumDelay / 3
+	if got > limit {
+		t.Errorf("a store reader blocked for %v during a layout re-resolve whose enumeration "+
+			"takes %v; want under %v", got, enumDelay, limit)
+	}
+	if snapshots, locates := loc.counts(); snapshots != 1 || locates != 0 {
+		t.Errorf("layout re-resolve did %d batch enumerations and %d per-session locates, want 1 and 0",
+			snapshots, locates)
 	}
 }
 
