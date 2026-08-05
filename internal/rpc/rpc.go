@@ -414,6 +414,53 @@ func (s *Server) handleHook(req Request) {
 				req.ToolName, info.Status, info.PendingTool, info.InFlightSubagents)
 		}
 
+		// T17 — defect 2 (docs/subagent-permission-oscillation.md §2.4/§3.2): a
+		// TEAMMATE's hook must not drive the MAIN thread's chip.
+		//
+		// switchboard-ctl identifies its caller with getppid() and subagents run
+		// in-process, so a teammate's hook is indistinguishable from the main
+		// thread's by pid — it lands on this very AgentInfo. PostToolUse maps
+		// unconditionally to working, so with four teammates the parent's chip was
+		// dragged green every ~4s no matter what the main thread was doing,
+		// including while it sat parked at a prompt. That is the ENGINE of the limit
+		// cycle in §3.4: it hands the reconciler something to demote on every tick.
+		// The 12:39:56 restart is the controlled experiment — it removed the stale
+		// anchor (defect 3, what T4 fixes) and the flap only slowed, from the 5s tick
+		// to the 15s grace, cycling seven more times. Damping it is not removing it;
+		// this is.
+		//
+		// agent_id is the discriminator and the ONLY one: normalized once at the top
+		// of handleHook, non-empty means "this hook fired inside a subagent". If it
+		// ever arrives empty on some subagent path this whole clause is inert and
+		// behavior is exactly what it is today — the correct degradation, and the
+		// reason nothing here guesses at teammate-ness from anything else.
+		//
+		// Two carve-outs, both deliberate:
+		//
+		//   - status == permission. A subagent-raised prompt MUST still turn the chip
+		//     red (status-color-state-model.md §5 case 16): it is blocking the user,
+		//     who has exactly one chip per session to look at. Raising red is the one
+		//     thing a teammate legitimately says about its parent.
+		//   - info.Status == permission. clearsPermission is the SINGLE door out of
+		//     red (T2/T3), it already refuses teammate events, and it logs why on a
+		//     parseable decision line. Dropping the event silently here would open a
+		//     second, unlogged exit and fragment exactly the forensics that diagnosed
+		//     this incident. Red stays the hold gate's to hold.
+		//
+		// Nothing else changes. SubagentStart/Stop already map to "" and still reach
+		// the fanout re-scan below, so the S dimension keeps updating at hook speed
+		// and the reconciler still paints a delegating parent green via
+		// case5-delegating — from S, which is what legitimately means "work is
+		// happening", rather than from a teammate's tool traffic. Nor is any
+		// main-thread signal lost: a mid-turn main thread already went working on its
+		// own UserPromptSubmit and fires its own hooks, and an orchestrator woken by
+		// a returning teammate is recovered by resume-activity, which reads the MAIN
+		// transcript (cmd/switchboard/main.go:831) — the Task tool_result lands there
+		// and classifies as SignalActivity before the main thread emits a token.
+		if req.AgentID != "" && status != state.StatusPermission && info.Status != state.StatusPermission {
+			status = ""
+		}
+
 		// A "permission" chip must stay red until the *prompt itself* resolves —
 		// not merely until some tool finishes, and not merely because some other
 		// hook fired. PostToolUse fires for EVERY tool that completes, including a
@@ -732,6 +779,13 @@ func sessionLabel(sess *state.Session, preferID string) string {
 // The two agents share most of the vocabulary; Codex additionally emits
 // PreToolUse (Claude Code does not wire it here). Any unmapped event returns ""
 // (status unchanged) and "unknown" is never emitted.
+//
+// It answers "what would this event mean for the thread that fired it" and
+// nothing more — WHICH thread fired it is not an input here. handleHook narrows
+// the answer afterwards: a hook carrying an agent_id came from a subagent, and a
+// subagent does not speak for its parent's chip (T17, defect 2). Keep that
+// narrowing at the call site; this stays the plain vocabulary table its test
+// enumerates.
 func statusFromHookEvent(agent, event string) string {
 	if agent == state.AgentKindCodex {
 		switch event {
