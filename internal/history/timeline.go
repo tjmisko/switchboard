@@ -809,23 +809,47 @@ func memAgentBytes(ev Event) int64 { return ev.MemAgentPssBytes + ev.MemAgentSwa
 func memTreeBytes(ev Event) int64  { return ev.MemTreePssBytes + ev.MemTreeSwapBytes }
 
 // suspectTails collects, per session, the stretches of a flagged lane whose
-// length is inference rather than observation: [SuspectSince, End]. Keyed by
-// lane rather than by a single per-session instant because one session id can own
-// two lanes (a second run after a session_end), and clipping the second run at
-// the first one's bound would delete real data.
+// length is inference rather than observation: [SuspectSince, …). Keyed by lane
+// rather than by a single per-session instant because one session id can own two
+// lanes (a second run after a session_end), and clipping the second run at the
+// first one's tail would delete real data — so a tail stops where the session's
+// next lane begins, and only there.
+//
+// It deliberately does NOT stop at the flagged lane's own End. That end is the
+// render horizon, which switchboard-ctl truncates onto nowQuantum, so it lags the
+// newest sample by up to a quantum. Bounded there, every reading a hung container
+// produced inside the current bucket walked straight back into the reported peak
+// and average — the one figure this clip exists to protect, and the sampler fires
+// every few seconds, so it was never just one reading. A lane nothing ever closed
+// has no instant at which its readings become believable again; the tail runs on.
 func suspectTails(lanes []Swimlane) map[string][]span {
+	starts := map[string][]time.Time{}
+	for _, lane := range lanes {
+		if lane.SessionID != "" {
+			starts[lane.SessionID] = append(starts[lane.SessionID], lane.Start)
+		}
+	}
 	out := map[string][]span{}
 	for _, lane := range lanes {
 		if lane.SessionID == "" || !lane.Suspect || lane.SuspectSince.IsZero() {
 			continue
 		}
-		out[lane.SessionID] = append(out[lane.SessionID], span{lane.SuspectSince, lane.End})
+		var stop time.Time // zero: nothing of this session's follows, so it runs on
+		for _, s := range starts[lane.SessionID] {
+			if s.After(lane.Start) && (stop.IsZero() || s.Before(stop)) {
+				stop = s
+			}
+		}
+		out[lane.SessionID] = append(out[lane.SessionID], span{lane.SuspectSince, stop})
 	}
 	return out
 }
 
-// dropInSpans removes events landing inside any of the spans. Both ends are
-// inclusive: a sample AT SuspectSince is already past the last thing observed.
+// dropInSpans removes events landing inside any of the spans. The left edge is
+// inclusive — a sample AT SuspectSince is already past the last thing observed —
+// and the right edge is exclusive, so a reading taken at the instant the session's
+// next lane opens belongs to that lane. A zero right edge means the span has no
+// end: see suspectTails.
 func dropInSpans(evs []Event, drop []span) []Event {
 	if len(drop) == 0 {
 		return evs
@@ -834,10 +858,14 @@ func dropInSpans(evs []Event, drop []span) []Event {
 	for _, ev := range evs {
 		inside := false
 		for _, d := range drop {
-			if !ev.Ts.Before(d.start) && !ev.Ts.After(d.end) {
-				inside = true
-				break
+			if ev.Ts.Before(d.start) {
+				continue
 			}
+			if !d.end.IsZero() && !ev.Ts.Before(d.end) {
+				continue
+			}
+			inside = true
+			break
 		}
 		if !inside {
 			out = append(out, ev)

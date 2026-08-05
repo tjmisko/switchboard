@@ -426,6 +426,47 @@ func TestMemoryAndTimelineShareTheLiveBound(t *testing.T) {
 	})
 }
 
+// The ghost-lane clip must not stop at the render horizon. That horizon is
+// truncated onto nowQuantum, so it lags the newest reading by up to a quantum —
+// and a hung container holding its pages keeps sampling right through the gap,
+// which is the entire shape the clip exists to catch. Bounded there, the readings
+// taken in the current bucket walked back into the reported peak.
+func TestMemoryClipDropsReadingsRecordedAfterTheQuantizedBound(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 6, 26, 12, 0, 0, 0, time.Local)
+	day := base.Format("2006-01-02")
+	sid := "eeee5555-6666-4777-8888-999999999999"
+	at := func(d time.Duration) time.Time { return base.Add(d) }
+	sample := func(ts time.Time, mib int64, procs int) history.Event {
+		return history.Event{Ts: ts, Type: history.EventMemorySample, SessionID: sid, PID: 8001,
+			Agent: "claude", Project: "sb", MemAgentPssBytes: mib * MiB, MemTreePssBytes: mib * MiB, MemTreeProcs: procs}
+	}
+
+	writeDay(t, dir, day,
+		history.Event{Ts: at(-5 * time.Hour), Type: history.EventSessionStart, PID: 8001, Agent: "claude"},
+		history.Event{Ts: at(-5 * time.Hour), Type: history.EventTransition, PID: 8001, SessionID: sid, To: "working"},
+		sample(at(-4*time.Hour-50*time.Minute), 200, 1),
+		// Last real evidence, 4h30m before the bound: the lane is flagged.
+		history.Event{Ts: at(-4*time.Hour - 30*time.Minute), Type: history.EventUsageSample, PID: 8001, SessionID: sid,
+			Model: "claude-opus-4-8", TokIn: 1000, TokOut: 500},
+		sample(at(-2*time.Hour), 3000, 12),   // squarely inside the tail
+		sample(at(18*time.Second), 5000, 14), // past the bound, before the wall clock
+	)
+
+	doc := runMemoryJSONAt(t, dir, day, base.Add(20*time.Second))
+	if len(doc.Sessions) != 1 {
+		t.Fatalf("sessions = %d, want 1", len(doc.Sessions))
+	}
+	s := doc.Sessions[0]
+	if len(s.Mem) != 1 {
+		t.Errorf("series has %d points, want 1 — only the 200 MiB reading predates the last evidence: %+v", len(s.Mem), s.Mem)
+	}
+	if got, want := *s.PeakTreeBytes, int64(200*MiB); got != want {
+		t.Errorf("peak_tree_bytes = %d MiB, want %d MiB — a reading taken after the truncated bound escaped the clip",
+			got/MiB, want/MiB)
+	}
+}
+
 func rawInt(t *testing.T, m map[string]json.RawMessage, field string) int64 {
 	t.Helper()
 	raw, ok := m[field]

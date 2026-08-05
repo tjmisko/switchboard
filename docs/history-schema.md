@@ -467,6 +467,14 @@ being believed at the same instant. The series is clipped at that lane's
 or stopping short of one the timeline still credits in full — would contradict
 the very view it is read against.
 
+That clip has **no right edge**. Everything a flagged lane recorded from its
+`suspect_since` onward is dropped, not merely everything up to the render
+horizon: the horizon is quantized, so it trails the newest reading by up to a
+bucket, and a hung container holding its pages keeps sampling straight through
+that gap — which is precisely the shape the clip exists to catch. The one thing
+that stops a tail is the same session's **next lane** opening, so a session
+resumed after its process died keeps the readings of its second run.
+
 ### Volume
 
 A sample per live session per reconcile tick (~5 s) is roughly **12× the
