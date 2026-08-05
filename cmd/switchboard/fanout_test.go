@@ -141,6 +141,100 @@ func TestObserveLabelEmitsOnChangeOnly(t *testing.T) {
 	}
 }
 
+// A /clear mints a fresh session id in the same pane, and the timeline reads that
+// as a new lane. The name is unchanged — it is the pane's name — so a pid-keyed
+// dedup would swallow it and leave the new lane permanently nameless. The label
+// must be re-announced for the new session id.
+func TestObserveLabelReAnnouncesTheNameToANewSessionInTheSameProcess(t *testing.T) {
+	dir := t.TempDir()
+	tpath := filepath.Join(dir, "t.jsonl")
+	writeLines(t, tpath, `{"type":"system"}`)
+
+	histDir := t.TempDir()
+	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+	sess := &state.Session{PID: 424242, Agent: "claude", CWD: "/home/u/proj",
+		Wezterm: &state.WeztermInfo{WindowTitle: "digest-status"},
+		Claude:  &state.AgentInfo{SessionID: "s1", Transcript: tpath}}
+
+	rs.observe(sink, sess, sess.Claude, time.Now()) // emit for s1
+	rs.observe(sink, sess, sess.Claude, time.Now()) // unchanged → no emit
+
+	sess.Claude.SessionID = "s2"                    // /clear: same pane, same name, new session
+	rs.observe(sink, sess, sess.Claude, time.Now()) // emit for s2
+	rs.observe(sink, sess, sess.Claude, time.Now()) // unchanged → no emit
+	sink.Close()
+
+	labels := eventsOfType(readEvents(t, histDir), history.EventSessionLabel)
+	if len(labels) != 2 {
+		t.Fatalf("got %d session_label events, want one per session: %+v", len(labels), labels)
+	}
+	if labels[0].SessionID != "s1" || labels[1].SessionID != "s2" {
+		t.Errorf("label sessions = %q, %q; want s1 then s2", labels[0].SessionID, labels[1].SessionID)
+	}
+	if labels[1].Label != "digest-status" {
+		t.Errorf("second label = %q, want the name the pane still carries", labels[1].Label)
+	}
+}
+
+// Label cursors expire with their PROCESS, not with the key's liveness: every
+// cursor a live pid owns survives, and a dead pid takes all of its cursors with
+// it.
+func TestPruneDropsLabelCursorsByTheirProcess(t *testing.T) {
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+	rs.labels["s:superseded"] = labelCursor{name: "digest-status", pid: 1} // pre-/clear session, pid still alive
+	rs.labels["s:live"] = labelCursor{name: "digest-status", pid: 1}
+	rs.labels["p:99"] = labelCursor{name: "some-pane", pid: 99} // its process is gone
+
+	rs.prune(map[int]*state.Session{
+		1: {PID: 1, Claude: &state.AgentInfo{SessionID: "live"}},
+	})
+
+	if _, ok := rs.labels["s:live"]; !ok {
+		t.Error("cursor for a live session should survive")
+	}
+	if _, ok := rs.labels["s:superseded"]; !ok {
+		t.Error("cursor for a superseded session should survive while its process does")
+	}
+	if _, ok := rs.labels["p:99"]; ok {
+		t.Error("cursors of a dead pid should be pruned")
+	}
+}
+
+// A tick that cannot see a session's claude info skips observe() but still runs
+// prune(). Expiring the cursor there would re-announce an identical name the
+// moment the info came back — a duplicate label event per blip, which is exactly
+// what the first restart after the session-id keying produced.
+func TestObserveLabelDoesNotReAnnounceAfterATickWithoutClaudeInfo(t *testing.T) {
+	dir := t.TempDir()
+	tpath := filepath.Join(dir, "t.jsonl")
+	writeLines(t, tpath, `{"type":"system"}`)
+
+	histDir := t.TempDir()
+	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+	sess := &state.Session{PID: 424242, Agent: "claude", CWD: "/home/u/proj",
+		Wezterm: &state.WeztermInfo{WindowTitle: "digest-status"},
+		Claude:  &state.AgentInfo{SessionID: "s1", Transcript: tpath}}
+	live := map[int]*state.Session{424242: sess}
+
+	rs.observe(sink, sess, sess.Claude, time.Now())
+	rs.prune(live)
+
+	claude := sess.Claude
+	sess.Claude = nil // the tick the reconciler could not resolve: observe is skipped
+	rs.prune(live)
+	sess.Claude = claude
+
+	rs.observe(sink, sess, sess.Claude, time.Now())
+	sink.Close()
+
+	labels := eventsOfType(readEvents(t, histDir), history.EventSessionLabel)
+	if len(labels) != 1 {
+		t.Fatalf("got %d session_label events, want 1 (the name never changed): %+v", len(labels), labels)
+	}
+}
+
 func TestApplyFocusRecordsOnChangeOnly(t *testing.T) {
 	histDir := t.TempDir()
 	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
