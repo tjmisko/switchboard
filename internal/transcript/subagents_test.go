@@ -384,3 +384,129 @@ func TestSubagentsModTimePrefersJSONL(t *testing.T) {
 		t.Errorf("ModTime = %v, want the jsonl mtime %v (not the meta's %v)", subs[0].ModTime, jsonlTime, metaTime)
 	}
 }
+
+// TestSubagentPath locks the writer→transcript resolution the permission path
+// depends on: a subagent's own entries live in the sibling
+// <session>/subagents/agent-<id>.jsonl and never in the parent transcript, while
+// an empty agent id (the hook's main-thread marker) must resolve to the parent
+// transcript itself so callers stay branch-free.
+func TestSubagentPath(t *testing.T) {
+	t.Run("should return the main transcript unchanged when the agent id is empty", func(t *testing.T) {
+		// The hook omits agent_id on the main thread, so "" means "the writer is the
+		// main thread" — whose entries ARE the parent transcript.
+		main := "/home/u/.claude/projects/-home-u-Projects-switchboard/sess-uuid.jsonl"
+		if got := SubagentPath(main, ""); got != main {
+			t.Errorf("SubagentPath(main, \"\") = %q, want the main transcript %q", got, main)
+		}
+	})
+
+	t.Run("should resolve the sibling subagents jsonl when the agent id names a teammate", func(t *testing.T) {
+		// The real on-disk shape: <projects>/<slug>/<session-uuid>.jsonl beside
+		// <projects>/<slug>/<session-uuid>/subagents/agent-<id>.jsonl.
+		main := "/home/u/.claude/projects/-home-u-Tools-DigestDownloads/5318eb5b-79df-4dee-a9f8-c80df4eca79e.jsonl"
+		want := "/home/u/.claude/projects/-home-u-Tools-DigestDownloads/5318eb5b-79df-4dee-a9f8-c80df4eca79e/subagents/agent-af5bd126402ac16c7.jsonl"
+		if got := SubagentPath(main, "af5bd126402ac16c7"); got != want {
+			t.Errorf("SubagentPath = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("should resolve from the stored transcript alone when the session runs in a git worktree", func(t *testing.T) {
+		// G10: derive from the passed path, never from cwd or a project slug. A
+		// worktree session's cwd is <repo>/.claude/worktrees/agent-<id>, unrelated to
+		// where its records live — so chdir somewhere else entirely and the answer
+		// must not move.
+		root := t.TempDir()
+		slug := "-home-u-Projects-switchboard--claude-worktrees-agent-ad471f23b56b4c180"
+		main := filepath.Join(root, "projects", slug, "d053f268-983c-4dfe-9e61-c9cf3ad55ce1.jsonl")
+		subagentsDir := filepath.Join(root, "projects", slug, "d053f268-983c-4dfe-9e61-c9cf3ad55ce1", "subagents")
+		if err := os.MkdirAll(subagentsDir, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		want := filepath.Join(subagentsDir, "agent-ad471f23b56b4c180.jsonl")
+		writeFile(t, want, []string{subagentWorkingLine("2026-08-05T12:38:21Z")})
+
+		t.Chdir(t.TempDir()) // an unrelated cwd: the derivation must ignore it
+		got := SubagentPath(main, "ad471f23b56b4c180")
+		if got != want {
+			t.Errorf("SubagentPath = %q, want %q", got, want)
+		}
+		if _, err := os.Stat(got); err != nil {
+			t.Errorf("resolved path is not the file on disk: %v", err)
+		}
+	})
+
+	t.Run("should not double the prefix when the agent id already carries agent-", func(t *testing.T) {
+		// Subagent.AgentID stores the stem WITHOUT "agent-"; it is unverified whether
+		// the hook's agent_id carries it. Both spellings must land on one file.
+		main := "/p/sess.jsonl"
+		want := "/p/sess/subagents/agent-a1b2.jsonl"
+		if got := SubagentPath(main, "a1b2"); got != want {
+			t.Errorf("bare id: SubagentPath = %q, want %q", got, want)
+		}
+		if got := SubagentPath(main, "agent-a1b2"); got != want {
+			t.Errorf("prefixed id: SubagentPath = %q, want %q (prefix must not be doubled)", got, want)
+		}
+		if got := SubagentPath(main, "agent-a1b2.jsonl"); got != want {
+			t.Errorf("prefixed+suffixed id: SubagentPath = %q, want %q (suffix must not be doubled)", got, want)
+		}
+	})
+
+	t.Run("should treat the whole path as the session stem when the transcript lacks the .jsonl suffix", func(t *testing.T) {
+		// TrimSuffix is a no-op; the result stays inside a plausible sibling dir
+		// rather than becoming a path outside the session tree.
+		if got, want := SubagentPath("/p/sess", "a1b2"), "/p/sess/subagents/agent-a1b2.jsonl"; got != want {
+			t.Errorf("SubagentPath = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("should return empty when there is nothing sane to derive", func(t *testing.T) {
+		cases := []struct{ name, main, agent string }{
+			{"empty transcript with a teammate id", "", "a1b2"},
+			{"id that is only the prefix", "/p/sess.jsonl", "agent-"},
+			{"id that would escape the subagents dir", "/p/sess.jsonl", "../../../etc/passwd"},
+		}
+		for _, c := range cases {
+			if got := SubagentPath(c.main, c.agent); got != "" {
+				t.Errorf("%s: SubagentPath = %q, want \"\"", c.name, got)
+			}
+		}
+	})
+}
+
+// TestSubagentPathAgreesWithSubagentsForTranscript is the anti-drift test: both
+// callers share one derivation, so every agent the dir scan reports must be
+// resolvable by SubagentPath from the same transcript path — including a
+// named-teammate id and an orphan jsonl with no meta.
+func TestSubagentPathAgreesWithSubagentsForTranscript(t *testing.T) {
+	dir := t.TempDir()
+	transcriptPath := filepath.Join(dir, "d053f268-983c-4dfe-9e61-c9cf3ad55ce1.jsonl")
+	subagentsDir := filepath.Join(dir, "d053f268-983c-4dfe-9e61-c9cf3ad55ce1", "subagents")
+	if err := os.MkdirAll(subagentsDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Three real id shapes: a hex id with meta+jsonl, a named in-process teammate,
+	// and an orphan jsonl with no meta.
+	ids := []string{"ad471f23b56b4c180", "aauth-tests-7152e6a858d30551", "aorphan9c0"}
+	writeFile(t, filepath.Join(subagentsDir, "agent-"+ids[0]+".meta.json"), []string{`{"agentType":"general-purpose","spawnDepth":1}`})
+	for _, id := range ids {
+		writeFile(t, filepath.Join(subagentsDir, "agent-"+id+".jsonl"), []string{subagentTerminalLine("2026-08-05T12:38:21Z")})
+	}
+
+	subs, err := SubagentsForTranscript(transcriptPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(subs) != len(ids) {
+		t.Fatalf("got %d subagents, want %d: %+v", len(subs), len(ids), subs)
+	}
+	for _, s := range subs {
+		got := SubagentPath(transcriptPath, s.AgentID)
+		want := filepath.Join(subagentsDir, "agent-"+s.AgentID+".jsonl")
+		if got != want {
+			t.Errorf("agent %q: SubagentPath = %q, want %q", s.AgentID, got, want)
+		}
+		if _, err := os.Stat(got); err != nil {
+			t.Errorf("agent %q: SubagentPath does not point at the scanned file: %v", s.AgentID, err)
+		}
+	}
+}
