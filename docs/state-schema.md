@@ -141,6 +141,7 @@ agent's first hook fires. Renderers read whichever is present.
 | `status_since` | RFC 3339 timestamp \| absent | optional | When `status` last transitioned to its current value — the wire projection of the daemon's in-memory `StatusSince`, stamped onto the snapshot. Renderers compute the hover duration (`idle · 3m`, `permission · 45s`) as `now - status_since`. **Omitted** (never `null`/zero) until the first status edge stamps it; absent on a block that only carries `session_id`/`transcript`. Additive (Phase: usage-history); consumers tolerate its absence. Formatted identically to `started_at`. |
 | `status` | string | always (when block present) | Session activity. One of: `working`, `idle`, `permission`, `delegating`. `delegating` is daemon-derived (added with the status-color state-model work): an idle main thread with subagents still in flight — it renders the **same green as `working`** ("work is happening, no action needed"). Consumers that do not know it MUST treat it as `working`, never as attention-worthy. ⚠ The doc-comment also lists `unknown`, but the daemon **never emits it** — tolerate an unrecognized value defensively. May be `""` before the first status-bearing hook. |
 | `in_flight_subagents` | number | omitted when 0 | How many subagent `Task`s the main thread has launched but not yet collected, recomputed each reconcile tick from the transcript tail. It is the signal behind a `delegating` chip; renderers show it as "N agents" in the tooltip, and `switchboard-ctl list --json` exposes it so a green chip's true state (genuinely working vs delegating) is visible. Claude-only. |
+| `pending_writers` | array of string | omitted when empty | Which **writers** are currently blocked on a permission prompt. A session is not one thread but 1 + N concurrent writers — the main thread plus each in-flight subagent — that share a pid and a chip, write to different files, and can each block independently. Each element is a bare subagent `agent_id` (the `<id>` stem of `<session>/subagents/agent-<id>.jsonl`), or the literal **`"main"`** for the main thread. **Sorted ascending**, so a renderer can diff two snapshots directly. A non-empty array means the chip is `permission`; a renderer may name the blocked teammate from it. Claude-only. Additive; consumers tolerate its absence. |
 
 #### `status` value mapping
 
@@ -201,6 +202,34 @@ This is purely a daemon-internal status correction. Every exit is recorded by a
 canonical decision log line (see below). The `StatusSince` it keys off is
 **in-memory only** (not in `state.json`); it is stamped to startup time on
 re-hydrate so a prompt live across a daemon restart is not misjudged as resolved.
+
+##### prompt ownership and `pending_writers`
+
+The daemon holds a pending prompt as a map from the **writer that raised it** to
+that prompt's correlators (its tool, a hash of its `tool_input`, its onset). The
+chip may leave `permission` only when no writer still owns a prompt, which is why
+a teammate finishing an unrelated tool cannot repaint a red chip.
+
+`pending_writers` is the **key set of that map, and only the key set**. The
+correlators are in-memory (`json:"-"`) and are deliberately not persisted:
+
+- Losing **ownership** across a restart is unrecoverable. `PermissionRequest` is
+  edge-triggered, none of the registered hooks re-raises a live prompt, and a
+  blocked writer runs no tools — so a dropped entry is a permanent missed red for
+  the rest of that prompt's life. Persisting the keys is what prevents it.
+- Losing the **correlators** costs only latency: a hydrated prompt cannot take the
+  hook-speed early clear above and resolves via the transcript on the next
+  reconcile tick instead. It also *must* fail closed that way — a persisted entry
+  has no tool to match, so nothing at hook speed can match it.
+
+At startup the daemon may use each writer's own transcript to **falsify** an entry
+— if every tool that writer dispatched has its `tool_result`, the tool returned, so
+whatever gate it sat behind opened and the entry is dropped (this is what catches a
+prompt answered while the daemon was down). It may never *manufacture* one: an
+unmatched `tool_use` means "a tool is dispatched and has not returned", which
+covers *awaiting approval* and *executing right now* with no field separating them.
+A `state.json` written before this field existed hydrates its red as a main-thread
+prompt, reproducing the pre-field behavior exactly.
 
 ##### `delegating` self-heal & decision log
 
@@ -303,9 +332,9 @@ re-locates the pane by `tty` at request time.
   as portable WM/terminal backends land — likely generalizing into
   backend-neutral `terminal`/`window` blocks with the WM-specific blocks
   retained or aliased. Treat `hyprland.address` as an opaque ref.
-- **Additive changes** (new optional fields like `status_since`, the
-  `capabilities` block, the `agent` discriminator and the `codex` enrichment
-  block) are **not** breaking;
+- **Additive changes** (new optional fields like `status_since`,
+  `pending_writers`, the `capabilities` block, the `agent` discriminator and the
+  `codex` enrichment block) are **not** breaking;
   consumers must ignore unknown fields and tolerate missing optional fields. The
   `claude` block is unchanged — a consumer reading `.claude.status` keeps working;
   to be agent-aware, read `.codex.status` too (e.g. `.claude.status // .codex.status`).
