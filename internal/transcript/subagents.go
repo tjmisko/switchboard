@@ -113,16 +113,32 @@ func subagentsDirForTranscript(mainTranscript string) string {
 // a caller resolve a pending writer with no branch, passing whatever agent_id the
 // hook carried (empty ⇒ main thread) straight through.
 //
-// agentID is the hook's agent_id, which equals the agent-<id> filename stem that
-// agent-<id>.meta.json and agent-<id>.jsonl share; Subagent.AgentID stores that
-// stem with the "agent-" prefix already removed. Because it is not settled
-// empirically whether the hook's agent_id carries the prefix, an agentID given
-// EITHER way ("a1b2" or "agent-a1b2") resolves to the same file — the prefix is
-// never doubled. A trailing ".jsonl" is tolerated the same way.
+// agentID must be BARE: the <id> between "agent-" and the suffix in the filename
+// pair agent-<id>.meta.json / agent-<id>.jsonl — exactly what Subagent.AgentID
+// holds. This function does NOT strip a leading "agent-", and no caller may strip
+// one on its behalf. Normalization of the hook's agent_id happens ONCE, at the RPC
+// boundary (normalizeAgentID), which removes at most one leading prefix; a second
+// strip anywhere downstream would eat a legitimate prefix.
+//
+// That is not hypothetical. A named subagent's id is shaped a<name><hex>, and the
+// name is user-supplied — a subagent named "gent-foo" gets id "agent-foo-<hex>",
+// stored on disk as agent-agent-foo-<hex>.jsonl. Stripping here would resolve it to
+// agent-foo-<hex>.jsonl, a DIFFERENT agent's transcript. A resolver would then read
+// that other agent's activity and clear a prompt this agent is still blocked on: a
+// missed RED, silent and unrecoverable.
+//
+// The two failure modes are deliberately asymmetric. Over-stripping is silent and
+// wrong. Under-stripping is not: a caller that mistakenly passes a still-prefixed
+// id derives agent-agent-<id>.jsonl, which does not exist, so the read fails and the
+// caller keeps its pending entry. Fail-safe is the direction to err in, so the
+// prefix is left alone.
+//
+// A trailing ".jsonl" IS tolerated — an id and its filename are interchangeable at
+// call sites, and ".jsonl" is a suffix no bare id carries.
 //
 // Returns "" when there is nothing sane to derive: an empty mainTranscript, an
-// agentID that is only the prefix, or an agentID containing a path separator (a
-// hook-supplied value must not be able to escape the subagents dir).
+// agentID that is only the ".jsonl" suffix, or an agentID containing a path
+// separator (a hook-supplied value must not be able to escape the subagents dir).
 func SubagentPath(mainTranscript, agentID string) string {
 	if agentID == "" {
 		return mainTranscript // main thread: its writes are the parent transcript
@@ -131,7 +147,9 @@ func SubagentPath(mainTranscript, agentID string) string {
 	if dir == "" {
 		return ""
 	}
-	id := strings.TrimSuffix(strings.TrimPrefix(agentID, subagentFilePrefix), subagentJSONLSuffix)
+	// No TrimPrefix: agentID is already bare (see the contract above). Stripping a
+	// second "agent-" here would silently retarget another agent's transcript.
+	id := strings.TrimSuffix(agentID, subagentJSONLSuffix)
 	if id == "" || strings.ContainsRune(id, filepath.Separator) || strings.ContainsRune(id, '/') {
 		return ""
 	}
@@ -185,6 +203,11 @@ func SubagentsForTranscript(transcriptPath string) ([]Subagent, error) {
 
 	// Union the metadata and transcript files by their agent-<id> stem, preserving
 	// first-seen (= filename) order for a stable result.
+	//
+	// The TrimPrefix below parses a FILENAME — it is what MAKES Subagent.AgentID bare,
+	// and is unrelated to normalizing a hook-supplied agent_id. Do not read it as
+	// license to strip again in SubagentPath: an id that itself begins with "agent-"
+	// lives in agent-agent-<id>.jsonl, and exactly one strip recovers it.
 	byID := map[string]*Subagent{}
 	var order []string
 	upsert := func(id string) *Subagent {
