@@ -420,4 +420,23 @@ func TestClearsPermissionNeverFastPathsAHydratedEntry(t *testing.T) {
 			t.Errorf("pending writers = %v, want none", pendingWriterNames(got))
 		}
 	})
+
+	t.Run("should still clear a hydrated MAIN-thread entry once the main transcript shows the turn resumed", func(t *testing.T) {
+		// Trap 3 of §9.6: main-thread entries are falsified against <session>.jsonl,
+		// which SubagentPath returns unchanged for the empty key — so the routing adds
+		// no branch and costs the common case nothing.
+		store, s := fannedRedSession(t, 0,
+			map[string]state.PendingPrompt{"": {Since: promptSince}},
+			map[string]string{"": turnResumed, blockedWriter: siblingResultOnly})
+
+		s.handleHook(Request{Cmd: "hook", Event: "PostToolUse", PID: 42, ToolName: "Read"})
+
+		got := claudeStatus(t, store)
+		if got.Status != state.StatusWorking {
+			t.Errorf("status = %q, want working (the main thread's own transcript resolved its own prompt)", got.Status)
+		}
+		if len(got.Pending) != 0 {
+			t.Errorf("pending writers = %v, want none", pendingWriterNames(got))
+		}
+	})
 }
