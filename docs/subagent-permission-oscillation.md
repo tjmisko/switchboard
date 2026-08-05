@@ -195,6 +195,36 @@ This cycle is **self-sustaining without any permission request at all** — a
 genuinely idle main thread with teammates in flight will flap the same way. The
 permission case is the damaging instance because it also discards the red.
 
+### 3.5 Two further defects, latent here, fatal to the target behavior
+
+Both were found while designing the fix. Neither fired in this incident because
+the main thread happened to be blocked too (silent since 12:25:24) — but the
+target behavior is *"a subagent prompt turns the chip red **even while the main
+thread is working**"*, and in that scenario each one independently discards the
+red within seconds.
+
+**Defect 4 — resolution is checked against the wrong writer's transcript.**
+`selfHealStaleAttention` (`cmd/switchboard/main.go:718`) and
+`clearsPermission`'s fallback (`internal/rpc/rpc.go:508`) both call
+`transcript.ResolveKind(c.Transcript, …)` — the **main** transcript — no matter
+who raised the prompt. `ResolveKind` returns `ResolutionResumed` for any
+assistant message dated after the prompt
+(`internal/transcript/transcript.go:392`). So a main thread that simply *keeps
+working* while a teammate is blocked produces a stream of assistant messages
+that read as "the prompt resolved." Main-thread activity is not evidence about a
+subagent's prompt.
+
+**Defect 5 — the hold gate only guards `PostToolUse`.**
+`internal/rpc/rpc.go:388` gates on
+`status == "working" && req.Event == "PostToolUse" && info.Status == "permission"`.
+Every other hook transitions out of `permission` unguarded: a main-thread `Stop`
+→ `idle`, a `UserPromptSubmit` → `working`, a `SessionStart` → `idle`. With a
+teammate blocked, the main thread finishing its turn silently repaints the chip
+orange. The guard protects one edge out of four.
+
+Together these mean the red cannot survive a working main thread today, which is
+precisely the case the fix must support.
+
 ---
 
 ## 4. Determining this reliably
@@ -312,6 +342,10 @@ work-is-happening is not.
 ---
 
 ## 5. Recommended fixes, in priority order
+
+> Superseded by [subagent-permission-plan.md](subagent-permission-plan.md),
+> which turns these into a phased tasklist and adds the two defects in §3.5.
+> Kept here as the diagnosis-time reading.
 
 | # | Fix | Site | Cost |
 |---|---|---|---|

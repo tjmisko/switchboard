@@ -146,13 +146,50 @@ model is a lossy projection of it onto one axis.
 |-----|------|--------|---------------|
 | **M** | main-thread turn state | `working` · `turn-ended` · `interrupted` · `blocked-on-prompt` · `unknown` | hooks + transcript |
 | **S** | subagents in flight | `0` · `>0` (count) | main-transcript Task pairing / `SubagentStop` |
-| **P** | genuine user-blocking prompt pending | `no` · `yes` | `PermissionRequest` + resolution check |
+| **P** | genuine user-blocking prompts pending | **a set**, keyed by the writer that raised each — `∅` · `{main}` · `{a₁…}` · `{main, a₁…}` | `PermissionRequest` + a **per-writer** resolution check |
 | **L** | process liveness/control | `live` · `suspended` · `gone` | `/proc` state |
 | **F** | confidence/freshness of our info | `fresh-hook` · `inferred` · `stale/unknown` | which path set it + age |
 
 `P` is a refinement of `M=blocked-on-prompt`, kept separate because a prompt can
 also be raised by a **subagent** and still requires user action. The color is a
 function `color(M, S, P, L, F)`.
+
+### 3.1 The writer dimension (added 2026-08-05)
+
+The model above treats `P` as a scalar and every other dimension as a property
+of *the session*. A Claude Code session is not one thread — it is **1 + N
+concurrent writers**: the main thread plus each in-flight subagent. They
+
+- **share one pid** — hooks identify themselves with `getppid()`, so a teammate's
+  event is indistinguishable from the main thread's by pid;
+- **share one chip** — one color must summarize all of them;
+- **share one `transcript_path` on the wire** — every hook reports the *parent's*
+  transcript, even when fired from inside a subagent
+  ([claude-code-hook-schema.md §3](claude-code-hook-schema.md));
+- **write to different files** — main `<session>.jsonl` vs.
+  `subagents/agent-<id>.jsonl`;
+- and each can **independently block on a permission prompt**.
+
+Two consequences the original model does not capture, and which together produced
+the 2026-08-05 incident:
+
+1. **`P` must be a set keyed by writer, not a boolean.** "A prompt is pending" is
+   a property of a writer, not of a session. Four teammates can block
+   independently, and the main thread can block while a teammate is blocked.
+2. **Every question about a prompt must be routed to the writer that raised it.**
+   "Did it resolve?" answered against the *main* transcript is a different
+   question from the one being asked when a *subagent* raised the prompt. Main
+   thread activity is not evidence about a teammate's prompt, and a teammate's
+   `PostToolUse` is not evidence about the main thread's.
+
+The writer identity is available and unambiguous: the `agent_id` hook field
+(absent ⇒ main thread). It is already on the wire and already forwarded as
+`rpc.Request.AgentID`.
+
+**P0 — Attribute every prompt to its writer, and resolve it only with evidence
+from that writer.** This is the design principle the §4 ranking was missing;
+without it, P1's "never clear red on a bare/unrelated `tool_result`" cannot be
+enforced, because "unrelated" is undecidable from `tool_name` alone.
 
 ---
 
@@ -198,33 +235,72 @@ Ranked most-expensive first:
 
 ## 5. The canonical case table
 
-`if (Main, Subagents, Pending-prompt, Liveness) then COLOR`. Liveness/confidence
+`if (Main, Subagents, Pending-prompts, Liveness) then COLOR`. Liveness/confidence
 modifiers are applied first, then the M×S×P core. "Worst error" names the costly
 mistake the rule is protecting against.
 
-| # | Main thread (M) | Subagents (S) | Prompt pending (P) | Liveness (L) | **Color** | Why | Worst error avoided |
+The **P** column names *which writers are blocked* (§3.1), not merely whether
+something is: `∅` none · `{main}` the main thread · `{a}` a subagent · `{main,a}`
+both. This is the column that disambiguates rows 8/12/16 — previously all three
+read "yes" and the M column silently carried the writer identity.
+
+**The fold**, stated once so no row is ambiguous. Evaluated top to bottom; the
+first match wins:
+
+```
+L = gone                    → hidden
+L = suspended               → grey-out
+P ≠ ∅                       → RED          ← dominates M and S entirely
+M = unknown ∧ S = 0         → GRAY
+M = working ∨ S > 0         → GREEN
+otherwise                   → ORANGE
+```
+
+`P ≠ ∅ → RED` is the priority rule the table previously encoded only
+implicitly: **a prompt pending anywhere in the session tree outranks any amount
+of work happening anywhere in it.** Blocking-the-user is actionable;
+work-is-happening is not, so the actionable signal wins. This is what makes
+case 16 fall out rather than be a special case.
+
+| # | Main thread (M) | Subagents (S) | Blocked writers (P) | Liveness (L) | **Color** | Why | Worst error avoided |
 |---|---|---|---|---|---|---|---|
 | 1 | * | * | * | **gone** | *hidden* | session ended | — |
 | 2 | * | * | * | **suspended** | **grey-out** | Ctrl-Z; user paused it, nothing can progress | false-green on a halted proc |
-| 3 | working | any | no | live | **GREEN** | work happening | — |
-| 4 | turn-ended | **0** | no | live | **ORANGE** | done, your turn, nothing stuck | false-green (#3 cost) |
-| 5 | turn-ended | **>0** | no | live | **GREEN** | **teammates working — no action needed** *(fix #2)* | false-orange (#4 cost) |
-| 6 | interrupted (Esc) | 0 | no | live | **ORANGE** | you stopped it; your turn | false-green |
-| 7 | interrupted (Esc) | >0 | no | live | **GREEN**\* | work still in flight; *(see Q3 — could be orange if Esc means "I want control")* | low either way |
-| 8 | **blocked-on-prompt** | any | **yes** | live | **RED** | main stalled; you must act (even if teammates still churn) | **missed-RED (#1, worst)** |
-| 9 | blocked, **resolved-by-approve** | any | no | live | **GREEN** | turn resumed → work continues *(go direct, not via orange — P3)* | false-orange + #2-latency |
-| 10 | blocked, **resolved-by-decline/interrupt** | 0 | no | live | **ORANGE** | you answered/declined; your turn | persistent false-red (#2) |
-| 11 | blocked, **resolved-by-decline** | >0 | no | live | **GREEN** | you declined but teammates still working | false-orange |
-| 12 | blocked, **bare unrelated tool_result lands** (subagent/sibling) | any | **still yes** | live | **RED** (hold) | not resolution — keep nagging | **missed-RED (#1)** |
-| 13 | unknown | 0 | unknown | live | **GRAY** | no signal yet / just rehydrated | confident wrong guess |
-| 14 | unknown | >0 | unknown | live | **GREEN** | we can see in-flight Tasks even with no main signal | false-orange |
-| 15 | blocked, transcript **unreadable** ≥ TTL | any | unknown | live | **ORANGE** (decay) | last-resort backstop; observed 0× | nagging forever |
-| 16 | a **subagent** raises a prompt | any | **yes** | live | **RED** | surfaces to user; needs action | missed-RED |
+| 3 | working | any | **∅** | live | **GREEN** | work happening | — |
+| 4 | turn-ended | **0** | **∅** | live | **ORANGE** | done, your turn, nothing stuck | false-green (#3 cost) |
+| 5 | turn-ended | **>0** | **∅** | live | **GREEN** | **teammates working — no action needed** *(fix #2)* | false-orange (#4 cost) |
+| 6 | interrupted (Esc) | 0 | **∅** | live | **ORANGE** | you stopped it; your turn | false-green |
+| 7 | interrupted (Esc) | >0 | **∅** | live | **GREEN**\* | work still in flight; *(see Q3)* | low either way |
+| 8 | **blocked-on-prompt** | any | **{main}** | live | **RED** | main stalled; you must act (even if teammates still churn) | **missed-RED (#1, worst)** |
+| 9 | blocked, **resolved-by-approve** | any | **∅** | live | **GREEN** | turn resumed → work continues *(go direct, not via orange — P3)* | false-orange + #2-latency |
+| 10 | blocked, **resolved-by-decline/interrupt** | 0 | **∅** | live | **ORANGE** | you answered/declined; your turn | persistent false-red (#2) |
+| 11 | blocked, **resolved-by-decline** | >0 | **∅** | live | **GREEN** | you declined but teammates still working | false-orange |
+| 12 | blocked | any | **still {main}** — an unrelated `tool_result` landed (teammate/sibling) | live | **RED** (hold) | not resolution — keep nagging | **missed-RED (#1)** |
+| 13 | unknown | 0 | **∅** | live | **GRAY** | no signal yet / just rehydrated | confident wrong guess |
+| 14 | unknown | >0 | **∅** | live | **GREEN** | we can see in-flight Tasks even with no main signal | false-orange |
+| 15 | blocked | any | **{main}**, transcript **unreadable** ≥ TTL | live | **ORANGE** (decay) | last-resort backstop; observed 0× | nagging forever |
+| 16 | **working** | **>0** | **{a}** — a *subagent* is blocked | live | **RED** | *you* are blocking teammate work; a quick decision unblocks it | **missed-RED (#1)** |
+| 17 | turn-ended | >0 | **{a}** | live | **RED** | same, with the main thread already done | missed-RED |
+| 18 | blocked-on-prompt | >0 | **{main, a}** | live | **RED** | two independent decisions outstanding; answering one does **not** clear the chip | missed-RED via partial resolution |
+| 19 | any | >0 | `{a}` where **a died / quiesced ≥ cap** | live | drop `a` from P, re-fold | a dead teammate's prompt can never be answered | red leaking forever |
 
 \* Case 7 is the one genuine judgment call — see Open Questions Q3.
 
+**Rows 16–19 are the writer dimension (§3.1).** 16 and 17 are the cases that
+motivated it: a teammate blocked on the user while work continues elsewhere.
+18 is why `P` must be a *set* — with a scalar, resolving either prompt clears
+both. 19 is the liveness backstop the set needs so a prompt from a crashed
+teammate cannot latch red forever (the per-writer analogue of case 15).
+
+Resolution routing follows directly from §3.1's P0: **each entry in `P` is
+removed only by evidence from the writer that raised it** — the main transcript
+for `{main}`, `subagents/agent-<a>.jsonl` and `agent_id`-matched hooks for `{a}`.
+Rows 9/10/11 therefore describe removal of `{main}` specifically; teammate
+activity is not evidence about it, and vice versa.
+
 The rows that change today's behavior: **5, 9, 11, 14** (subagent-awareness and
-direct red→green), and the *latency* of **8→9/10** (earlier resolution).
+direct red→green), **16–19** (the writer dimension, unimplemented), and the
+*latency* of **8→9/10** (earlier resolution).
 
 > **⚠ Cases 12 and 16 are violated in practice.** The shipped
 > `case9-approve-toolmatch` clears red on a bare teammate `PostToolUse` whenever
