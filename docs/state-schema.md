@@ -25,10 +25,18 @@ Default location: `$XDG_CACHE_HOME/switchboard/state.json`, falling back to
 `$HOME/.cache/switchboard/state.json`. Overridable with the daemon's `-state`
 flag.
 
-The file is rewritten on **every** state mutation (a session appearing or
-dying, a focus change, a hook status update, a reconcile tick). `updated_at`
-changes on every write even when `sessions` is unchanged. Consumers that poll
-should treat the file as a whole-document replace, not a delta.
+The file is rewritten whenever a state mutation **changes something observable**
+(a session appearing or dying, a focus change, a hook status update). A mutation
+that changes nothing writes nothing: an idle reconcile tick re-derives the same
+state and is suppressed, so `updated_at` is the time of the last *change*, not
+the time of the last tick.
+
+`updated_at` is therefore advisory. **Do not treat a stale `updated_at` as a
+dead daemon** — on a quiet machine it is simply the age of the last real change.
+Use the RPC socket if you need liveness.
+
+Consumers that poll should treat the file as a whole-document replace, not a
+delta.
 
 ## Top level: `Snapshot`
 

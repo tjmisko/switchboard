@@ -58,9 +58,9 @@ func TestApplyBroadcastsAndPersists(t *testing.T) {
 	})
 
 	select {
-	case snap := <-ch:
-		if len(snap.Sessions) != 1 || snap.Sessions[0].PID != 42 {
-			t.Fatalf("broadcast snapshot = %+v, want one session PID 42", snap.Sessions)
+	case b := <-ch:
+		if len(b.Snapshot.Sessions) != 1 || b.Snapshot.Sessions[0].PID != 42 {
+			t.Fatalf("broadcast snapshot = %+v, want one session PID 42", b.Snapshot.Sessions)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Apply did not broadcast to subscriber")
