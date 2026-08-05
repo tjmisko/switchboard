@@ -2,6 +2,7 @@ package terminal
 
 import (
 	"context"
+	"errors"
 	"testing"
 )
 
@@ -95,17 +96,19 @@ func TestAutoSnapshotShouldReportAnEmptySetWhenNoBackendIsLive(t *testing.T) {
 	}
 }
 
-// A live backend with no batch path must produce an ERROR, not an empty map:
-// SnapshotOrNil then degrades the caller to per-session Locate, whereas an empty
-// map would read as "no tty owns a pane" and blank every chip.
-func TestAutoSnapshotShouldReportAnErrorWhenTheLiveBackendHasNoBatchPath(t *testing.T) {
+// A live backend with no batch path must produce ErrNoBatchPath, not an empty
+// map and not an undistinguished error: an empty map would read as "no tty owns a
+// pane" and blank every chip, while a plain error would read as a transient
+// failure and skip the per-session fallback this case depends on.
+func TestAutoSnapshotShouldReportNoBatchPathWhenTheLiveBackendHasNone(t *testing.T) {
 	a := auto{candidates: []Locator{&fakeLocator{name: "kitty", available: true}}}
 
-	if _, err := a.Snapshot(context.Background()); err == nil {
-		t.Fatal("Snapshot() = nil error, want a refusal so the caller falls back to Locate")
+	_, err := a.Snapshot(context.Background())
+	if !errors.Is(err, ErrNoBatchPath) {
+		t.Fatalf("Snapshot() err = %v, want ErrNoBatchPath so the caller falls back to Locate", err)
 	}
-	if got := SnapshotOrNil(context.Background(), a); got != nil {
-		t.Errorf("SnapshotOrNil = %+v, want nil", got)
+	if got, err := Snapshot(context.Background(), a); got != nil || !errors.Is(err, ErrNoBatchPath) {
+		t.Errorf("Snapshot = (%+v, %v), want (nil, ErrNoBatchPath)", got, err)
 	}
 }
 

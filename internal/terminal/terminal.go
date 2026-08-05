@@ -12,6 +12,7 @@ package terminal
 import (
 	"context"
 	"errors"
+	"fmt"
 )
 
 // PaneRef is the neutral pane record. It carries the mux-scoped identity the
@@ -74,22 +75,36 @@ type Snapshotter interface {
 	Snapshot(ctx context.Context) (map[string]PaneRef, error)
 }
 
-// SnapshotOrNil returns loc's batch pane set, or nil when loc does not implement
-// Snapshotter (the caller then falls back to per-session Locate). A backend that
-// implements it but fails also yields nil, so a transient enumeration error
-// degrades to the single path rather than blanking every session's pane — an
-// empty map would read as "no tty owns a pane" and wipe every chip's title.
+// ErrNoBatchPath reports that a backend has no batch enumeration AT ALL — a
+// static property of the backend, not a failure of this call. It is deliberately
+// distinct from an enumeration that was attempted and failed, because the two
+// warrant opposite responses: a backend that will never have a batch path has to
+// be served some other way, whereas a mux that was briefly unreachable will
+// answer again on the next tick and must not trigger the expensive other way in
+// the meantime.
 //
-// nil is therefore unambiguous ("no usable batch answer"); a non-nil result is
-// complete and its missing keys are real misses.
-func SnapshotOrNil(ctx context.Context, loc Locator) map[string]PaneRef {
+// Collapsing the two is not hypothetical: it is exactly how the daemon regressed
+// to forking a terminal enumeration per session under the store lock whenever the
+// mux blipped, with nothing logged to say it had happened.
+var ErrNoBatchPath = errors.New("terminal: backend provides no batch snapshot path")
+
+// Snapshot returns loc's batch pane set. The error says which of the two "no
+// batch answer" cases occurred: ErrNoBatchPath (static — this Locator has no
+// Snapshotter, and will not grow one) or anything else (transient — the
+// enumeration was attempted and failed).
+//
+// On any error the map is nil, never empty: an empty map is a real answer meaning
+// no tty owns a pane, and returning one on failure would read as "every session
+// lost its pane" and wipe every chip's title. A non-nil result is complete and its
+// missing keys are real misses.
+func Snapshot(ctx context.Context, loc Locator) (map[string]PaneRef, error) {
 	s, ok := loc.(Snapshotter)
 	if !ok {
-		return nil
+		return nil, fmt.Errorf("%w: %q", ErrNoBatchPath, loc.Name())
 	}
 	panes, err := s.Snapshot(ctx)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	return panes
+	return panes, nil
 }

@@ -460,11 +460,11 @@ func reresolveAll(ctx context.Context, store *state.Store, resolver *mapping.Res
 	// layout events this path serves. The debounce above rations how often this
 	// runs; this is what makes each run cheap.
 	turn.Do(func() {
-		panes, clients := resolver.Enumerate(ctx)
+		panes, clients := enumerateForResolve(ctx, resolver, store.Snapshot(), turn.degradeLog())
 		now := time.Now()
 		store.Apply(func(m map[int]*state.Session) {
 			for _, sess := range m {
-				resolveSession(ctx, resolver, sess, panes, clients, now)
+				resolver.ReconcileFrom(sess, panes, clients, now)
 			}
 		})
 	})
@@ -491,7 +491,23 @@ func reresolveAll(ctx context.Context, store *state.Store, resolver *mapping.Res
 // reader, hook, or subscriber touches it, so a waiter here blocks nothing a user
 // can feel — unlike the store lock, where a waiter is a chip click. Always take
 // this BEFORE store.Apply, never the reverse.
-type resolveTurn struct{ mu sync.Mutex }
+//
+// Being the two producers' shared seat, it also carries the one piece of state
+// they must not each keep privately: whether the terminal enumeration is
+// currently degraded (see enumerate/resolveDegradeLog).
+type resolveTurn struct {
+	mu      sync.Mutex
+	degrade resolveDegradeLog
+}
+
+// degradeLog is the turn's shared enumeration-degradation tracker, nil-safe like
+// Do so a call site without a turn still type-checks and simply keeps no state.
+func (t *resolveTurn) degradeLog() *resolveDegradeLog {
+	if t == nil {
+		return nil
+	}
+	return &t.degrade
+}
 
 // Do runs fn as the sole resolver. A nil turn runs fn unserialized, which keeps
 // single-goroutine call sites (and tests) from having to construct one.
@@ -505,19 +521,72 @@ func (t *resolveTurn) Do(fn func()) {
 	fn()
 }
 
-// resolveSession applies a tick's already-fetched enumeration to one session,
-// falling back to the per-session resolve — which does its own I/O — when the
-// terminal backend offers no batch path.
+// enumerateForResolve is the ONE place either resolve producer fetches the
+// terminal + WM enumeration a tick needs. Both call it immediately before their
+// store.Apply, and neither may resolve any other way.
 //
 // It exists so the reconciler and the WM layout path cannot drift apart on the
-// rule that matters: the enumeration happens BEFORE store.Apply, never inside
-// it. They drifted once already.
-func resolveSession(ctx context.Context, resolver *mapping.Resolver, sess *state.Session, panes map[string]terminal.PaneRef, clients []wm.Window, now time.Time) {
-	if panes != nil {
-		resolver.ReconcileFrom(sess, panes, clients, now)
+// rule that matters: every resolve read happens BEFORE store.Apply, never inside
+// it. They drifted once already, and then a second time — through a per-session
+// fallback that sat inside resolveSession, downstream of both, and fired on ANY
+// empty enumeration. A transient mux failure was enough to put a fork of
+// `wezterm cli list` per session back under the exclusive lock, silently, on a box
+// whose operator believed the fix was deployed. mapping.Enumerate now separates
+// that case from a backend with no batch path, and the only thing either call site
+// does under the lock is apply the result.
+//
+// deg makes a degraded tick audible and is shared by both producers, so an
+// alternating tick and layout event cannot each report the same degradation as
+// new. It is nil-safe, matching resolveTurn.Do.
+func enumerateForResolve(ctx context.Context, resolver *mapping.Resolver, snap state.Snapshot, deg *resolveDegradeLog) (map[string]terminal.PaneRef, []wm.Window) {
+	panes, clients, err := resolver.Enumerate(ctx, ttysOf(snap))
+	deg.observe(err)
+	return panes, clients
+}
+
+// ttysOf is the tty set of a pre-lock snapshot, which is all mapping.Enumerate
+// needs from it (and only in its degraded mode).
+func ttysOf(snap state.Snapshot) []string {
+	ttys := make([]string, 0, len(snap.Sessions))
+	for _, sess := range snap.Sessions {
+		if sess.TTY != "" {
+			ttys = append(ttys, sess.TTY)
+		}
+	}
+	return ttys
+}
+
+// resolveDegradeLog reports the terminal enumeration failing, and recovering, on
+// the EDGES rather than every tick — a 5s ticker would otherwise turn a wedged mux
+// into a log flood, and a flood is its own kind of silence.
+//
+// It exists because the failure it reports used to have no symptom at all: the
+// daemon quietly stopped resolving (or, before this, quietly started forking per
+// session under the lock) and looked healthy from the outside. Both resolve
+// producers share one of these, so an alternating tick and layout event cannot
+// each report the same degradation as new.
+//
+// Logging happens outside the store lock, at both call sites, and must stay that
+// way: a blocking write with the exclusive lock held is an unbounded stall.
+type resolveDegradeLog struct {
+	mu       sync.Mutex
+	degraded bool
+}
+
+func (d *resolveDegradeLog) observe(err error) {
+	if d == nil {
 		return
 	}
-	resolver.Reconcile(ctx, sess)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	switch {
+	case err != nil && !d.degraded:
+		d.degraded = true
+		log.Printf("switchboard: terminal enumeration failed, session→window mapping is frozen until it recovers: %v", err)
+	case err == nil && d.degraded:
+		d.degraded = false
+		log.Printf("switchboard: terminal enumeration recovered; session→window mapping resumed")
+	}
 }
 
 // runReconciler periodically re-resolves every session's wezterm + hyprland
@@ -534,7 +603,7 @@ func runReconciler(ctx context.Context, store *state.Store, resolver *mapping.Re
 	// the WM path landing an older observation between them. See resolveTurn.
 	tick := func() {
 		turn.Do(func() {
-			reconcileOnce(ctx, store, resolver, manager, stack, tun, sink, rstate, forget)
+			reconcileOnce(ctx, store, resolver, manager, stack, tun, sink, rstate, forget, turn.degradeLog())
 		})
 	}
 	tick()
@@ -548,12 +617,18 @@ func runReconciler(ctx context.Context, store *state.Store, resolver *mapping.Re
 	}
 }
 
-func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, tun statustune.Tuning, sink *history.Sink, rstate *reconcileState, forget func(int)) {
+func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, tun statustune.Tuning, sink *history.Sink, rstate *reconcileState, forget func(int), deg *resolveDegradeLog) {
 	// Re-publish capabilities every tick: the terminal locator is self-redetecting
 	// (detect.NewAuto), so a terminal that came up after the daemon flips
 	// terminal/navigate from their boot-race "none" values without a restart.
 	store.SetCapabilities(stack.Capabilities())
 	active, _ := manager.ActiveWindow(ctx)
+	// ONE snapshot for the enumeration and every sampler below. Each used to take
+	// its own, which is four acquisitions of the read lock and four deep copies of
+	// every session per tick — and, worse than the cost, four different views of
+	// which sessions exist, taken at four different instants and then applied
+	// together. Taken here, before any of them, so they all describe one instant.
+	snap := store.Snapshot()
 	// The two enumerations the per-session resolve needs, fetched ONCE for the
 	// whole tick and OUTSIDE the lock. This is the same rule the memory sample
 	// below already follows, and it is why this function has this shape:
@@ -563,19 +638,13 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 	// them on an 8-session, 2-mux box — and every RPC reader, every hook, and
 	// every chip click queued behind it. Measured before this change: p99 166ms,
 	// worst 1382ms, with the spike train landing exactly on the tick interval.
-	panes, clients := resolver.Enumerate(ctx)
+	panes, clients := enumerateForResolve(ctx, resolver, snap, deg)
 	// Stamped AFTER the enumeration so TitleAt still means "when the title was
 	// sampled", which is what it meant when each session stamped its own clock on
 	// the way out of Locate. Stamping before would backdate every title by the
 	// fetch duration, and TitleAt is the freshness gate for the H9 idle-title
 	// recovery (docs/timing-hazards.md).
 	now := time.Now()
-	// ONE snapshot for every sampler below. Each used to take its own, which is four
-	// acquisitions of the read lock and four deep copies of every session per tick —
-	// and, worse than the cost, four different views of the world that could disagree
-	// with each other about which sessions exist. Taken here, before any sampling, so
-	// they all describe the same instant.
-	snap := store.Snapshot()
 	// Memory is sampled BEFORE the lock is taken, against the pid set of that
 	// snapshot: the reads are milliseconds and Store.Apply blocks every RPC reader
 	// and every hook for as long as it holds. Only the assignment and the
@@ -596,7 +665,10 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 		// work below — a dead session earns none of it.
 		sweepDeadSessions(m, stack.OSProc, sink, forget, now)
 		for _, sess := range m {
-			resolveSession(ctx, resolver, sess, panes, clients, now)
+			// Applies the pre-lock enumeration and does no I/O — ReconcileFrom takes no
+			// context precisely so it cannot. A degraded tick arrives here with nil
+			// panes, which every session reads as a miss and leaves alone.
+			resolver.ReconcileFrom(sess, panes, clients, now)
 			// Refresh job-control suspension (Ctrl-Z). On ErrGone the sweep above has
 			// already dropped the session, so this only ever sees a live pid; leave
 			// the last-known value on any other read error rather than flapping. A
