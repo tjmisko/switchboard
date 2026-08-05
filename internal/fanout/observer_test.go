@@ -294,6 +294,136 @@ func TestReconcileFrom_appliesAFreshSampleWithoutReadingAgain(t *testing.T) {
 	}
 }
 
+// The reproduced defect: the freshness guard used to check only the transcript
+// byte cursor, which covers the TasksSince half of a sample and nothing else. The
+// subagents dir scan has no cursor, so a sample could carry a dir listing a
+// competing Reconcile had already superseded — and applying it RESURRECTED the
+// superseded state.
+//
+// A stamp on the dir cannot close this. The terminal entry is appended to the
+// subagent's OWN jsonl, and appending to an existing file does not move its
+// directory's mtime (only creating/removing/renaming an entry does), so a dir
+// stamp is blind to exactly the write that matters here. What IS detectable
+// exactly, and for free, is the thing that actually invalidates the sample:
+// another producer reconciled this session in between.
+func TestReconcileFrom_doesNotResurrectASubagentTheStopHookAlreadyDrained(t *testing.T) {
+	e := newEnv(t)
+	writeSub(t, e.subdir, "a1", metaClassic(1, "toolu_a1"), "") // running
+	obs := NewObserver(e.historyDir)
+	now := time.Now()
+
+	// The tick samples while a1 runs: subs=[a1 running], taken at cursor 0.
+	s := obs.Sample(e.c.SessionID, e.c.Transcript)
+
+	// a1 finishes. Its terminal entry goes to its own jsonl; the PARENT transcript
+	// is untouched because a1's tool_result has not landed yet — so the cursor
+	// cannot move, and a cursor-only guard sees nothing at all happen.
+	writeSub(t, e.subdir, "a1", metaClassic(1, "toolu_a1"), "end_turn")
+
+	// The SubagentStop hook reconciles inline, ahead of the tick that sampled.
+	if ev := obs.Reconcile(e.sess, e.c, now); !hasEvent(ev, history.EventSubagentStop, "a1") {
+		t.Fatalf("setup: the hook's Reconcile should stop a1; got %+v", ev)
+	}
+	if e.c.InFlightSubagents != 0 {
+		t.Fatalf("setup: inflight = %d, want 0 once the hook drained a1", e.c.InFlightSubagents)
+	}
+
+	// Only now does the tick apply the sample it took before any of that.
+	obs.ReconcileFrom(s, e.sess, e.c, now)
+	if e.c.InFlightSubagents != 0 {
+		t.Fatalf("a stale sample resurrected a drained subagent: inflight = %d, want 0 "+
+			"(selfHealStuckStatus reads this and paints a phantom delegating span for a full tick)",
+			e.c.InFlightSubagents)
+	}
+}
+
+// The mirror of the case above, equally reachable: a subagent that appears between
+// Sample and apply is counted by the SubagentStart hook, then zeroed by the stale
+// sample's empty dir listing.
+func TestReconcileFrom_doesNotZeroASubagentTheStartHookAlreadyCounted(t *testing.T) {
+	e := newEnv(t)
+	obs := NewObserver(e.historyDir)
+	now := time.Now()
+
+	// Sampled with an empty subagents dir: subs=[], cursor 0.
+	s := obs.Sample(e.c.SessionID, e.c.Transcript)
+
+	// A fanout starts and the SubagentStart hook reconciles it in.
+	writeSub(t, e.subdir, "a1", metaClassic(1, "toolu_a1"), "")
+	if ev := obs.Reconcile(e.sess, e.c, now); !hasEvent(ev, history.EventSubagentSpawn, "a1") {
+		t.Fatalf("setup: the hook's Reconcile should spawn a1; got %+v", ev)
+	}
+
+	obs.ReconcileFrom(s, e.sess, e.c, now)
+	if e.c.InFlightSubagents != 1 {
+		t.Fatalf("a stale sample zeroed a live subagent: inflight = %d, want 1", e.c.InFlightSubagents)
+	}
+}
+
+// A session id is not by itself a unique key for a transcript: two panes resumed
+// onto one conversation, or a hook payload carrying transcript_path without
+// session_id (which handleHook tolerates), put two store sessions on one id with
+// different transcripts. usableFor must compare the path — its sibling
+// signalSample.freshFor always has — or one session's dir scan is applied to the
+// other's sessions.
+func TestReconcileFrom_rejectsASampleTakenAgainstADifferentTranscript(t *testing.T) {
+	e := newEnv(t)
+	writeSub(t, e.subdir, "a1", metaClassic(1, "toolu_a1"), "")
+
+	// A second transcript wearing the SAME session id, with its own subagents dir.
+	other := filepath.Join(e.base, "other.jsonl")
+	otherSub := filepath.Join(e.base, "other", "subagents")
+	if err := os.MkdirAll(otherSub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(other, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeSub(t, otherSub, "b1", metaClassic(1, "toolu_b1"), "")
+
+	obs := NewObserver(e.historyDir)
+	s := obs.Sample(e.c.SessionID, e.transcript) // sampled against transcript A
+
+	c := &state.AgentInfo{SessionID: e.sid, Transcript: other} // applied to transcript B
+	ev := obs.ReconcileFrom(s, e.sess, c, time.Now())
+	if hasEvent(ev, history.EventSubagentSpawn, "a1") {
+		t.Fatalf("transcript A's dir scan was applied to transcript B; got %+v", ev)
+	}
+	if !hasEvent(ev, history.EventSubagentSpawn, "b1") {
+		t.Fatalf("a sample for another transcript should fall back to an inline read of B's own dir; got %+v", ev)
+	}
+}
+
+// A sample whose reads FAILED carries no facts, but it used to satisfy the guard
+// anyway (valid was set before the reads, never revised by them). ReconcileFrom
+// therefore skipped the inline fallback and then bailed on !subsOK, giving up for
+// the whole tick where plain Reconcile would have retried and recovered in it.
+// Claude Code recreates <session>/subagents/ during a /clear, so a momentarily
+// unreadable dir is reachable in ordinary use.
+func TestReconcileFrom_readsInlineWhenTheSampleReadsFailed(t *testing.T) {
+	e := newEnv(t)
+	writeSub(t, e.subdir, "a1", metaClassic(1, "toolu_a1"), "")
+	obs := NewObserver(e.historyDir)
+
+	if err := os.Chmod(e.subdir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	s := obs.Sample(e.c.SessionID, e.c.Transcript)
+	if err := os.Chmod(e.subdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if s.subsOK {
+		t.Skip("the dir scan succeeded despite mode 0000 — running as root?")
+	}
+
+	if ev := obs.ReconcileFrom(s, e.sess, e.c, time.Now()); !hasEvent(ev, history.EventSubagentSpawn, "a1") {
+		t.Fatalf("a sample whose reads failed must fall back to an inline read; got %+v", ev)
+	}
+	if e.c.InFlightSubagents != 1 {
+		t.Fatalf("inflight = %d, want 1 after the inline recovery", e.c.InFlightSubagents)
+	}
+}
+
 func TestPrime_isANoopWithoutASessionID(t *testing.T) {
 	e := newEnv(t)
 	obs := NewObserver(e.historyDir)

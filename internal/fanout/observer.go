@@ -44,6 +44,7 @@ const DefaultStaleCap = 30 * time.Minute
 // — new pid, same session-id, same subagents/ dir — reuses it after re-seeding.
 type sessionState struct {
 	seeded     bool
+	gen        uint64          // bumped by every seed and every applied reconcile; see Sample.usableFor
 	offset     int64           // forward cursor into the parent transcript
 	spawned    map[string]bool // agent_id -> spawn event already emitted
 	stopped    map[string]bool // agent_id -> stop event already emitted
@@ -159,6 +160,7 @@ func (ss *sessionState) applySeed(spawned, stopped map[string]bool, offset int64
 	}
 	ss.offset = offset
 	ss.seeded = true
+	ss.gen++
 }
 
 // Sample is the I/O half of one session's Reconcile, taken with no store lock
@@ -168,26 +170,47 @@ func (ss *sessionState) applySeed(spawned, stopped map[string]bool, offset int64
 // The zero value is "no sample", which makes ReconcileFrom behave exactly like
 // Reconcile.
 type Sample struct {
-	sessionID string
-	base      int64 // the cursor the reads were taken against
-	spawns    []transcript.Task
-	resultIDs []string
-	newOffset int64
-	tasksOK   bool
-	subs      []transcript.Subagent
-	subsOK    bool
-	valid     bool
+	sessionID  string
+	transcript string // the file the reads were taken from; a session id alone does not identify one
+	base       int64  // the cursor the reads were taken against
+	gen        uint64 // the session's state generation at sample time
+	spawns     []transcript.Task
+	resultIDs  []string
+	newOffset  int64
+	tasksOK    bool
+	subs       []transcript.Subagent
+	subsOK     bool
+	valid      bool
 }
 
-// usableFor reports whether this sample still describes the session's current
-// cursor. A sample taken against a cursor that has since moved — another
-// producer reconciled in between — is discarded rather than applied, because
-// applying it would rewind the cursor to a stale newOffset and re-scan bytes
-// whose signals were already folded in. This is the same inversion hazard the
-// resolve path hit when its enumeration moved outside the lock; here it is
+// usableFor reports whether this sample still describes the session the caller is
+// about to apply it to. A sample another producer has already overtaken is
+// discarded rather than applied, because applying it would rewind the cursor to a
+// stale newOffset and — worse — overwrite an in-flight count derived from a fresher
+// dir scan with one derived from an older one. This is the same inversion hazard
+// the resolve path hit when its enumeration moved outside the lock; here it is
 // cheap to detect exactly, so it is detected rather than serialized against.
-func (s Sample) usableFor(sessionID string, offset int64) bool {
-	return s.valid && s.sessionID == sessionID && s.base == offset
+//
+// The generation, not the cursor, is what makes this sound. The cursor guards only
+// the TasksSince half of a sample: the dir scan has no cursor, and cannot get one
+// that works — a subagent's terminal entry is appended to its OWN jsonl, and
+// appending to an existing file does not move the containing dir's mtime, so a dir
+// stamp is blind to the exact write that ends a fanout. What is detectable exactly,
+// and for free, is that this session was reconciled between the sample and its
+// application (the SubagentStart/Stop hook trigger reconciles the same session
+// independently, and the window is wide — every other sampler runs in it). A
+// generation bump on every seed and every applied reconcile catches that, and a
+// mismatch costs one inline read, never correctness.
+//
+// The transcript path is compared for a different reason: rs.samples is keyed by
+// session id, but two store sessions can carry one session id with different
+// transcripts (two panes resumed onto one conversation; a hook payload with a
+// transcript_path but no session_id, which handleHook tolerates). Without this the
+// loser of that collision has the other's dir scan applied to it.
+func (s Sample) usableFor(sessionID, transcriptPath string, ss *sessionState) bool {
+	return s.valid && ss != nil &&
+		s.sessionID == sessionID && s.transcript == transcriptPath &&
+		s.base == ss.offset && s.gen == ss.gen
 }
 
 // Sample performs every read one Reconcile needs, holding no lock while it does
@@ -205,12 +228,15 @@ func (o *Observer) Sample(sessionID, transcriptPath string) Sample {
 
 	o.mu.Lock()
 	var base int64
+	var gen uint64
 	if ss := o.sessions[sessionID]; ss != nil {
-		base = ss.offset
+		base, gen = ss.offset, ss.gen
 	}
 	o.mu.Unlock()
 
-	return readSample(sessionID, transcriptPath, base)
+	s := readSample(sessionID, transcriptPath, base)
+	s.gen = gen
+	return s
 }
 
 // readSample is the actual I/O, shared by the pre-lock Sample and the under-lock
@@ -219,8 +245,13 @@ func (o *Observer) Sample(sessionID, transcriptPath string) Sample {
 // G5: on /clear or compaction the file shrinks below the cursor — re-read from 0
 // once (the agent-id seen-set keeps emission idempotent), and never let the
 // cursor run past EOF.
+//
+// valid is set from the reads rather than ahead of them: a sample that failed to
+// read carries no facts, and passing it off as usable would make ReconcileFrom skip
+// the inline retry and then bail on !subsOK — giving up for the whole tick where
+// plain Reconcile would have recovered within it.
 func readSample(sessionID, transcriptPath string, base int64) Sample {
-	s := Sample{sessionID: sessionID, base: base, valid: true}
+	s := Sample{sessionID: sessionID, transcript: transcriptPath, base: base}
 	from := base
 	if size := fileSize(transcriptPath); from > size {
 		from = 0
@@ -231,6 +262,7 @@ func readSample(sessionID, transcriptPath string, base int64) Sample {
 	if subs, err := transcript.SubagentsForTranscript(transcriptPath); err == nil {
 		s.subs, s.subsOK = subs, true
 	}
+	s.valid = s.tasksOK && s.subsOK
 	return s
 }
 
@@ -247,8 +279,15 @@ func (o *Observer) Reconcile(sess *state.Session, c *state.AgentInfo, now time.T
 }
 
 // ReconcileFrom is Reconcile applied to reads already taken outside the lock. A
-// sample that no longer matches the session's cursor is silently re-read inline,
-// so this is never less correct than Reconcile — only faster when it hits.
+// sample this session has moved past — a different cursor, a different transcript,
+// a reconcile applied in between, or reads that failed — is rejected and re-read
+// inline, so a rejected sample costs latency, never correctness.
+//
+// An ACCEPTED sample is still a sample: it describes the transcript and subagents
+// dir as of sample time, so a change on disk in the window between is folded in one
+// tick later than plain Reconcile would have. That lag is inherent to sampling and
+// bounded by the tick; what is NOT tolerable, and what usableFor exists to prevent,
+// is a sample overwriting state a fresher read already established.
 func (o *Observer) ReconcileFrom(s Sample, sess *state.Session, c *state.AgentInfo, now time.Time) []history.Event {
 	return o.reconcile(sess, c, now, s)
 }
@@ -275,12 +314,16 @@ func (o *Observer) reconcile(sess *state.Session, c *state.AgentInfo, now time.T
 		ss.applySeed(sp, st, off)
 	}
 
-	if !s.usableFor(c.SessionID, ss.offset) {
-		// No sample, or one the cursor has moved past. Read inline — under the lock,
+	if !s.usableFor(c.SessionID, c.Transcript, ss) {
+		// No sample, or one this session has moved past. Read inline — under the lock,
 		// as this always used to be. Correctness never depends on the sample; only
 		// the lock hold does.
 		s = readSample(c.SessionID, c.Transcript, ss.offset)
 	}
+	// Everything below mutates ss, which retires every sample taken against it —
+	// including the one another producer may be holding right now, mid-tick. o.mu is
+	// held for the whole body, so where the bump sits inside it does not matter.
+	ss.gen++
 
 	// 1) Advance the forward cursor. It supplies the run_in_background flag (only
 	// the parent tool_use carries it) and a secondary tool_result completion

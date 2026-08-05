@@ -68,16 +68,24 @@ func newReconcileState(obs *fanout.Observer, mem *memorySampler) *reconcileState
 //     body of the hold rather than its tail.
 //
 // Read through Snapshot — the shared read lock — never through Apply. A session
-// that appears between this snapshot and the lock, or whose cursor moves in
-// between, is simply read inline inside Reconcile exactly as before: the sample
-// is checked against the cursor it was taken at and discarded if stale. This is a
-// latency optimization with no bearing on what gets emitted.
+// that appears between this snapshot and the lock, or that something else
+// reconciles in between, is simply read inline inside Reconcile exactly as before:
+// the sample is checked against the state it was taken against and discarded if
+// that state has moved (fanout.Sample.usableFor).
+//
+// It does shift WHEN a change is seen, which the guard cannot and should not
+// prevent: a fanout that starts or ends inside the window between this sampling
+// and the tick's Apply is folded in on the NEXT tick, so its stop event is dated a
+// tick later than an inline read would have dated it. That lag is inherent to
+// sampling and bounded by the tick interval. The hazard the guard does remove is
+// the one that is not merely late — a sample overwriting a count that a fresher
+// read (the SubagentStart/Stop hook's own Reconcile) already established.
 func (rs *reconcileState) sampleFanout(store *state.Store) {
 	if rs.fanout == nil {
 		return
 	}
-	// A fresh map per tick: a sample is only valid against the cursor it was taken
-	// at, and keeping last tick's around would just be dead weight for the
+	// A fresh map per tick: a sample is only valid against the state it was taken
+	// against, and keeping last tick's around would just be dead weight for the
 	// usableFor check to reject.
 	rs.samples = map[string]fanout.Sample{}
 	for _, sess := range store.Snapshot().Sessions {
@@ -85,8 +93,20 @@ func (rs *reconcileState) sampleFanout(store *state.Store) {
 		if c == nil || c.SessionID == "" || c.Transcript == "" {
 			continue
 		}
-		rs.samples[c.SessionID] = rs.fanout.Sample(c.SessionID, c.Transcript)
+		rs.samples[sampleKey(c)] = rs.fanout.Sample(c.SessionID, c.Transcript)
 	}
+}
+
+// sampleKey identifies the reads one session needs. The session id alone does not:
+// two store sessions can carry the same id with different transcripts (two panes
+// resumed onto one conversation, or a hook payload with a transcript_path but no
+// session_id, which handleHook tolerates), and under an id-only key one of them
+// silently overwrites the other's sample. The Observer rejects a sample taken
+// against another transcript anyway, so this is the difference between both
+// sessions using their own reads and one of them falling back to an inline read
+// under the lock — which is the cost this whole path exists to avoid.
+func sampleKey(c *state.AgentInfo) string {
+	return c.SessionID + "\x00" + c.Transcript
 }
 
 // observe updates c.InFlightSubagents and emits any new subagent_spawn/stop
@@ -157,7 +177,7 @@ func (rs *reconcileState) observeFanout(sink *history.Sink, sess *state.Session,
 	if rs.fanout == nil {
 		return
 	}
-	for _, ev := range rs.fanout.ReconcileFrom(rs.samples[c.SessionID], sess, c, now) {
+	for _, ev := range rs.fanout.ReconcileFrom(rs.samples[sampleKey(c)], sess, c, now) {
 		sink.Record(ev)
 	}
 }
