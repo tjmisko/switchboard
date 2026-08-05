@@ -13,9 +13,10 @@ import (
 	"github.com/tjmisko/switchboard/internal/transcript"
 )
 
-// T9 (docs/subagent-permission-plan.md §3.3, docs/subagent-permission-oscillation.md
+// T9/T10 (docs/subagent-permission-plan.md §3.3, docs/subagent-permission-oscillation.md
 // §3.5 defect 4): the reconciler must resolve each pending prompt against the
-// transcript of the WRITER that raised it.
+// transcript of the WRITER that raised it, and must bound a prompt whose writer
+// will never answer.
 //
 // Defect 4 is the reason the project's goal was not met. ResolveKind reports
 // ResolutionResumed for any assistant message dated after the prompt, so asking
@@ -316,6 +317,161 @@ func TestSelfHealRoutesResolutionToTheRaisingWriter(t *testing.T) {
 
 		if got := m[100].Claude.Status; got != state.StatusWorking {
 			t.Errorf("status = %q, want working", got)
+		}
+	})
+}
+
+// T10 / case 19: the per-prompt liveness backstop. T3 broadened the hold to every
+// hook event, so without this a prompt from a CRASHED teammate — one that will
+// never fire a hook and never write another transcript entry — holds the chip red
+// forever (plan risk R3). The policy is the fanout Observer's: quiescence measured
+// on the writer's own file, against a hard cap, force-closing rather than leaking.
+func TestPendingWriterStaleCapBackstop(t *testing.T) {
+	since := mustParse(t, "2026-08-05T19:38:13Z")
+	cap := testTune.PendingWriterStaleCap
+
+	t.Run("should drop a prompt and re-fold the chip when its writer is gone past the cap", func(t *testing.T) {
+		var buf bytes.Buffer
+		defer log.SetOutput(log.Writer())
+		log.SetOutput(&buf)
+
+		// The teammate left no file behind at all — the crashed-before-it-wrote shape.
+		main := routedFixture(t, map[string]string{"": routedBlocked(since)}, since)
+		m := routedSession(main, since, routedTeammate)
+
+		selfHealStaleAttention(m, since.Add(cap+time.Minute), testTune, nil)
+
+		if len(m[100].Claude.Pending) != 0 {
+			t.Errorf("pending writers = %v, want none (an unanswerable prompt is dropped, not latched)", pendingWriterSet(m[100].Claude))
+		}
+		if got := m[100].Claude.Status; got != testTune.InterruptExitStatus {
+			t.Errorf("status = %q, want %q — the chip must re-fold once the last entry is gone", got, testTune.InterruptExitStatus)
+		}
+		if !strings.Contains(buf.String(), "rule=case19-stale-writer-backstop") {
+			t.Errorf("missing the case-19 backstop line in:\n%s", buf.String())
+		}
+	})
+
+	t.Run("should drop a prompt when its writer's file is readable but has not moved past the cap", func(t *testing.T) {
+		// The case case 15 cannot reach: the jsonl is on disk and reads fine, it just
+		// never advances again. ResolveKind says ResolutionNone forever, so before
+		// T10 this red had nothing that could ever release it.
+		main := routedFixture(t, map[string]string{
+			"":             routedBlocked(since),
+			routedTeammate: routedBlocked(since),
+		}, since)
+		m := routedSession(main, since, routedTeammate)
+
+		selfHealStaleAttention(m, since.Add(cap+time.Minute), testTune, nil)
+
+		if len(m[100].Claude.Pending) != 0 {
+			t.Errorf("pending writers = %v, want none", pendingWriterSet(m[100].Claude))
+		}
+		if got := m[100].Claude.Status; got != testTune.InterruptExitStatus {
+			t.Errorf("status = %q, want %q", got, testTune.InterruptExitStatus)
+		}
+	})
+
+	t.Run("should keep a prompt when its writer is gone but the cap has not elapsed", func(t *testing.T) {
+		main := routedFixture(t, map[string]string{"": routedBlocked(since)}, since)
+		m := routedSession(main, since, routedTeammate)
+
+		selfHealStaleAttention(m, since.Add(cap-time.Minute), testTune, nil)
+
+		if want := []string{routedTeammate}; !equalStrings(pendingWriterSet(m[100].Claude), want) {
+			t.Errorf("pending writers = %v, want %v", pendingWriterSet(m[100].Claude), want)
+		}
+		if got := m[100].Claude.Status; got != state.StatusPermission {
+			t.Errorf("status = %q, want permission", got)
+		}
+	})
+
+	t.Run("should keep a prompt whose writer is still touching its transcript", func(t *testing.T) {
+		// The clock runs from the LATER of the onset and the file's mtime, so a
+		// writer that keeps writing never accumulates age however old its prompt is.
+		// Guards the case of a long human deliberation over a writer that is meanwhile
+		// still emitting (a parallel sibling tool finishing, a streaming chunk).
+		now := since.Add(cap + time.Hour)
+		main := routedFixture(t, map[string]string{
+			"":             routedBlocked(since),
+			routedTeammate: routedBlocked(since),
+		}, now.Add(-time.Minute))
+		m := routedSession(main, since, routedTeammate)
+
+		selfHealStaleAttention(m, now, testTune, nil)
+
+		if want := []string{routedTeammate}; !equalStrings(pendingWriterSet(m[100].Claude), want) {
+			t.Errorf("pending writers = %v, want %v (a fresh mtime resets the quiescence clock)", pendingWriterSet(m[100].Claude), want)
+		}
+	})
+
+	t.Run("should give a re-stamped prompt a fresh full cap when its writer's file is already old", func(t *testing.T) {
+		// The hydrate path re-stamps Since to startup (§9.6). A prompt raised now
+		// against a file last written hours ago must get the whole cap, not inherit
+		// the file's age — otherwise every restart would instantly drop the reds it
+		// just took the trouble to carry across.
+		main := routedFixture(t, map[string]string{
+			"":             routedBlocked(since),
+			routedTeammate: routedBlocked(since),
+		}, since.Add(-4*time.Hour))
+		m := routedSession(main, since, routedTeammate)
+
+		selfHealStaleAttention(m, since.Add(cap-time.Minute), testTune, nil)
+
+		if want := []string{routedTeammate}; !equalStrings(pendingWriterSet(m[100].Claude), want) {
+			t.Errorf("pending writers = %v, want %v", pendingWriterSet(m[100].Claude), want)
+		}
+	})
+
+	t.Run("should keep the chip red when only one of two writers passes the cap", func(t *testing.T) {
+		// Case 19 through case 18's fold: dropping the dead writer's entry must not
+		// clear the live writer's red.
+		main := routedFixture(t, map[string]string{
+			"": routedBlocked(since), // main is blocked and quiescent...
+		}, since.Add(-time.Minute))
+		// ...but its prompt was raised only a moment ago, while the teammate's is old.
+		m := routedSession(main, since.Add(-2*cap), "", routedTeammate)
+		fresh := m[100].Claude.Pending[""]
+		fresh.Since = since
+		m[100].Claude.Pending[""] = fresh
+
+		selfHealStaleAttention(m, since.Add(time.Minute), testTune, nil)
+
+		if got := m[100].Claude.Status; got != state.StatusPermission {
+			t.Errorf("status = %q, want permission — the main thread's prompt is minutes old, not hours", got)
+		}
+		if want := []string{state.PendingWriterMain}; !equalStrings(pendingWriterSet(m[100].Claude), want) {
+			t.Errorf("pending writers = %v, want %v", pendingWriterSet(m[100].Claude), want)
+		}
+	})
+
+	t.Run("should never drop a prompt when the cap is tuned off", func(t *testing.T) {
+		tun := testTune
+		tun.PendingWriterStaleCap = 0
+
+		main := routedFixture(t, map[string]string{"": routedBlocked(since)}, since)
+		m := routedSession(main, since, routedTeammate)
+
+		selfHealStaleAttention(m, since.Add(30*24*time.Hour), tun, nil)
+
+		if want := []string{routedTeammate}; !equalStrings(pendingWriterSet(m[100].Claude), want) {
+			t.Errorf("pending writers = %v, want %v (a non-positive cap disables the backstop)", pendingWriterSet(m[100].Claude), want)
+		}
+	})
+
+	t.Run("should prefer a real resolution over the cap when both are available", func(t *testing.T) {
+		// A writer that resumed after a long wait exits to the resume color (green),
+		// not the backstop's. The cap is the last resort, never the first answer.
+		main := routedFixture(t, map[string]string{
+			"":             routedBlocked(since),
+			routedTeammate: routedWorking(since),
+		}, since)
+		m := routedSession(main, since, routedTeammate)
+
+		selfHealStaleAttention(m, since.Add(cap+time.Hour), testTune, nil)
+
+		if got := m[100].Claude.Status; got != testTune.ResumeExitStatus {
+			t.Errorf("status = %q, want %q (the transcript answered; the cap never had to)", got, testTune.ResumeExitStatus)
 		}
 	})
 }

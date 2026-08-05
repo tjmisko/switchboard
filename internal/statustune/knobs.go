@@ -46,6 +46,11 @@ const (
 	// red. Case 18 — the case the old whole-session ClearPending could not express,
 	// and the reason resolution is routed per writer at all.
 	RuleHoldOtherWriters = "case18-hold-other-writers"
+	// RuleStaleWriterBackstop — reconciler exit: a writer's own transcript has been
+	// quiescent past PendingWriterStaleCap (or the writer is gone entirely), so its
+	// prompt is unanswerable and is dropped rather than latched. Case 19, the
+	// per-writer analogue of case 15 for a file that reads fine and never moves.
+	RuleStaleWriterBackstop = "case19-stale-writer-backstop"
 
 	// RuleDelegating — idle promoted to delegating (green) because subagents are in
 	// flight.
@@ -86,6 +91,7 @@ var ruleKnobs = map[string]KnobHint{
 	RuleDeclineIdle:           {"InterruptExitStatus", "the color a red chip exits to when interrupted/declined with no teammates (default idle/orange)"},
 	RuleDeclineDelegating:     {"EscWithTeammatesStatus", "the color when interrupted/declined while teammates are in flight (default delegating/green)"},
 	RuleTTLBackstop:           {"PermissionDecayTTL", "how long an unreadable-transcript red chip waits before the backstop releases it (default 30s)"},
+	RuleStaleWriterBackstop:   {"PendingWriterStaleCap", "how long one writer's transcript may sit quiescent before its prompt is dropped as unanswerable (default 30m, matching the fanout Observer's force-close of the same subagent). Raise it to let a crashed teammate's red nag longer; lowering it starts cutting real human decision windows short, which is a missed RED"},
 	RuleHoldOtherWriters:      {"", "intentional missed-RED guard, and the point of keying red by writer: one prompt resolving says nothing about another writer's, so the chip stays red until every entry is gone. There is no knob — a session with two blocked writers needs two answers"},
 	RuleDelegating:            {"DelegatingEnabled", "set false to keep an idle-with-teammates chip orange instead of green"},
 	RuleDrained:               {"DelegatingEnabled", "set false to disable the delegating state entirely"},

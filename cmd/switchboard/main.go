@@ -853,6 +853,13 @@ func enrichmentID(s *state.Session) string {
 // leaves "permission" only once the map is empty (plan §3.3) — case 18: with the
 // main thread and a teammate both blocked, answering one keeps the chip red.
 //
+// # T10 — the per-prompt liveness backstop
+//
+// A writer that is gone, or whose own file has been quiescent past
+// PendingWriterStaleCap, has its entry dropped as unanswerable (case 19). Without
+// it the generalized hold (T3) lets a crashed teammate's prompt latch red forever
+// — plan risk R3, which T3 widened. See writerQuiescentPastCap.
+//
 // It runs inside the reconcile Apply, so it operates on the locked session map
 // directly (no shared-pointer race) and folds into the tick's single persist.
 // The bounded transcript reads under the lock are consistent with the per-session
@@ -982,10 +989,64 @@ func resolveWriterPrompt(c *state.AgentInfo, writer string, now time.Time, tun s
 	path := transcript.SubagentPath(c.Transcript, writer)
 	kind, err := transcript.ResolveKind(path, since, tun.TailBytes)
 	exit, rule, reason, ok := permissionExit(kind, err != nil && writer == "", now.Sub(since), c.InFlightSubagents, tun)
-	if !ok {
+	if ok {
+		return writerVerdict{writer, exit, rule, reason}, true
+	}
+	if !writerQuiescentPastCap(path, since, now, tun.PendingWriterStaleCap) {
 		return writerVerdict{}, false
 	}
-	return writerVerdict{writer, exit, rule, reason}, true
+	return writerVerdict{
+		writer: writer,
+		exit:   tun.InterruptExitStatus,
+		rule:   statustune.RuleStaleWriterBackstop,
+		reason: fmt.Sprintf("%s quiescent past the %s cap", pendingWriterLabel(writer), tun.PendingWriterStaleCap),
+	}, true
+}
+
+// writerQuiescentPastCap is T10's per-prompt liveness backstop (case 19): it
+// reports whether writer `path`'s prompt has become unanswerable, either because
+// the writer is gone or because its own file has stopped moving for longer than
+// the cap.
+//
+// The policy is the fanout Observer's, not a second one invented here. That
+// Observer force-closes a spawned-but-unfinished subagent as completion=unknown
+// once its jsonl mtime is older than fanout.DefaultStaleCap, so in-flight cannot
+// leak (internal/fanout/observer.go). This is the same measurement applied to the
+// same file for the same reason: at the default cap the two agree, and the chip
+// never stays red for a teammate the Observer has already stopped counting.
+//
+// The clock runs from the LATER of the prompt's onset and the file's mtime:
+//
+//   - mtime later — an active writer resets it on every write, so only a genuinely
+//     stalled one accumulates age. A blocked writer stops within ~1s of its
+//     PermissionRequest, so in practice its clock starts at the prompt.
+//   - onset later — a prompt raised against a file that was already old (the
+//     hydrate path re-stamps Since to startup) gets a fresh FULL cap rather than
+//     inheriting the stale file's age. §9.6 states that trade explicitly.
+//
+// A file that cannot be stat-ed contributes nothing, so the clock runs from the
+// onset alone: "the writer is gone" and "the writer went quiet" are the same
+// verdict here, reached the same way, which is what keeps a prompt from a crashed
+// teammate from latching red forever.
+//
+// Stated plainly, because it is a real cost: a genuinely pending prompt is
+// indistinguishable from a dead one by this measurement — both are a quiescent
+// file — so a user who walks away for longer than the cap comes back to a chip
+// that stopped nagging. That is why the cap sits at 30 minutes rather than
+// anywhere near a plausible time-to-answer, and why it is a Tuning field.
+//
+// A zero onset (a chip with no Since at all) and a non-positive cap both disable
+// the backstop — the same shape as the Observer's zero-ModTime guard, and the
+// reason a mis-stamped chip fails toward red rather than away from it.
+func writerQuiescentPastCap(path string, since, now time.Time, staleCap time.Duration) bool {
+	if staleCap <= 0 || since.IsZero() {
+		return false
+	}
+	quiescentSince := since
+	if fi, err := os.Stat(path); err == nil && fi.ModTime().After(quiescentSince) {
+		quiescentSince = fi.ModTime()
+	}
+	return now.Sub(quiescentSince) >= staleCap
 }
 
 // selfHealStuckStatus recovers the two non-permission status latches the hooks
