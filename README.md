@@ -321,6 +321,22 @@ JSON line per snapshot; `class` carries status + `focused` + `suspended` so
 `style.css` paints the chip. Click = focus that slot; right-click = rofi picker;
 scroll = cycle.
 
+Waybar's row does not wrap, so each slot abbreviates its label to fit the
+monitor (`internal/barlayout`). The fit shares out *glyph cells*, not pixels —
+every chip pays the same fixed overhead, so what remains is one pool the row
+divides max-min fair, with the remainder handed back a cell at a time rather
+than rounded off into the bar's margin. That overhead is the chip's CSS box, so
+`barlayout.DefaultMetrics` has to mirror `style.css` and `claude.jsonc`:
+
+```
+ChipFixedPx = 2×padding + 2×border + 2×margin + spacing
+            =    2×7    +   2×1    +   2×2    +    2     = 22
+```
+
+Change the chip padding, margin, or the bar's `spacing` and you must update
+`DefaultMetrics` to match, or the labels will be cut short (too high) or spill
+off the edge of the bar (too low).
+
 A chip whose `claude` process is job-control-stopped (Ctrl-Z) gains the
 `suspended` class on top of its status class. Grey it out in `style.css`:
 

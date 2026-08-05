@@ -57,6 +57,60 @@ func TestFitRespectsMinLabelRunes(t *testing.T) {
 	}
 }
 
+// The bug this guards: the fit used to cap chips in pixels and then floor the
+// cap to whole runes, so every truncated chip discarded its fractional rune and
+// the row's leftover surfaced as dead margin at the edges of the bar.
+func TestFitSpendsTheWholeRuneBudgetWhenCrowded(t *testing.T) {
+	// Three 10-rune labels into 20 cells: the fair cap is 6 (18 cells), leaving
+	// 2 unclaimed. Those two must reach chips, not the margin.
+	got := Fit([]string{label(10), label(10), label(10)}, 20, unitMetrics)
+	total := 0
+	for _, g := range got {
+		total += utf8.RuneCountInString(g)
+	}
+	if total != 20 {
+		t.Errorf("fitted labels use %d of 20 available cells, want all 20 (%q)", total, got)
+	}
+}
+
+func TestFitCompletesALabelThatIsOneRuneShort(t *testing.T) {
+	// Budget 9 caps both chips at 4. The single leftover cell is worth two
+	// characters on the short label (it also retires the ellipsis), so it goes
+	// there rather than to the label that would still be truncated.
+	got := Fit([]string{label(20), label(5)}, 9, unitMetrics)
+	if got[1] != label(5) {
+		t.Errorf("one-rune-short label = %q, want it completed to %q", got[1], label(5))
+	}
+	if !strings.HasSuffix(got[0], ellipsis) {
+		t.Errorf("long label = %q, want it to stay abbreviated", got[0])
+	}
+}
+
+func TestFitStaysWithinAvailableWidthWithRealMetrics(t *testing.T) {
+	// The eight-session row that motivated the change, on a 1512px logical
+	// screen: long project-prefixed names, one short one.
+	labels := []string{
+		"sb-dash-chart-animation-enhancement",
+		"switchboard-ae",
+		"jobfeed-tune-job-feed-filter",
+		"jobfeed-expand-screener-data-sources",
+		"tjmisko-github-io-retend-timeline-integration",
+		"tjmisko-github-io-mobile-trajectory-redesign",
+		"arachne-ascii-dag-monitor-ui",
+		"digestdownloads-status-update-request",
+	}
+	const avail float64 = 1512 - safetyMarginPx
+	m := DefaultMetrics()
+	got := Fit(labels, avail, m)
+	if total := width(got, m); total > avail {
+		t.Errorf("fitted row is %.1fpx wide, want <= %.1f", total, avail)
+	}
+	// And it must actually use the room: less than one chip's slack left over.
+	if total := width(got, m); avail-total > m.ChipFixedPx+m.CharPx {
+		t.Errorf("fitted row wastes %.1fpx of %.1f available", avail-total, avail)
+	}
+}
+
 func TestFitEmptyInput(t *testing.T) {
 	if got := Fit(nil, 100, unitMetrics); got != nil {
 		t.Errorf("Fit(nil) = %v, want nil", got)
