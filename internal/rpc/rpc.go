@@ -522,7 +522,7 @@ func (s *Server) handleHook(req Request) {
 		var transitionRule, transitionReason string
 		if agent == state.AgentKindClaude && !rotated && info.Status == state.StatusPermission &&
 			status != "" && status != state.StatusPermission {
-			clear, rule, reason := s.clearsPermission(info, req.Event, req.ToolName)
+			clear, writer, rule, reason := s.clearsPermission(info, req)
 			d := statustune.Decision{
 				PID: pid, Session: shortID(coalesce(req.SessionID, info.SessionID)),
 				From: state.StatusPermission, To: state.StatusPermission, Rule: rule, Reason: reason,
@@ -530,24 +530,31 @@ func (s *Server) handleHook(req Request) {
 				Age: time.Since(info.StatusSince),
 			}
 			if clear {
-				// T5 note for whoever lands T7/T9: clearsPermission is a WHOLE-SESSION
-				// verdict today — it answers "is this session's red resolved", not "is
-				// writer a's prompt resolved" — so the faithful translation onto the map
-				// is to drop every entry with it. Narrowing this to the writer the
-				// evidence names is T9's job (and T7's for the hook-speed match); when it
-				// lands, the len(Pending) fold below starts holding red for the writers
-				// that were NOT named, which is case 18.
-				info.ClearPending()
+				// T7/T9: the verdict is now per-WRITER, so it removes ONLY the entry the
+				// evidence names (plan §3.3: "P[a] is removed only by evidence from writer
+				// a"). Dropping the whole map here — which is what T5 had to do while the
+				// verdict was whole-session — is case 18's missed RED: one writer's approved
+				// tool would discard a second writer's still-waiting prompt.
+				info.DropPending(writer)
 			}
 			// The fold (plan §3.3): red is owned by Pending, so the chip may leave
-			// "permission" only when no writer still holds a prompt. The second
-			// conjunct is redundant today for the reason just given, and becomes
-			// load-bearing the moment resolution is routed per writer — which is why it
-			// is written here rather than left for T9 to remember.
+			// "permission" only when no writer still holds a prompt. With the removal
+			// narrowed above, this conjunct is what actually holds red for the writers the
+			// evidence did NOT name — case 18.
 			if clear && len(info.Pending) == 0 {
 				d.To = status
 				transitionRule, transitionReason = rule, reason
 			} else {
+				if clear {
+					// Case 18: this event DID resolve a prompt, and the chip stays red anyway
+					// because another writer is still waiting. Re-attribute the line — an
+					// approve rule on a permission==permission edge reads as a contradiction to
+					// the forensics, and this state has never had a rule of its own. The
+					// remainder is named post-drop, so the line says who is still blocking;
+					// pending= stays the pre-decision snapshot every other decision line carries.
+					d.Rule = statustune.RuleHoldOtherWriter
+					d.Reason = fmt.Sprintf("%s; %s still blocked", reason, pendingWritersLabel(info))
+				}
 				status = "" // hold red
 			}
 			d.Log()
@@ -705,68 +712,171 @@ func normalizeAgentID(id string) string {
 	return rest
 }
 
-// clearsPermission decides whether a hook event should release a red chip and
-// names the rule/reason for the forensic decision log. Two gates, fast first:
+// pendingEntryFor resolves the prompt entry a hook's evidence is allowed to speak
+// to: the one owned by `writer` (bare, normalized agent_id; "" = main thread).
 //
-//   - tool-name fast path (A2): the PostToolUse's tool_name matches the tool the
-//     prompt was raised for (PendingTool), i.e. the *approved* tool just
-//     completed. Clears at hook speed — the fix for the ~26s approve-path lag.
-//     Refused while subagents are in flight, see below.
-//   - transcript fallback: the main thread produced an assistant message after the
-//     prompt (ResolutionResumed), i.e. the turn resumed. Covers the case where the
-//     tool_name was not forwarded, and every non-tool event (Stop /
-//     UserPromptSubmit / SessionStart), which carries no tool_name at all.
+// A writer that owns no entry gets ok=false, and that is the hard part of the T7
+// rule — evidence from a writer with no prompt of its own says nothing about
+// anybody else's (plan §3.3). It is what rules teammates out.
 //
-// ⚠ The fast path is a comparison on a tool *kind*, not a tool *identity*. With
-// any subagent in flight, a teammate running the same kind of tool satisfies it —
-// and the tool in question is usually Bash, the most frequently executed tool
-// there is. That is the 2026-08-05 lost RED verbatim: at 12:38:20 this guard
-// correctly held, and one second later a teammate's Bash cleared the same pending
-// Bash prompt (docs/subagent-permission-oscillation.md §2.2/§3.1). So with
-// InFlightSubagents > 0 the fast path is refused outright and the transcript
-// fallback decides. This deliberately trades back some of the approve-path
-// latency the fast path bought, but only in sessions with teammates in flight,
-// and only until (agent_id, tool_name, tool_input) matching lands (plan T7): a
-// missed RED is the worst error and a slow-but-correct clear is the cheapest.
-//
-// A decline/interrupt deliberately does NOT clear here (it fires no PostToolUse;
-// and exiting a hook-driven *working* edge to green on an interrupt would paint
-// the wrong color) — the reconciler demotes it to idle/orange instead. Anything
-// else holds red (case 12: a bare/sibling/teammate tool_result is not resolution,
-// and neither is an unrelated lifecycle event).
-//
-// ⚠ Two properties of the T5 map this rule now sits on, both of which plan T7
-// must preserve when it replaces the name match with (agent_id, tool_name,
-// inputHash):
-//
-//   - info.PendingTool is DERIVED from state.AgentInfo.Pending, so a prompt
-//     rebuilt at hydrate — which persists ownership only, never the correlators —
-//     leaves it empty. The `toolName != ""` guard therefore already makes a
-//     hydrated entry unmatchable, which is correct: it must resolve by transcript.
-//     Do NOT "fix" that by relaxing the rule to an agent_id-only match. Same-writer
-//     matching reads as sound ("a blocked writer runs no tools") and is not —
-//     Claude Code emits parallel tool_use blocks in one assistant message, so a
-//     writer can complete an auto-approved sibling while its own prompt still
-//     waits. That is the 2026-08-05 bug at a narrower radius.
-//   - the verdict is whole-SESSION, not per-writer. handleHook translates a clear
-//     into "drop every entry" for exactly that reason; narrowing it is T7/T9's.
-func (s *Server) clearsPermission(info *state.AgentInfo, event, toolName string) (clear bool, rule, reason string) {
-	nameMatch := s.tun.EarlyClearApproveByToolName && toolName != "" && toolName == info.PendingTool
-	teammateCollision := nameMatch && info.InFlightSubagents > 0
-	if nameMatch && !teammateCollision {
-		return true, statustune.RuleApproveToolMatch, "tool-name match: " + toolName
+// The one degradation: an EMPTY map beside a red chip. Post-T5 every live claude
+// red has an entry (PermissionRequest writes one, hydrate rebuilds one), so this is
+// a pre-map or hand-seeded block. There the derived scalar PendingTool stands in for
+// a main-thread entry with no input correlator, which reproduces exactly the
+// pre-T7 behavior for the only writer such a block can be describing. Restricted to
+// writer == "": with a NON-empty map, an unattributable event must not borrow some
+// other writer's prompt (PendingTool falls back to the lowest-keyed writer, so
+// reading it here would resurrect defect 1 — the flattening this whole change
+// removes).
+func pendingEntryFor(info *state.AgentInfo, writer string) (state.PendingPrompt, bool) {
+	if p, ok := info.Pending[writer]; ok {
+		return p, true
 	}
-	if k, _ := transcript.ResolveKind(info.Transcript, info.StatusSince, s.tun.TailBytes); k == transcript.ResolutionResumed {
-		return true, statustune.RuleApproveTranscript, "transcript: turn resumed"
+	if len(info.Pending) == 0 && writer == "" {
+		return state.PendingPrompt{Tool: info.PendingTool}, true
 	}
-	if teammateCollision {
-		return false, statustune.RuleHoldTeammateCollision,
-			fmt.Sprintf("tool-name match on %s but %d subagent(s) in flight — kind, not identity", toolName, info.InFlightSubagents)
+	return state.PendingPrompt{}, false
+}
+
+// clearsPermission decides whether a hook event releases a red chip, WHICH writer's
+// prompt it releases, and the rule/reason for the forensic decision log. The
+// returned writer is the key handleHook drops from Pending — never the whole map,
+// or one writer's approved tool discards another's still-waiting prompt (case 18).
+//
+// req.AgentID must already be normalized (handleHook does it once, at entry).
+//
+// The rule, in one line: evidence resolves a prompt only when it comes from the
+// writer that raised it (plan §3.3, docs/claude-code-hook-schema.md §2).
+//
+//	writer mismatch (agent_id owns no prompt)  → HOLD, no transcript read
+//	writer + tool_name + input hash all match  → CLEAR at hook speed
+//	writer + tool_name, hashes differ          → fall through to the transcript
+//	writer + tool_name, no hash on either side → CLEAR, unless the T2 floor applies
+//	anything else                              → the writer's OWN transcript decides
+//
+// ⚠ Why a hash MISMATCH does not hold red on its own. PostToolUse reports
+// `updatedInput` — the input AFTER the permission decision — and the approval paths
+// rewrite it: `{...e,command:g}` on "path layer approved", `{...e,path:r}` on a
+// permission-root relocation, injected keys, plus a `userModified` flag when the
+// user edits the call in the dialog. The rewrites include `command:` on Bash, the
+// tool in the 2026-08-05 incident. So a mismatch is genuinely ambiguous between
+// "same call, input rewritten on approval" (must clear) and "sibling same-named call
+// by the same writer" (must hold), and requiring a hash match would have held red
+// forever on exactly the approve path this fast path exists to serve. The transcript
+// asks the question that is actually decisive: did the blocked writer resume?
+//
+// ⚠ An EMPTY hash is NO SIGNAL, not a mismatch (rpc.Request.ToolInputHash: absent,
+// unparseable, null and empty inputs all send ""). Two empties must never read as a
+// match, so the decision falls back to (agent_id, tool_name) — T2's rule narrowed to
+// one writer — rather than to the transcript, which would strand every no-arg tool
+// call and every pre-T6 ctl on the slow path.
+//
+// ⚠ T2's guard survives as the FLOOR for the unidentifiable writer: an empty
+// agent_id is "main thread" AND "a hook that carried no id", so with subagents in
+// flight it may never clear on tool NAME alone — that is the 12:38:21 lost RED
+// verbatim. A hash match is not name alone and still clears; fail closed, never open.
+//
+// ⚠ Do NOT relax matching to agent_id alone (plan §9.6 trap 2). A hydrated entry has
+// Tool == "", so the `req.ToolName != ""` guard makes it unmatchable and it resolves
+// by transcript — which is correct and load-bearing: Claude Code emits parallel
+// tool_use blocks in one assistant message, so a writer can complete an
+// auto-approved sibling while its own prompt still waits. That is this incident's
+// bug at a narrower radius.
+//
+// The transcript fallback is ROUTED (T9): entry P[a] is resolved against
+// transcript.SubagentPath(info.Transcript, a) — the main .jsonl when a == "", the
+// teammate's own sibling file otherwise. info.Transcript is ALWAYS the parent's
+// (hook-schema §3), so reading it for a subagent-raised prompt asks about the wrong
+// writer: while the main thread works, its file shows resume the whole time a
+// teammate sits blocked (defect 4).
+//
+// A decline/interrupt deliberately does NOT clear here (it fires no PostToolUse; and
+// exiting a hook-driven *working* edge to green on an interrupt would paint the
+// wrong color) — the reconciler demotes it to idle/orange instead. Anything else
+// holds red (case 12), and the reconciler's per-prompt backstop decays a stuck one.
+func (s *Server) clearsPermission(info *state.AgentInfo, req Request) (clear bool, writer, rule, reason string) {
+	writer = req.AgentID
+	entry, owns := pendingEntryFor(info, writer)
+
+	// The fast path, in three parts. `owns` is the writer gate; ToolName != "" is
+	// trap 2's guard (a hydrated entry, Tool == "", can never satisfy it).
+	nameMatch := s.tun.EarlyClearApproveByToolName && owns &&
+		req.ToolName != "" && req.ToolName == entry.Tool
+	hashKnown := entry.InputHash != "" && req.ToolInputHash != ""
+	hashMatch := hashKnown && entry.InputHash == req.ToolInputHash
+	hashMismatch := hashKnown && entry.InputHash != req.ToolInputHash
+	// The T2 floor: nothing identifies this writer, so a tool-KIND match is a
+	// teammate collision waiting to happen while any teammate can produce one.
+	unidentified := writer == "" && info.InFlightSubagents > 0
+
+	switch {
+	case nameMatch && hashMatch:
+		return true, writer, statustune.RuleApproveToolMatch,
+			fmt.Sprintf("%s completed %s, input %s — the approved call", writerLabel(writer), req.ToolName, req.ToolInputHash)
+	case nameMatch && hashMismatch, nameMatch && unidentified:
+		// Ambiguous (input rewritten on approval vs. a sibling call), or unattributable
+		// with teammates live. Either way the transcript below decides.
+	case nameMatch:
+		return true, writer, statustune.RuleApproveToolMatch,
+			fmt.Sprintf("%s completed %s (no input signal on either event)", writerLabel(writer), req.ToolName)
 	}
-	if event != "PostToolUse" {
-		return false, statustune.RuleHoldNonToolEvent, "prompt still pending; " + event + " is not evidence"
+
+	// Transcript fallback, routed to the prompt's own writer. Skipped outright when
+	// the event's writer owns no prompt: there is no entry it could resolve, and
+	// reading the main transcript for somebody else's prompt is defect 4.
+	if owns {
+		since := entry.Since
+		if since.IsZero() {
+			since = info.StatusSince // pre-map/hand-seeded block: the chip's own onset
+		}
+		path := transcript.SubagentPath(info.Transcript, writer)
+		if k, _ := transcript.ResolveKind(path, since, s.tun.TailBytes); k == transcript.ResolutionResumed {
+			return true, writer, statustune.RuleApproveTranscript,
+				"transcript: " + writerLabel(writer) + " resumed"
+		}
 	}
-	return false, statustune.RuleHoldBareResult, "prompt still pending"
+
+	// Holds, safety-critical attribution first: an unattributable or wrong-writer
+	// tool-KIND collision with the tool the chip's red is reported under is the
+	// 12:38:21 edge, and it must read as that even when a hash also disagrees.
+	if req.ToolName != "" && req.ToolName == info.PendingTool && (!owns || unidentified) {
+		return false, writer, statustune.RuleHoldTeammateCollision,
+			fmt.Sprintf("%s completed %s; the prompt belongs to %s — tool kind, not tool identity (S=%d)",
+				writerLabel(writer), req.ToolName, pendingWritersLabel(info), info.InFlightSubagents)
+	}
+	if nameMatch && hashMismatch {
+		return false, writer, statustune.RuleHoldInputMismatch,
+			fmt.Sprintf("%s completed %s but input %s != the pending %s, and its transcript shows no resume",
+				writerLabel(writer), req.ToolName, req.ToolInputHash, entry.InputHash)
+	}
+	if req.Event != "PostToolUse" {
+		return false, writer, statustune.RuleHoldNonToolEvent, "prompt still pending; " + req.Event + " is not evidence"
+	}
+	return false, writer, statustune.RuleHoldBareResult, "prompt still pending"
+}
+
+// writerLabel renders a Pending key for a human-read decision line, spelling the
+// empty (main-thread) key out. Log text only — never a map key.
+func writerLabel(writer string) string {
+	if writer == "" {
+		return state.PendingWriterMain
+	}
+	return writer
+}
+
+// pendingWritersLabel names every writer currently holding a prompt, for the
+// decision log's reason= field — so a hold says WHO is still waiting, not just that
+// somebody is. Ordered by PendingWriterKeys (sorted), because a reason string that
+// permutes between ticks is unreadable and undiffable.
+func pendingWritersLabel(info *state.AgentInfo) string {
+	keys := info.PendingWriterKeys() // freshly allocated and sorted; safe to relabel
+	if len(keys) == 0 {
+		return "no recorded writer" // a pre-map/hand-seeded block: PendingTool with no owner
+	}
+	for i, k := range keys {
+		keys[i] = writerLabel(k)
+	}
+	return strings.Join(keys, ",")
 }
 
 // handleActivity records a global, session-less user-activity edge: "idle" when
