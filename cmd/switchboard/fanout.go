@@ -89,10 +89,13 @@ func (rs *reconcileState) sampleFanout(store *state.Store) {
 	}
 }
 
-// observe updates c.InFlightSubagents and emits any new subagent_spawn/stop and
-// usage_sample events for one claude session. It runs inside the reconcile Apply
-// (under the store lock); sink.Record is non-blocking, and the transcript reads
-// are bounded — the same I/O profile as the status self-heals in the same loop.
+// observe updates c.InFlightSubagents and emits any new subagent_spawn/stop
+// events for one claude session. It runs inside the reconcile Apply (under the
+// store lock) because it writes to c, which the store owns.
+//
+// It performs no reads of its own any more. The fanout reads come from the
+// pre-lock sample (sampleFanout), the name comes from a stamp-checked cache, and
+// the usage delta left entirely — see sampleUsage.
 func (rs *reconcileState) observe(sink *history.Sink, sess *state.Session, c *state.AgentInfo, now time.Time) {
 	// The session label is derived from disk/window title, not the transcript, so
 	// it is tracked even before the transcript exists.
@@ -101,7 +104,6 @@ func (rs *reconcileState) observe(sink *history.Sink, sess *state.Session, c *st
 		return
 	}
 	rs.observeFanout(sink, sess, c, now)
-	rs.observeUsage(sink, sess, c, now)
 }
 
 // observeLabel records the session's current display name when it changes. The
@@ -160,6 +162,32 @@ func (rs *reconcileState) observeFanout(sink *history.Sink, sess *state.Session,
 	}
 }
 
+// sampleUsage runs observeUsage for every session in the last published snapshot,
+// BEFORE the tick takes the store lock.
+//
+// It can move out wholesale, unlike the fanout observation next to it, because it
+// mutates no session state at all: it reads a transcript delta, advances a
+// daemon-internal cursor, and emits history events. Nothing a consumer can see
+// through the store depends on it, and sink.Record is non-blocking, so there was
+// never a reason for the read to be inside the lock beyond the loop it happened
+// to sit in.
+//
+// This was the last transcript read left under the lock. It is easy to overlook
+// because first sight is genuinely cheap — the cursor primes with a bare os.Stat
+// and returns without reading — so an audit that only looks at a newly-appeared
+// session concludes, wrongly, that this path is already cold-safe. Every tick
+// AFTER that reads the delta, and during an active turn the delta is real bytes.
+func (rs *reconcileState) sampleUsage(store *state.Store, sink *history.Sink, now time.Time) {
+	for _, snap := range store.Snapshot().Sessions {
+		sess := snap
+		c := sess.Claude
+		if c == nil || c.Transcript == "" {
+			continue
+		}
+		rs.observeUsage(sink, &sess, c, now)
+	}
+}
+
 // observeUsage samples the token delta since the last offset and emits one
 // usage_sample per model the delta touched, each tagged with Event.Model so the
 // deriver can price it at that model's rate. On first sight of a session it
@@ -167,6 +195,9 @@ func (rs *reconcileState) observeFanout(sink *history.Sink, sess *state.Session,
 // transcript's backlog is not dumped as one spike dated at daemon start — only
 // usage accrued while we are watching is recorded. Cost is deliberately NOT
 // computed here; the sample only carries the model name and raw token counts.
+//
+// Called from sampleUsage, outside the store lock. It is keyed by pid and only
+// the reconcile tick ever calls it, so the cursor has a single writer.
 func (rs *reconcileState) observeUsage(sink *history.Sink, sess *state.Session, c *state.AgentInfo, now time.Time) {
 	off, primed := rs.usageOffset[sess.PID]
 	if !primed {

@@ -189,8 +189,13 @@ func TestObserveUsageEmitsOneSamplePerModel(t *testing.T) {
 	sess := &state.Session{PID: 7, Agent: "claude", CWD: "/home/u/proj",
 		Claude: &state.AgentInfo{SessionID: "s7", Transcript: tpath}}
 
-	// First observe primes the usage cursor to EOF — no sample for the baseline.
-	rs.observe(sink, sess, sess.Claude, time.Now())
+	// Usage is sampled before the store lock now, so drive it the way the tick
+	// does — through the store — rather than through observe.
+	store := state.New(filepath.Join(t.TempDir(), "state.json"))
+	store.Apply(func(m map[int]*state.Session) { m[sess.PID] = sess })
+
+	// First pass primes the usage cursor to EOF — no sample for the baseline.
+	rs.sampleUsage(store, sink, time.Now())
 
 	// Two models accrue tokens while we watch.
 	f, _ := os.OpenFile(tpath, os.O_APPEND|os.O_WRONLY, 0o644)
@@ -199,7 +204,7 @@ func TestObserveUsageEmitsOneSamplePerModel(t *testing.T) {
 	f.WriteString(assistantUsageModelLine("claude-opus-4-8", 20, 8) + "\n")
 	f.Close()
 
-	rs.observe(sink, sess, sess.Claude, time.Now())
+	rs.sampleUsage(store, sink, time.Now())
 	sink.Close()
 
 	samples := eventsOfType(readEvents(t, histDir), history.EventUsageSample)
@@ -452,15 +457,20 @@ func TestObserveUsagePrimesThenSamples(t *testing.T) {
 	sess := &state.Session{PID: 1, Agent: "claude", CWD: "/home/u/proj",
 		Claude: &state.AgentInfo{SessionID: "s1", Transcript: tpath}}
 
-	// First observe primes the usage cursor to EOF — no sample for the backlog.
-	rs.observe(sink, sess, sess.Claude, time.Now())
+	// Usage is sampled before the store lock now, so drive it the way the tick
+	// does — through the store — rather than through observe.
+	store := state.New(filepath.Join(t.TempDir(), "state.json"))
+	store.Apply(func(m map[int]*state.Session) { m[sess.PID] = sess })
+
+	// First pass primes the usage cursor to EOF — no sample for the backlog.
+	rs.sampleUsage(store, sink, time.Now())
 
 	// New usage accrues while we watch.
 	f, _ := os.OpenFile(tpath, os.O_APPEND|os.O_WRONLY, 0o644)
 	f.WriteString(`{"type":"assistant","message":{"role":"assistant","content":[],"usage":{"input_tokens":120,"output_tokens":34}}}` + "\n")
 	f.Close()
 
-	rs.observe(sink, sess, sess.Claude, time.Now())
+	rs.sampleUsage(store, sink, time.Now())
 	sink.Close()
 
 	samples := eventsOfType(readEvents(t, histDir), history.EventUsageSample)

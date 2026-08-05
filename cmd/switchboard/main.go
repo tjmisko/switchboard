@@ -579,6 +579,9 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 	// history seed, the transcript cursor, and the per-session subagents/ dir scan —
 	// used to happen inside the Apply below. See sampleFanout.
 	rstate.sampleFanout(store)
+	// Usage moves out entirely rather than being sampled-then-applied: it mutates
+	// no session state, so nothing about it needs the lock. See sampleUsage.
+	rstate.sampleUsage(store, sink, now)
 	store.Apply(func(m map[int]*state.Session) {
 		// Close the lanes of any session whose process is gone, BEFORE the per-tick
 		// work below — a dead session earns none of it.
