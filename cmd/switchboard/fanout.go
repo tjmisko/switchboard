@@ -26,9 +26,10 @@ import (
 type reconcileState struct {
 	fanout      *fanout.Observer
 	memory      *memorySampler
-	usageOffset map[int]int64          // pid -> transcript bytes already summed for usage
-	labels      map[string]labelCursor // labelKey -> last-emitted session label (change dedup)
-	names       *label.NameCache       // pid -> Claude session name, memoized against the file's stamp
+	usageOffset map[int]int64            // pid -> transcript bytes already summed for usage
+	labels      map[string]labelCursor   // labelKey -> last-emitted session label (change dedup)
+	names       *label.NameCache         // pid -> Claude session name, memoized against the file's stamp
+	samples     map[string]fanout.Sample // session id -> this tick's pre-lock fanout reads (see sampleFanout)
 }
 
 // labelCursor is the last name emitted for one session, plus the pid hosting it.
@@ -50,30 +51,41 @@ func newReconcileState(obs *fanout.Observer, mem *memorySampler) *reconcileState
 	}
 }
 
-// primeFanout does the fanout Observer's first-sight seeding for every session in
-// the last published snapshot, BEFORE the tick takes the store lock.
+// sampleFanout does ALL of the fanout Observer's reading for every session in the
+// last published snapshot, BEFORE the tick takes the store lock: the first-sight
+// history seed, the forward transcript cursor, and the per-session subagents/ dir
+// scan.
 //
 // It follows the same rule as sampleMemory directly below it, and for the same
-// reason: the seed reads the history archive, which is milliseconds at best and
-// was measured at 481-639ms on the live daemon, and Store.Apply blocks every RPC
-// reader and every hook for as long as it holds. Every multi-hundred-millisecond
-// lock hold observed after the reconcile I/O was hoisted traced to this one call,
-// firing the first time a tick saw a newly started session.
+// reason: Store.Apply blocks every RPC reader and every hook for as long as it
+// holds, so nothing that touches a disk belongs inside it. Two distinct costs
+// lived in there, and they showed up differently on the live daemon:
+//
+//   - the seed reads the history archive, and produced 481-639ms holds the first
+//     time a tick saw a newly started session (or an existing pid taking a new
+//     session id);
+//   - the dir scan runs EVERY tick for EVERY session, and is the steady-state
+//     body of the hold rather than its tail.
 //
 // Read through Snapshot — the shared read lock — never through Apply. A session
-// that appears between this snapshot and the lock is simply seeded lazily inside
-// Reconcile, exactly as before; this is a latency optimization with no bearing on
-// what gets emitted.
-func (rs *reconcileState) primeFanout(store *state.Store) {
+// that appears between this snapshot and the lock, or whose cursor moves in
+// between, is simply read inline inside Reconcile exactly as before: the sample
+// is checked against the cursor it was taken at and discarded if stale. This is a
+// latency optimization with no bearing on what gets emitted.
+func (rs *reconcileState) sampleFanout(store *state.Store) {
 	if rs.fanout == nil {
 		return
 	}
+	// A fresh map per tick: a sample is only valid against the cursor it was taken
+	// at, and keeping last tick's around would just be dead weight for the
+	// usableFor check to reject.
+	rs.samples = map[string]fanout.Sample{}
 	for _, sess := range store.Snapshot().Sessions {
 		c := sess.Claude
 		if c == nil || c.SessionID == "" || c.Transcript == "" {
 			continue
 		}
-		rs.fanout.Prime(c.SessionID, c.Transcript)
+		rs.samples[c.SessionID] = rs.fanout.Sample(c.SessionID, c.Transcript)
 	}
 }
 
@@ -135,11 +147,15 @@ func (rs *reconcileState) observeLabel(sink *history.Sink, sess *state.Session, 
 // spawn and result straddle the 128 KiB window is no longer lost. The same
 // Reconcile is invoked from the SubagentStart/Stop hook for hook-speed updates;
 // the Observer's durable per-session state dedups across both triggers.
+//
+// This runs under the store lock, so it applies the reads sampleFanout already
+// took outside it. A session with no sample — one that appeared after the
+// snapshot — falls back to reading inline, which is what this always did.
 func (rs *reconcileState) observeFanout(sink *history.Sink, sess *state.Session, c *state.AgentInfo, now time.Time) {
 	if rs.fanout == nil {
 		return
 	}
-	for _, ev := range rs.fanout.Reconcile(sess, c, now) {
+	for _, ev := range rs.fanout.ReconcileFrom(rs.samples[c.SessionID], sess, c, now) {
 		sink.Record(ev)
 	}
 }

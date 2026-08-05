@@ -244,6 +244,56 @@ func TestPrime_leavesAnAlreadySeededSessionAlone(t *testing.T) {
 	}
 }
 
+// The sample carries reads taken before the lock, so the cursor it was taken
+// against can move before it is applied — the hook trigger reconciles the same
+// session independently. Applying a stale sample would rewind the cursor to its
+// older newOffset and re-fold signals that were already folded in. The guard is
+// exact rather than serialized, so this pins that it actually rejects.
+func TestReconcileFrom_ignoresASampleTakenAgainstAMovedCursor(t *testing.T) {
+	e := newEnv(t)
+	writeSub(t, e.subdir, "n1", metaClassic(1, "toolu_n1"), "")
+	obs := NewObserver(e.historyDir)
+
+	stale := obs.Sample(e.c.SessionID, e.c.Transcript)
+
+	// Something else reconciles first and advances the cursor past the sample.
+	if err := os.WriteFile(e.transcript, []byte(`{"type":"system"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	obs.Reconcile(e.sess, e.c, time.Now())
+
+	// n1 was already spawned by that Reconcile, so a correctly-rejected stale
+	// sample yields no second spawn — and the cursor must not go backwards.
+	before := obs.cursorFor(e.c.SessionID)
+	if ev := obs.ReconcileFrom(stale, e.sess, e.c, time.Now()); hasEvent(ev, history.EventSubagentSpawn, "n1") {
+		t.Fatalf("a stale sample must not re-emit n1's spawn; got %+v", ev)
+	}
+	if after := obs.cursorFor(e.c.SessionID); after < before {
+		t.Fatalf("cursor went backwards: %d -> %d; a stale sample was applied", before, after)
+	}
+}
+
+func TestReconcileFrom_appliesAFreshSampleWithoutReadingAgain(t *testing.T) {
+	e := newEnv(t)
+	writeSub(t, e.subdir, "n1", metaClassic(1, "toolu_n1"), "")
+	obs := NewObserver(e.historyDir)
+
+	s := obs.Sample(e.c.SessionID, e.c.Transcript)
+
+	// Delete the subagents dir the sample already read. If ReconcileFrom went back
+	// to disk, it would now find nothing and emit no spawn.
+	if err := os.RemoveAll(filepath.Join(e.base, e.sid)); err != nil {
+		t.Fatal(err)
+	}
+
+	if ev := obs.ReconcileFrom(s, e.sess, e.c, time.Now()); !hasEvent(ev, history.EventSubagentSpawn, "n1") {
+		t.Fatalf("n1's spawn should come from the sample taken before the dir was removed; got %+v", ev)
+	}
+	if e.c.InFlightSubagents != 1 {
+		t.Fatalf("inflight = %d, want 1 from the sampled dir scan", e.c.InFlightSubagents)
+	}
+}
+
 func TestPrime_isANoopWithoutASessionID(t *testing.T) {
 	e := newEnv(t)
 	obs := NewObserver(e.historyDir)

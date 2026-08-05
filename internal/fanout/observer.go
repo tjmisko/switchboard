@@ -161,12 +161,99 @@ func (ss *sessionState) applySeed(spawned, stopped map[string]bool, offset int64
 	ss.seeded = true
 }
 
+// Sample is the I/O half of one session's Reconcile, taken with no store lock
+// held. It is a value, not a promise: it describes the transcript and subagents
+// dir as they were at sample time, against the cursor position recorded in base.
+//
+// The zero value is "no sample", which makes ReconcileFrom behave exactly like
+// Reconcile.
+type Sample struct {
+	sessionID string
+	base      int64 // the cursor the reads were taken against
+	spawns    []transcript.Task
+	resultIDs []string
+	newOffset int64
+	tasksOK   bool
+	subs      []transcript.Subagent
+	subsOK    bool
+	valid     bool
+}
+
+// usableFor reports whether this sample still describes the session's current
+// cursor. A sample taken against a cursor that has since moved — another
+// producer reconciled in between — is discarded rather than applied, because
+// applying it would rewind the cursor to a stale newOffset and re-scan bytes
+// whose signals were already folded in. This is the same inversion hazard the
+// resolve path hit when its enumeration moved outside the lock; here it is
+// cheap to detect exactly, so it is detected rather than serialized against.
+func (s Sample) usableFor(sessionID string, offset int64) bool {
+	return s.valid && s.sessionID == sessionID && s.base == offset
+}
+
+// Sample performs every read one Reconcile needs, holding no lock while it does
+// so, and seeds the session first if it has never been seen.
+//
+// This is the batched half of the Enumerate/ReconcileFrom split the resolve path
+// already uses: the tick calls it for every session BEFORE taking the store
+// lock, and ReconcileFrom then applies the result with the lock held but no I/O
+// under it. The dir scan in particular ran per session per tick inside the lock.
+func (o *Observer) Sample(sessionID, transcriptPath string) Sample {
+	if o == nil || sessionID == "" || transcriptPath == "" {
+		return Sample{}
+	}
+	o.Prime(sessionID, transcriptPath)
+
+	o.mu.Lock()
+	var base int64
+	if ss := o.sessions[sessionID]; ss != nil {
+		base = ss.offset
+	}
+	o.mu.Unlock()
+
+	return readSample(sessionID, transcriptPath, base)
+}
+
+// readSample is the actual I/O, shared by the pre-lock Sample and the under-lock
+// fallback in reconcile so the two cannot drift. It takes no locks.
+//
+// G5: on /clear or compaction the file shrinks below the cursor — re-read from 0
+// once (the agent-id seen-set keeps emission idempotent), and never let the
+// cursor run past EOF.
+func readSample(sessionID, transcriptPath string, base int64) Sample {
+	s := Sample{sessionID: sessionID, base: base, valid: true}
+	from := base
+	if size := fileSize(transcriptPath); from > size {
+		from = 0
+	}
+	if spawns, resultIDs, newOff, err := transcript.TasksSince(transcriptPath, from); err == nil {
+		s.spawns, s.resultIDs, s.newOffset, s.tasksOK = spawns, resultIDs, newOff, true
+	}
+	if subs, err := transcript.SubagentsForTranscript(transcriptPath); err == nil {
+		s.subs, s.subsOK = subs, true
+	}
+	return s
+}
+
 // Reconcile brings the Observer's view of one Claude session up to date and
 // returns the subagent_spawn/stop events to record (each exactly once). It also
 // sets c.InFlightSubagents to the durable spawned-minus-completed count over the
 // session's direct children (spawnDepth<2). A nil/empty/idless session, or a
 // transcript that cannot be scanned, is a no-op that leaves the last-known count.
+//
+// It does its own reads. Callers with a pre-lock phase should use Sample +
+// ReconcileFrom instead; the hook trigger has none, so it lands here.
 func (o *Observer) Reconcile(sess *state.Session, c *state.AgentInfo, now time.Time) []history.Event {
+	return o.reconcile(sess, c, now, Sample{})
+}
+
+// ReconcileFrom is Reconcile applied to reads already taken outside the lock. A
+// sample that no longer matches the session's cursor is silently re-read inline,
+// so this is never less correct than Reconcile — only faster when it hits.
+func (o *Observer) ReconcileFrom(s Sample, sess *state.Session, c *state.AgentInfo, now time.Time) []history.Event {
+	return o.reconcile(sess, c, now, s)
+}
+
+func (o *Observer) reconcile(sess *state.Session, c *state.AgentInfo, now time.Time, s Sample) []history.Event {
 	if sess == nil || c == nil || c.Transcript == "" || c.SessionID == "" {
 		return nil
 	}
@@ -188,36 +275,37 @@ func (o *Observer) Reconcile(sess *state.Session, c *state.AgentInfo, now time.T
 		ss.applySeed(sp, st, off)
 	}
 
+	if !s.usableFor(c.SessionID, ss.offset) {
+		// No sample, or one the cursor has moved past. Read inline — under the lock,
+		// as this always used to be. Correctness never depends on the sample; only
+		// the lock hold does.
+		s = readSample(c.SessionID, c.Transcript, ss.offset)
+	}
+
 	// 1) Advance the forward cursor. It supplies the run_in_background flag (only
 	// the parent tool_use carries it) and a secondary tool_result completion
-	// cross-check. G5: on /clear or compaction the file shrinks below the offset —
-	// re-read from 0 once (the agent-id seen-set keeps emission idempotent), and
-	// never let the offset run past EOF.
-	if size := fileSize(c.Transcript); ss.offset > size {
-		ss.offset = 0
-	}
-	if spawns, resultIDs, newOff, err := transcript.TasksSince(c.Transcript, ss.offset); err == nil {
-		ss.offset = newOff
-		for _, t := range spawns {
+	// cross-check.
+	if s.tasksOK {
+		ss.offset = s.newOffset
+		for _, t := range s.spawns {
 			if t.Background && t.ID != "" {
 				ss.background[t.ID] = true
 			}
 		}
-		for _, id := range resultIDs {
+		for _, id := range s.resultIDs {
 			ss.resultDone[id] = true
 		}
 	}
 
 	// 2) Authoritative dir scan: every subagent of this session, keyed by the
 	// universal agent-id, immune to transcript scroll-out.
-	subs, err := transcript.SubagentsForTranscript(c.Transcript)
-	if err != nil {
+	if !s.subsOK {
 		return nil // leave the last-known count rather than guess
 	}
 
 	var events []history.Event
 	inflight := 0
-	for _, s := range subs {
+	for _, s := range s.subs {
 		if s.AgentID == "" {
 			continue
 		}
@@ -260,6 +348,17 @@ func (o *Observer) Reconcile(sess *state.Session, c *state.AgentInfo, now time.T
 	}
 	c.InFlightSubagents = inflight
 	return events
+}
+
+// cursorFor exposes one session's forward cursor for tests that need to assert it
+// did not move backwards.
+func (o *Observer) cursorFor(sessionID string) int64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if ss := o.sessions[sessionID]; ss != nil {
+		return ss.offset
+	}
+	return 0
 }
 
 // Prune drops per-session state for session-ids no longer live, bounding the map

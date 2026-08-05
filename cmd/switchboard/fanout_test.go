@@ -68,14 +68,14 @@ func assistantUsageModelLine(model string, in, out int64) string {
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }
 
-// The wiring test for the pre-lock seed. The Observer's own tests cover Prime;
-// this one covers primeFanout actually reaching the sessions in the store, since
-// a Prime that is never called is exactly as slow as no Prime at all.
+// The wiring test for the pre-lock reads. The Observer's own tests cover Sample
+// and Prime; this one covers sampleFanout actually reaching the sessions in the
+// store, since a Sample that is never taken is exactly as slow as no Sample.
 //
-// Same trick as the Observer test: the history is deleted after primeFanout, so
+// Same trick as the Observer test: the history is deleted after sampleFanout, so
 // a Reconcile that still seeded from disk would find nothing and re-emit r1's
 // already-recorded spawn.
-func TestPrimeFanoutSeedsEverySessionInTheSnapshot(t *testing.T) {
+func TestSampleFanoutSeedsEverySessionInTheSnapshot(t *testing.T) {
 	base := t.TempDir()
 	sid := "s-primed"
 	tpath := filepath.Join(base, sid+".jsonl")
@@ -110,7 +110,7 @@ func TestPrimeFanoutSeedsEverySessionInTheSnapshot(t *testing.T) {
 	store := state.New(filepath.Join(t.TempDir(), "state.json"))
 	store.Apply(func(m map[int]*state.Session) { m[sess.PID] = sess })
 
-	rs.primeFanout(store)
+	rs.sampleFanout(store)
 	if err := os.Remove(day); err != nil {
 		t.Fatal(err)
 	}
@@ -122,6 +122,59 @@ func TestPrimeFanoutSeedsEverySessionInTheSnapshot(t *testing.T) {
 		if ev.AgentID == "r1" {
 			t.Fatalf("r1's spawn was re-emitted, so primeFanout did not seed this session before observe ran: %+v", ev)
 		}
+	}
+}
+
+// The seed test above passes even if observeFanout throws the sample away, since
+// sampleFanout seeds as a side effect. This one covers the plumbing itself: the
+// subagents dir is removed after sampling, so the spawn can ONLY come from the
+// sample. It fails if observeFanout reads inline instead.
+func TestObserveFanoutAppliesTheSampledDirScan(t *testing.T) {
+	base := t.TempDir()
+	sid := "s-sampled"
+	tpath := filepath.Join(base, sid+".jsonl")
+	writeLines(t, tpath, `{"type":"system"}`)
+	subdir := filepath.Join(base, sid, "subagents")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subdir, "agent-n1.meta.json"),
+		[]byte(`{"agentType":"Explore","description":"probe","spawnDepth":1,"toolUseId":"toolu_n1"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subdir, "agent-n1.jsonl"),
+		[]byte(`{"type":"assistant","message":{"role":"assistant","stop_reason":null}}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	histDir := t.TempDir()
+	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+	sess := &state.Session{PID: 12, Agent: "claude", CWD: "/home/u/proj",
+		Claude: &state.AgentInfo{SessionID: sid, Transcript: tpath}}
+
+	store := state.New(filepath.Join(t.TempDir(), "state.json"))
+	store.Apply(func(m map[int]*state.Session) { m[sess.PID] = sess })
+
+	rs.sampleFanout(store)
+	if err := os.RemoveAll(filepath.Join(base, sid)); err != nil {
+		t.Fatal(err)
+	}
+
+	rs.observe(sink, sess, sess.Claude, time.Now())
+	sink.Close()
+
+	var spawned bool
+	for _, ev := range eventsOfType(readEvents(t, histDir), history.EventSubagentSpawn) {
+		if ev.AgentID == "n1" {
+			spawned = true
+		}
+	}
+	if !spawned {
+		t.Fatal("n1's spawn must come from the pre-lock sample; observeFanout appears to have read inline instead")
+	}
+	if sess.Claude.InFlightSubagents != 1 {
+		t.Fatalf("inflight = %d, want 1 from the sampled dir scan", sess.Claude.InFlightSubagents)
 	}
 }
 
