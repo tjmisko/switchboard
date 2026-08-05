@@ -57,6 +57,14 @@ func cmdTimeline(args []string) {
 		fail("read %s: %v", *dir, err)
 	}
 	lanes := history.BuildSwimlanes(events, end)
+	// A `/name` is recorded once, when it is set, so a session named before this
+	// window opened (yesterday evening, for one still running this morning) has no
+	// label event inside it and would render as never-named. Back-fill each such
+	// lane from the earlier day-files before anything renders or derives a name.
+	// Cosmetic, so a failed lookback logs and leaves the lanes as they were built.
+	if err := history.BackfillCarriedNames(*dir, lanes, from); err != nil {
+		log.Printf("carried names: %v — lanes named before this window may render unnamed", err)
+	}
 	// Post-check the lanes for implausibly long trailing intervals BEFORE anything
 	// derives a number from them, so the text renderer, --json, and every dashboard
 	// provider read the same flag and the same aggregates. It annotates and never

@@ -183,7 +183,7 @@ fix are unaffected.
 | `subagent_spawn` | a `Task`/`Agent` subagent is launched (seen in the main transcript) | `tool_use_id`, `agent_type`, `description` |
 | `subagent_stop` | that subagent's result lands | `tool_use_id`, `agent_type` |
 | `usage_sample` | tokens accrued since the last sample (each reconcile tick), one per model | `tok_in`, `tok_out`, `tok_cache_read`, `tok_cache_create`, `model` |
-| `session_label` | the session's name/label changed | `session_id`, `label` (full tier) |
+| `session_label` | the session's name/label changed (deduped per **session id**, so a `/clear` re-announces the unchanged name to the new session) | `session_id`, `label` (full tier) |
 | `focus` | window focus moved to/away from an agent session (Hyprland) | `session_id` = focused agent session, empty = focus left all agent windows |
 | `activity` | the user went idle / active (global, session-less; from an idle daemon) | `to` = `idle` \| `active` |
 | `memory_sample` | the session's resident cost, sampled every reconcile tick | `mem_agent_*`, `mem_tree_*`, `mem_tree_procs`, `sys_*` |
@@ -305,6 +305,16 @@ always present and read `0` on a clean day:
                    "tok_in": 0, "tok_out": 0, "tok_cache_read": 0, "tok_cache_create": 0 }
 }
 ```
+
+**Carried names.** A name is recorded once, when it is set, so a session named
+before the window opened — yesterday evening, for one still running this morning —
+has no `session_label` event inside the window. Before rendering, the producer
+looks back over the earlier day-files (bounded, and by **session id** only: a pid
+is recycled, an id is not) for the last name each still-unnamed lane carried in,
+and back-fills its lead-in with it. So a `labels[]`/`names[]` span may start at the
+lane's start rather than at an event inside the window, and a lane that was named
+days ago still reports a `name`. Consumers need no special handling: the spans are
+ordinary spans.
 
 **Delegation (C3)** splits agent-active time by whether you were *attending* it —
 focused on that session while active at the keyboard. It needs the `focus` stream

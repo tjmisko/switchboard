@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/fanout"
@@ -12,8 +13,10 @@ import (
 )
 
 // reconcileState is the per-session bookkeeping the reconciler carries ACROSS
-// ticks. The usage (token) and label cursors are daemon-internal, keyed by pid,
-// and pruned when a session dies. Subagent fanout detection is delegated to the
+// ticks. The usage cursor is daemon-internal and keyed by pid; the label cursor
+// is keyed by session id (see observeLabel) and carries the pid it belongs to, so
+// both are pruned when the process they track dies. Subagent fanout detection is
+// delegated to the
 // Observer, which owns InFlightSubagents and the subagent_spawn/stop events and
 // keys its own durable state by session-id (so it survives a daemon restart or a
 // `claude --resume` rather than re-emitting historical spawns).
@@ -23,8 +26,17 @@ import (
 type reconcileState struct {
 	fanout      *fanout.Observer
 	memory      *memorySampler
-	usageOffset map[int]int64  // pid -> transcript bytes already summed for usage
-	labels      map[int]string // pid -> last-emitted session label (change dedup)
+	usageOffset map[int]int64          // pid -> transcript bytes already summed for usage
+	labels      map[string]labelCursor // labelKey -> last-emitted session label (change dedup)
+}
+
+// labelCursor is the last name emitted for one session, plus the pid hosting it.
+// The key dedups (per session, so a /clear re-announces), the pid decides
+// lifetime (per process, so a tick that cannot see the session id cannot expire
+// it) — see observeLabel and prune.
+type labelCursor struct {
+	name string
+	pid  int
 }
 
 func newReconcileState(obs *fanout.Observer, mem *memorySampler) *reconcileState {
@@ -32,7 +44,7 @@ func newReconcileState(obs *fanout.Observer, mem *memorySampler) *reconcileState
 		fanout:      obs,
 		memory:      mem,
 		usageOffset: map[int]int64{},
-		labels:      map[int]string{},
+		labels:      map[string]labelCursor{},
 	}
 }
 
@@ -54,16 +66,26 @@ func (rs *reconcileState) observe(sink *history.Sink, sess *state.Session, c *st
 // observeLabel records the session's current display name when it changes. The
 // name is derived via label.RawName (the Claude session name on disk, else the
 // wezterm title, else the cwd basename), and an EventSessionLabel is emitted only
-// when it differs from the last-seen value for this pid — so a renamed/relocated
-// session leaves a multilabel-over-time trail without spamming an event per tick.
-// The label is full-tier content (it can name your work) and is scrubbed at the
-// minimal tier by the sink.
+// when it differs from the last-seen value for this SESSION — so a
+// renamed/relocated session leaves a multilabel-over-time trail without spamming
+// an event per tick. The label is full-tier content (it can name your work) and
+// is scrubbed at the minimal tier by the sink.
+//
+// Dedup keys on the session id, not the pid, because one process hosts a
+// SEQUENCE of sessions: a /clear or a new conversation mints a fresh id in the
+// same pane, and the timeline (correctly) reads that as a new lane. Under a
+// pid-keyed cursor the unchanged name would be deduped away, so the new lane
+// would never be told its name and would render as never-named for the rest of
+// its life — while the name it is plainly wearing shows in the status bar. A
+// session id is also the safer key in the other direction: it never repeats, so
+// a recycled pid can never inherit a dead session's name.
 func (rs *reconcileState) observeLabel(sink *history.Sink, sess *state.Session, c *state.AgentInfo, now time.Time) {
 	name := label.RawName(*sess)
-	if name == "" || name == rs.labels[sess.PID] {
+	key := labelKey(sess.PID, c)
+	if name == "" || name == rs.labels[key].name {
 		return
 	}
-	rs.labels[sess.PID] = name
+	rs.labels[key] = labelCursor{name: name, pid: sess.PID}
 	sink.Record(history.Event{
 		Ts: now, Type: history.EventSessionLabel,
 		SessionID: c.SessionID, PID: sess.PID, Agent: sess.Agent, CWD: sess.CWD,
@@ -124,18 +146,34 @@ func (rs *reconcileState) observeUsage(sink *history.Sink, sess *state.Session, 
 	}
 }
 
+// labelKey identifies the thing a label cursor is about: the session, once a hook
+// has supplied its id, else the process hosting it (the pre-hook lead-in, where a
+// pid is all there is to dedup against).
+func labelKey(pid int, c *state.AgentInfo) string {
+	if c != nil && c.SessionID != "" {
+		return "s:" + c.SessionID
+	}
+	return "p:" + strconv.Itoa(pid)
+}
+
 // prune drops cursor state for pids no longer tracked, so the maps do not grow
-// without bound as sessions come and go. The Observer's per-session state is
-// pruned against the set of live session-ids (it is keyed by session-id, not pid).
+// without bound as sessions come and go. Label cursors expire by their pid rather
+// than by whether their key is still live: observe() is skipped for a tick that
+// cannot see a session's claude info, but prune runs every tick regardless, and
+// expiring the cursor on that blip would re-emit an identical label the moment the
+// info came back. The cost is that a session id its process has rolled past (a
+// /clear) is retained until the process exits — a handful of entries per pane,
+// against a duplicate event per blip. The Observer's per-session state is pruned
+// against the set of live session-ids (it is keyed by session-id, not pid).
 func (rs *reconcileState) prune(m map[int]*state.Session) {
 	for pid := range rs.usageOffset {
 		if _, ok := m[pid]; !ok {
 			delete(rs.usageOffset, pid)
 		}
 	}
-	for pid := range rs.labels {
-		if _, ok := m[pid]; !ok {
-			delete(rs.labels, pid)
+	for key, cur := range rs.labels {
+		if _, ok := m[cur.pid]; !ok {
+			delete(rs.labels, key)
 		}
 	}
 	if rs.fanout != nil {
