@@ -6,8 +6,8 @@ pinned to a daemon log line or a transcript timestamp.
 **Incident:** 2026-08-05, session `5318eb5b-79df-4dee-a9f8-c80df4eca79e`
 (pid 1090904, `/home/tjmisko/Tools/DigestDownloads`, chip
 `digestdownloads-status-update-request`). Two occurrences: 12:21:48–12:23:26
-and 12:38:13–12:39:56 local. The daemon was restarted at 12:39:56, which ended
-the second one by accident, not by fix.
+and 12:38:13–**12:41:20** local. The daemon restart at 12:39:56 did **not** end
+the second one — see §2.4, which is the most informative part of this document.
 
 > Transcript `timestamp` fields are UTC; the daemon log is local (UTC−7).
 > `19:38:14Z` and `12:38:14` are the same instant. Local time is used
@@ -103,6 +103,54 @@ writes — never with the main thread's (silent) or `escalate-cleanup`'s (silent
 
 The chip was being painted green by the tool activity of agents that had nothing
 to do with the blocked prompt.
+
+### 2.4 The daemon restart was an accidental controlled experiment
+
+An earlier revision of this document claimed the 12:39:56 restart ended the
+oscillation. **That was wrong**, and the correction is the most useful evidence
+here. The flap continued for another ~90 seconds:
+
+```
+12:40:08.526  working->idle  rule=case6-idle-title  [S=3 pending="" age=15s]
+12:40:23.101  working->idle  rule=case6-idle-title  [S=3 pending="" age=15s]
+12:40:33.062  working->idle  rule=case6-idle-title  [S=3 pending="" age=16s]
+12:40:43.070  working->idle  rule=case6-idle-title  [S=3 pending="" age=18s]
+12:40:53.051  working->idle  rule=case6-idle-title  [S=3 pending="" age=16s]
+12:41:08.077  working->idle  rule=case6-idle-title  [S=3 pending="" age=16s]
+12:41:18.086  working->idle  rule=case6-idle-title  [S=3 pending="" age=16s]
+12:41:20.173  "⠂ status-update-request" idle->working (event=PostToolUse)   ← spinner glyph: the
+                                                                              turn genuinely resumed
+```
+
+It ended at 12:41:20, when the pane title flipped from the idle glyph `✳` to a
+spinner frame `⠂` — i.e. when the **user answered the prompt**, four and a half
+minutes after it was raised. Nothing the daemon did ended it.
+
+What the restart *did* change is the one variable of defect 3. A fresh hydrate
+re-stamps `StatusSince` to startup time (`dropStaleSessions`,
+`cmd/switchboard/main.go:250`), so the back-dated anchor was gone:
+
+| | `age` at demotion | flap period |
+|---|---|---|
+| before restart (back-dated anchor) | 13m2s → 14m17s | **~5 s** — the reconcile tick |
+| after restart (fresh anchor) | 15–18 s | **~10–15 s** — the `IdleTitleGrace` interval |
+
+That is a clean natural experiment, and it settles two things:
+
+1. **It confirms defect 3's mechanism exactly.** Remove the stale anchor and the
+   demotion is gated by `IdleTitleGrace` (15 s) as designed, instead of firing on
+   the next 5 s tick. The `age` column moves from "13 minutes" to "15 seconds"
+   with no code change.
+2. **It proves T4 alone does not stop the oscillation — it only slows it**, from
+   the tick interval to the grace interval. The chip still cycled orange→green
+   seven more times after the anchor was fixed.
+
+The second point matters for the plan. The engine that survives T4 is **defect 2**:
+a teammate's `PostToolUse` maps unconditionally to `working`
+(`internal/rpc/rpc.go:612`) and repaints the parent chip, so the reconciler has
+something to demote every time. Until the main thread's chip stops being driven
+by teammate events, the flap is damped but not removed. Defect 2 is the one
+defect in §3 with no task in the original plan — see T17.
 
 ---
 

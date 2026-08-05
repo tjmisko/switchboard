@@ -58,9 +58,23 @@ The binary's own field doc for `agent_id` is explicit about the intended use:
 ⚠ `agent_type` is **not** a subagent discriminator — it is populated on the main
 thread of an `--agent` session. Only `agent_id` is.
 
-`agent_id` equals the `agent-<id>` stem shared by
-`subagents/agent-<id>.meta.json` and `subagents/agent-<id>.jsonl`, so it joins
-the hook stream to the on-disk fanout records directly.
+`agent_id` identifies the same subagent as the `subagents/agent-<id>.*` files,
+so it joins the hook stream to the on-disk fanout records directly.
+
+⚠ **The exact string shape is not yet confirmed.** On-disk files are
+`agent-<rawid>` where `rawid` itself begins with `a` (e.g. file
+`agent-a158b13da3d13b0ea` ⇒ `rawid = a158b13da3d13b0ea`; a named teammate's file
+`agent-aauth-tests-7152e6a858d30551` shows the same doubled `a`). The daemon's
+`Subagent.AgentID` and `history.Event.AgentID` both store the **prefix-stripped**
+`rawid` — but both are written by the Observer from a directory scan, **not**
+from a hook, so they are not evidence about what the hook sends. Whether the
+hook's `agent_id` is `a158b13da3d13b0ea` or `agent-a158b13da3d13b0ea` remains
+unobserved (this is plan T1).
+
+⇒ **Normalize `agent_id` once at the RPC boundary** (strip a leading `agent-` if
+present) so every map in the daemon is keyed identically. Otherwise a `Pending`
+map keyed by the raw hook value will silently fail to join the Observer's
+seen-set keyed by the stripped value.
 
 ---
 
@@ -108,9 +122,36 @@ for?", strongest first:
    (`Bash`). Insufficient alone — see
    [subagent-permission-oscillation.md](subagent-permission-oscillation.md).
 
-`(agent_id, tool_name, tool_input)` is exact enough in practice and needs **no
-new hook registration**. `tool_use_id` via `PreToolUse` would be exact, at the
-cost of a hook firing on every tool call in every session.
+`(agent_id, tool_name, tool_input)` needs **no new hook registration**.
+`tool_use_id` via `PreToolUse` would be exact, at the cost of a hook firing on
+every tool call in every session.
+
+### ⚠ `tool_input` is NOT stable across the two events
+
+`PermissionRequest` reports the input as it stands **before** the decision
+resolves. `PostToolUse` reports `updatedInput` — the input **after** it. They
+differ by design on several approval paths, verified in the bundle:
+
+```js
+updatedInput:{...e,command:g}, decisionReason:{…reason:"Bare output redirection with no command; path layer approved"}
+updatedInput:{...e,path:r},    decisionReason:{type:"safetyCheck",reason:`permission-root relocation …`}
+updatedInput:{...e,[Mkr]:lHe(t)}, suppressAlwaysAllowRule:!0        // injected keys
+```
+
+plus a `userModified` flag (the user can edit the call in the approval dialog),
+and a `PermissionRequest` **hook** may itself return an `updatedInput` — the
+binary logs `Hook … modified tool input keys: [...]`.
+
+**Consequence for the permission gate:** a `tool_input` hash **match** is strong
+positive confirmation, but a **mismatch proves nothing** — it is equally "same
+call, input rewritten on approval" (exactly the approve path we want to clear
+fast) and "different call by the same writer" (a sibling we must hold red for).
+Note the rewrite paths include `command:` rewriting on **Bash**, the tool in the
+2026-08-05 incident.
+
+⇒ Never latch red on a hash mismatch. Treat the hash as: match ⇒ clear at hook
+speed; mismatch ⇒ *fall through to the writer-routed transcript check*, which
+asks the question that is actually decisive ("did the blocked writer resume?").
 
 ### Lifecycle events
 
