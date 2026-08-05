@@ -272,6 +272,26 @@ func (s *Store) SetCapabilities(c Capabilities) {
 	s.mu.Unlock()
 }
 
+// lockHoldWarn is the Apply hold duration above which the daemon logs a line.
+// Zero — the default — disables the check entirely, costing one comparison per
+// Apply. Enable with SWITCHBOARD_DEBUG_LOCK set to a Go duration ("5ms").
+//
+// It exists because "is the store lock still what is stalling the bar?" is the
+// only question that matters when a chip click feels slow, and it cannot be
+// answered from outside the process: an RPC probe measures lock wait plus
+// round-trip plus scheduling, and cannot say which. This measures the hold
+// itself. On a healthy daemon the answer is silence.
+//
+// Read once at init rather than per call so the hot path never touches the
+// environment.
+var lockHoldWarn = func() time.Duration {
+	d, err := time.ParseDuration(os.Getenv("SWITCHBOARD_DEBUG_LOCK"))
+	if err != nil || d <= 0 {
+		return 0
+	}
+	return d
+}()
+
 // Apply mutates the store under lock, then — only when the mutation actually
 // changed something a consumer can see — notifies subscribers and persists.
 //
@@ -281,9 +301,22 @@ func (s *Store) SetCapabilities(c Capabilities) {
 // state.json on every tick, forever, to republish byte-identical state.
 func (s *Store) Apply(fn func(map[int]*Session)) {
 	s.mu.Lock()
+	var heldFrom time.Time
+	if lockHoldWarn > 0 {
+		heldFrom = time.Now()
+	}
 	fn(s.sessions)
 	snap := s.snapshotLocked()
 	gen, changed := s.adoptPublishedLocked(snap)
+	if lockHoldWarn > 0 {
+		if held := time.Since(heldFrom); held > lockHoldWarn {
+			// Deliberately still under the lock: this reports the hold, and a hold
+			// long enough to trip the threshold has already done its damage. The
+			// write is one Fprintf on a path that by definition fires rarely.
+			fmt.Fprintf(os.Stderr, "state: Apply held the write lock %v (> %v) sessions=%d\n",
+				held.Round(time.Microsecond), lockHoldWarn, len(s.sessions))
+		}
+	}
 	s.mu.Unlock()
 
 	if !changed {
