@@ -53,7 +53,7 @@ func (r *Resolver) Resolve(ctx context.Context, info osproc.Info) state.Session 
 		return sess
 	}
 	if pane.Backend == "wezterm" {
-		sess.Wezterm = weztermInfo(pane)
+		sess.Wezterm = weztermInfo(pane, time.Now())
 	}
 	if sess.CWD == "" {
 		sess.CWD = pane.CWD
@@ -89,7 +89,7 @@ func (r *Resolver) Reconcile(ctx context.Context, sess *state.Session) {
 		return
 	}
 	if pane.Backend == "wezterm" {
-		sess.Wezterm = weztermInfo(pane)
+		sess.Wezterm = weztermInfo(pane, time.Now())
 	}
 
 	if pane.Mux != 0 {
@@ -104,7 +104,105 @@ func (r *Resolver) Reconcile(ctx context.Context, sess *state.Session) {
 	}
 }
 
-func weztermInfo(pane *terminal.PaneRef) *state.WeztermInfo {
+// Enumerate fetches the terminal and WM enumerations ReconcileFrom needs — one
+// call each, for a whole reconcile tick.
+//
+// It hangs on the Resolver rather than letting the caller assemble the two
+// arguments itself, and that is load-bearing: it reads through the SAME seams
+// Reconcile would have used. A caller that snapshotted a different Locator than
+// the one backing the fallback path would resolve sessions against panes that
+// path could never produce, and the two would disagree exactly when the batch
+// path degraded — the worst possible time.
+//
+// panes is nil when the terminal backend offers no batch path OR its enumeration
+// failed; both mean "no usable batch answer" and the caller falls back to
+// per-session Reconcile (see terminal.SnapshotOrNil). Note that nil is NOT the
+// same as an empty map, which is a real answer meaning no tty owns a pane.
+// clients is nil on a WM error, matching findWindow, which swallows that error
+// and returns no window.
+//
+// Carries Reconcile's 3s timeout so a wedged mux or compositor bounds the tick
+// rather than stalling it.
+func (r *Resolver) Enumerate(ctx context.Context) (map[string]terminal.PaneRef, []wm.Window) {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	panes := terminal.SnapshotOrNil(ctx, r.term)
+	clients, err := r.wm.Clients(ctx)
+	if err != nil {
+		clients = nil
+	}
+	return panes, clients
+}
+
+// ReconcileFrom is Reconcile with the two I/O calls hoisted out: it applies an
+// already-fetched terminal + WM enumeration to one session and performs NO I/O
+// of its own. Reconcile forks a terminal enumeration and a full WM client query
+// PER SESSION, so a reconcile tick over N sessions paid N of each — identical
+// data, fetched N times, with the store's write lock held the whole way. The
+// batched call site fetches once and fans the same two snapshots across every
+// session, which is why this takes plain values and no context: with nothing to
+// wait on there is nothing to time out.
+//
+// panes is keyed by controlling tty — the portable join key (see the package
+// doc); clients is one wm.Clients() result. Both are read-only here, so one
+// snapshot pair is safe to hand to every session in the tick.
+//
+// now is the tick's clock, threaded in rather than sampled per session so a
+// whole tick stamps one TitleAt. That keeps the H9 idle-title freshness gate
+// (state.WeztermInfo.TitleAt) comparing sessions on equal footing, and leaves
+// this function pure and testable.
+//
+// Behavior is observationally identical to Reconcile, including the parts that
+// look like omissions:
+//   - A tty absent from panes behaves exactly as Locate returning (nil, nil):
+//     return without touching the session. A miss NEVER clears an already
+//     resolved mapping — a terminal that is briefly unenumerable must not blank
+//     a live chip; the next tick re-resolves it.
+//   - Ambiguity is still resolved by matchUniqueClient, i.e. not at all: zero or
+//     multiple (pid, title) matches leave the prior address in place rather than
+//     guess (the "retry next tick" contract, decisions.md #4).
+//   - No fallback to pane.CWD for an empty sess.CWD. Only the initial Resolve
+//     does that; reconcile deliberately does not, and this mirrors reconcile.
+//
+// A WM query that failed at fetch time should arrive here as a nil clients
+// slice, which matches findWindow swallowing the error and returning nil.
+//
+// The receiver is deliberately unnamed: the seams live on the Resolver, so
+// having no handle on them makes "does no I/O" a compile-time property rather
+// than a promise a later edit can quietly break. It stays a method so the
+// batched call site reaches it through the same Resolver as Resolve/Reconcile.
+func (*Resolver) ReconcileFrom(sess *state.Session, panes map[string]terminal.PaneRef, clients []wm.Window, now time.Time) {
+	if sess.TTY == "" {
+		return
+	}
+	pane, ok := panes[sess.TTY]
+	if !ok {
+		return // no pane owns this tty this tick — same as Locate finding nothing
+	}
+	if pane.Backend == "wezterm" {
+		sess.Wezterm = weztermInfo(&pane, now)
+	}
+
+	// The WM join keys on the terminal's mux pid; backends that don't expose one
+	// (e.g. tmux, whose pane pid is the in-pane process) leave Mux 0 and the
+	// session stays Observe-only on the WM axis.
+	if pane.Mux != 0 {
+		if win := matchUniqueClient(clients, pane.Mux, pane.WindowTitle); win != nil {
+			if sess.Hyprland == nil {
+				sess.Hyprland = &state.HyprlandInfo{}
+			}
+			sess.Hyprland.Address = win.Address
+			sess.Hyprland.Workspace = win.Workspace
+			sess.Hyprland.WorkspaceID = win.WorkspaceID
+		}
+	}
+}
+
+// weztermInfo snapshots a pane into the session's wezterm block. now is passed
+// in rather than sampled here so a batched tick shares one TitleAt across every
+// session it stamps (see ReconcileFrom).
+func weztermInfo(pane *terminal.PaneRef, now time.Time) *state.WeztermInfo {
 	return &state.WeztermInfo{
 		MuxPID:      pane.Mux,
 		MuxSocket:   pane.MuxSocket,
@@ -113,7 +211,7 @@ func weztermInfo(pane *terminal.PaneRef) *state.WeztermInfo {
 		WindowID:    pane.WindowID,
 		WindowTitle: pane.WindowTitle,
 		Title:       pane.Title,
-		TitleAt:     time.Now(),
+		TitleAt:     now,
 	}
 }
 

@@ -4,6 +4,7 @@
 package state
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -210,19 +211,56 @@ type Capabilities struct {
 	Terminal string `json:"terminal"`
 }
 
+// Broadcast is one fan-out unit: a snapshot plus the JSON body every subscriber
+// is about to send. It exists because the encode is per-BROADCAST work that used
+// to be done per-SUBSCRIBER. The live bar declares ten waybar slot modules, each
+// a separate `switchboard-waybar --slot N` process holding its own subscription,
+// so a single state mutation serialized the identical snapshot ten times inside
+// the daemon — ten allocations and ten encodes of the same bytes.
+//
+// The alternative was to keep the marshal in rpc behind a cache keyed on snapshot
+// identity. Snapshot has no identity of its own, so that needs a synthetic one (a
+// sequence number) plus a cache that still re-encodes for any subscriber running
+// a beat behind the others, and it puts a shared mutable cache on the RPC
+// goroutines. Encoding at the single point where the fan-out already happens is
+// both cheaper and impossible to get wrong.
+type Broadcast struct {
+	Snapshot Snapshot
+	// JSON is the COMPACT encoding of Snapshot: exactly what json.Encoder writes,
+	// minus the trailing newline. rpc splices it into the response envelope
+	// verbatim (json.RawMessage), so these bytes ARE the public wire document —
+	// see docs/state-schema.md and the golden tests that pin them.
+	//
+	// It is nil when the encode failed. A subscriber must then encode Snapshot
+	// itself rather than send a truncated frame.
+	//
+	// Treat it as immutable: every subscriber holds this same backing array.
+	JSON []byte
+}
+
 type Store struct {
 	path        string
 	mu          sync.RWMutex
 	sessions    map[int]*Session
-	subscribers map[chan Snapshot]struct{}
+	subscribers map[chan Broadcast]struct{}
 	caps        *Capabilities
+	// publishedKey is snapshotChangeKey of the last snapshot Apply decided to
+	// publish — the reference the change check compares against. nil before the
+	// first publish (and after a failed encode or a failed persist), which compares
+	// unequal to everything, so the next Apply publishes.
+	publishedKey []byte
+	// publishedGen counts adoptions of publishedKey. Apply captures it at adopt
+	// time so that a persist failing AFTER the unlock can retract its own adoption
+	// without clobbering one a later Apply made in the meantime. See
+	// invalidatePublished.
+	publishedGen uint64
 }
 
 func New(statePath string) *Store {
 	return &Store{
 		path:        statePath,
 		sessions:    make(map[int]*Session),
-		subscribers: make(map[chan Snapshot]struct{}),
+		subscribers: make(map[chan Broadcast]struct{}),
 	}
 }
 
@@ -234,17 +272,168 @@ func (s *Store) SetCapabilities(c Capabilities) {
 	s.mu.Unlock()
 }
 
-// Apply mutates the store under lock, then notifies subscribers and persists.
+// lockHoldWarn is the Apply hold duration above which the daemon logs a line.
+// Zero — the default — disables the check entirely, costing one comparison per
+// Apply. Enable with SWITCHBOARD_DEBUG_LOCK set to a Go duration ("5ms").
+//
+// It exists because "is the store lock still what is stalling the bar?" is the
+// only question that matters when a chip click feels slow, and it cannot be
+// answered from outside the process: an RPC probe measures lock wait plus
+// round-trip plus scheduling, and cannot say which. This measures the hold
+// itself. On a healthy daemon the answer is silence.
+//
+// Read once at init rather than per call so the hot path never touches the
+// environment.
+var lockHoldWarn = func() time.Duration {
+	d, err := time.ParseDuration(os.Getenv("SWITCHBOARD_DEBUG_LOCK"))
+	if err != nil || d <= 0 {
+		return 0
+	}
+	return d
+}()
+
+// Apply mutates the store under lock, then — only when the mutation actually
+// changed something a consumer can see — notifies subscribers and persists.
+//
+// The change check exists because Apply's callers are mostly unconditional: the
+// reconciler runs every 5 s and calls Apply whether or not the world moved, so a
+// machine sitting idle overnight was waking ten waybar processes and rewriting
+// state.json on every tick, forever, to republish byte-identical state.
 func (s *Store) Apply(fn func(map[int]*Session)) {
 	s.mu.Lock()
+	var heldFrom time.Time
+	if lockHoldWarn > 0 {
+		heldFrom = time.Now()
+	}
 	fn(s.sessions)
 	snap := s.snapshotLocked()
+	gen, changed := s.adoptPublishedLocked(snap)
+	if lockHoldWarn > 0 {
+		if held := time.Since(heldFrom); held > lockHoldWarn {
+			// Deliberately still under the lock: this reports the hold, and a hold
+			// long enough to trip the threshold has already done its damage. The
+			// write is one Fprintf on a path that by definition fires rarely.
+			fmt.Fprintf(os.Stderr, "state: Apply held the write lock %v (> %v) sessions=%d\n",
+				held.Round(time.Microsecond), lockHoldWarn, len(s.sessions))
+		}
+	}
 	s.mu.Unlock()
 
+	if !changed {
+		return
+	}
 	s.broadcast(snap)
 	if err := s.persist(snap); err != nil {
 		fmt.Fprintf(os.Stderr, "state: persist failed: %v\n", err)
+		// The reference was adopted before the write was attempted, so leaving it
+		// adopted would suppress every later Apply that produces this same state —
+		// freezing state.json at its last good content indefinitely, until something
+		// unrelated happens to change. Before the publish gate existed every Apply
+		// rewrote the file, so a transient failure (ENOSPC, a momentarily unwritable
+		// cache dir) healed on the very next tick. Retracting the adoption restores
+		// exactly that: the next Apply republishes even if nothing moved.
+		s.invalidatePublished(gen)
 	}
+}
+
+// adoptPublishedLocked compares snap against the last snapshot Apply decided to
+// publish and, when they differ, adopts snap as the new reference. It reports the
+// generation of the adoption (for invalidatePublished) and whether anything
+// changed.
+//
+// It deliberately runs under the SAME write lock as the mutation that produced
+// snap. That is what makes suppression safe: the reference advances in mutation
+// order, so a change can never be compared against a reference stamped by a
+// LATER mutation and dropped as a no-op. (The broadcast and the persist still
+// happen after the unlock and can still race each other on the wire, exactly as
+// they always have — that ordering is unchanged by this check.) The cost is one
+// encode inside the write lock, which is microseconds against the milliseconds of
+// terminal/WM I/O the reconciler used to hold it for.
+func (s *Store) adoptPublishedLocked(snap Snapshot) (gen uint64, changed bool) {
+	key := snapshotChangeKey(snap)
+	if key != nil && bytes.Equal(key, s.publishedKey) {
+		return s.publishedGen, false
+	}
+	s.publishedKey = key
+	s.publishedGen++
+	return s.publishedGen, true
+}
+
+// invalidatePublished retracts the adoption made at generation gen, so the next
+// Apply republishes even when the state has not moved. Apply calls it when the
+// persist that followed the adoption failed.
+//
+// The generation check is the whole point: Apply is past its unlock by the time a
+// persist can fail, so another Apply may already have adopted a NEWER reference.
+// Clearing unconditionally would discard that newer reference. The cost of doing
+// so would only be one redundant publish, not a correctness bug — but the newer
+// Apply is also the one that knows whether ITS persist succeeded, so it is the
+// only one entitled to decide. Retracting only our own adoption leaves that
+// decision where it belongs: if the newer persist also failed, it retracts its
+// own generation; if it succeeded, state.json already holds strictly fresher
+// state than ours and there is nothing to heal.
+func (s *Store) invalidatePublished(gen uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.publishedGen != gen {
+		return // a later Apply owns the reference now; it will heal its own failure
+	}
+	s.publishedKey = nil
+}
+
+// snapshotChangeKey encodes everything about a snapshot that a consumer can
+// observe, and nothing else. Two snapshots with equal keys are indistinguishable
+// both on the subscribe stream and in state.json, so publishing the second is
+// pure noise.
+//
+// It is a JSON encode rather than a hand-written field-by-field comparison on
+// purpose. A comparator's failure mode is silent: add a field to Session, forget
+// to compare it, and bars simply stop updating for that field with no test
+// failing anywhere. Encoding inherits the wire contract instead — every field
+// carrying a JSON tag is compared by construction, and every in-memory-only
+// field (json:"-") is excluded by construction, now and for anything added later.
+//
+// UpdatedAt is the single field dropped by hand, and it is the whole reason a
+// naive equality check would never fire: snapshotLocked stamps it time.Now() on
+// EVERY snapshot, so two identical states differ there by definition and the
+// suppression would silently never trigger. The other fields re-stamped from the
+// wall clock rather than earned by a real change fall out for free, because they
+// are already json:"-" and so never reach an encode:
+//
+//   - WeztermInfo.TitleAt — the resolver re-samples the pane title every reconcile
+//     tick and stamps it (mapping.weztermInfo), so it advances on a quiet machine.
+//   - WeztermInfo.Title with it: the agent CLI repaints that string continuously
+//     while a turn runs (animated spinner glyph).
+//   - AgentInfo.PendingTool — transient red-onset state, not a clock but equally
+//     invisible to consumers.
+//
+// AgentInfo.StatusSince is json:"-" too, but it is NOT a hidden field for this
+// purpose: snapshotLocked projects it onto StatusSinceWire (status_since), which
+// IS encoded and IS compared. That is correct rather than a leak — audited against
+// docs/state-schema.md ("when status last transitioned to its current value") and
+// against every writer: rpc.handleHook stamps it only inside its
+// `status != info.Status` guard, and each of the reconciler's self-heals stamps it
+// on the same line it assigns a new Status. It moves on a status edge and nowhere
+// else, so a moved status_since is a real change that must reach the bar.
+//
+// ⚠ Not excluded, and worth knowing: mem_agent_bytes / mem_tree_bytes are
+// re-sampled every tick and genuinely jitter, so a session whose PSS drifts
+// publishes even when nothing else moved. They are real wire data driving the
+// tooltip, so suppressing them would be a lie — the suppression simply fires less
+// often on a machine whose agents are still breathing.
+func snapshotChangeKey(snap Snapshot) []byte {
+	key, err := json.Marshal(struct {
+		Sessions     []Session     `json:"sessions"`
+		Capabilities *Capabilities `json:"capabilities,omitempty"`
+	}{Sessions: snap.Sessions, Capabilities: snap.Capabilities})
+	if err != nil {
+		// Not reachable today (Snapshot holds no unencodable field), but fail OPEN:
+		// a nil key compares unequal to everything, so a broken encode republishes
+		// rather than silently freezing every bar on the last good state.
+		fmt.Fprintf(os.Stderr, "state: change key encode failed: %v\n", err)
+		return nil
+	}
+	return key
 }
 
 // Snapshot returns a deep-ish copy of current state. Values are copied; the
@@ -325,11 +514,12 @@ func workspaceID(s Session) (int, bool) {
 	return s.Hyprland.WorkspaceID, true
 }
 
-// Subscribe returns a channel that receives every snapshot after a mutation.
+// Subscribe returns a channel that receives every snapshot after a mutation that
+// changed it, each paired with the shared encoding of that snapshot (Broadcast).
 // The channel is buffered (cap=4) and drops if the receiver lags. Close the
 // returned cancel func to unsubscribe.
-func (s *Store) Subscribe() (<-chan Snapshot, func()) {
-	ch := make(chan Snapshot, 4)
+func (s *Store) Subscribe() (<-chan Broadcast, func()) {
+	ch := make(chan Broadcast, 4)
 	s.mu.Lock()
 	s.subscribers[ch] = struct{}{}
 	s.mu.Unlock()
@@ -344,15 +534,50 @@ func (s *Store) Subscribe() (<-chan Snapshot, func()) {
 }
 
 func (s *Store) broadcast(snap Snapshot) {
+	// Peek the subscriber count before paying for the encode. A daemon with no bar
+	// attached — headless box, bar mid-restart — should not serialize into the void.
+	s.mu.RLock()
+	subscribers := len(s.subscribers)
+	s.mu.RUnlock()
+	if subscribers == 0 {
+		return
+	}
+
+	// Encode OUTSIDE the lock, once, for everyone. Holding RLock across the encode
+	// would block every Apply (the write lock) for its duration, which is the exact
+	// contention this package is being pulled apart to remove. A subscriber that
+	// arrives in the gap misses nothing: rpc.subscribe hands a brand-new connection
+	// its own full snapshot on connect, independently of this path.
+	b := Broadcast{Snapshot: snap}
+	if js, err := marshalSnapshot(snap); err == nil {
+		b.JSON = js
+	} else {
+		// Leave JSON nil and let the subscriber encode the snapshot itself; a bar
+		// falling back to a slower path beats a bar receiving a broken frame.
+		fmt.Fprintf(os.Stderr, "state: broadcast encode failed: %v\n", err)
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for ch := range s.subscribers {
 		select {
-		case ch <- snap:
+		case ch <- b:
 		default:
+			// Deliberate back-pressure: a subscriber that cannot keep up drops
+			// snapshots rather than stalling every other subscriber (and the next
+			// Apply) behind it. A drop costs latency and never correctness — the next
+			// broadcast carries the whole state, not a delta.
 		}
 	}
 }
+
+// marshalSnapshot produces the compact wire body a broadcast shares with every
+// subscriber: plain encoding/json defaults, so it is byte-for-byte what
+// json.Encoder would write for the same value (minus the trailing newline) and
+// what Store.persist writes with indentation added. It is a named function rather
+// than an inline call so the golden test pins THESE bytes against the frozen
+// state.json document instead of a copy of this line that could drift from it.
+func marshalSnapshot(snap Snapshot) ([]byte, error) { return json.Marshal(snap) }
 
 func (s *Store) persist(snap Snapshot) error {
 	if s.path == "" {

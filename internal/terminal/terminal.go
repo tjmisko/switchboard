@@ -51,3 +51,45 @@ type Locator interface {
 	// Activate focuses the pane. Backends that cannot focus return ErrUnsupported.
 	Activate(ctx context.Context, ref *PaneRef) error
 }
+
+// Snapshotter is the optional batch fast-path a Locator may provide: resolve
+// many ttys against ONE enumeration. It is deliberately NOT part of the neutral
+// Locator contract — the reconciler upgrades to it when present and degrades to
+// per-session Locate when absent, so a new backend drops in either way.
+//
+// It exists because Locate is per-tty while every multiplexer backend answers it
+// by enumerating the whole mux. With N sessions across M muxes the reconciler
+// forks N×M `wezterm cli list` calls per tick, each returning the identical pane
+// list, and it pays that while holding the store's write lock — the dominant
+// source of both daemon CPU and RPC stalls. One Snapshot serves every session.
+type Snapshotter interface {
+	// Snapshot returns every pane the backend owns, keyed by the pane's own
+	// controlling tty (PaneRef.TTY) — the join key the whole mapping layer is
+	// anchored on, and the same key Locate matches. Panes with no tty are
+	// omitted: nothing can ever join to them.
+	//
+	// A key's absence must mean "no pane owns this tty", so implementations
+	// return a non-nil (possibly empty) map on success and an error whenever the
+	// set would be incomplete. Owning nothing is success, not failure.
+	Snapshot(ctx context.Context) (map[string]PaneRef, error)
+}
+
+// SnapshotOrNil returns loc's batch pane set, or nil when loc does not implement
+// Snapshotter (the caller then falls back to per-session Locate). A backend that
+// implements it but fails also yields nil, so a transient enumeration error
+// degrades to the single path rather than blanking every session's pane — an
+// empty map would read as "no tty owns a pane" and wipe every chip's title.
+//
+// nil is therefore unambiguous ("no usable batch answer"); a non-nil result is
+// complete and its missing keys are real misses.
+func SnapshotOrNil(ctx context.Context, loc Locator) map[string]PaneRef {
+	s, ok := loc.(Snapshotter)
+	if !ok {
+		return nil
+	}
+	panes, err := s.Snapshot(ctx)
+	if err != nil {
+		return nil
+	}
+	return panes
+}

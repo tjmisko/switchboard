@@ -307,6 +307,22 @@ type Locator interface {
 	SomeTTY(ctx context.Context) (string, bool)
 }
 
+// LocatorSnapshotter is the OPTIONAL batch fast-path a Locator may provide:
+// resolve every tty it owns against one enumeration instead of one enumeration
+// per tty. It is deliberately not folded into Locator — the daemon upgrades to
+// it when a backend has it and degrades to per-session Locate when it does not,
+// so the suite SKIPS its batch assertions for a backend without one rather than
+// failing them. A fixture must expose this method only when its backend really
+// implements the fast path, or the skip stops being reachable.
+type LocatorSnapshotter interface {
+	// Snapshot returns every owned pane keyed by its controlling tty.
+	Snapshot(ctx context.Context) (map[string]Pane, error)
+}
+
+// unknownTTY is a tty no backend can ever own — the negative-path anchor for
+// both the single and the batch assertions.
+const unknownTTY = "/dev/pts/this-is-not-a-real-tty"
+
 // RunLocatorContract asserts the neutral terminal-locator contract. The
 // unknown-tty path runs anywhere; the owned-tty path needs a live terminal and
 // skips when Available() is false.
@@ -316,7 +332,7 @@ func RunLocatorContract(t *testing.T, l Locator) {
 	t.Run("unknown tty resolves to no pane without error or hang", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		pane, err := l.Locate(ctx, "/dev/pts/this-is-not-a-real-tty")
+		pane, err := l.Locate(ctx, unknownTTY)
 		if err != nil {
 			t.Errorf("Locate(unknown) err = %v, want nil", err)
 		}
@@ -324,6 +340,8 @@ func RunLocatorContract(t *testing.T, l Locator) {
 			t.Errorf("Locate(unknown) = %+v, want nil", pane)
 		}
 	})
+
+	runLocatorBatchContract(t, l)
 
 	if !liveConformance() {
 		t.Log("live terminal assertions gated off (set SWITCHBOARD_LIVE_CONFORMANCE=1 on a host with the backend)")
@@ -354,4 +372,73 @@ func RunLocatorContract(t *testing.T, l Locator) {
 	if pane.Mux == 0 && pane.PaneID == 0 {
 		t.Errorf("located pane lacks a stable (mux, pane) identity: %+v", pane)
 	}
+}
+
+// runLocatorBatchContract asserts the optional batch fast-path: one enumeration
+// must answer exactly what N per-tty Locate calls would. The two paths exist
+// only because the batch one is cheap, so the contract that matters is that
+// they cannot drift — a backend whose Snapshot reports a different pane (or a
+// different pane's fields) than Locate would silently mis-Navigate sessions.
+//
+// It runs ungated, like the unknown-tty assertion above and for the same
+// reason: enumeration is read-only and already happens on that path. On a host
+// with no live terminal the snapshot is simply empty and only the negative
+// assertion has teeth, so the suite keeps a scripted fixture to drive the
+// agreement loop everywhere.
+func runLocatorBatchContract(t *testing.T, l Locator) {
+	t.Helper()
+
+	s, ok := l.(LocatorSnapshotter)
+	if !ok {
+		// Not a failure: the fast-path is optional and this backend runs on the
+		// per-session Locate path, unchanged.
+		t.Log("locator provides no batch snapshot path: skipping the batch assertions (optional, not required)")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	panes, err := s.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if panes == nil {
+		t.Fatal("Snapshot returned a nil map with no error; want a non-nil (possibly empty) set, since a missing key must mean 'no pane owns this tty'")
+	}
+
+	t.Run("should agree with Locate on every tty in the batch snapshot", func(t *testing.T) {
+		for tty, want := range panes {
+			if tty == "" {
+				t.Error("snapshot contains an empty tty key; a pane with no tty can never join a session and must be omitted")
+				continue
+			}
+			// The map key is the pane's OWN tty — the mapping layer joins on it.
+			if want.TTY != tty {
+				t.Errorf("snapshot key %q holds a pane whose TTY is %q", tty, want.TTY)
+			}
+			got, err := l.Locate(ctx, tty)
+			if err != nil {
+				t.Errorf("Locate(%q) err = %v, want nil for a tty the snapshot claims", tty, err)
+				continue
+			}
+			if got == nil {
+				t.Errorf("Locate(%q) = nil, but the batch snapshot claims that tty", tty)
+				continue
+			}
+			if *got != want {
+				t.Errorf("batch and single paths disagree for %q:\n  Snapshot = %+v\n  Locate   = %+v", tty, want, *got)
+			}
+		}
+	})
+
+	t.Run("should resolve to no pane when a tty is absent from the batch snapshot", func(t *testing.T) {
+		if _, present := panes[unknownTTY]; present {
+			t.Fatalf("precondition: %q must not be owned by any backend", unknownTTY)
+		}
+		pane, err := l.Locate(ctx, unknownTTY)
+		if err != nil || pane != nil {
+			t.Errorf("Locate(absent from snapshot) = (%+v, %v), want (nil, nil)", pane, err)
+		}
+	})
 }

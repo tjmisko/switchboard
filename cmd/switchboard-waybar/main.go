@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,27 +43,53 @@ type waybarOutput struct {
 func main() {
 	socketPath := flag.String("socket", defaultSocketPath(), "daemon socket")
 	slot := flag.Int("slot", -1, "emit JSON for Nth session only (waybar slot mode)")
+	widthPx := flag.Float64("width-px", 0, "usable bar width in px; 0 auto-detects via hyprctl")
 	flag.Parse()
 
 	// The abbreviation budget is the monitor's usable width against fixed chip
 	// metrics. Width is stable for the bar's lifetime, so resolve it once.
-	availPx := barlayout.ScreenWidthPx()
+	availPx := resolveAvailPx(*widthPx)
 	metrics := barlayout.DefaultMetrics()
 
+	names := &nameConfig{}
+	out := &emitter{w: os.Stdout}
+
 	for {
-		runOnce(*socketPath, *slot, availPx, metrics)
+		runOnce(*socketPath, *slot, availPx, metrics, names, out)
 		// Daemon socket dropped — emit a degraded chip so waybar shows
 		// something while we wait, then retry.
 		if *slot >= 0 {
-			emit(waybarOutput{Text: "", Class: []string{"empty"}})
+			out.emit(waybarOutput{Text: "", Class: []string{"empty"}})
 		} else {
-			emit(waybarOutput{Text: "✕", Tooltip: "switchboard not running", Class: []string{"tracker-down"}})
+			out.emit(waybarOutput{Text: "✕", Tooltip: "switchboard not running", Class: []string{"tracker-down"}})
 		}
 		time.Sleep(2 * time.Second)
 	}
 }
 
-func runOnce(socketPath string, slot int, availPx float64, metrics barlayout.Metrics) {
+// resolveAvailPx returns the abbreviation budget: the --width-px override when
+// the bar config supplies one, otherwise the auto-detected monitor width.
+//
+// The override exists because barlayout.ScreenWidthPx auto-detects by forking
+// `hyprctl monitors -j`, and the bar declares TEN slot modules — so every bottom
+// bar spawn is ten hyprctl processes, all racing to read the same unchanging
+// number. It is once per process lifetime, so this is a startup cost, not a
+// per-emission one; passing the width from ~/.config/waybar/claude.jsonc removes
+// the fork entirely.
+//
+// The value is the USABLE width, not the raw monitor width: ScreenWidthPx nets
+// off an internal safety margin that this package cannot see, so a caller
+// passing a monitor's full pixel width would over-budget the row and lose the
+// ellipsis. Non-positive means "auto-detect", which stays the default so the bar
+// keeps working with no config change.
+func resolveAvailPx(widthPx float64) float64 {
+	if widthPx > 0 {
+		return widthPx
+	}
+	return barlayout.ScreenWidthPx()
+}
+
+func runOnce(socketPath string, slot int, availPx float64, metrics barlayout.Metrics, names *nameConfig, out *emitter) {
 	c, err := rpc.Dial(socketPath)
 	if err != nil {
 		return
@@ -71,6 +98,14 @@ func runOnce(socketPath string, slot int, availPx float64, metrics barlayout.Met
 	if err := c.Send(rpc.Request{Cmd: "subscribe"}); err != nil {
 		return
 	}
+	// A fresh subscription means the daemon restarted (or we just started), and
+	// waybar may have reloaded the module under us — our belief about the line
+	// the bar is currently showing is no longer trustworthy. Forget it so the
+	// first chip of this stream is always printed, at a cost of exactly one
+	// redundant line per reconnect. Deliberately NOT reset on a failed dial: the
+	// retry loop would then re-print the degraded chip every 2s for as long as
+	// the daemon is down, which is the relayout churn the dedupe exists to stop.
+	out.forget()
 	for {
 		var resp rpc.Response
 		if err := c.Recv(&resp); err != nil {
@@ -80,11 +115,64 @@ func runOnce(socketPath string, slot int, availPx float64, metrics barlayout.Met
 			continue
 		}
 		if slot >= 0 {
-			emit(renderSlot(*resp.Snapshot, slot, availPx, metrics))
+			out.emit(renderSlot(*resp.Snapshot, slot, availPx, metrics, names))
 		} else {
-			emit(renderAggregate(*resp.Snapshot))
+			out.emit(renderAggregate(*resp.Snapshot, names))
 		}
 	}
+}
+
+// nameConfig memoizes projectname.Load() across emissions, re-reading the file
+// only when it has changed on disk.
+//
+// The cache lives HERE, in the one command with a hot loop, rather than inside
+// projectname.Load. Nobody else would benefit: the daemon calls Load once at
+// startup (cmd/switchboard/main.go) and switchboard-ctl is a one-shot process.
+// The cost of putting it in Load, though, is paid by every caller — Load is a
+// bare function with no synchronization, so giving it package-level state means
+// any future concurrent caller races on it silently, and it would put mutable
+// global state in a package whose doc promises "only ProjectRoot, ConfigPath,
+// Load, SetAbbrev and SetFull touch the filesystem". It would also make
+// ctl's write-then-read-back (`name set` calls SetAbbrev then Load to echo the
+// result) depend on stat granularity for correctness, where today it is
+// unconditionally right. Keeping the cache in the caller that needs it leaves
+// every other caller's behavior exactly as it was.
+//
+// Invalidation is by (path, mtime, size) rather than load-once because the bar's
+// middle-click binding runs ~/.config/scripts/claude-abbrev-edit, which rewrites
+// this file and expects the chips to pick the rename up on the next snapshot.
+// projectname.upsertEntry writes via a temp file + rename, so a rename always
+// lands a fresh mtime; size rides along to catch a same-mtime rewrite on a
+// coarse-granularity filesystem. path is part of the key so a caller that moves
+// XDG_CONFIG_HOME mid-process (tests do) is not served the old file's config.
+type nameConfig struct {
+	loaded  bool
+	path    string
+	modTime time.Time
+	size    int64
+	cfg     projectname.Config
+}
+
+// config returns the merged project-name config, re-reading it only when the
+// user file's identity or stamp has moved. One stat replaces a read + unmarshal
+// on the overwhelming majority of emissions.
+func (n *nameConfig) config() projectname.Config {
+	path := projectname.ConfigPath()
+	// A missing file (the common case — the user has never renamed a project)
+	// stats as the zero stamp, which is itself a perfectly good cache key: the
+	// "no user overrides, defaults only" result stays cached until the file is
+	// created, at which point the stamp goes non-zero and we reload.
+	var modTime time.Time
+	var size int64
+	if fi, err := os.Stat(path); err == nil {
+		modTime, size = fi.ModTime(), fi.Size()
+	}
+	if n.loaded && n.path == path && n.size == size && n.modTime.Equal(modTime) {
+		return n.cfg
+	}
+	n.loaded, n.path, n.modTime, n.size = true, path, modTime, size
+	n.cfg = projectname.Load()
+	return n.cfg
 }
 
 // renderSlot emits JSON for the Nth session. The class array carries the
@@ -94,11 +182,11 @@ func runOnce(socketPath string, slot int, availPx float64, metrics barlayout.Met
 // The chip text is the session's label abbreviated (with an ellipsis) so the
 // whole set fits the bar; the tooltip keeps the full name. Every slot fits the
 // same label set, so the abbreviation agrees across chips.
-func renderSlot(snap state.Snapshot, slot int, availPx float64, metrics barlayout.Metrics) waybarOutput {
+func renderSlot(snap state.Snapshot, slot int, availPx float64, metrics barlayout.Metrics, names *nameConfig) waybarOutput {
 	if slot >= len(snap.Sessions) {
 		return waybarOutput{Text: "", Class: []string{"empty"}}
 	}
-	cfg := projectname.Load()
+	cfg := names.config()
 	labels := make([]string, len(snap.Sessions))
 	for i := range snap.Sessions {
 		labels[i] = sblabel.Chip(cfg, snap.Sessions[i])
@@ -145,11 +233,11 @@ func chipClass(status string) string {
 
 // renderAggregate is the original single-module mode. Kept for ad-hoc
 // inspection (`switchboard-waybar | jq .`) but not driven by the live bar.
-func renderAggregate(snap state.Snapshot) waybarOutput {
+func renderAggregate(snap state.Snapshot, names *nameConfig) waybarOutput {
 	if len(snap.Sessions) == 0 {
 		return waybarOutput{Text: "", Tooltip: "no claude sessions", Class: []string{"empty"}}
 	}
-	cfg := projectname.Load()
+	cfg := names.config()
 	var parts []string
 	for _, s := range snap.Sessions {
 		mark := ""
@@ -285,9 +373,45 @@ func plural(n int) string {
 	return "s"
 }
 
-func emit(o waybarOutput) {
+// emitter writes waybar JSON lines, dropping any line byte-identical to the one
+// it wrote last.
+//
+// Waybar relayouts a module for every line it reads off the pipe, and with TEN
+// slot modules subscribed the daemon's broadcast cadence buys ten relayouts per
+// snapshot — most of them repainting exactly what is already on screen. Since
+// the suppressed line is identical byte-for-byte, the bar's rendered state after
+// a skip is by construction what it would have been after a write; the only
+// thing a skip can get wrong is our BELIEF about what the bar last read, which
+// is what forget() re-syncs.
+//
+// This is worth having despite the tooltip's live "idle · 3m" counter, which
+// does make a chip's bytes change on its own as the clock advances. durfmt
+// coarsens with magnitude on purpose, so the counter only ticks per-second below
+// one minute and per-minute above it; measured against this machine's own
+// history log, 95.6% of session-time is spent at a status age past that first
+// minute, where all but one emission per minute is a duplicate.
+type emitter struct {
+	w    io.Writer
+	last string
+}
+
+// emit writes o as a JSON line unless it repeats the previous line. It reports
+// whether it wrote, for tests.
+func (e *emitter) emit(o waybarOutput) bool {
 	b, _ := json.Marshal(o)
-	fmt.Println(string(b))
+	line := string(b)
+	if e.last == line {
+		return false
+	}
+	e.last = line
+	fmt.Fprintln(e.w, line)
+	return true
+}
+
+// forget drops the remembered line so the next emit always writes. Called on a
+// fresh subscription: see the hazard note in runOnce.
+func (e *emitter) forget() {
+	e.last = ""
 }
 
 func defaultSocketPath() string {

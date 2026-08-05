@@ -83,6 +83,19 @@ type Response struct {
 	Error    string          `json:"error,omitempty"`
 }
 
+// rawResponse mirrors Response field-for-field — same names, same order, same
+// omitempty — except the snapshot arrives already encoded. It is the envelope for
+// the subscribe stream, where state.Store has marshaled the snapshot once for all
+// subscribers (see snapshotFrame).
+//
+// ⚠ The two structs must be edited together: their encodings are required to be
+// byte-identical, which TestSubscribeFrameMatchesResponseEncoding pins.
+type rawResponse struct {
+	Snapshot json.RawMessage `json:"snapshot,omitempty"`
+	OK       bool            `json:"ok,omitempty"`
+	Error    string          `json:"error,omitempty"`
+}
+
 type Server struct {
 	store      *state.Store
 	socketPath string
@@ -193,15 +206,37 @@ func (s *Server) subscribe(ctx context.Context, conn net.Conn, enc *json.Encoder
 		select {
 		case <-ctx.Done():
 			return
-		case snap, ok := <-ch:
+		case b, ok := <-ch:
 			if !ok {
 				return
 			}
-			if err := enc.Encode(Response{Snapshot: &snap}); err != nil {
+			if err := enc.Encode(snapshotFrame(b)); err != nil {
 				return
 			}
 		}
 	}
+}
+
+// snapshotFrame wraps a broadcast in the response envelope WITHOUT re-encoding
+// the snapshot. This connection is one of many — the live bar declares ten waybar
+// slot modules, each a separate process holding its own subscription — and every
+// one of them was serializing the identical snapshot on its own goroutine after
+// every mutation. state.Store.broadcast now encodes it once and shares the bytes;
+// json.RawMessage carries them through the envelope verbatim.
+//
+// Byte-identity with enc.Encode(Response{Snapshot:&snap}) holds because
+// rawResponse mirrors Response exactly and encoding/json emits a RawMessage
+// through compact(), which is a no-op on already-compact bytes and whose HTML
+// escaping is idempotent here: state.Broadcast.JSON was produced with escaping
+// on, so no '<', '>' or '&' survives to be escaped a second time.
+//
+// A nil JSON means the encode failed upstream; fall back to encoding the snapshot
+// so this subscriber gets a valid frame rather than a truncated one.
+func snapshotFrame(b state.Broadcast) any {
+	if b.JSON == nil {
+		return Response{Snapshot: &b.Snapshot}
+	}
+	return rawResponse{Snapshot: b.JSON}
 }
 
 func (s *Server) focus(ctx context.Context, selector string) error {

@@ -17,4 +17,11 @@ func (noneLocator) Available() bool { return false }
 
 func (noneLocator) Locate(context.Context, string) (*PaneRef, error) { return nil, nil }
 
+// Snapshot reports the empty pane set. Owning nothing is a complete answer, not
+// a failure, so the caller stays on the batch path and resolves every session to
+// no pane — exactly what Locate says one tty at a time, without N forks to say it.
+func (noneLocator) Snapshot(context.Context) (map[string]PaneRef, error) {
+	return map[string]PaneRef{}, nil
+}
+
 func (noneLocator) Activate(context.Context, *PaneRef) error { return ErrUnsupported }

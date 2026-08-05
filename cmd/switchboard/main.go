@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -29,6 +30,7 @@ import (
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/statustune"
+	"github.com/tjmisko/switchboard/internal/terminal"
 	"github.com/tjmisko/switchboard/internal/transcript"
 	"github.com/tjmisko/switchboard/internal/wm"
 )
@@ -141,8 +143,11 @@ func main() {
 			log.Printf("scanner: %v", err)
 		}
 	}()
-	go runWMLoop(ctx, store, resolver, manager, sink, procSrc, scanner.Forget)
-	go runReconciler(ctx, store, resolver, manager, stack, *reconcileInterval, tun, sink, fanoutObs, memSampler, scanner.Forget)
+	// One turn shared by both resolve producers, so an older enumeration can never
+	// land after a newer one. See resolveTurn.
+	turn := &resolveTurn{}
+	go runWMLoop(ctx, store, resolver, manager, sink, procSrc, scanner.Forget, turn)
+	go runReconciler(ctx, store, resolver, manager, stack, *reconcileInterval, tun, sink, fanoutObs, memSampler, scanner.Forget, turn)
 
 	server := rpc.New(store, *socketPath, term, manager)
 	server.SetTuning(tun)
@@ -271,7 +276,26 @@ func dropStaleSessions(store *state.Store, procSrc osproc.Source, sink *history.
 	})
 }
 
-func runWMLoop(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, sink *history.Sink, src osproc.Source, forget func(int)) {
+// layoutDebounce is the window a burst of layout events is coalesced into.
+// Three raw Hyprland events map to EventLayoutChanged — movewindowv2,
+// windowtitlev2, openwindow (internal/wm/hyprland.go) — and each one re-resolves
+// EVERY session, which costs a full terminal + WM enumeration. windowtitlev2 is
+// the hazard: a running agent CLI repaints its pane title as it works, so an
+// uncoalesced stream multiplies that enumeration by the title rate.
+//
+// Rate limit, NOT a plain trailing-edge debounce: the timer is armed by the
+// first event of a burst and not re-armed by the rest, so it always fires within
+// one window of the burst starting. A re-arming debounce would have no maximum
+// wait at all — under events spaced closer than the window it never fires — and
+// the staleness bound would quietly become the reconcile interval. See
+// drainWMEvents.
+//
+// So the cost really is at most one window of staleness on a chip's workspace,
+// and the burst's last state still lands: an event arriving after a firing finds
+// the timer disarmed and arms it again.
+const layoutDebounce = 200 * time.Millisecond
+
+func runWMLoop(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, sink *history.Sink, src osproc.Source, forget func(int), turn *resolveTurn) {
 	for ctx.Err() == nil {
 		events, err := manager.Subscribe(ctx)
 		if err != nil {
@@ -283,17 +307,96 @@ func runWMLoop(ctx context.Context, store *state.Store, resolver *mapping.Resolv
 				continue
 			}
 		}
-		for evt := range events {
-			handleWMEvent(ctx, store, resolver, evt, sink, src, forget)
-		}
+		drainWMEvents(ctx, store, resolver, events, sink, src, forget, turn, layoutDebounce)
 		// channel closed (connection EOF or ctx cancel) — loop will retry
+	}
+}
+
+// drainWMEvents dispatches one subscription's events until the stream closes,
+// coalescing EventLayoutChanged (see layoutDebounce) and passing everything else
+// straight through.
+//
+// ONLY layout is delayed. EventFocusChanged drives the chip highlight and the
+// click-to-focus round trip, and EventWindowClosed drives session teardown;
+// debouncing either would be a user-visible regression, not an optimization.
+//
+// debounce is a parameter rather than the layoutDebounce constant so tests can
+// drive the coalescing without sleeping a real 200ms per case.
+func drainWMEvents(ctx context.Context, store *state.Store, resolver *mapping.Resolver, events <-chan wm.Event, sink *history.Sink, src osproc.Source, forget func(int), turn *resolveTurn, debounce time.Duration) {
+	// Go 1.23+ timer semantics: Stop/Reset never leave a stale value on the
+	// channel, so the classic stop-and-drain dance is unnecessary. `pending`
+	// tracks whether the timer is armed — the channel itself cannot answer that.
+	timer := time.NewTimer(debounce)
+	timer.Stop()
+	defer timer.Stop()
+	pending := false
+
+	// flush runs a pending coalesce NOW and disarms the timer.
+	flush := func() {
+		if !pending {
+			return
+		}
+		timer.Stop()
+		pending = false
+		reresolveAll(ctx, store, resolver, turn)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case evt, ok := <-events:
+			if !ok {
+				// Stream closed (connection EOF or cancel). Flush rather than drop: the
+				// burst's last state is exactly what a reconnect would otherwise have to
+				// rediscover on its next tick.
+				flush()
+				return
+			}
+			if evt.Kind != wm.EventLayoutChanged {
+				// Land the pending layout re-resolve BEFORE this event, restoring the
+				// ordering the old `for evt := range events` loop had for free.
+				//
+				// It is load-bearing, not tidiness. Every wezterm window shares one mux
+				// pid, so matchUniqueClient effectively joins on title alone and two
+				// windows with equal titles leave BOTH sessions unresolved. The layout
+				// event carrying a title change is precisely what disambiguates one of
+				// them. Let a focus event overtake it and applyFocus finds no session
+				// holding that address, unfocuses everything, and — since the focused id
+				// changed — records a spurious focus event with an empty session id.
+				// The real highlight then waits on the reconciler's backstop.
+				//
+				// Still strictly fewer re-resolves than before the debounce, which ran
+				// one per layout event unconditionally.
+				flush()
+				handleWMEvent(ctx, store, resolver, evt, sink, src, forget, turn)
+				continue
+			}
+			// Arm on the FIRST event of a burst rather than re-arming on every one.
+			// Re-arming is a trailing-edge debounce, which has NO maximum wait: while
+			// events keep arriving closer together than the window, the timer is reset
+			// before it ever fires and the layout path re-resolves zero times. A
+			// terminal that repaints its OS window title at animation rate during a
+			// turn would do exactly that, and the staleness bound would silently become
+			// the reconcile interval instead of the window. Arming once per burst gives
+			// the "at most one re-resolve per window while events flow" this claims to
+			// have; the burst's last state still lands, because an event after a firing
+			// finds pending false and arms again.
+			if !pending {
+				timer.Reset(debounce)
+				pending = true
+			}
+		case <-timer.C:
+			pending = false
+			reresolveAll(ctx, store, resolver, turn)
+		}
 	}
 }
 
 // handleWMEvent reacts to a neutral window event. Addresses arrive already
 // normalized to Clients() form (the wm seam owns the Hyprland 0x quirk), so the
 // daemon compares them directly against sess.Hyprland.Address.
-func handleWMEvent(ctx context.Context, store *state.Store, resolver *mapping.Resolver, evt wm.Event, sink *history.Sink, src osproc.Source, forget func(int)) {
+func handleWMEvent(ctx context.Context, store *state.Store, resolver *mapping.Resolver, evt wm.Event, sink *history.Sink, src osproc.Source, forget func(int), turn *resolveTurn) {
 	switch evt.Kind {
 	case wm.EventWindowClosed:
 		// A session's window went away — the "user closed the terminal while claude
@@ -330,13 +433,91 @@ func handleWMEvent(ctx context.Context, store *state.Store, resolver *mapping.Re
 		})
 	case wm.EventLayoutChanged:
 		// Something changed — kick a reconcile on any session that might match.
-		// Cheap: just iterate live sessions and re-resolve.
+		//
+		// The live stream never reaches this: drainWMEvents routes layout events to
+		// its debounce instead, so in production this branch is unreachable. It is
+		// kept correct rather than deleted because deleting it would make a future
+		// caller that dispatches a layout event here silently update nothing, which
+		// is a worse failure than the one it would prevent. It takes the same turn
+		// as every other resolve, so reviving it cannot reintroduce the concurrent-
+		// enumeration inversion — it would only bypass the debounce's rationing.
+		reresolveAll(ctx, store, resolver, turn)
+	}
+}
+
+// reresolveAll re-runs the terminal + WM match for every live session.
+//
+// This used to be commented "cheap: just iterate live sessions and re-resolve",
+// which was the bug: resolver.Reconcile enumerates the terminal AND the WM once
+// PER SESSION, so this is O(sessions) subprocess spawns — measured at 71% of the
+// daemon's CPU — and it runs inside store.Apply, holding the lock every RPC
+// reader and every hook queues behind. layoutDebounce exists to ration it.
+func reresolveAll(ctx context.Context, store *state.Store, resolver *mapping.Resolver, turn *resolveTurn) {
+	// Enumerate ONCE, outside the lock, exactly as reconcileOnce does. Hoisting
+	// only the reconciler left this path still resolving per-session under the
+	// lock, and a live 12-session box showed it immediately: the 5s spike train
+	// vanished and was replaced by sub-second stalls up to 776ms, fired by the
+	// layout events this path serves. The debounce above rations how often this
+	// runs; this is what makes each run cheap.
+	turn.Do(func() {
+		panes, clients := resolver.Enumerate(ctx)
+		now := time.Now()
 		store.Apply(func(m map[int]*state.Session) {
 			for _, sess := range m {
-				resolver.Reconcile(ctx, sess)
+				resolveSession(ctx, resolver, sess, panes, clients, now)
 			}
 		})
+	})
+}
+
+// resolveTurn serializes the two producers of the session→window mapping: the
+// reconciler's tick and the WM layout path.
+//
+// Both now enumerate BEFORE taking the store lock. That is what made them fast,
+// and it is also what introduced a write class that could not exist before: with
+// sampling and writing no longer atomic, an enumeration taken at T0 can land
+// AFTER one taken at T1 > T0, reverting a chip's workspace to the older reading
+// until the next tick corrects it. Nothing blanks (ReconcileFrom no-ops on a
+// miss) and nothing tears (each Apply writes one coherent enumeration), so the
+// damage is bounded — but three separate behaviors were already leaning on "the
+// next tick fixes it", and that is one too many.
+//
+// Holding this across enumerate-and-apply means the loser waits and then
+// enumerates FRESH, so the last write always carries the freshest observation.
+// It also stops the two paths from running duplicate concurrent enumerations,
+// which is the very cost this change set exists to remove.
+//
+// ⚠ This is NOT the store lock and must never be conflated with it. No RPC
+// reader, hook, or subscriber touches it, so a waiter here blocks nothing a user
+// can feel — unlike the store lock, where a waiter is a chip click. Always take
+// this BEFORE store.Apply, never the reverse.
+type resolveTurn struct{ mu sync.Mutex }
+
+// Do runs fn as the sole resolver. A nil turn runs fn unserialized, which keeps
+// single-goroutine call sites (and tests) from having to construct one.
+func (t *resolveTurn) Do(fn func()) {
+	if t == nil {
+		fn()
+		return
 	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	fn()
+}
+
+// resolveSession applies a tick's already-fetched enumeration to one session,
+// falling back to the per-session resolve — which does its own I/O — when the
+// terminal backend offers no batch path.
+//
+// It exists so the reconciler and the WM layout path cannot drift apart on the
+// rule that matters: the enumeration happens BEFORE store.Apply, never inside
+// it. They drifted once already.
+func resolveSession(ctx context.Context, resolver *mapping.Resolver, sess *state.Session, panes map[string]terminal.PaneRef, clients []wm.Window, now time.Time) {
+	if panes != nil {
+		resolver.ReconcileFrom(sess, panes, clients, now)
+		return
+	}
+	resolver.Reconcile(ctx, sess)
 }
 
 // runReconciler periodically re-resolves every session's wezterm + hyprland
@@ -344,17 +525,25 @@ func handleWMEvent(ctx context.Context, store *state.Store, resolver *mapping.Re
 // Catches anything missed by event-driven updates (e.g. a session whose
 // mapping was incomplete when first created, the initial focus state, or a
 // hyprctl race).
-func runReconciler(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, interval time.Duration, tun statustune.Tuning, sink *history.Sink, obs *fanout.Observer, mem *memorySampler, forget func(int)) {
+func runReconciler(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, interval time.Duration, tun statustune.Tuning, sink *history.Sink, obs *fanout.Observer, mem *memorySampler, forget func(int), turn *resolveTurn) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	rstate := newReconcileState(obs, mem)
-	reconcileOnce(ctx, store, resolver, manager, stack, tun, sink, rstate, forget)
+	// The turn is taken around the WHOLE tick rather than threaded into
+	// reconcileOnce, so the enumeration and the writes it feeds cannot be split by
+	// the WM path landing an older observation between them. See resolveTurn.
+	tick := func() {
+		turn.Do(func() {
+			reconcileOnce(ctx, store, resolver, manager, stack, tun, sink, rstate, forget)
+		})
+	}
+	tick()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			reconcileOnce(ctx, store, resolver, manager, stack, tun, sink, rstate, forget)
+			tick()
 		}
 	}
 }
@@ -365,6 +554,21 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 	// terminal/navigate from their boot-race "none" values without a restart.
 	store.SetCapabilities(stack.Capabilities())
 	active, _ := manager.ActiveWindow(ctx)
+	// The two enumerations the per-session resolve needs, fetched ONCE for the
+	// whole tick and OUTSIDE the lock. This is the same rule the memory sample
+	// below already follows, and it is why this function has this shape:
+	// resolver.Reconcile does a terminal enumeration and a WM client query PER
+	// SESSION, and it used to do them INSIDE store.Apply. A tick over N sessions
+	// therefore held the write lock across N forks of `wezterm cli list` — 16 of
+	// them on an 8-session, 2-mux box — and every RPC reader, every hook, and
+	// every chip click queued behind it. Measured before this change: p99 166ms,
+	// worst 1382ms, with the spike train landing exactly on the tick interval.
+	panes, clients := resolver.Enumerate(ctx)
+	// Stamped AFTER the enumeration so TitleAt still means "when the title was
+	// sampled", which is what it meant when each session stamped its own clock on
+	// the way out of Locate. Stamping before would backdate every title by the
+	// fetch duration, and TitleAt is the freshness gate for the H9 idle-title
+	// recovery (docs/timing-hazards.md).
 	now := time.Now()
 	// Memory is sampled BEFORE the lock is taken, against the pid set of the last
 	// published snapshot: the reads are milliseconds and Store.Apply blocks every
@@ -376,7 +580,7 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 		// work below — a dead session earns none of it.
 		sweepDeadSessions(m, stack.OSProc, sink, forget, now)
 		for _, sess := range m {
-			resolver.Reconcile(ctx, sess)
+			resolveSession(ctx, resolver, sess, panes, clients, now)
 			// Refresh job-control suspension (Ctrl-Z). On ErrGone the sweep above has
 			// already dropped the session, so this only ever sees a live pid; leave
 			// the last-known value on any other read error rather than flapping. A

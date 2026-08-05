@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""sb-perf — measure the daemon's responsiveness and its subprocess cost.
+
+Two probes, both against the LIVE daemon:
+
+  latency  One long-lived connection issuing {"cmd":"list"} in a loop. Every
+           reply must cross Store's lock, so the tail of this distribution IS
+           the lock-hold time that `switchboard-ctl focus` (a chip click) and
+           every waybar subscriber queue behind.
+
+  cpu      Splits the daemon's CPU between its own work (utime+stime) and the
+           work of reaped children (cutime+cstime). The child figure is the
+           fork-and-exec cost of shelling out to `wezterm cli list`.
+
+BASELINE — 2026-08-05, before the reconcile-lock work. 8 claude sessions,
+2 wezterm muxes, host independently saturated (load 11-12 on 8 cores, CPU PSI
+some avg300 26.9%, 10.3GB in zram):
+
+  latency  528 samples/30s: p50 0.18ms  p90 1.14ms  p99 165.55ms  max 1382.14ms
+           slow samples spaced 4.95s / 4.92s apart == the 5s reconcile interval
+  cpu      own 1.7% of a core, reaped children 4.1% of a core
+           -> 71% of the daemon's cost was forking `wezterm cli`
+  forks    16 `wezterm cli list` + 8 WM client queries per reconcile tick
+
+Re-measure under COMPARABLE host load or the numbers do not compare.
+"""
+
+import argparse
+import os
+import socket
+import sys
+import time
+
+HZ = os.sysconf("SC_CLK_TCK")
+
+
+def socket_path(override: str = "") -> str:
+    if override:
+        return override
+    rt = os.environ.get("XDG_RUNTIME_DIR")
+    if rt:
+        return os.path.join(rt, "switchboard.sock")
+    return f"/tmp/switchboard-{os.getuid()}.sock"
+
+
+def daemon_pid() -> int:
+    """The switchboard daemon's pid, found by exe basename over /proc."""
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/comm") as fh:
+                if fh.read().strip() != "switchboard":
+                    continue
+            # Exclude switchboard-ctl and friends: comm is truncated at 15
+            # chars, so confirm against argv[0]'s basename.
+            with open(f"/proc/{entry}/cmdline", "rb") as fh:
+                argv0 = fh.read().split(b"\0")[0].decode(errors="replace")
+            if os.path.basename(argv0) == "switchboard":
+                return int(entry)
+        except OSError:
+            continue
+    raise SystemExit("sb-perf: no running switchboard daemon found")
+
+
+def probe_latency(duration: float, interval: float, sock_override: str = "") -> int:
+    path = socket_path(sock_override)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(path)
+    except OSError as err:
+        raise SystemExit(f"sb-perf: cannot connect to {path}: {err}")
+    stream = sock.makefile("rwb")
+
+    samples = []
+    deadline = time.time() + duration
+    while time.time() < deadline:
+        start = time.perf_counter()
+        stream.write(b'{"cmd":"list"}\n')
+        stream.flush()
+        line = stream.readline()
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        if not line:
+            break
+        samples.append((time.time(), elapsed_ms))
+        time.sleep(interval)
+
+    if not samples:
+        raise SystemExit("sb-perf: daemon closed the connection with no replies")
+
+    values = sorted(ms for _, ms in samples)
+    count = len(values)
+
+    def pct(p: float) -> float:
+        return values[min(count - 1, int(count * p / 100))]
+
+    print(f"latency  samples={count} over {duration:.0f}s")
+    print(f"  p50 {pct(50):8.2f} ms")
+    print(f"  p90 {pct(90):8.2f} ms")
+    print(f"  p99 {pct(99):8.2f} ms")
+    print(f"  max {values[-1]:8.2f} ms")
+
+    # Spacing between slow samples is the tell: a spike train at the reconcile
+    # interval means the reconciler is holding the lock across its I/O.
+    origin = samples[0][0]
+    slow = [(ts - origin, ms) for ts, ms in samples if ms > 50]
+    print(f"\n  samples >50ms: {len(slow)}   >200ms: {sum(1 for _, ms in samples if ms > 200)}")
+    for offset, ms in slow:
+        print(f"    t+{offset:6.2f}s  {ms:8.1f} ms")
+    if len(slow) > 1:
+        gaps = [slow[i + 1][0] - slow[i][0] for i in range(len(slow) - 1)]
+        print("  gaps between slow samples: " + ", ".join(f"{g:.2f}s" for g in gaps))
+        print("  (gaps clustering at the reconcile interval == lock held across I/O)")
+    return 0
+
+
+def read_cpu(pid: int):
+    """(utime, stime, cutime, cstime) in jiffies.
+
+    comm can contain spaces and parentheses, so split after the LAST ')'.
+    """
+    with open(f"/proc/{pid}/stat") as fh:
+        raw = fh.read()
+    fields = raw[raw.rindex(")") + 2:].split()
+    return tuple(int(fields[i]) for i in (10, 11, 12, 13))
+
+
+def probe_cpu(duration: float, pid: int) -> int:
+    before = read_cpu(pid)
+    start = time.time()
+    time.sleep(duration)
+    after = read_cpu(pid)
+    window = time.time() - start
+
+    own = ((after[0] - before[0]) + (after[1] - before[1])) / HZ
+    children = ((after[2] - before[2]) + (after[3] - before[3])) / HZ
+    total = own + children
+
+    print(f"cpu      pid={pid} over {window:.1f}s")
+    print(f"  own work        {own:6.3f}s  ({own / window * 100:5.1f}% of one core)")
+    print(f"  reaped children {children:6.3f}s  ({children / window * 100:5.1f}% of one core)")
+    print(f"  total           {total:6.3f}s  ({total / window * 100:5.1f}% of one core)")
+    if total > 0:
+        print(f"\n  {children / total * 100:.0f}% of the daemon's cost is subprocess spawns")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Measure switchboard daemon responsiveness and subprocess cost.",
+        epilog="Baseline figures are recorded in this file's docstring.",
+    )
+    parser.add_argument("probe", choices=("latency", "cpu", "all"), nargs="?", default="all")
+    parser.add_argument("-d", "--duration", type=float, default=30.0,
+                        help="seconds per probe (default 30)")
+    parser.add_argument("-i", "--interval", type=float, default=0.05,
+                        help="seconds between latency samples (default 0.05)")
+    parser.add_argument("-p", "--pid", type=int, default=0,
+                        help="daemon pid (default: discover it)")
+    parser.add_argument("-s", "--socket", default="",
+                        help="daemon socket (default: $XDG_RUNTIME_DIR/switchboard.sock). "
+                             "Point this at a second daemon started on a scratch socket to A/B "
+                             "a build against the running one on the same live session set.")
+    args = parser.parse_args()
+
+    if args.probe in ("latency", "all"):
+        probe_latency(args.duration, args.interval, args.socket)
+    if args.probe == "all":
+        print()
+    if args.probe in ("cpu", "all"):
+        probe_cpu(args.duration, args.pid or daemon_pid())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

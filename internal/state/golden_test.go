@@ -165,6 +165,75 @@ func TestStateGoldenPinsCanonicalSnapshot(t *testing.T) {
 	}
 }
 
+// TestBroadcastEncodingIsTheGoldenDocument extends the golden discipline to the
+// bytes a subscriber actually receives. Store.broadcast now encodes each snapshot
+// ONCE (marshalSnapshot) and every subscriber sends those same bytes, spliced
+// into the response envelope verbatim by rpc — so that buffer IS the public
+// document in docs/state-schema.md, merely without state.json's indentation.
+// Compacting the golden and demanding the broadcast encoding match is what stops
+// the shared-buffer path from quietly diverging from the file the schema
+// describes: a change to escaping, field order, or omitempty fails here as loudly
+// as it does for the on-disk mirror.
+func TestBroadcastEncodingIsTheGoldenDocument(t *testing.T) {
+	want, err := os.ReadFile(goldenPath)
+	if err != nil {
+		t.Fatalf("read golden: %v (run with UPDATE_GOLDEN=1 to create)", err)
+	}
+	var compacted bytes.Buffer
+	if err := json.Compact(&compacted, want); err != nil {
+		t.Fatalf("compact golden: %v", err)
+	}
+
+	got, err := marshalSnapshot(canonicalSnapshot())
+	if err != nil {
+		t.Fatalf("marshal canonical snapshot: %v", err)
+	}
+
+	if !bytes.Equal(got, compacted.Bytes()) {
+		t.Errorf("broadcast encoding differs from the golden document.\n--- broadcast ---\n%s\n--- golden (compacted) ---\n%s", got, compacted.Bytes())
+	}
+}
+
+// TestChangeKeyIgnoresUpdatedAtOnly pins the exact boundary of the publish gate:
+// the change key must drop updated_at (snapshotLocked re-stamps it time.Now() on
+// every snapshot, so comparing it would make the gate a no-op) and must keep
+// everything else the golden document carries. Building it from the golden's own
+// bytes means a newly added wire field is covered the moment the fixture is
+// regenerated — the same tripwire that guards the file itself.
+func TestChangeKeyIgnoresUpdatedAtOnly(t *testing.T) {
+	base := canonicalSnapshot()
+
+	restamped := base
+	restamped.UpdatedAt = base.UpdatedAt.Add(5 * time.Second)
+	if !bytes.Equal(snapshotChangeKey(base), snapshotChangeKey(restamped)) {
+		t.Error("a fresh updated_at changed the key; the publish gate would never suppress anything")
+	}
+
+	// Every other kind of edit must move the key. status_since is the one to watch:
+	// it is stamped from a wall clock, but only on a status edge, so it is a real
+	// change and must NOT be excluded (see snapshotChangeKey).
+	for name, mutate := range map[string]func(*Snapshot){
+		"a session appearing": func(s *Snapshot) { s.Sessions = append(s.Sessions, Session{PID: 9001}) },
+		"a focus change":      func(s *Snapshot) { s.Sessions[0].Focused = !s.Sessions[0].Focused },
+		"a status edge":       func(s *Snapshot) { s.Sessions[0].Claude.Status = StatusIdle },
+		"status_since moving": func(s *Snapshot) { s.Sessions[0].Claude.StatusSinceWire = timePtr(base.UpdatedAt) },
+		"a memory reading":    func(s *Snapshot) { s.Sessions[0].MemTreeBytes++ },
+		"a subagent landing":  func(s *Snapshot) { s.Sessions[0].Claude.InFlightSubagents++ },
+		"a window moving":     func(s *Snapshot) { s.Sessions[0].Hyprland.WorkspaceID = 9 },
+		"capabilities flipping": func(s *Snapshot) {
+			s.Capabilities = &Capabilities{Observe: true, Navigate: true, WM: "sway", Terminal: "tmux"}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := canonicalSnapshot()
+			mutate(&changed)
+			if bytes.Equal(snapshotChangeKey(base), snapshotChangeKey(changed)) {
+				t.Errorf("%s did not move the change key; the bar would never see it", name)
+			}
+		})
+	}
+}
+
 // TestUpdateGolden regenerates the golden from canonicalSnapshot. It is a
 // no-op unless UPDATE_GOLDEN is set, so it never fails CI; run
 // `UPDATE_GOLDEN=1 go test ./internal/state` to refresh after a deliberate

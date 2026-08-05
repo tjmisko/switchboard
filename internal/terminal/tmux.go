@@ -58,16 +58,55 @@ func (l tmuxLocator) Locate(ctx context.Context, tty string) (*PaneRef, error) {
 	}
 	for _, p := range parseTmuxPanes(out) {
 		if p.TTY == tty {
-			return &PaneRef{
-				Backend:     "tmux",
-				Handle:      p.PaneID,
-				WindowTitle: p.WindowName,
-				TTY:         p.TTY,
-				CWD:         p.CWD,
-			}, nil
+			ref := tmuxPaneRef(p)
+			return &ref, nil
 		}
 	}
 	return nil, nil
+}
+
+// Snapshot indexes the whole pane list by tty. Locate already runs this exact
+// `list-panes -a` and then discards every row but its one match, so serving all
+// sessions from one call costs nothing extra — it just stops throwing the rest
+// away N times per tick.
+func (l tmuxLocator) Snapshot(ctx context.Context) (map[string]PaneRef, error) {
+	byTTY := make(map[string]PaneRef)
+	// No reachable server → owns no panes. That is a complete answer (an empty
+	// set), not a failure: erroring here would drop the whole chain off the batch
+	// path on every host where tmux simply isn't running.
+	if !l.Available() {
+		return byTTY, nil
+	}
+	out, noServer, err := tmuxRun(ctx, "list-panes", "-a", "-F", tmuxPaneFormat)
+	if noServer {
+		return byTTY, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range parseTmuxPanes(out) {
+		if p.TTY == "" {
+			continue // no tty to join a session against
+		}
+		// First row wins, matching Locate's scan order.
+		if _, claimed := byTTY[p.TTY]; claimed {
+			continue
+		}
+		byTTY[p.TTY] = tmuxPaneRef(p)
+	}
+	return byTTY, nil
+}
+
+// tmuxPaneRef converts one listed pane into the neutral PaneRef. Shared by
+// Locate and Snapshot so the single and batch paths cannot drift apart.
+func tmuxPaneRef(p tmuxPane) PaneRef {
+	return PaneRef{
+		Backend:     "tmux",
+		Handle:      p.PaneID,
+		WindowTitle: p.WindowName,
+		TTY:         p.TTY,
+		CWD:         p.CWD,
+	}
 }
 
 func (tmuxLocator) Activate(ctx context.Context, ref *PaneRef) error {

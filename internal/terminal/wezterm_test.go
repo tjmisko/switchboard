@@ -1,6 +1,10 @@
 package terminal
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/tjmisko/switchboard/internal/wezterm"
+)
 
 // §3.1 decodeCWD. This table moved here from internal/mapping when the terminal
 // seam took ownership of cwd decoding (Phase 1.2). The host-no-path case is the
@@ -28,6 +32,38 @@ func TestDecodeCWD(t *testing.T) {
 				t.Errorf("decodeCWD(%q) = %q, want %q", tt.url, got, tt.want)
 			}
 		})
+	}
+}
+
+// weztermPaneRef is the single conversion Locate and Snapshot share; pinning it
+// pins both paths at once. The (mux, pane) pair is the stable identity Activate
+// dispatches on, so a dropped field here mis-focuses panes rather than failing.
+func TestWeztermPaneRefShouldCarryTheMuxIdentityAndDecodedCWD(t *testing.T) {
+	got := weztermPaneRef(wezterm.Pane{
+		MuxPID:      4242,
+		MuxSocket:   "/run/user/1000/wezterm/gui-sock-4242",
+		WindowID:    3,
+		TabID:       2,
+		PaneID:      7,
+		Title:       "claude",
+		WindowTitle: "switchboard",
+		CWDURL:      "file://host/home/u/my%20proj",
+		TTYName:     "/dev/pts/5",
+	})
+	want := PaneRef{
+		Backend:     "wezterm",
+		Mux:         4242,
+		MuxSocket:   "/run/user/1000/wezterm/gui-sock-4242",
+		PaneID:      7,
+		TabID:       2,
+		WindowID:    3,
+		Title:       "claude",
+		WindowTitle: "switchboard",
+		TTY:         "/dev/pts/5",
+		CWD:         "/home/u/my proj",
+	}
+	if got != want {
+		t.Errorf("weztermPaneRef =\n  %+v\nwant\n  %+v", got, want)
 	}
 }
 
