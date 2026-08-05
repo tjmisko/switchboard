@@ -50,6 +50,33 @@ func newReconcileState(obs *fanout.Observer, mem *memorySampler) *reconcileState
 	}
 }
 
+// primeFanout does the fanout Observer's first-sight seeding for every session in
+// the last published snapshot, BEFORE the tick takes the store lock.
+//
+// It follows the same rule as sampleMemory directly below it, and for the same
+// reason: the seed reads the history archive, which is milliseconds at best and
+// was measured at 481-639ms on the live daemon, and Store.Apply blocks every RPC
+// reader and every hook for as long as it holds. Every multi-hundred-millisecond
+// lock hold observed after the reconcile I/O was hoisted traced to this one call,
+// firing the first time a tick saw a newly started session.
+//
+// Read through Snapshot — the shared read lock — never through Apply. A session
+// that appears between this snapshot and the lock is simply seeded lazily inside
+// Reconcile, exactly as before; this is a latency optimization with no bearing on
+// what gets emitted.
+func (rs *reconcileState) primeFanout(store *state.Store) {
+	if rs.fanout == nil {
+		return
+	}
+	for _, sess := range store.Snapshot().Sessions {
+		c := sess.Claude
+		if c == nil || c.SessionID == "" || c.Transcript == "" {
+			continue
+		}
+		rs.fanout.Prime(c.SessionID, c.Transcript)
+	}
+}
+
 // observe updates c.InFlightSubagents and emits any new subagent_spawn/stop and
 // usage_sample events for one claude session. It runs inside the reconcile Apply
 // (under the store lock); sink.Record is non-blocking, and the transcript reads

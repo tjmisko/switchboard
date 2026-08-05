@@ -183,6 +183,100 @@ func TestReconcile_seedsFromHistoryNoReemitOnRestart(t *testing.T) {
 	}
 }
 
+// seedHistory writes the prior-run history the seeding tests share: r1's spawn
+// was already emitted for this session, plus an unrelated session's.
+func seedHistory(t *testing.T, e env) string {
+	t.Helper()
+	day := filepath.Join(e.historyDir, "2026-06-27.jsonl")
+	lines := `{"ts":"2026-06-27T12:00:00Z","type":"subagent_spawn","session_id":"sess-abc123","agent_id":"r1"}
+{"ts":"2026-06-27T12:00:00Z","type":"subagent_spawn","session_id":"other","agent_id":"x9"}
+`
+	if err := os.WriteFile(day, []byte(lines), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return day
+}
+
+// This is the test that fails without the hoist, and the trick is deleting the
+// history between the two calls.
+//
+// Prime is claimed to do the seed read so that Reconcile — which runs under the
+// store lock — does not. "Did not read" is otherwise unobservable from outside,
+// so the history is removed after Prime: if Reconcile still seeded from disk it
+// would find nothing, and r1's already-emitted spawn would come back out. A
+// passing run therefore proves the seed came from Prime.
+func TestPrime_seedsBeforeTheLockSoReconcileDoesNotReadHistory(t *testing.T) {
+	e := newEnv(t)
+	day := seedHistory(t, e)
+	writeSub(t, e.subdir, "r1", metaClassic(1, "toolu_r1"), "end_turn")
+	obs := NewObserver(e.historyDir)
+
+	obs.Prime(e.c.SessionID, e.c.Transcript)
+	if err := os.Remove(day); err != nil {
+		t.Fatal(err)
+	}
+
+	ev := obs.Reconcile(e.sess, e.c, time.Now())
+	if hasEvent(ev, history.EventSubagentSpawn, "r1") {
+		t.Fatalf("r1's spawn was re-emitted, so Reconcile seeded from a history that Prime should already have read; got %+v", ev)
+	}
+	if !hasEvent(ev, history.EventSubagentStop, "r1") {
+		t.Fatalf("r1 finished during downtime; the missed stop should still be emitted; got %+v", ev)
+	}
+}
+
+func TestPrime_leavesAnAlreadySeededSessionAlone(t *testing.T) {
+	e := newEnv(t)
+	seedHistory(t, e)
+	writeSub(t, e.subdir, "r1", metaClassic(1, "toolu_r1"), "end_turn")
+	obs := NewObserver(e.historyDir)
+
+	// Reconcile seeds lazily and emits r1's stop, marking it stopped.
+	if ev := obs.Reconcile(e.sess, e.c, time.Now()); !hasEvent(ev, history.EventSubagentStop, "r1") {
+		t.Fatalf("setup: expected r1's stop on the first Reconcile; got %+v", ev)
+	}
+	// A later Prime must not reset that back to unseeded — doing so would re-emit
+	// the stop, since the seen-sets it installs come from history alone.
+	obs.Prime(e.c.SessionID, e.c.Transcript)
+
+	if ev := obs.Reconcile(e.sess, e.c, time.Now()); len(ev) != 0 {
+		t.Fatalf("a second Prime+Reconcile must emit nothing; got %+v", ev)
+	}
+}
+
+func TestPrime_isANoopWithoutASessionID(t *testing.T) {
+	e := newEnv(t)
+	obs := NewObserver(e.historyDir)
+	obs.Prime("", e.c.Transcript) // must not panic, must not create state
+	if len(obs.sessions) != 0 {
+		t.Fatalf("an empty session id must not create observer state; got %v", obs.sessions)
+	}
+}
+
+func TestPrime_servesConcurrentCallersWithoutRacingTheSeed(t *testing.T) {
+	e := newEnv(t)
+	seedHistory(t, e)
+	writeSub(t, e.subdir, "r1", metaClassic(1, "toolu_r1"), "end_turn")
+	obs := NewObserver(e.historyDir)
+
+	// Two producers prime the same cold session at once — the tick and the hook
+	// trigger can genuinely overlap. Both may read; neither may corrupt the state.
+	// Under -race this also covers the lock discipline in Prime.
+	done := make(chan struct{}, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			obs.Prime(e.c.SessionID, e.c.Transcript)
+			done <- struct{}{}
+		}()
+	}
+	<-done
+	<-done
+
+	if ev := obs.Reconcile(e.sess, e.c, time.Now()); hasEvent(ev, history.EventSubagentSpawn, "r1") {
+		t.Fatalf("r1's spawn must stay suppressed after a concurrent prime; got %+v", ev)
+	}
+}
+
 func TestReconcile_staleCapForceClosesLeak(t *testing.T) {
 	e := newEnv(t)
 	jsonl := writeSub(t, e.subdir, "s1", metaClassic(1, "toolu_s1"), "") // running, never terminal

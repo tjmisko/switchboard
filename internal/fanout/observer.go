@@ -80,6 +80,87 @@ func (o *Observer) SetStaleCap(d time.Duration) {
 	o.mu.Unlock()
 }
 
+// Prime performs the first-sight seed for one session WITHOUT holding the store
+// lock, so the reconcile tick can pay that cost before it takes the lock rather
+// than inside it.
+//
+// It exists because the seed is the most expensive thing the Observer does and
+// it used to run in the worst possible place. Reconcile is called from inside
+// store.Apply, so a newly discovered session made the tick read the history
+// archive with the exclusive lock held — measured on the live daemon at 481-639ms
+// per new session, which every waybar subscriber, every hook, and every chip
+// click queued behind. Sessions appear whenever the user starts one, so this was
+// not a rare path; it was a stall you could feel every time.
+//
+// Calling it is optional and always safe: it is idempotent, a no-op for a session
+// already seeded, and Reconcile still seeds lazily for anything that reaches it
+// unprimed. Skipping it costs latency, never correctness.
+//
+// The file read deliberately happens with NO lock held, not even o.mu. Holding
+// o.mu across it would hand the stall straight back: Reconcile takes o.mu while
+// the caller holds the store lock, so a hook-triggered Reconcile would block on
+// this read with the store lock in hand. Two callers racing the same cold session
+// both read and both install the same answer, which is harmless.
+func (o *Observer) Prime(sessionID, transcript string) {
+	if o == nil || sessionID == "" {
+		return
+	}
+	o.mu.Lock()
+	ss := o.sessions[sessionID]
+	seeded := ss != nil && ss.seeded
+	o.mu.Unlock()
+	if seeded {
+		return
+	}
+
+	sp, st, off := seedFor(o.dir, sessionID, transcript)
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	ss = o.sessions[sessionID]
+	if ss == nil {
+		ss = newSessionState()
+		o.sessions[sessionID] = ss
+	}
+	if ss.seeded {
+		// Lost the race to a Reconcile (or another Prime) that seeded while this one
+		// was reading. Its state is at least as fresh, and it may already have
+		// advanced the cursor past what was measured here, so discard this read
+		// rather than overwrite.
+		return
+	}
+	ss.applySeed(sp, st, off)
+}
+
+// seedFor is the first-sight read, factored out so the pre-lock Prime and the
+// under-lock backstop in Reconcile cannot drift apart. It performs I/O and takes
+// no locks.
+//
+// G1: seed the seen-set from already-emitted history so a restart or `--resume`
+// does not re-emit historical spawns (metas are never deleted). The cursor is
+// primed to EOF — the dir scan is the authoritative spawn source, so there is no
+// need to re-read the whole transcript on every restart.
+func seedFor(dir, sessionID, transcript string) (spawned, stopped map[string]bool, offset int64) {
+	if sp, st, err := history.PriorSubagentState(dir, sessionID); err == nil {
+		spawned, stopped = sp, st
+	}
+	return spawned, stopped, fileSize(transcript)
+}
+
+// applySeed installs a seedFor result. The caller holds o.mu. A failed history
+// read (nil maps) leaves the empty sets newSessionState built rather than
+// nilling them out, so a later spawn can still be recorded.
+func (ss *sessionState) applySeed(spawned, stopped map[string]bool, offset int64) {
+	if spawned != nil {
+		ss.spawned = spawned
+	}
+	if stopped != nil {
+		ss.stopped = stopped
+	}
+	ss.offset = offset
+	ss.seeded = true
+}
+
 // Reconcile brings the Observer's view of one Claude session up to date and
 // returns the subagent_spawn/stop events to record (each exactly once). It also
 // sets c.InFlightSubagents to the durable spawned-minus-completed count over the
@@ -98,15 +179,13 @@ func (o *Observer) Reconcile(sess *state.Session, c *state.AgentInfo, now time.T
 		o.sessions[c.SessionID] = ss
 	}
 	if !ss.seeded {
-		// G1: seed the seen-set from already-emitted history so a restart or
-		// `--resume` does not re-emit historical spawns (metas are never deleted).
-		// Prime the cursor to EOF — the dir scan is the authoritative spawn source,
-		// so there is no need to re-read the whole transcript on every restart.
-		if sp, st, err := history.PriorSubagentState(o.dir, c.SessionID); err == nil {
-			ss.spawned, ss.stopped = sp, st
-		}
-		ss.offset = fileSize(c.Transcript)
-		ss.seeded = true
+		// The lazy backstop. Prime (called before the store lock is taken) normally
+		// gets here first, so this fires only for a session that appeared between
+		// the caller's snapshot and the lock, or on the hook trigger, which has no
+		// pre-lock phase to hang a Prime on. Correctness does not depend on which
+		// path seeds — only cost does, and this one pays it under the lock.
+		sp, st, off := seedFor(o.dir, c.SessionID, c.Transcript)
+		ss.applySeed(sp, st, off)
 	}
 
 	// 1) Advance the forward cursor. It supplies the run_in_background flag (only

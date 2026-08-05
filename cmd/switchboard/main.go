@@ -575,6 +575,9 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 	// RPC reader and every hook for as long as it holds. Only the assignment and
 	// the sink.Record below run under the lock. See memorySampler.
 	mem := rstate.sampleMemory(store)
+	// Same rule, same reason: the fanout Observer's first-sight seed reads the
+	// history archive, and it used to do it inside the Apply below. See primeFanout.
+	rstate.primeFanout(store)
 	store.Apply(func(m map[int]*state.Session) {
 		// Close the lanes of any session whose process is gone, BEFORE the per-tick
 		// work below — a dead session earns none of it.

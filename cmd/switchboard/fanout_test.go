@@ -68,6 +68,63 @@ func assistantUsageModelLine(model string, in, out int64) string {
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }
 
+// The wiring test for the pre-lock seed. The Observer's own tests cover Prime;
+// this one covers primeFanout actually reaching the sessions in the store, since
+// a Prime that is never called is exactly as slow as no Prime at all.
+//
+// Same trick as the Observer test: the history is deleted after primeFanout, so
+// a Reconcile that still seeded from disk would find nothing and re-emit r1's
+// already-recorded spawn.
+func TestPrimeFanoutSeedsEverySessionInTheSnapshot(t *testing.T) {
+	base := t.TempDir()
+	sid := "s-primed"
+	tpath := filepath.Join(base, sid+".jsonl")
+	writeLines(t, tpath, `{"type":"system"}`)
+	subdir := filepath.Join(base, sid, "subagents")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// r1 ran and finished; its spawn was already emitted on a previous daemon run.
+	if err := os.WriteFile(filepath.Join(subdir, "agent-r1.meta.json"),
+		[]byte(`{"agentType":"Explore","description":"probe","spawnDepth":1,"toolUseId":"toolu_r1"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subdir, "agent-r1.jsonl"),
+		[]byte(`{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn"}}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	obsDir := t.TempDir()
+	day := filepath.Join(obsDir, "2026-06-27.jsonl")
+	if err := os.WriteFile(day,
+		[]byte(`{"ts":"2026-06-27T12:00:00Z","type":"subagent_spawn","session_id":"`+sid+`","agent_id":"r1"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	histDir := t.TempDir()
+	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
+	rs := newReconcileState(fanout.NewObserver(obsDir), nil)
+	sess := &state.Session{PID: 11, Agent: "claude", CWD: "/home/u/proj",
+		Claude: &state.AgentInfo{SessionID: sid, Transcript: tpath}}
+
+	store := state.New(filepath.Join(t.TempDir(), "state.json"))
+	store.Apply(func(m map[int]*state.Session) { m[sess.PID] = sess })
+
+	rs.primeFanout(store)
+	if err := os.Remove(day); err != nil {
+		t.Fatal(err)
+	}
+
+	rs.observe(sink, sess, sess.Claude, time.Now())
+	sink.Close()
+
+	for _, ev := range eventsOfType(readEvents(t, histDir), history.EventSubagentSpawn) {
+		if ev.AgentID == "r1" {
+			t.Fatalf("r1's spawn was re-emitted, so primeFanout did not seed this session before observe ran: %+v", ev)
+		}
+	}
+}
+
 func TestObserveUsageEmitsOneSamplePerModel(t *testing.T) {
 	dir := t.TempDir()
 	tpath := filepath.Join(dir, "t.jsonl")
