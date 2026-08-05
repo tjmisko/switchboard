@@ -80,6 +80,10 @@ type PendingPrompt struct {
 Pending map[string]PendingPrompt `json:"-"`   // key: agent_id; "" = main thread
 ```
 
+In-memory as written here; T12 (§9) projects its **keys only** onto one additive
+wire field so prompt ownership survives a daemon restart. `Tool`/`InputHash`/
+`Since` stay off the wire.
+
 `PendingTool` is retained as a derived value for the decision log and the
 existing `pending=` forensic field (report the main thread's if present, else any
 one, plus a count).
@@ -189,11 +193,13 @@ Worth doing regardless: the oscillation exists with no permission involved.
 
 - **T11 — Surface *which* writer is blocked** in the tooltip/label
   ("escalate-cleanup needs approval"). The information is now in `Pending`.
-- **T12 — Decide whether `Pending` should survive a daemon restart.** It is
-  `json:"-"` today, so a restart drops the red — which is what accidentally
-  ended the 2026-08-05 incident. Either persist it and re-verify against the
-  transcripts on hydrate, or document the drop as intentional fail-open. **This
-  is a real decision, not a cleanup** (Q7).
+- **T12 — Persist prompt *ownership* across a daemon restart. RESOLVED — see
+  §9.** Add one additive wire field (`claude.pending_writers`), rebuild `Pending`
+  from it in `dropStaleSessions`, and falsify entries at hydrate against each
+  subagent's own jsonl. Do **not** persist `Tool`/`InputHash`/`Since`; do **not**
+  re-derive `Pending` from transcripts as a *source*. §9 carries the reasoning,
+  the migration path, and the four implementation traps. *Depends on T5 (the map
+  is what gets projected) and wants T10 (the cap bounds a stale hydrated red).*
 
 ---
 
@@ -262,9 +268,11 @@ the incident doc §2.2 are sufficient to reconstruct it.
   the fold yields GREEN anyway.
 - **Q6 — should `UserPromptSubmit` clear a pending prompt?** §3.4. Recommend no,
   initially.
-- **Q7 — should `Pending` survive a daemon restart?** T12. Persisting is more
-  correct and re-verifiable on hydrate; dropping is simpler and fails toward the
-  *second*-worst error rather than the worst. Needs a call.
+- **Q7 — should `Pending` survive a daemon restart?** **Resolved in §9:** the
+  *key set* is persisted, the correlator values are not, and the transcripts may
+  only falsify entries at hydrate, never manufacture them. The question as posed
+  ("persist vs. drop") contained a false premise — `Status` is already on the
+  wire, so a restart never dropped the red; it dropped the red's *owner*. §9.1.
 - **Q2 (reopened)** — resolved by this plan in favor of
   `(agent_id, tool_name, tool_input)` over both bare `tool_name` (insufficient)
   and `PreToolUse`/`tool_use_id` (too costly).
@@ -279,8 +287,309 @@ T1 ─────────────────────────�
 T2, T3  ── ship first, independent
 T4      ── independent, fixes the flap generally
 T6      ── independent, feeds T7
-T12     ── decision, any time
+T12     ── decided (§9); implement after T5, ship with or after T10
 ```
 
 Phase 0 (T2, T3) is a same-day change and closes the worst error. T1 should be
 started immediately since it gates the rest and needs a live session to observe.
+
+T12 moved out of "any time": the decision (§9) is to project `Pending` to the
+wire, so it cannot precede T5, and its stale-red exposure is bounded by T10's
+per-writer cap. Shipping T12 before T5 would be strictly worse than today —
+§9.1 explains why.
+
+---
+
+## 9. T12 resolved — `Pending` across a daemon restart
+
+**Decision.** Persist the **key set** of `Pending` as one additive wire field;
+drop the correlator *values*; use the transcripts at hydrate **only to falsify**
+a persisted entry, never to manufacture one.
+
+```
+persist   Pending's keys           → claude.pending_writers: ["main", "af5b…"]
+drop      Tool, InputHash          → re-earned from the next hook; loss costs latency only
+re-stamp  Since := startup         → unchanged from today's dropStaleSessions rule
+falsify   at hydrate, per writer   → a subagent whose jsonl shows no unmatched
+                                     trailing tool_use is dropped immediately
+```
+
+The one-line justification: **losing ownership is error #1, losing the
+correlators is error #2, and re-deriving ownership manufactures error #2 at a
+rate proportional to how often a restart lands mid-tool.** Persist what guards
+#1, drop what only costs #2, and let disk evidence subtract but never add.
+
+### 9.1 The premise Q7 was built on is false
+
+`AgentInfo.Status` is `json:"status"` — **on the wire, and restored by
+`Store.Load`** (`internal/state/state.go:154`, `:610`). A `permission` chip
+therefore already survives a daemon restart today, and `dropStaleSessions`
+(`cmd/switchboard/main.go:250`) contains a deliberate, commented re-stamp
+(`StatusSince = now`) whose stated purpose is *"a zero value would read every old
+`tool_result` as 'resolved after', wrongly demoting a still-pending prompt that
+was live across the restart."* Someone already made this call, in the direction
+of keeping the red.
+
+So the restart at 12:39:56 did **not** drop a red. There was no red to drop: it
+had been lost 95 s earlier at 12:38:21 by `case9-approve-toolmatch`. What the
+restart did was re-stamp `StatusSince` to startup time, which is precisely what
+T4 does permanently — it broke the flap's engine (`IdleTitleGrace` became a real
+15 s again), not a permission hold. The incident doc's "ended it by accident" is
+correct; the T12 gloss "a restart drops the red" was not.
+
+What a restart actually destroys is **ownership**, and the consequence is worse
+than a clean drop:
+
+| after a restart, today | value |
+|---|---|
+| `Status` | `permission` — restored |
+| `Transcript`, `SessionID`, `InFlightSubagents` | restored |
+| `StatusSince` | re-stamped to startup (deliberate) |
+| `PendingTool` | **lost** (`json:"-"`) |
+| the raising `agent_id` (post-T5: all of `Pending`) | **never stored** |
+
+An ownerless red is not a neutral red. `clearsPermission`'s second gate
+(`internal/rpc/rpc.go:508`) and `selfHealStaleAttention`
+(`cmd/switchboard/main.go:718`) both resolve against `info.Transcript` — the
+**main** transcript. With no owner recorded, a hydrated red silently becomes a
+*main-thread-owned* red, and defect 4 clears it on the first main-thread
+assistant message after startup. For case 16 — the target behavior, main working
+while a teammate is blocked — that is seconds. **T9 does not fix this**: T9
+routes `Pending[a]` to `a`'s transcript, and after a restart `Pending` is empty,
+so there is nothing to route.
+
+And post-T5 the fold is `len(Pending) > 0 → RED`. An empty map beside a
+persisted `Status == "permission"` is an *inconsistent* hydrate: the authority
+says not-red, the persisted field says red. Whichever wins, T5 shipped without
+T12 would regress the one restart property the codebase currently has. That is
+why T12 lost its "any time" slot.
+
+### 9.2 Why the drop does not self-heal — and why that is decisive
+
+Nearly every piece of transient status state in this daemon is safe to drop
+because the next event rebuilds it. A pending permission is the exception, and
+the same property that makes the reconciler's self-heal necessary makes the drop
+unrecoverable:
+
+- Claude Code fires `PermissionRequest` **once**, when the prompt appears. It is
+  edge-triggered, with no repeat and no level signal.
+- Switchboard registers seven hooks (README) and **none of them is a
+  `Notification`-style waiting hook.** No hook re-raises a live prompt.
+- A blocked writer runs no tools, so it emits no `PostToolUse` either. The
+  quiescence *is* the state.
+- Codex records no approvals in its rollout at all, so there is not even a
+  file-level fallback there.
+
+So a dropped `Pending` entry is not a transient false GREEN that the next tick
+repairs. It is a **permanent missed RED for the entire remaining life of that
+prompt** — cost #1, the worst error, unbounded in duration, and concentrated on
+exactly the sessions the signal exists for. This is what moves the decision off
+the naive "fail open, it's only #3" reading.
+
+### 9.3 What the transcripts can and cannot reconstruct
+
+`subagent-permission-oscillation.md` §4.3 proposes reconstructing the state from
+the blocked-writer signature. Read carefully, §4.3 is a **conjunction**:
+
+> a `PermissionRequest` was seen and no resolution has been proven; **and** the
+> writer it was raised under has been quiescent since
+
+The first conjunct is exactly the hook state a restart destroys. Drop it and the
+remainder — "this writer is quiescent" — is not identifiable: it is equally
+consistent with a long-running tool, a drained teammate, a crashed teammate, and
+a main thread parked at the human prompt. §4.3 is a *resolution* primitive, not
+a *reconstruction* primitive. Using it as the latter is a category error.
+
+There is, however, a stronger on-disk signal than §4.3 assumed, and it is worth
+recording because it changes what a hydrate can do. Checked against the incident
+files (`agent-af5bd126402ac16c7.jsonl`, the blocked `escalate-cleanup`):
+
+```jsonc
+{"type":"assistant","ts":"…19:38:13.284Z","stop_reason":null,   "content":[{"type":"tool_use","name":"Bash"}]}
+{"type":"assistant","ts":"…19:38:14.068Z","stop_reason":"tool_use","content":[{"type":"tool_use","name":"Bash"}]}
+// EOF — no tool_result for 4.5 minutes, until the user answered
+```
+
+A subagent's own jsonl **does** record the pending `tool_use`, with its
+`tool_name` and `tool_input`, and simply never receives the matching
+`tool_result`. ⚠ This contradicts `status-color-state-model.md`'s "Claude Code
+withholds the pending tool_use's assistant message until it resolves" — that
+claim was made about the **main** transcript and does not hold for a subagent's
+own file. Whether it holds for the main thread is unverified (V4 below).
+
+But an unmatched trailing `tool_use` means "a tool is dispatched and has not
+returned," which covers *awaiting approval* **and** *executing right now*. There
+is no third field that separates them. Re-deriving `Pending` from this signature
+would therefore raise a false RED on every session that happened to be mid-tool
+when the daemon restarted — for the remaining duration of that tool. Negligible
+for a 2 s `Bash` (#5), several minutes for a test suite (#2, and #2's cost scales
+with duration). Restarts land at arbitrary points in a session's life, so the
+false-positive rate is roughly the duty cycle of tool execution: high.
+
+The asymmetry is the whole decision: **the same check is unsound as a source and
+sound as a falsifier.** An unmatched trailing `tool_use` does not prove a prompt
+is pending, but its *absence* does prove the writer is no longer blocked — the
+tool returned, so whatever gate it was behind opened. Applied only to entries we
+already persisted, the check can only remove, so its worst outcome is shortening
+a red (#2/#3), never inventing or missing one.
+
+That matters because naive persistence has a real hole the falsifier closes: a
+prompt **answered while the daemon was down**. The `Since := startup` re-stamp
+makes the pre-restart resolution invisible, so the red would latch until T10's
+cap. The falsifier sees the landed `tool_result` and drops the entry on the first
+tick.
+
+### 9.4 The hydrate-I/O objection does not survive contact with the code
+
+The brief framed hydrate-time I/O as a possible blocker, given the recent work
+keeping I/O out of the daemon's store lock. It is not:
+
+- **The daemon is not serving yet.** `store.Load()` (`main.go:96`) and
+  `dropStaleSessions` (`:106`) both run before the scanner and reconciler
+  goroutines start (`:141`–`:150`) and long before `server.Serve` (`:160`). There
+  is no lock contention to create. `dropStaleSessions` already performs a
+  `/proc` read per session *inside* `store.Apply`, for exactly this reason.
+- **The reads are already in the per-tick budget.** `fanout.Observer.Reconcile`
+  calls `transcript.SubagentsForTranscript` for every session on **every**
+  reconcile tick (`internal/fanout/observer.go:134`), and that already does a
+  `ReadDir` plus a bounded 128 KiB tail read of *every* `agent-<id>.jsonl` for
+  its `Done` check (`internal/transcript/subagents.go:173`, `:192`). The
+  falsifier reads the same files, once, at startup — strictly cheaper than one
+  ordinary tick.
+
+The real costs of persisting are contract cost and stale-red cost, not I/O.
+Still, do the reads **outside** `store.Apply` and pass the verdicts in, per the
+direction the recent perf work established.
+
+### 9.5 The options, weighed
+
+| Option | Guards #1 (missed RED) | Introduces | Verdict |
+|---|---|---|---|
+| **A — drop and accept** | ✗ permanent missed RED (§9.2); post-T5 also a regression vs. today (§9.1) | — | rejected |
+| **B — re-derive from transcripts** | ✗ cannot reconstruct the "a prompt was raised" conjunct (§9.3) | false RED ∝ tool duty cycle | rejected as a source |
+| **C — persist the whole `PendingPrompt`** | ✓ | frozen-contract obligation on `input_hash`; a red latched across a restart that was answered while down | rejected — pays contract cost for a latency-only gain |
+| **D — replay the history sink** | ✓ when enabled | history is **off by default** and privacy-tiered (`internal/history/history.go:18`) — a red chip's survival would depend on a telemetry setting | rejected on coupling |
+| **E — keys only + hydrate falsifier** | ✓ | one additive wire field; a bounded stale red; approve-path latency reverts to the transcript path for one prompt after a restart | **adopted** |
+
+Against §4's ranking, E is the only option that spends nothing on #1. What it
+spends is #2-latency, and only for prompts alive across a restart: the hook-speed
+early clear is unavailable for a hydrated entry (no `Tool`/`InputHash` to match),
+so it resolves via the transcript on the next reconcile tick instead — one tick,
+bounded, and exactly the trade Phase 0's T2 already makes deliberately.
+
+Why not persist `Tool`/`InputHash` too, since they are cheap? Because they buy
+one prompt's worth of sub-tick latency and cost a permanent field on a frozen
+public contract, and because a hydrated entry **must** fail closed on the hook
+path anyway (§9.6, trap 2). Keys carry the #1 protection; values carry the #2
+polish. Persist the first, re-earn the second.
+
+Why not persist `Since`? The existing re-stamp comment answers it: a true
+pre-restart onset makes every pre-restart transcript entry read as "resolved
+after." Keeping it would require two clocks — true onset for T10's cap, restart
+for the resolution window — for a marginal gain. Consequence, stated plainly: a
+prompt raised ten minutes before a restart gets a **fresh full cap** after it.
+That is the same #1-over-#2 trade `dropStaleSessions` already makes. Revisit only
+if hydrated reds become a felt nag (§9.8).
+
+### 9.6 Implementation notes — the four things that will go wrong
+
+Non-obvious enough that the follow-up task should be written from this list.
+
+1. **Sort the projection, or you break publish-suppression.** `Pending` is a
+   map; `snapshotChangeKey` (`state.go:424`) JSON-encodes every tagged field to
+   decide whether to publish. An unsorted `[]string` built by ranging the map
+   differs between snapshots of identical state, so every reconcile tick would
+   republish to all ten waybar slots and rewrite `state.json` — reintroducing
+   precisely the wake-storm the change key exists to suppress. Sort ascending.
+2. **A hydrated entry must fail closed on the hook path.** `clearsPermission`'s
+   first gate already guards `toolName != "" && toolName == info.PendingTool`, so
+   an empty `PendingTool` cannot match — do not "fix" that by relaxing it to an
+   `agent_id`-only match. Same-writer matching looks sound ("a blocked writer
+   runs no tools") but is not: Claude Code emits parallel `tool_use` blocks in
+   one assistant message, so a writer can complete an auto-approved sibling while
+   its own prompt is still pending. That is the incident's bug at a narrower
+   radius. A hydrated entry resolves by transcript only.
+3. **Do not falsify main-thread entries until V4.** The unmatched-trailing-
+   `tool_use` signature is verified for *subagent* jsonls only (§9.3). If the
+   main transcript really does withhold the pending `tool_use`, then a genuinely
+   pending main-thread prompt shows **no** unmatched tail and the falsifier would
+   drop it — a missed RED, the exact error this task exists to prevent. Gate the
+   falsifier on `a != main` until V4 lands. Unreadable, truncated-tail, or
+   tail-window-missed-the-`tool_use` all mean *keep*, matching
+   `permissionExit`'s `unreadable` handling.
+4. **Handle the three hydrate combinations explicitly.**
+
+   | persisted `Status` | persisted `pending_writers` | action |
+   |---|---|---|
+   | `permission` | non-empty | rebuild `Pending`, `Since := startup`, falsify subagent entries |
+   | `permission` | empty / absent | a pre-T12 `state.json`. Seed `Pending{main}` — this reproduces today's behavior exactly and is the honest downgrade across the version boundary |
+   | not `permission` | non-empty | should be unreachable. `Pending` is the authority post-T5: keep it, re-fold to RED, and log it — a silent disagreement here is how a missed RED hides |
+
+Mechanics, briefly:
+
+```go
+// AgentInfo — the wire projection of Pending's key set (T12, §9).
+PendingWriters []string `json:"pending_writers,omitempty"` // sorted; "main" = main thread
+```
+
+projected in `enrichForWire` (`state.go:474`) from the in-memory map exactly as
+`StatusSinceWire` is projected from `StatusSince` — never written by hook or
+reconciler logic. Use the literal
+`"main"` for the `""` map key rather than emitting an empty string on a public
+contract (`main` is not a valid `agent-<id>` stem, so it cannot collide);
+translate at the wire boundary in both directions. Rebuild inside
+`dropStaleSessions`, on the same lines as the `StatusSince` re-stamp and for the
+same stated reason. Falsifier lives in `internal/transcript` next to
+`ResolveKind`, reading the same bounded tail: report *definitively resolved* /
+*still unmatched* / *unknown*, and let the caller keep the entry on anything but
+the first. Per `docs/state-schema.md`: additive, so no major bump, but it must be
+documented there, set on the canonical session in `canonicalSnapshot()` (left
+absent on the minimal session to pin the omission), and the golden regenerated.
+
+Tests, in the §5 style:
+- should keep a subagent-owned red across a hydrate when that subagent's jsonl
+  still ends in an unmatched `tool_use`
+- should drop a hydrated entry when the subagent's jsonl shows the matching
+  `tool_result` (answered while the daemon was down)
+- should not clear a hydrated red on a `PostToolUse` from the owning writer
+  carrying a *different* tool (trap 2)
+- should seed `Pending{main}` from a `state.json` written before this field
+  existed (trap 4)
+- should produce a byte-identical change key for two snapshots whose `Pending`
+  maps are equal but iterate in different orders (trap 1)
+
+### 9.7 New verification step
+
+- **V4 — does the main transcript record a pending main-thread `tool_use`?**
+  Raise a main-thread permission prompt, leave it unanswered, and inspect the
+  tail of `<session>.jsonl`. If the pending `tool_use` is present and unmatched,
+  extend the §9.6 trap-3 falsifier to `a == main`. If it is withheld, the
+  falsifier stays subagent-only permanently and
+  `status-color-state-model.md`'s "withholds the pending tool_use" note should be
+  scoped to the main transcript rather than deleted. Joins V1–V3 in the
+  oscillation doc §6.
+
+### 9.8 What would change this decision
+
+- **V3 shows the trailing-`tool_use` signature is not stable across prompt kinds**
+  (`AskUserQuestion`, `ExitPlanMode`, plan mode). Then drop the falsifier
+  entirely and rely on persistence plus T10's cap. Cost: a prompt answered while
+  the daemon was down latches red until the cap. Everything else in §9 stands —
+  the falsifier is an optimization on the #2 axis, not load-bearing for #1.
+- **Hydrated reds become a felt nag.** Then persist `Since` as a second field and
+  run two clocks (true onset for the cap, restart for the resolution window),
+  rather than weakening the hold. This is the escape hatch §9.5 declined to build
+  pre-emptively.
+- **Restarts become frequent and unattended** (daemon auto-update, a crash loop).
+  Persistence gets *more* valuable, not less, and the falsifier moves from
+  optional to required — the answered-while-down window is proportional to
+  downtime.
+- **A `Notification`-style waiting hook is registered.** That would give a live
+  prompt a level signal instead of an edge, and §9.2's "no hook re-raises it"
+  — the load-bearing premise of the whole decision — collapses. Then drop the
+  wire field and let the hook rebuild `Pending` after a restart. Worth a
+  standing recheck at each Claude Code version bump alongside
+  `claude-code-hook-schema.md`.
+- **Not a mind-changer:** the cost of the hydrate reads (§9.4), or discomfort
+  with a new field on the frozen contract. The field is additive, it is the
+  minimum that guards #1, and it is information a renderer wants anyway (T11).
