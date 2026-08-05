@@ -110,7 +110,7 @@ func TestSampleFanoutSeedsEverySessionInTheSnapshot(t *testing.T) {
 	store := state.New(filepath.Join(t.TempDir(), "state.json"))
 	store.Apply(func(m map[int]*state.Session) { m[sess.PID] = sess })
 
-	rs.sampleFanout(store)
+	rs.sampleFanout(store.Snapshot())
 	if err := os.Remove(day); err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +156,7 @@ func TestObserveFanoutAppliesTheSampledDirScan(t *testing.T) {
 	store := state.New(filepath.Join(t.TempDir(), "state.json"))
 	store.Apply(func(m map[int]*state.Session) { m[sess.PID] = sess })
 
-	rs.sampleFanout(store)
+	rs.sampleFanout(store.Snapshot())
 	if err := os.RemoveAll(filepath.Join(base, sid)); err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +195,7 @@ func TestObserveUsageEmitsOneSamplePerModel(t *testing.T) {
 	store.Apply(func(m map[int]*state.Session) { m[sess.PID] = sess })
 
 	// First pass primes the usage cursor to EOF — no sample for the baseline.
-	rs.sampleUsage(store, sink, time.Now())
+	rs.sampleUsage(store.Snapshot(), sink, time.Now())
 
 	// Two models accrue tokens while we watch.
 	f, _ := os.OpenFile(tpath, os.O_APPEND|os.O_WRONLY, 0o644)
@@ -204,7 +204,7 @@ func TestObserveUsageEmitsOneSamplePerModel(t *testing.T) {
 	f.WriteString(assistantUsageModelLine("claude-opus-4-8", 20, 8) + "\n")
 	f.Close()
 
-	rs.sampleUsage(store, sink, time.Now())
+	rs.sampleUsage(store.Snapshot(), sink, time.Now())
 	sink.Close()
 
 	samples := eventsOfType(readEvents(t, histDir), history.EventUsageSample)
@@ -463,14 +463,14 @@ func TestObserveUsagePrimesThenSamples(t *testing.T) {
 	store.Apply(func(m map[int]*state.Session) { m[sess.PID] = sess })
 
 	// First pass primes the usage cursor to EOF — no sample for the backlog.
-	rs.sampleUsage(store, sink, time.Now())
+	rs.sampleUsage(store.Snapshot(), sink, time.Now())
 
 	// New usage accrues while we watch.
 	f, _ := os.OpenFile(tpath, os.O_APPEND|os.O_WRONLY, 0o644)
 	f.WriteString(`{"type":"assistant","message":{"role":"assistant","content":[],"usage":{"input_tokens":120,"output_tokens":34}}}` + "\n")
 	f.Close()
 
-	rs.sampleUsage(store, sink, time.Now())
+	rs.sampleUsage(store.Snapshot(), sink, time.Now())
 	sink.Close()
 
 	samples := eventsOfType(readEvents(t, histDir), history.EventUsageSample)

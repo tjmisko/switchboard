@@ -570,21 +570,27 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 	// fetch duration, and TitleAt is the freshness gate for the H9 idle-title
 	// recovery (docs/timing-hazards.md).
 	now := time.Now()
-	// Memory is sampled BEFORE the lock is taken, against the pid set of the last
-	// published snapshot: the reads are milliseconds and Store.Apply blocks every
-	// RPC reader and every hook for as long as it holds. Only the assignment and
-	// the sink.Record below run under the lock. See memorySampler.
-	mem := rstate.sampleMemory(store)
+	// ONE snapshot for every sampler below. Each used to take its own, which is four
+	// acquisitions of the read lock and four deep copies of every session per tick —
+	// and, worse than the cost, four different views of the world that could disagree
+	// with each other about which sessions exist. Taken here, before any sampling, so
+	// they all describe the same instant.
+	snap := store.Snapshot()
+	// Memory is sampled BEFORE the lock is taken, against the pid set of that
+	// snapshot: the reads are milliseconds and Store.Apply blocks every RPC reader
+	// and every hook for as long as it holds. Only the assignment and the
+	// sink.Record below run under the lock. See memorySampler.
+	mem := rstate.sampleMemory(snap)
 	// Same rule, same reason: every read the fanout Observer needs — the first-sight
 	// history seed, the transcript cursor, and the per-session subagents/ dir scan —
 	// used to happen inside the Apply below. See sampleFanout.
-	rstate.sampleFanout(store)
+	rstate.sampleFanout(snap)
 	// Usage moves out entirely rather than being sampled-then-applied: it mutates
 	// no session state, so nothing about it needs the lock. See sampleUsage.
-	rstate.sampleUsage(store, sink, now)
+	rstate.sampleUsage(snap, sink, now)
 	// The two status self-heals' transcript reads. Their DECISIONS stay under the
 	// lock — only the reads move. See signalSample.
-	signals := sampleSignals(store, tun)
+	signals := sampleSignals(snap, tun)
 	store.Apply(func(m map[int]*state.Session) {
 		// Close the lanes of any session whose process is gone, BEFORE the per-tick
 		// work below — a dead session earns none of it.

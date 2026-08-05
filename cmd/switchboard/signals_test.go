@@ -39,7 +39,7 @@ func TestSelfHealStuckStatusUsesThePreLockSample(t *testing.T) {
 
 	store := state.New(filepath.Join(t.TempDir(), "state.json"))
 	store.Apply(func(sm map[int]*state.Session) { sm[sess.PID] = sess })
-	signals := sampleSignals(store, testTune)
+	signals := sampleSignals(store.Snapshot(), testTune)
 
 	if err := os.Remove(tpath); err != nil {
 		t.Fatal(err)
@@ -63,7 +63,7 @@ func TestSelfHealStuckStatusRejectsASampleFromABeforeStatusEdge(t *testing.T) {
 
 	store := state.New(filepath.Join(t.TempDir(), "state.json"))
 	store.Apply(func(sm map[int]*state.Session) { sm[sess.PID] = sess })
-	signals := sampleSignals(store, testTune)
+	signals := sampleSignals(store.Snapshot(), testTune)
 
 	// A hook lands mid-tick: the chip went idle and re-stamped StatusSince, so the
 	// sampled interrupt notice is now OLDER than the transition it would justify.
@@ -117,7 +117,7 @@ func TestSelfHealStaleAttentionRejectsAResolutionBelongingToAPriorPrompt(t *test
 
 	store := state.New(filepath.Join(t.TempDir(), "state.json"))
 	store.Apply(func(sm map[int]*state.Session) { sm[sess.PID] = sess })
-	signals := sampleSignals(store, testTune)
+	signals := sampleSignals(store.Snapshot(), testTune)
 
 	// Mid-tick, a SECOND permission prompt latches the chip red again. The decline
 	// above predates it and must not clear it.
@@ -145,7 +145,7 @@ func TestSampleSignalsSkipsTheTailReadWhenNothingWasWritten(t *testing.T) {
 	store := state.New(filepath.Join(t.TempDir(), "state.json"))
 	store.Apply(func(sm map[int]*state.Session) { sm[sess.PID] = sess })
 
-	got := sampleSignals(store, testTune)[sess.PID]
+	got := sampleSignals(store.Snapshot(), testTune)[sess.PID]
 	if !got.quiescent {
 		t.Fatalf("sample = %+v, want quiescent: nothing was written since the chip transitioned", got)
 	}

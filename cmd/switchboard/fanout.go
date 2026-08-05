@@ -80,7 +80,7 @@ func newReconcileState(obs *fanout.Observer, mem *memorySampler) *reconcileState
 // sampling and bounded by the tick interval. The hazard the guard does remove is
 // the one that is not merely late — a sample overwriting a count that a fresher
 // read (the SubagentStart/Stop hook's own Reconcile) already established.
-func (rs *reconcileState) sampleFanout(store *state.Store) {
+func (rs *reconcileState) sampleFanout(snap state.Snapshot) {
 	if rs.fanout == nil {
 		return
 	}
@@ -88,7 +88,7 @@ func (rs *reconcileState) sampleFanout(store *state.Store) {
 	// against, and keeping last tick's around would just be dead weight for the
 	// usableFor check to reject.
 	rs.samples = map[string]fanout.Sample{}
-	for _, sess := range store.Snapshot().Sessions {
+	for _, sess := range snap.Sessions {
 		c := sess.Claude
 		if c == nil || c.SessionID == "" || c.Transcript == "" {
 			continue
@@ -182,7 +182,7 @@ func (rs *reconcileState) observeFanout(sink *history.Sink, sess *state.Session,
 	}
 }
 
-// sampleUsage runs observeUsage for every session in the last published snapshot,
+// sampleUsage runs observeUsage for every session in the tick's pre-lock snapshot,
 // BEFORE the tick takes the store lock.
 //
 // It can move out wholesale, unlike the fanout observation next to it, because it
@@ -197,9 +197,9 @@ func (rs *reconcileState) observeFanout(sink *history.Sink, sess *state.Session,
 // and returns without reading — so an audit that only looks at a newly-appeared
 // session concludes, wrongly, that this path is already cold-safe. Every tick
 // AFTER that reads the delta, and during an active turn the delta is real bytes.
-func (rs *reconcileState) sampleUsage(store *state.Store, sink *history.Sink, now time.Time) {
-	for _, snap := range store.Snapshot().Sessions {
-		sess := snap
+func (rs *reconcileState) sampleUsage(snap state.Snapshot, sink *history.Sink, now time.Time) {
+	for _, s := range snap.Sessions {
+		sess := s
 		c := sess.Claude
 		if c == nil || c.Transcript == "" {
 			continue

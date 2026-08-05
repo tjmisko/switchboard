@@ -54,13 +54,14 @@ func (s signalSample) freshFor(c *state.AgentInfo) bool {
 }
 
 // sampleSignals performs both self-heals' transcript reads for every session in
-// the last published snapshot, holding no store lock.
+// the tick's pre-lock snapshot, holding no store lock.
 //
-// Read through Snapshot — the shared read lock — never through Apply, the same
-// rule sampleMemory and sampleFanout follow.
-func sampleSignals(store *state.Store, tun statustune.Tuning) map[int]signalSample {
+// The snapshot is taken by the caller and shared with every other sampler — one
+// read lock and one set of session copies per tick, and one view of the world for
+// all of them to agree on.
+func sampleSignals(snap state.Snapshot, tun statustune.Tuning) map[int]signalSample {
 	out := map[int]signalSample{}
-	for _, sess := range store.Snapshot().Sessions {
+	for _, sess := range snap.Sessions {
 		c := sess.Claude
 		if c == nil || c.Transcript == "" {
 			continue
