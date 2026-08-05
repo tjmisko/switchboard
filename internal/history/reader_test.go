@@ -118,6 +118,98 @@ func TestPriorSubagentStateByAgentIDExcludesOtherSessions(t *testing.T) {
 	}
 }
 
+// The tests below pin the behavior the byte pre-filter in scanSubagentLines
+// must not change. Both mutations below were actually run.
+//
+// Only ONE of the filter's two parts is load-bearing for correctness: the
+// post-decode `ev.SessionID != sessionID` check. Delete it and
+// ...IgnoresTheIDAppearingInAnotherField fails, because a substring hit is not
+// a parse and the byte scan cannot tell which field it matched.
+//
+// Quoting the needle is a PERFORMANCE guard, not a correctness one — it stops
+// `s1` from matching inside `"session_id":"s10"` and wasting a decode, but the
+// SessionID check would reject that line anyway. Replacing the needle with the
+// bare id leaves every test here green, which is the honest result: do not read
+// ...PrefixOfAnother as protecting the quoting. It is a regression test for the
+// s1/s10 hazard itself, which is worth keeping whichever guard catches it.
+
+func TestPriorSubagentStateExcludesASessionWhoseIDIsAPrefixOfAnother(t *testing.T) {
+	dir := t.TempDir()
+	writeDay(t, dir, "2026-06-26",
+		`{"ts":"2026-06-26T10:00:00Z","type":"subagent_spawn","session_id":"s1","agent_id":"mine"}`,
+		`{"ts":"2026-06-26T10:01:00Z","type":"subagent_spawn","session_id":"s10","agent_id":"theirs"}`,
+		`{"ts":"2026-06-26T10:02:00Z","type":"subagent_stop","session_id":"s10","agent_id":"theirs"}`,
+	)
+
+	spawned, stopped, err := PriorSubagentState(dir, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(spawned) != 1 || !spawned["mine"] {
+		t.Errorf("spawned = %v, want exactly {mine}: s10 is a different session that merely starts with s1", spawned)
+	}
+	if len(stopped) != 0 {
+		t.Errorf("stopped = %v, want empty: the only stop belongs to s10", stopped)
+	}
+}
+
+func TestPriorSubagentStateIgnoresTheIDAppearingInAnotherField(t *testing.T) {
+	dir := t.TempDir()
+	// A DIFFERENT session's spawn, carrying our session id as the value of some
+	// other field — here a cwd, which is contrived on purpose. The point is not
+	// that this happens often; it is that the byte scan cannot tell WHICH field it
+	// matched, so this line passes both needles and IS decoded. Only the SessionID
+	// check after the decode can reject it.
+	writeDay(t, dir, "2026-06-26",
+		`{"ts":"2026-06-26T10:00:00Z","type":"subagent_spawn","session_id":"other","agent_id":"theirs","cwd":"s1"}`,
+		`{"ts":"2026-06-26T10:01:00Z","type":"subagent_spawn","session_id":"s1","agent_id":"mine"}`,
+	)
+
+	spawned, _, err := PriorSubagentState(dir, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(spawned) != 1 || !spawned["mine"] {
+		t.Errorf("spawned = %v, want exactly {mine}: a substring hit in another field is not a session match", spawned)
+	}
+}
+
+func TestPriorSubagentStateSkipsNonSubagentEventsForTheSameSession(t *testing.T) {
+	dir := t.TempDir()
+	writeDay(t, dir, "2026-06-26",
+		`{"ts":"2026-06-26T10:00:00Z","type":"transition","session_id":"s1","from":"idle","to":"working"}`,
+		`{"ts":"2026-06-26T10:01:00Z","type":"usage_sample","session_id":"s1","agent_id":"notaspawn"}`,
+		`{"ts":"2026-06-26T10:02:00Z","type":"subagent_spawn","session_id":"s1","agent_id":"a1"}`,
+	)
+
+	spawned, stopped, err := PriorSubagentState(dir, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(spawned) != 1 || !spawned["a1"] {
+		t.Errorf("spawned = %v, want exactly {a1}: only subagent_spawn seeds the set", spawned)
+	}
+	if len(stopped) != 0 {
+		t.Errorf("stopped = %v, want empty", stopped)
+	}
+}
+
+func TestPriorSubagentStateToleratesATornLine(t *testing.T) {
+	dir := t.TempDir()
+	writeDay(t, dir, "2026-06-26",
+		`{"ts":"2026-06-26T10:00:00Z","type":"subagent_spawn","session_id":"s1","agent_id":"a1"}`,
+		`{"ts":"2026-06-26T10:01:00Z","type":"subagent_spawn","session_id":"s1","agent_i`, // torn mid-append
+	)
+
+	spawned, _, err := PriorSubagentState(dir, "s1")
+	if err != nil {
+		t.Fatalf("a torn final line must not be an error: %v", err)
+	}
+	if len(spawned) != 1 || !spawned["a1"] {
+		t.Errorf("spawned = %v, want exactly {a1} with the torn line skipped", spawned)
+	}
+}
+
 func TestPriorSubagentStateEmptySessionIsEmpty(t *testing.T) {
 	dir := t.TempDir()
 	writeDay(t, dir, "2026-06-26",
