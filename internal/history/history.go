@@ -42,6 +42,8 @@ const (
 	EventSessionLabel = "session_label" // the session's name/label changed (Label set)
 	EventFocus        = "focus"         // window focus moved (SessionID = focused agent, empty = focus left all agents)
 	EventActivity     = "activity"      // user went idle / active (global; To = idle|active)
+	// v3 — per-session memory.
+	EventMemorySample = "memory_sample" // the session's resident cost, sampled each reconcile tick
 )
 
 // Detail tiers. Minimal records only what a timeline needs (ids, status, timing,
@@ -94,6 +96,51 @@ type Event struct {
 	TokCacheRead   int64  `json:"tok_cache_read,omitempty"`
 	TokCacheCreate int64  `json:"tok_cache_create,omitempty"`
 	Model          string `json:"model,omitempty"`
+
+	// Memory payload (memory_sample): an instantaneous gauge, not an accrual —
+	// unlike the token counters above, these do not sum across samples. Bytes
+	// throughout, PSS + SwapPss: PSS charges each shared page to its sharers in
+	// fractions, so summing across sessions never double-counts, and swap counts
+	// because a page pushed out is still memory the session is answerable for.
+	// Agent is the claude process alone; Tree is it plus every descendant, which
+	// is the only unit that can capture subagents — they have no pids of their
+	// own. What spawned work cost is derived as Tree - Agent by the consumer,
+	// never measured as its own sum, which would double-count the pages a forked
+	// child shares with its parent.
+	MemAgentPssBytes  int64 `json:"mem_agent_pss_bytes,omitempty"`
+	MemAgentSwapBytes int64 `json:"mem_agent_swap_bytes,omitempty"`
+	MemTreePssBytes   int64 `json:"mem_tree_pss_bytes,omitempty"`
+	MemTreeSwapBytes  int64 `json:"mem_tree_swap_bytes,omitempty"`
+	MemTreeProcs      int   `json:"mem_tree_procs,omitempty"`
+
+	// Machine-wide pressure, read once per tick and stamped onto every sample in
+	// it. Redundant across a tick's samples by design: it keeps each line
+	// self-describing, and the fold dedupes to one point per tick.
+	//
+	// SysPsiSomeTotalUs is the monotonic since-boot counter, NOT a per-interval
+	// figure — consumers difference adjacent samples to get the microseconds
+	// actually stalled in between. It is kept alongside the decaying avg10
+	// because a 5-second sampler can alias straight past a spike that avg10 would
+	// have shown, while the counter cannot lose one.
+	//
+	// The emitter writes the PSI pair only when the kernel actually reported it,
+	// so a build without CONFIG_PSI leaves both off the line entirely.
+	//
+	// That is inference, not proof, and the limit is worth stating: omitempty
+	// also drops a genuine zero, so "PSI absent" and "PSI present and exactly
+	// idle" are the same bytes. Readers recover presence from a nonzero reading
+	// (see hasPSI in timeline.go). The only case that misreads is a machine
+	// freshly booted with no stall yet, which reports as unmeasured for as long
+	// as that stays true — and there the two answers carry the same meaning, so
+	// nothing downstream can act on the difference. Making it exact on the wire
+	// would take a pointer or an explicit presence flag.
+	//
+	// The absent-is-not-zero rule IS enforced where it can bite: a failed
+	// reading emits no memory_sample at all rather than a zero one, because a
+	// zero tree would read as a session that had freed everything.
+	SysAvailBytes     int64   `json:"sys_avail_bytes,omitempty"`
+	SysPsiSomeAvg10   float64 `json:"sys_psi_some_avg10,omitempty"`
+	SysPsiSomeTotalUs int64   `json:"sys_psi_some_total_us,omitempty"`
 
 	// Full-tier only (scrubbed at the minimal tier).
 	CWD         string `json:"cwd,omitempty"`         // working directory

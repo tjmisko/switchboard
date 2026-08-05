@@ -8,9 +8,11 @@
 > versioning rules below.
 >
 > The canonical example is [`internal/state/testdata/state.golden.json`](../internal/state/testdata/state.golden.json),
-> pinned by `TestStateGoldenRoundTrips` in `internal/state/golden_test.go`. The
-> Go source of truth is the `Snapshot`/`Session` structs in
-> `internal/state/state.go`.
+> pinned by `TestStateGoldenRoundTrips` (the fixture re-encodes byte-for-byte)
+> and `TestStateGoldenPinsCanonicalSnapshot` (the fixture matches
+> `canonicalSnapshot()`, so a **new optional field cannot go silently unpinned**)
+> in `internal/state/golden_test.go`. The Go source of truth is the
+> `Snapshot`/`Session` structs in `internal/state/state.go`.
 
 ## How it is written
 
@@ -51,8 +53,9 @@ should key on `pid`.
 
 ## `Session`
 
-The session record. Five fields are always present; `suspended` appears only
-when true; three nested blocks are optional and omitted entirely when their
+The session record. Five fields are always present; `suspended` and `headless`
+appear only when true; the two `mem_*` fields appear only when a reading
+succeeded; three nested blocks are optional and omitted entirely when their
 data has not been resolved yet.
 
 ```jsonc
@@ -63,7 +66,10 @@ data has not been resolved yet.
   "started_at": "2026-05-28T09:00:00Z",
   "focused": true,
   "suspended": true,         // omitted when false
+  "headless": true,          // omitted when false
   "agent": "claude",         // "claude" | "codex"; omitted until the kind is known
+  "mem_agent_bytes": 461373440,  // omitted when unmeasured
+  "mem_tree_bytes": 674234368,   // omitted when unmeasured
   "wezterm":  { /* WeztermInfo, optional */ },
   "hyprland": { /* HyprlandInfo, optional */ },
   "claude":   { /* AgentInfo, optional — present for a claude session */ },
@@ -79,7 +85,10 @@ data has not been resolved yet.
 | `started_at` | RFC 3339 timestamp | always | stable | When Switchboard first observed the session (wall clock at discovery), **not** the process's real start time. |
 | `focused` | boolean | always | stable | Whether this session's window is the active window in the WM. Best-effort; `false` for any session without a resolved WM address. |
 | `suspended` | boolean | omitted when false | stable | Whether the agent process is job-control-stopped — paused by `SIGTSTP`/`SIGSTOP` (Ctrl-Z). Derived from the `State:` field of `/proc/<pid>/status` (`T`); refreshed each reconcile tick (~5 s). Renderers grey such chips out, since the status is stale while paused. `t` (tracing stop, e.g. under a debugger) does **not** count. Linux-only signal today; absent on backends that can't read process run-state. |
+| `headless` | boolean | omitted when false | additive | Whether this is a non-interactive `claude -p`/SDK run (see `discovery.IsHeadless`). Such a session appears in bars for visibility but has no TUI to navigate to, so renderers style it inert and focus/cycle/pick skip it. |
 | `agent` | string | omitted until known | additive | Which coding-agent CLI owns the session: `"claude"` or `"codex"`. Set at discovery from the process. Selects which enrichment block (`claude`/`codex`) carries the status. Consumers should tolerate its absence (pre-multi-agent daemons) and any unrecognized value. |
+| `mem_agent_bytes` | integer | omitted when unmeasured | additive | Live resident cost of the agent process alone, in **bytes**: `Pss + SwapPss` from `/proc/<pid>/smaps_rollup`. PSS (proportional set size) charges each shared page to its sharers in fractions, so summing it across sessions never double-counts. Swap is included because a page pushed to swap is still memory the session is responsible for. Refreshed each reconcile tick (~5 s). Linux-only; absent on backends that cannot read it, and absent (rather than `0`) whenever a reading failed — `0` would mean "measured, and empty". |
+| `mem_tree_bytes` | integer | omitted when unmeasured | additive | Same measure summed over the agent process **and every descendant** — the session's whole process tree. Subagents have no PIDs of their own, so the tree is the only unit that captures spawned work. Subtract `mem_agent_bytes` to get what the session's children cost. Same units, cadence, and absence semantics as above. |
 | `wezterm` | object \| absent | optional | provisional | Terminal-locator data. Present once the tty is matched to a **wezterm** pane. Other terminal backends (e.g. tmux) do **not** populate it — those sessions are still observed via `/proc`, and focus re-locates the pane by tty at request time. Field set is terminal-backend-specific and may generalize when the seam grows a neutral terminal block. |
 | `hyprland` | object \| absent | optional | provisional | Window-manager data. Present once the pane is matched to a WM window. WM-backend-specific; will generalize behind a neutral window block as other WM backends land. |
 | `claude` | object \| absent | optional | stable | Claude-side enrichment fed by Claude Code hooks. Present once at least one hook fires for a **claude** session. Shape is `AgentInfo` (below). |
@@ -295,9 +304,14 @@ re-locates the pane by `tty` at request time.
   optional blocks are **omitted** entirely (never `null`) when unresolved.
   `claude.session_id`/`transcript` are omitted when empty; `claude.status` is
   present-but-`""` before the first status hook.
-- The golden fixture + `TestStateGoldenRoundTrips` is the tripwire: any change
-  to field name, order, type, or omitempty behavior breaks that test, forcing a
-  deliberate `UPDATE_GOLDEN=1` regen and a review of this document.
+- The golden fixture is the tripwire: any change to field name, order, type, or
+  omitempty behavior breaks `TestStateGoldenRoundTrips`, forcing a deliberate
+  `UPDATE_GOLDEN=1` regen and a review of this document. **Adding an optional
+  field also means setting it in `canonicalSnapshot()`** — round-tripping the
+  fixture against itself cannot see a field the fixture never carried, so
+  `TestStateGoldenPinsCanonicalSnapshot` is the test that fails until the
+  fixture is regenerated. Every optional field must be set on at least one
+  session there, with the minimal session left bare to pin the absence side.
 
 The ⚠ items above are tracked characterization quirks; each has a pin-then-fix
 entry in `docs/decisions.md` (Phase 0.9).

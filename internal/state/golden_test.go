@@ -15,10 +15,19 @@ import (
 var goldenPath = filepath.Join("testdata", "state.golden.json")
 
 // canonicalSnapshot is the schema example: a fully-populated claude session
-// (every optional block present, every AgentInfo field set), a codex session on
-// the Observe tier (the additive "agent"/"codex" fields), and one minimal
-// session (all optional blocks omitted, only the always-present fields). All
-// timestamps are fixed and UTC so encode/decode is deterministic.
+// (every optional block present, every optional scalar and AgentInfo field set
+// — deliberately maximal for coverage, not a realistic combination), a codex
+// session on the Observe tier (the additive "agent"/"codex" fields, plus the
+// mem_* pair to pin that memory is agent-agnostic), and one minimal session
+// (all optional blocks omitted, only the always-present fields — it is what
+// pins the omitempty ABSENCE of the optional fields). All timestamps are fixed
+// and UTC so encode/decode is deterministic.
+//
+// Every optional field MUST be set on at least one session here. An omitempty
+// field that is never set is invisible to the golden, and
+// TestStateGoldenRoundTrips cannot see the gap (it round-trips the fixture
+// against itself); TestStateGoldenPinsCanonicalSnapshot is what forces this
+// function and the fixture to agree.
 func canonicalSnapshot() Snapshot {
 	return Snapshot{
 		Sessions: []Session{
@@ -29,7 +38,13 @@ func canonicalSnapshot() Snapshot {
 				StartedAt: time.Date(2026, 5, 28, 9, 0, 0, 0, time.UTC),
 				Focused:   true,
 				Suspended: true,
+				Headless:  true,
 				Agent:     AgentKindClaude,
+				// mem_agent_bytes / mem_tree_bytes: Pss+SwapPss for the agent
+				// process alone and for its whole tree. Tree > agent whenever
+				// subagents are in flight; the difference is what the children cost.
+				MemAgentBytes: 461373440,
+				MemTreeBytes:  674234368,
 				Wezterm: &WeztermInfo{
 					MuxPID:      4790,
 					MuxSocket:   "/run/user/1000/wezterm/gui-sock-4790",
@@ -52,15 +67,21 @@ func canonicalSnapshot() Snapshot {
 					// status edge has stamped it (omitted before then — see the codex/
 					// minimal sessions). Renderers compute "working 3m" from it.
 					StatusSinceWire: timePtr(time.Date(2026, 5, 28, 9, 1, 0, 0, time.UTC)),
+					// in_flight_subagents: the S dimension. Set here so the fixture
+					// pins the field at all; >0 with an *idle* main thread is what
+					// promotes a session to "delegating".
+					InFlightSubagents: 2,
 				},
 			},
 			{
-				PID:       4999,
-				CWD:       "/home/tjmisko/Projects/api",
-				TTY:       "/dev/pts/7",
-				StartedAt: time.Date(2026, 5, 28, 9, 2, 0, 0, time.UTC),
-				Focused:   false,
-				Agent:     AgentKindCodex,
+				PID:           4999,
+				CWD:           "/home/tjmisko/Projects/api",
+				TTY:           "/dev/pts/7",
+				StartedAt:     time.Date(2026, 5, 28, 9, 2, 0, 0, time.UTC),
+				Focused:       false,
+				Agent:         AgentKindCodex,
+				MemAgentBytes: 298844160,
+				MemTreeBytes:  298844160,
 				Codex: &AgentInfo{
 					SessionID:  "0199736b-b713-74e2-99a2-f015a1c42816",
 					Transcript: "/home/tjmisko/.codex/sessions/2026/05/28/rollout-2026-05-28T09-02-00-0199736b-b713-74e2-99a2-f015a1c42816.jsonl",
@@ -115,6 +136,32 @@ func TestStateGoldenRoundTrips(t *testing.T) {
 
 	if !bytes.Equal(got, want) {
 		t.Errorf("round-trip mismatch.\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
+// TestStateGoldenPinsCanonicalSnapshot closes the hole in the round-trip test
+// above: that one decodes the fixture and re-encodes it, so an omitempty field
+// missing from the fixture decodes to zero and re-encodes to absent — green
+// whether or not the field exists on the struct at all. A newly added optional
+// field is therefore unpinned until it reaches the fixture, which is how
+// in_flight_subagents and headless came to sit on the wire while the golden
+// said nothing about them. Encoding canonicalSnapshot and demanding the fixture
+// match makes the golden a real tripwire: add a field, set it in
+// canonicalSnapshot, and this fails until you run
+// `UPDATE_GOLDEN=1 go test ./internal/state` and commit the result.
+func TestStateGoldenPinsCanonicalSnapshot(t *testing.T) {
+	want, err := os.ReadFile(goldenPath)
+	if err != nil {
+		t.Fatalf("read golden: %v (run with UPDATE_GOLDEN=1 to create)", err)
+	}
+
+	got, err := encodeSnapshot(canonicalSnapshot())
+	if err != nil {
+		t.Fatalf("encode canonical snapshot: %v", err)
+	}
+
+	if !bytes.Equal(got, want) {
+		t.Errorf("golden is stale — regenerate with UPDATE_GOLDEN=1 go test ./internal/state.\n--- canonicalSnapshot ---\n%s\n--- golden ---\n%s", got, want)
 	}
 }
 

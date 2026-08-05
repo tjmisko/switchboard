@@ -30,9 +30,10 @@ any bar can render it.*
 ## The four seams (current coupling → target)
 
 ### Seam 1 — OS process layer  `internal/proc`, `internal/procwatch`, `internal/discovery`
-- **Today:** `/proc/<pid>/{comm,exe,cwd,status,fd}` + `pidfd_open(2)` (Linux 5.3+).
+- **Today:** `/proc/<pid>/{comm,exe,cwd,status,stat,fd,smaps_rollup}` + `/proc/meminfo` + `/proc/pressure/memory` + `pidfd_open(2)` (Linux 5.3+).
 - **Abstraction:** enumerate processes matching a predicate; return `{pid, ppid, comm, exe, cwd, tty}`; signal once when a pid dies.
 - **Backends:** `linux` (/proc + pidfd, existing), `darwin` (`libproc`/`KERN_PROC` sysctl enumerate + kqueue `EVFILT_PROC`/`NOTE_EXIT` death). Per-OS via `//go:build`.
+- **Memory sampling sits BELOW this seam and is Linux-only.** Per-session PSS/SwapPss come from `/proc/<pid>/smaps_rollup`; the process-tree walk reads `/proc/<pid>/stat` for ppid alone (deliberately not `proc.Read`, which spends ~7 more syscalls per process); machine-wide availability and pressure come from `/proc/meminfo` (`MemAvailable`) and `/proc/pressure/memory` (the `some` line). Like `proc.State`, these are called straight from `internal/proc` rather than through `osproc.Source`, so they have no darwin backend and simply return an error there — `internal/proc` is untagged pure Go (`os.ReadFile` + string parsing, no `unix` imports), so the darwin build still compiles. `smaps_rollup` needs Linux 4.14+; PSI needs `CONFIG_PSI` and is reported **absent, never zero**, when unavailable, because zero means "no stall" and absent means "not measured".
 
 ### Seam 2 — terminal locator  `internal/wezterm`
 - **Today:** wezterm CLI + `gui-sock-<pid>` socket layout; match on `tty_name`; `activate-pane` to focus.

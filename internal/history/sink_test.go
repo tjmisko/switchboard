@@ -248,8 +248,8 @@ func TestLoadConfigOmittedRetentionKeepsDefaults(t *testing.T) {
 	if cfg.RetainDays != 90 {
 		t.Errorf("omitted retain_days = %d, want default 90", cfg.RetainDays)
 	}
-	if cfg.MaxBytes != 104857600 {
-		t.Errorf("omitted max_bytes = %d, want default 104857600", cfg.MaxBytes)
+	if cfg.MaxBytes != defaultMemoryMaxBytes {
+		t.Errorf("omitted max_bytes = %d, want default %d", cfg.MaxBytes, int64(defaultMemoryMaxBytes))
 	}
 }
 
@@ -260,7 +260,7 @@ func TestLoadConfigMalformedJSONFallsBackToDisabledDefaults(t *testing.T) {
 	if cfg.Enabled {
 		t.Error("malformed config should stay disabled")
 	}
-	if cfg.Detail != DetailMinimal || cfg.RetainDays != 90 || cfg.MaxBytes != 104857600 {
+	if cfg.Detail != DetailMinimal || cfg.RetainDays != 90 || cfg.MaxBytes != defaultMemoryMaxBytes {
 		t.Errorf("malformed config should keep defaults, got %+v", cfg)
 	}
 }
@@ -293,5 +293,173 @@ func TestLoadConfigParsesAndNormalizes(t *testing.T) {
 	}
 	if cfg.RetainDays != 0 {
 		t.Errorf("explicit retain_days=0 (unlimited) should be honored, got %d", cfg.RetainDays)
+	}
+}
+
+// --- memory samples ---
+
+// memSample is a fully-populated memory_sample, so a round-trip proves every
+// field on the contract survives rather than only the ones a shorter fixture
+// happens to set.
+func memSample(ts time.Time) Event {
+	return Event{
+		Ts: ts, Type: EventMemorySample,
+		SessionID: "ce13c0f2", PID: 4821, Agent: "claude",
+		CWD:               "/home/u/Projects/switchboard",
+		MemAgentPssBytes:  450639872,
+		MemAgentSwapBytes: 1048576,
+		MemTreePssBytes:   658374656,
+		MemTreeSwapBytes:  157335552,
+		MemTreeProcs:      7,
+		SysAvailBytes:     2977546240,
+		SysPsiSomeAvg10:   1.25,
+		SysPsiSomeTotalUs: 556011549,
+	}
+}
+
+func TestMemorySampleRoundTripsThroughTheSinkAndReader(t *testing.T) {
+	dir := t.TempDir()
+	s := NewSink(Config{Enabled: true, Detail: DetailFull, Dir: dir})
+	ts := time.Date(2026, 8, 3, 12, 0, 0, 0, time.Local)
+	s.Record(memSample(ts))
+	s.Close()
+
+	evs, err := ReadDay(dir, "2026-08-03")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) != 1 {
+		t.Fatalf("read %d events, want 1", len(evs))
+	}
+	got, want := evs[0], memSample(ts)
+	if got.Type != EventMemorySample {
+		t.Errorf("type = %q, want %q", got.Type, EventMemorySample)
+	}
+	if got.MemAgentPssBytes != want.MemAgentPssBytes || got.MemAgentSwapBytes != want.MemAgentSwapBytes {
+		t.Errorf("agent = %d/%d, want %d/%d", got.MemAgentPssBytes, got.MemAgentSwapBytes,
+			want.MemAgentPssBytes, want.MemAgentSwapBytes)
+	}
+	if got.MemTreePssBytes != want.MemTreePssBytes || got.MemTreeSwapBytes != want.MemTreeSwapBytes {
+		t.Errorf("tree = %d/%d, want %d/%d", got.MemTreePssBytes, got.MemTreeSwapBytes,
+			want.MemTreePssBytes, want.MemTreeSwapBytes)
+	}
+	if got.MemTreeProcs != want.MemTreeProcs {
+		t.Errorf("tree procs = %d, want %d", got.MemTreeProcs, want.MemTreeProcs)
+	}
+	if got.SysAvailBytes != want.SysAvailBytes || got.SysPsiSomeAvg10 != want.SysPsiSomeAvg10 ||
+		got.SysPsiSomeTotalUs != want.SysPsiSomeTotalUs {
+		t.Errorf("sys = %d/%v/%d, want %d/%v/%d",
+			got.SysAvailBytes, got.SysPsiSomeAvg10, got.SysPsiSomeTotalUs,
+			want.SysAvailBytes, want.SysPsiSomeAvg10, want.SysPsiSomeTotalUs)
+	}
+}
+
+func TestMinimalTierKeepsEveryMemoryCounter(t *testing.T) {
+	dir := t.TempDir()
+	s := NewSink(Config{
+		Enabled: true, Detail: DetailMinimal, Dir: dir,
+		ResolveProject: func(string) string { return "sb" },
+	})
+	ts := time.Date(2026, 8, 3, 12, 0, 0, 0, time.Local)
+	s.Record(memSample(ts))
+	s.Close()
+
+	got := readDay(t, dir, "2026-08-03")[0]
+	// scrub is a blacklist of five named content fields, so the counters survive
+	// the minimal tier by construction. That is deliberate rather than inherited:
+	// they are byte and microsecond counts, and the tree is one summed figure plus
+	// a process count — no child names, nothing content-shaped to scrub.
+	if got.MemAgentPssBytes == 0 || got.MemTreePssBytes == 0 || got.MemTreeProcs == 0 {
+		t.Errorf("minimal tier dropped the memory counters: %+v", got)
+	}
+	if got.SysAvailBytes == 0 || got.SysPsiSomeTotalUs == 0 {
+		t.Errorf("minimal tier dropped the pressure counters: %+v", got)
+	}
+	if got.CWD != "" {
+		t.Errorf("minimal tier kept cwd %q", got.CWD)
+	}
+	if got.Project != "sb" {
+		t.Errorf("project = %q, want sb (resolved before the cwd is scrubbed)", got.Project)
+	}
+}
+
+func TestDisabledSinkDropsMemorySamplesWithoutWriting(t *testing.T) {
+	dir := t.TempDir()
+	s := NewSink(Config{Enabled: false, Dir: dir})
+	ts := time.Now()
+	// A tick's worth of samples for a busy day, at the rate the sampler emits.
+	for range 1000 {
+		s.Record(memSample(ts))
+	}
+	s.Close()
+
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Errorf("disabled sink wrote %d files, want 0", len(entries))
+	}
+}
+
+// --- the memory-conditional retention default ---
+
+func TestMemorySamplingRaisesTheDefaultSizeCap(t *testing.T) {
+	write := func(body string) Config {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "history.json")
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return loadConfigFrom(path)
+	}
+
+	// Memory sampling is on unless the file turns it off, and the cap follows it:
+	// at ~12x the line volume, 100 MB would silently trim 90-day retention to ~10
+	// days, because pruneDir bounds on size before RetainDays gets a say.
+	if cfg := write(`{"enabled":true}`); !cfg.Memory || cfg.MaxBytes != defaultMemoryMaxBytes {
+		t.Errorf("memory=%t max_bytes=%d, want true/%d", cfg.Memory, cfg.MaxBytes, int64(defaultMemoryMaxBytes))
+	}
+	if cfg := write(`{"enabled":true,"memory":false}`); cfg.Memory || cfg.MaxBytes != defaultMaxBytes {
+		t.Errorf("memory=%t max_bytes=%d, want false/%d", cfg.Memory, cfg.MaxBytes, int64(defaultMaxBytes))
+	}
+}
+
+func TestExplicitMaxBytesWinsOverTheMemoryDefault(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want int64
+	}{
+		{"explicit cap with memory on", `{"enabled":true,"max_bytes":500}`, 500},
+		{"explicit cap with memory off", `{"enabled":true,"memory":false,"max_bytes":500}`, 500},
+		// 0 is a deliberate value (unlimited), not an omission, so it must survive
+		// the conditional default rather than be backfilled by it.
+		{"explicit unlimited with memory on", `{"enabled":true,"max_bytes":0}`, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "history.json")
+			if err := os.WriteFile(path, []byte(tc.body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if got := loadConfigFrom(path).MaxBytes; got != tc.want {
+				t.Errorf("max_bytes = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHumanBytesRendersTheEffectiveCap(t *testing.T) {
+	cases := []struct {
+		in   int64
+		want string
+	}{
+		{0, "unlimited"},
+		{-1, "unlimited"},
+		{512, "512 B"},
+		{defaultMaxBytes, "100.0 MB"},
+		{defaultMemoryMaxBytes, "2.0 GB"},
+	}
+	for _, tc := range cases {
+		if got := HumanBytes(tc.in); got != tc.want {
+			t.Errorf("HumanBytes(%d) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }

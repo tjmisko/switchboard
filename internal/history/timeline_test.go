@@ -1039,3 +1039,160 @@ func equalFocus(got, want []FocusSpan) bool {
 	}
 	return true
 }
+
+// The memory fold's bound. This surface is read lazily when a tooltip opens, not
+// polled every few seconds, so it does not need aggressive downsampling — but a
+// day of 5-second ticks is ~17k points per session, and an unbounded series would
+// put megabytes behind a hover.
+func TestDownsampleMemBoundsTheSeriesWithoutMovingTheScalars(t *testing.T) {
+	// 5000 readings a second apart, with the two peaks buried mid-series where a
+	// plain stride would step straight over them.
+	pts := make([]MemorySample, 5000)
+	for i := range pts {
+		pts[i] = MemorySample{Ts: ts(i), Agent: 100, Tree: 200}
+	}
+	pts[1234].Agent = 999
+	pts[3777].Tree = 4444
+
+	peakAgent, peakTree := memPeaks(pts)
+	avgAgent, avgTree := memTimeWeightedAvg(pts)
+	out := downsampleMem(pts, DefaultMemSeriesCap)
+
+	t.Run("should bound the series to the cap plus the first, last and peak points", func(t *testing.T) {
+		if len(out) > DefaultMemSeriesCap+3 {
+			t.Errorf("kept %d points, want at most %d", len(out), DefaultMemSeriesCap+3)
+		}
+		// …and close to it from below: the stride is an integer, so it lands a few
+		// points short rather than exactly on the cap, but a series downsampled to
+		// half the budget it was given has thrown away shape for nothing.
+		if len(out) < DefaultMemSeriesCap*9/10 {
+			t.Errorf("kept %d points, want roughly the cap %d", len(out), DefaultMemSeriesCap)
+		}
+	})
+
+	t.Run("should keep the series in time order with its first and last readings", func(t *testing.T) {
+		if !out[0].Ts.Equal(pts[0].Ts) || !out[len(out)-1].Ts.Equal(pts[len(pts)-1].Ts) {
+			t.Errorf("series runs %v–%v, want the full %v–%v",
+				out[0].Ts, out[len(out)-1].Ts, pts[0].Ts, pts[len(pts)-1].Ts)
+		}
+		for i := 1; i < len(out); i++ {
+			if !out[i].Ts.After(out[i-1].Ts) {
+				t.Fatalf("out of order at %d: %v then %v", i, out[i-1].Ts, out[i].Ts)
+			}
+		}
+	})
+
+	t.Run("should keep the peak readings so the series still shows the figure the scalars report", func(t *testing.T) {
+		var sawAgent, sawTree bool
+		for _, p := range out {
+			sawAgent = sawAgent || p.Agent == peakAgent
+			sawTree = sawTree || p.Tree == peakTree
+		}
+		if !sawAgent || !sawTree {
+			t.Errorf("peaks survived: agent %v, tree %v — a hover would report a high-water mark its own series never reaches", sawAgent, sawTree)
+		}
+	})
+
+	t.Run("should leave the scalars derived from the full series untouched", func(t *testing.T) {
+		// The scalars are computed BEFORE downsampling, so bounding the series is
+		// purely a rendering concession and never moves a reported number.
+		if peakAgent != 999 || peakTree != 4444 {
+			t.Errorf("peaks = %d / %d, want 999 / 4444", peakAgent, peakTree)
+		}
+		if avgAgent < 100 || avgAgent > 101 || avgTree < 200 || avgTree > 202 {
+			t.Errorf("averages = %d / %d, want ~100 / ~200", avgAgent, avgTree)
+		}
+	})
+}
+
+// The pressure delta telescopes: it is taken over adjacent EMITTED points, so
+// bounding the series redistributes the stall microseconds across fewer, longer
+// intervals rather than dropping the ones that fell between kept points.
+func TestBuildPressureDeltaTelescopesAcrossDownsampling(t *testing.T) {
+	// 3000 ticks, each stalling 1000µs more than the last.
+	var evs []Event
+	for i := 0; i < 3000; i++ {
+		evs = append(evs, Event{
+			Ts: ts(i), Type: EventMemorySample, PID: 1, SessionID: "s1",
+			SysAvailBytes: int64(1 << 30), SysPsiSomeTotalUs: int64(1_000_000 + i*1000),
+		})
+	}
+	pts := BuildPressure(evs)
+
+	if len(pts) > DefaultMemSeriesCap+1 {
+		t.Errorf("kept %d pressure points, want at most %d", len(pts), DefaultMemSeriesCap+1)
+	}
+	var stall int64
+	for _, p := range pts {
+		if p.PSIStallUs != nil {
+			stall += *p.PSIStallUs
+		}
+	}
+	// The counter ran 1_000_000 → 1_002_999_000; every microsecond of it has to
+	// survive whichever points the stride happened to keep.
+	if want := int64(2999 * 1000); stall != want {
+		t.Errorf("total stall = %dµs, want %dµs — downsampling lost stall time instead of aggregating it", stall, want)
+	}
+}
+
+// A pid is not an identity, and memory is keyed by session throughout. The fold
+// is a pass of its own for exactly that reason: it never consults a lane.
+func TestBuildMemorySessionsKeysBySessionNotPid(t *testing.T) {
+	mem := func(sec int, sid string, agent, tree int64) Event {
+		return Event{Ts: ts(sec), Type: EventMemorySample, PID: 7, SessionID: sid,
+			MemAgentPssBytes: agent, MemTreePssBytes: tree}
+	}
+	// One pid, two sequential sessions (a /clear mid-stream), plus a sample from
+	// before either was identified. The id-less stretch is real data — a session
+	// emits samples from discovery, but only gets its id at its first hook — so
+	// it lands in its own pid-keyed bucket rather than being dropped or folded
+	// into a neighbour it may not belong to.
+	evs := []Event{
+		mem(0, "first", 100, 100),
+		mem(10, "first", 200, 200),
+		mem(20, "second", 300, 300),
+		mem(30, "second", 400, 400),
+		{Ts: ts(40), Type: EventMemorySample, PID: 7, MemAgentPssBytes: 999, MemTreePssBytes: 999},
+	}
+	got := BuildMemorySessions(evs, nil)
+	if len(got) != 3 {
+		t.Fatalf("got %d records, want 3 (two identified sessions + the pre-hook stretch): %+v", len(got), got)
+	}
+	if got[0].SessionID != "first" || got[1].SessionID != "second" || got[2].SessionID != "pid:7" {
+		t.Errorf("records = %s, %s, %s — want them ordered by first sample, with the unidentified one keyed by pid",
+			got[0].SessionID, got[1].SessionID, got[2].SessionID)
+	}
+	if got[0].PeakAgentBytes != 200 || got[1].PeakAgentBytes != 400 {
+		t.Errorf("peaks = %d / %d, want 200 / 400 — the two sessions were merged on their shared pid",
+			got[0].PeakAgentBytes, got[1].PeakAgentBytes)
+	}
+	if got[2].PeakAgentBytes != 999 {
+		t.Errorf("pre-hook peak = %d, want 999 — an unidentified sample must not be discarded",
+			got[2].PeakAgentBytes)
+	}
+}
+
+// A session emits samples from the moment it is discovered, but only receives
+// its id at its first agent hook. Dropping id-less samples therefore discarded
+// every reading from a session that had not been prompted yet — measured on a
+// live machine, 100% of them, including a long-idle session sitting on a
+// gigabyte, which is the reading most worth having.
+func TestBuildMemorySessionsKeepsSamplesFromBeforeTheFirstHook(t *testing.T) {
+	evs := []Event{
+		{Ts: ts(0), Type: EventMemorySample, PID: 42, Project: "sb",
+			MemAgentPssBytes: 500, MemTreePssBytes: 900, MemTreeProcs: 3},
+		{Ts: ts(10), Type: EventMemorySample, PID: 42, Project: "sb",
+			MemAgentPssBytes: 700, MemTreePssBytes: 1100, MemTreeProcs: 3},
+	}
+	got := BuildMemorySessions(evs, nil)
+	if len(got) != 1 {
+		t.Fatalf("got %d records, want 1: %+v", len(got), got)
+	}
+	if got[0].SessionID != "pid:42" {
+		t.Errorf("session id = %q, want %q — the pid fallback keeps the two id namespaces apart",
+			got[0].SessionID, "pid:42")
+	}
+	if got[0].PeakAgentBytes != 700 || got[0].PeakTreeBytes != 1100 {
+		t.Errorf("peaks = %d / %d, want 700 / 1100", got[0].PeakAgentBytes, got[0].PeakTreeBytes)
+	}
+}

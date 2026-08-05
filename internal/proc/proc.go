@@ -3,8 +3,8 @@ package proc
 
 import (
 	"errors"
-	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -20,34 +20,67 @@ type Info struct {
 	State string   // single-char run state from /proc/<pid>/status (R/S/D/T/t/Z/...)
 }
 
+// Reader reads from a /proc-shaped directory tree. Its zero value reads the
+// real /proc, so the package-level functions below are the whole API for
+// production callers; NewReader roots it at a fixture directory instead, which
+// is what makes the memory and process-tree paths unit-testable without
+// spawning real processes (see testsupport.FakeProcTree).
+type Reader struct {
+	root string // "" means the real /proc
+}
+
+// NewReader returns a Reader rooted at root instead of /proc.
+func NewReader(root string) *Reader { return &Reader{root: root} }
+
+// hostProc reads the real /proc. Every package-level function delegates to it.
+var hostProc = &Reader{}
+
+func (r *Reader) procRoot() string {
+	if r == nil || r.root == "" {
+		return "/proc"
+	}
+	return r.root
+}
+
+// pidPath joins the per-process path elements under the reader's root, e.g.
+// pidPath(42, "fd", "0") -> "/proc/42/fd/0".
+func (r *Reader) pidPath(pid int, elem ...string) string {
+	parts := make([]string, 0, len(elem)+2)
+	parts = append(parts, r.procRoot(), strconv.Itoa(pid))
+	parts = append(parts, elem...)
+	return filepath.Join(parts...)
+}
+
 // Read collects /proc/<pid>/{comm,cmdline,exe,cwd,status,fd/0..2}. Returns
 // ErrGone if the process disappeared mid-read (the most common race).
-func Read(pid int) (Info, error) {
+func Read(pid int) (Info, error) { return hostProc.Read(pid) }
+
+func (r *Reader) Read(pid int) (Info, error) {
 	out := Info{PID: pid}
 
-	comm, err := readSmallFile(fmt.Sprintf("/proc/%d/comm", pid))
+	comm, err := readSmallFile(r.pidPath(pid, "comm"))
 	if err != nil {
 		return out, wrapGone(err)
 	}
 	out.Comm = strings.TrimRight(comm, "\n")
 
-	out.Args = readArgs(pid)
+	out.Args = r.readArgs(pid)
 
-	if exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid)); err == nil {
+	if exe, err := os.Readlink(r.pidPath(pid, "exe")); err == nil {
 		out.Exe = exe
 	}
-	if cwd, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", pid)); err == nil {
+	if cwd, err := os.Readlink(r.pidPath(pid, "cwd")); err == nil {
 		out.CWD = cwd
 	}
 
-	status, err := readSmallFile(fmt.Sprintf("/proc/%d/status", pid))
+	status, err := readSmallFile(r.pidPath(pid, "status"))
 	if err != nil {
 		return out, wrapGone(err)
 	}
 	out.PPID = parsePPID(status)
 	out.State = parseState(status)
 
-	out.TTY = readTTY(pid)
+	out.TTY = r.readTTY(pid)
 	return out, nil
 }
 
@@ -55,8 +88,10 @@ func Read(pid int) (Info, error) {
 // code ("R", "S", "T", ...). Lighter than Read for the reconcile hot path,
 // which re-checks suspension on every live session each tick. Returns ErrGone
 // if the process vanished.
-func State(pid int) (string, error) {
-	status, err := readSmallFile(fmt.Sprintf("/proc/%d/status", pid))
+func State(pid int) (string, error) { return hostProc.State(pid) }
+
+func (r *Reader) State(pid int) (string, error) {
+	status, err := readSmallFile(r.pidPath(pid, "status"))
 	if err != nil {
 		return "", wrapGone(err)
 	}
@@ -75,8 +110,8 @@ func Suspended(state string) bool {
 // threads have an empty cmdline. The argv lets discovery tell an interactive
 // `claude` session apart from a `claude daemon …` background process, which
 // shares the same comm and exe.
-func readArgs(pid int) []string {
-	raw, err := readSmallFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+func (r *Reader) readArgs(pid int) []string {
+	raw, err := readSmallFile(r.pidPath(pid, "cmdline"))
 	if err != nil || raw == "" {
 		return nil
 	}
@@ -90,9 +125,9 @@ func readArgs(pid int) []string {
 // readTTY tries /proc/<pid>/fd/{0,1,2} for a /dev/pts/N link. Interactive TUIs
 // like claude reliably have at least one of these attached to the controlling
 // terminal. Returns "" if none of them point at a pts.
-func readTTY(pid int) string {
+func (r *Reader) readTTY(pid int) string {
 	for _, fd := range []int{0, 1, 2} {
-		link, err := os.Readlink(fmt.Sprintf("/proc/%d/fd/%d", pid, fd))
+		link, err := os.Readlink(r.pidPath(pid, "fd", strconv.Itoa(fd)))
 		if err != nil {
 			continue
 		}
@@ -104,8 +139,10 @@ func readTTY(pid int) string {
 }
 
 // AllPIDs lists every numeric entry under /proc. Cheap (one getdents).
-func AllPIDs() ([]int, error) {
-	entries, err := os.ReadDir("/proc")
+func AllPIDs() ([]int, error) { return hostProc.AllPIDs() }
+
+func (r *Reader) AllPIDs() ([]int, error) {
+	entries, err := os.ReadDir(r.procRoot())
 	if err != nil {
 		return nil, err
 	}
@@ -140,6 +177,22 @@ func readSmallFile(path string) (string, error) {
 		return "", err
 	}
 	return string(b), nil
+}
+
+// parseKBToBytes reads the leading integer out of a "  440078 kB" value and
+// converts it to bytes. /proc reports memory in kB throughout; converting at
+// the parse boundary keeps every downstream field in the bytes the schema
+// specifies. Returns 0 for a missing or malformed value.
+func parseKBToBytes(value string) int64 {
+	fields := strings.Fields(value)
+	if len(fields) == 0 {
+		return 0
+	}
+	kb, err := strconv.ParseInt(fields[0], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return kb * 1024
 }
 
 func parsePPID(status string) int {
