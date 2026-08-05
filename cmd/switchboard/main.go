@@ -432,6 +432,21 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 	// terminal/navigate from their boot-race "none" values without a restart.
 	store.SetCapabilities(stack.Capabilities())
 	active, _ := manager.ActiveWindow(ctx)
+	// The two enumerations the per-session resolve needs, fetched ONCE for the
+	// whole tick and OUTSIDE the lock. This is the same rule the memory sample
+	// below already follows, and it is why this function has this shape:
+	// resolver.Reconcile does a terminal enumeration and a WM client query PER
+	// SESSION, and it used to do them INSIDE store.Apply. A tick over N sessions
+	// therefore held the write lock across N forks of `wezterm cli list` — 16 of
+	// them on an 8-session, 2-mux box — and every RPC reader, every hook, and
+	// every chip click queued behind it. Measured before this change: p99 166ms,
+	// worst 1382ms, with the spike train landing exactly on the tick interval.
+	panes, clients := resolver.Enumerate(ctx)
+	// Stamped AFTER the enumeration so TitleAt still means "when the title was
+	// sampled", which is what it meant when each session stamped its own clock on
+	// the way out of Locate. Stamping before would backdate every title by the
+	// fetch duration, and TitleAt is the freshness gate for the H9 idle-title
+	// recovery (docs/timing-hazards.md).
 	now := time.Now()
 	// Memory is sampled BEFORE the lock is taken, against the pid set of the last
 	// published snapshot: the reads are milliseconds and Store.Apply blocks every
@@ -443,7 +458,14 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 		// work below — a dead session earns none of it.
 		sweepDeadSessions(m, stack.OSProc, sink, forget, now)
 		for _, sess := range m {
-			resolver.Reconcile(ctx, sess)
+			// The batch path when the backend offers one, and otherwise the original
+			// per-session resolve — which still does its own I/O under the lock, but
+			// correctness first: no backend regresses just because it cannot batch.
+			if panes != nil {
+				resolver.ReconcileFrom(sess, panes, clients, now)
+			} else {
+				resolver.Reconcile(ctx, sess)
+			}
 			// Refresh job-control suspension (Ctrl-Z). On ErrGone the sweep above has
 			// already dropped the session, so this only ever sees a live pid; leave
 			// the last-known value on any other read error rather than flapping. A

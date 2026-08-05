@@ -104,6 +104,37 @@ func (r *Resolver) Reconcile(ctx context.Context, sess *state.Session) {
 	}
 }
 
+// Enumerate fetches the terminal and WM enumerations ReconcileFrom needs — one
+// call each, for a whole reconcile tick.
+//
+// It hangs on the Resolver rather than letting the caller assemble the two
+// arguments itself, and that is load-bearing: it reads through the SAME seams
+// Reconcile would have used. A caller that snapshotted a different Locator than
+// the one backing the fallback path would resolve sessions against panes that
+// path could never produce, and the two would disagree exactly when the batch
+// path degraded — the worst possible time.
+//
+// panes is nil when the terminal backend offers no batch path OR its enumeration
+// failed; both mean "no usable batch answer" and the caller falls back to
+// per-session Reconcile (see terminal.SnapshotOrNil). Note that nil is NOT the
+// same as an empty map, which is a real answer meaning no tty owns a pane.
+// clients is nil on a WM error, matching findWindow, which swallows that error
+// and returns no window.
+//
+// Carries Reconcile's 3s timeout so a wedged mux or compositor bounds the tick
+// rather than stalling it.
+func (r *Resolver) Enumerate(ctx context.Context) (map[string]terminal.PaneRef, []wm.Window) {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	panes := terminal.SnapshotOrNil(ctx, r.term)
+	clients, err := r.wm.Clients(ctx)
+	if err != nil {
+		clients = nil
+	}
+	return panes, clients
+}
+
 // ReconcileFrom is Reconcile with the two I/O calls hoisted out: it applies an
 // already-fetched terminal + WM enumeration to one session and performs NO I/O
 // of its own. Reconcile forks a terminal enumeration and a full WM client query
