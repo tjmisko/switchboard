@@ -682,7 +682,8 @@ func AnchorTime(path string, maxBytes int64) (ts time.Time, ok bool) {
 
 // AnchorSince picks the time a status transition should be dated from
 // (StatusSince), given the wall-clock instant `now` the daemon processed the
-// triggering hook and whether the transition is into working. There are two
+// triggering hook, the chip's PREVIOUS StatusSince (`prev`, the clamp floor —
+// see below), and whether the transition is into working. There are two
 // opposite clock-skew risks, one per direction — see docs/timing-hazards.md:
 //
 //   - Into working: the hook reaches us AFTER Claude wrote the entry that
@@ -713,14 +714,45 @@ func AnchorTime(path string, maxBytes int64) (ts time.Time, ok bool) {
 //
 // The pull-back never runs `now` backward: it applies only when the anchor is
 // strictly before `now`, and a missing/unreadable transcript falls back to `now`.
-func AnchorSince(path string, now time.Time, intoWorking bool, maxBytes int64) time.Time {
+//
+// It is also floored at `prev`, the chip's StatusSince before this edge, so the
+// result is max(anchor, prev) (itself capped at `now`). H1 wants an anchor
+// slightly behind `now` — the entry that caused THIS hook. It does not want an
+// arbitrarily old one, and `path` can supply exactly that: a subagent's hooks
+// are attributed to the parent session and carry the PARENT's transcript_path,
+// so when a teammate's PostToolUse drives the edge, the newest entry in the main
+// transcript is whatever the main thread last wrote — possibly minutes ago,
+// possibly never during this turn. Dating the edge from it makes StatusSince
+// arbitrarily stale, which in turn defeats every "has it been in this state long
+// enough?" damper downstream: the idle-title demotion's freshness gate and its
+// IdleTitleGrace both go trivially true, so a chip re-greened one second ago is
+// demoted on the very next reconcile tick and the pair oscillates
+// (docs/subagent-permission-oscillation.md §3.3, §3.4 — a 13-minute-stale
+// anchor drove a 95-second orange/green limit cycle).
+//
+// The floor keeps H1's whole benefit — an anchor between `prev` and `now` is
+// still a genuine same-turn pull-back and is returned unchanged — while bounding
+// the staleness by the one timestamp that is definitionally not stale: where the
+// chip already sat. StatusSince then never moves backward across an edge, so
+// each state gets its full grace period. A zero `prev` (the first transition an
+// AgentInfo ever makes) is a no-op: no real transcript timestamp precedes it.
+func AnchorSince(path string, now, prev time.Time, intoWorking bool, maxBytes int64) time.Time {
 	if !intoWorking {
 		return now
 	}
-	if anchor, ok := AnchorTime(path, maxBytes); ok && anchor.Before(now) {
-		return anchor
+	anchor, ok := AnchorTime(path, maxBytes)
+	if !ok || !anchor.Before(now) {
+		return now
 	}
-	return now
+	if anchor.Before(prev) {
+		// Floor at prev, but never past `now` — a prev at or ahead of the hook's
+		// wall clock (skew, a restored chip) must not date the edge into the future.
+		if prev.Before(now) {
+			return prev
+		}
+		return now
+	}
+	return anchor
 }
 
 // classify maps an entry to its status signal: an assistant message is activity;
