@@ -41,6 +41,11 @@ const (
 	// RuleTTLBackstop — reconciler exit: the transcript was unreadable and the TTL
 	// elapsed, so red is released as a last resort.
 	RuleTTLBackstop = "case15-ttl-backstop"
+	// RuleHoldOtherWriters — reconciler HOLD: one writer's prompt was proven
+	// resolved and dropped, but another writer is still blocked, so the chip stays
+	// red. Case 18 — the case the old whole-session ClearPending could not express,
+	// and the reason resolution is routed per writer at all.
+	RuleHoldOtherWriters = "case18-hold-other-writers"
 
 	// RuleDelegating — idle promoted to delegating (green) because subagents are in
 	// flight.
@@ -81,6 +86,7 @@ var ruleKnobs = map[string]KnobHint{
 	RuleDeclineIdle:           {"InterruptExitStatus", "the color a red chip exits to when interrupted/declined with no teammates (default idle/orange)"},
 	RuleDeclineDelegating:     {"EscWithTeammatesStatus", "the color when interrupted/declined while teammates are in flight (default delegating/green)"},
 	RuleTTLBackstop:           {"PermissionDecayTTL", "how long an unreadable-transcript red chip waits before the backstop releases it (default 30s)"},
+	RuleHoldOtherWriters:      {"", "intentional missed-RED guard, and the point of keying red by writer: one prompt resolving says nothing about another writer's, so the chip stays red until every entry is gone. There is no knob — a session with two blocked writers needs two answers"},
 	RuleDelegating:            {"DelegatingEnabled", "set false to keep an idle-with-teammates chip orange instead of green"},
 	RuleDrained:               {"DelegatingEnabled", "set false to disable the delegating state entirely"},
 	RuleHoldBareResult:        {"", "intentional missed-RED guard: a bare/Task PostToolUse must not clear a pending prompt — there is no knob, and loosening it risks the worst error (a blocked agent shown not-red)"},
