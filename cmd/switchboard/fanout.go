@@ -28,6 +28,7 @@ type reconcileState struct {
 	memory      *memorySampler
 	usageOffset map[int]int64          // pid -> transcript bytes already summed for usage
 	labels      map[string]labelCursor // labelKey -> last-emitted session label (change dedup)
+	names       *label.NameCache       // pid -> Claude session name, memoized against the file's stamp
 }
 
 // labelCursor is the last name emitted for one session, plus the pid hosting it.
@@ -45,6 +46,7 @@ func newReconcileState(obs *fanout.Observer, mem *memorySampler) *reconcileState
 		memory:      mem,
 		usageOffset: map[int]int64{},
 		labels:      map[string]labelCursor{},
+		names:       &label.NameCache{},
 	}
 }
 
@@ -79,8 +81,13 @@ func (rs *reconcileState) observe(sink *history.Sink, sess *state.Session, c *st
 // its life — while the name it is plainly wearing shows in the status bar. A
 // session id is also the safer key in the other direction: it never repeats, so
 // a recycled pid can never inherit a dead session's name.
+//
+// The name lookup goes through rs.names because this runs under the store lock,
+// once per session per tick, and label.RawName reads and unmarshals a file on
+// every call. The cache re-reads when the file's stamp moves, so a `/name` still
+// lands an EventSessionLabel on the next tick.
 func (rs *reconcileState) observeLabel(sink *history.Sink, sess *state.Session, c *state.AgentInfo, now time.Time) {
-	name := label.RawName(*sess)
+	name := rs.names.RawName(*sess)
 	key := labelKey(sess.PID, c)
 	if name == "" || name == rs.labels[key].name {
 		return
