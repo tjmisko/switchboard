@@ -69,12 +69,14 @@ type KnobHint struct {
 	What  string
 }
 
-// ruleKnobs maps every rule id to the Tuning field that decides its color. Kept
-// exhaustive over the Rule* constants (TestRuleKnobCoverage enforces it) so the
-// diagnose command can always answer "what do I change?".
+// ruleKnobs maps every rule id to the Tuning field that decides its color, so the
+// diagnose command can always answer "what do I change?". Exhaustive over the
+// Rule* constants above, and TestRuleKnobCoverage enforces that by parsing THIS
+// file for `Rule*` declarations — adding a constant without adding a row here
+// fails the test, naming the constant and its line.
 var ruleKnobs = map[string]KnobHint{
-	RuleApproveToolMatch:      {"EarlyClearApproveByToolName", "set false to require the transcript to confirm resume before clearing red (slower, but no tool-name guessing)"},
-	RuleApproveTranscript:     {"ResumeExitStatus", "the color a red chip exits to when the turn resumes (default working/green)"},
+	RuleApproveToolMatch:      {"EarlyClearApproveByToolName", "set false to require the transcript to confirm resume before clearing red (slower, but no tool-name guessing). Note the knob only reaches teammate-free sessions: with subagents in flight the fast path is refused whatever this says, because a tool_name match is then a tool KIND collision (case12-hold-teammate-collision)"},
+	RuleApproveTranscript:     {"", "no knob decides this one. It is the hook path's fallback clear, and the color it exits to is the hook event's own status (PostToolUse→working, Stop→idle), not a policy field — ResumeExitStatus governs the reconciler's case9-approve-resume, not this. What you CAN change is how often it fires: EarlyClearApproveByToolName=false routes every approve clear through here"},
 	RuleApproveResume:         {"ResumeExitStatus", "the color a red chip exits to when the turn resumes (default working/green)"},
 	RuleDeclineIdle:           {"InterruptExitStatus", "the color a red chip exits to when interrupted/declined with no teammates (default idle/orange)"},
 	RuleDeclineDelegating:     {"EscWithTeammatesStatus", "the color when interrupted/declined while teammates are in flight (default delegating/green)"},

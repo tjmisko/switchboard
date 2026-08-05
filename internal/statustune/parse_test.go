@@ -113,23 +113,3 @@ func TestParseDecisionRejectsNonDecisionLines(t *testing.T) {
 		}
 	}
 }
-
-// Every rule the daemon can emit must have a concrete knob hint (Field set, or a
-// deliberate "no knob" explanation), so `diagnose` can always answer "what do I
-// change?".
-func TestRuleKnobCoverage(t *testing.T) {
-	all := []string{
-		RuleApproveToolMatch, RuleApproveTranscript, RuleHoldBareResult,
-		RuleApproveResume, RuleDeclineIdle, RuleDeclineDelegating, RuleTTLBackstop,
-		RuleDelegating, RuleDrained, RuleResumeActivity, RuleInterrupt,
-	}
-	for _, r := range all {
-		h := RuleKnob(r)
-		if h.What == "" {
-			t.Errorf("rule %q has no knob hint", r)
-		}
-	}
-	if got := RuleKnob("bogus-rule"); got.Field != "" || got.What == "" {
-		t.Errorf("unknown rule should yield an empty Field with an explanatory What, got %+v", got)
-	}
-}
