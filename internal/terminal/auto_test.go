@@ -66,6 +66,49 @@ func TestAutoShouldDelegateLocateToTheLiveBackend(t *testing.T) {
 	}
 }
 
+func TestAutoSnapshotShouldDelegateToTheLiveBackend(t *testing.T) {
+	want := map[string]PaneRef{"/dev/pts/2": {Backend: "wezterm", TTY: "/dev/pts/2"}}
+	wez := newBatchFake("wezterm", want)
+	a := auto{candidates: []Locator{wez}}
+
+	got, err := a.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	if len(got) != 1 || got["/dev/pts/2"].Backend != "wezterm" {
+		t.Fatalf("Snapshot() = %+v, want the live backend's pane set", got)
+	}
+}
+
+// No backend live → the none backend, which owns nothing. That is an empty set,
+// not a failure: the caller stays on the batch path instead of forking per
+// session to be told the same nothing.
+func TestAutoSnapshotShouldReportAnEmptySetWhenNoBackendIsLive(t *testing.T) {
+	a := auto{candidates: []Locator{&autoFake{name: "wezterm", available: false}}}
+
+	got, err := a.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v, want nil", err)
+	}
+	if got == nil || len(got) != 0 {
+		t.Fatalf("Snapshot() = %+v, want a non-nil empty set", got)
+	}
+}
+
+// A live backend with no batch path must produce an ERROR, not an empty map:
+// SnapshotOrNil then degrades the caller to per-session Locate, whereas an empty
+// map would read as "no tty owns a pane" and blank every chip.
+func TestAutoSnapshotShouldReportAnErrorWhenTheLiveBackendHasNoBatchPath(t *testing.T) {
+	a := auto{candidates: []Locator{&fakeLocator{name: "kitty", available: true}}}
+
+	if _, err := a.Snapshot(context.Background()); err == nil {
+		t.Fatal("Snapshot() = nil error, want a refusal so the caller falls back to Locate")
+	}
+	if got := SnapshotOrNil(context.Background(), a); got != nil {
+		t.Errorf("SnapshotOrNil = %+v, want nil", got)
+	}
+}
+
 func TestAutoShouldStayLiveWhenSeveralBackendsCompose(t *testing.T) {
 	tmux := &autoFake{name: "tmux", available: true}
 	wez := &autoFake{name: "wezterm", available: true}

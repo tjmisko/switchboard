@@ -1,6 +1,9 @@
 package terminal
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
 
 // auto is a Locator that re-selects its concrete backend on every call. The
 // daemon autostarts at graphical-session login and routinely wins the boot
@@ -54,4 +57,23 @@ func (a auto) Locate(ctx context.Context, tty string) (*PaneRef, error) {
 
 func (a auto) Activate(ctx context.Context, ref *PaneRef) error {
 	return a.current().Activate(ctx, ref)
+}
+
+// Snapshot delegates to the currently-live backend, so the batch path inherits
+// the same per-call re-detection — a terminal that wins the boot race after the
+// daemon starts joins the fast path on the next reconcile tick, not on restart.
+//
+// current() hands back a plain Locator that may or may not carry the fast path,
+// so this applies SnapshotOrNil's upgrade/degrade rule itself. When the live
+// backend has no batch path it must ERROR rather than return an empty map:
+// SnapshotOrNil then reports "no usable batch answer" and the caller falls back
+// to Locate, whereas an empty map would be read as "no tty owns a pane" and
+// blank every chip.
+func (a auto) Snapshot(ctx context.Context) (map[string]PaneRef, error) {
+	cur := a.current()
+	s, ok := cur.(Snapshotter)
+	if !ok {
+		return nil, fmt.Errorf("terminal: backend %q provides no batch snapshot path", cur.Name())
+	}
+	return s.Snapshot(ctx)
 }

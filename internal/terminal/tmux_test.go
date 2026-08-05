@@ -22,6 +22,17 @@ func TestParseTmuxPanes(t *testing.T) {
 	}
 }
 
+// tmuxPaneRef is the single conversion Locate and Snapshot share. The handle is
+// the only focus token this backend has, so losing it here turns Navigate into
+// the "pane ref has no handle" error rather than a wrong focus.
+func TestTmuxPaneRefShouldCarryTheHandleAndTTY(t *testing.T) {
+	got := tmuxPaneRef(tmuxPane{TTY: "/dev/pts/5", PaneID: "%3", CWD: "/home/u/proj", WindowName: "claude"})
+	want := PaneRef{Backend: "tmux", Handle: "%3", WindowTitle: "claude", TTY: "/dev/pts/5", CWD: "/home/u/proj"}
+	if got != want {
+		t.Errorf("tmuxPaneRef = %+v, want %+v", got, want)
+	}
+}
+
 // Activate refuses a ref with no pane handle rather than running a bogus tmux
 // command.
 func TestTmuxActivateRequiresHandle(t *testing.T) {

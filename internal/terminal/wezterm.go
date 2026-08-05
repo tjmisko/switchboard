@@ -31,7 +31,44 @@ func (weztermLocator) Locate(ctx context.Context, tty string) (*PaneRef, error) 
 	if p == nil {
 		return nil, nil
 	}
-	return &PaneRef{
+	ref := weztermPaneRef(*p)
+	return &ref, nil
+}
+
+// Snapshot resolves every wezterm-owned tty against a single enumeration —
+// exactly the one `wezterm.List` FindByTTY runs per call, but paid once for all
+// sessions instead of once per session per mux.
+func (weztermLocator) Snapshot(ctx context.Context) (map[string]PaneRef, error) {
+	panes, err := wezterm.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	byTTY := make(map[string]PaneRef, len(panes))
+	for _, p := range panes {
+		if p.TTYName == "" {
+			continue // no tty to join a session against
+		}
+		// FindByTTY returns the FIRST pane matching the tty, so first-wins here
+		// too: if two muxes ever reported the same tty_name, the batch and single
+		// paths would otherwise disagree on which pane owns it.
+		if _, claimed := byTTY[p.TTYName]; claimed {
+			continue
+		}
+		byTTY[p.TTYName] = weztermPaneRef(p)
+	}
+	return byTTY, nil
+}
+
+func (weztermLocator) Activate(ctx context.Context, ref *PaneRef) error {
+	return wezterm.ActivatePane(ctx, ref.MuxSocket, ref.PaneID)
+}
+
+// weztermPaneRef converts one enumerated pane into the neutral PaneRef. Locate
+// and Snapshot both go through it so the single and batch paths cannot drift:
+// the conformance suite asserts they return equal refs for the same tty, and a
+// second hand-rolled conversion is exactly how that assertion starts failing.
+func weztermPaneRef(p wezterm.Pane) PaneRef {
+	return PaneRef{
 		Backend:     "wezterm",
 		Mux:         p.MuxPID,
 		MuxSocket:   p.MuxSocket,
@@ -42,11 +79,7 @@ func (weztermLocator) Locate(ctx context.Context, tty string) (*PaneRef, error) 
 		WindowTitle: p.WindowTitle,
 		TTY:         p.TTYName,
 		CWD:         decodeCWD(p.CWDURL),
-	}, nil
-}
-
-func (weztermLocator) Activate(ctx context.Context, ref *PaneRef) error {
-	return wezterm.ActivatePane(ctx, ref.MuxSocket, ref.PaneID)
+	}
 }
 
 // decodeCWD turns wezterm's file:// cwd URL into a filesystem path. Owning cwd
