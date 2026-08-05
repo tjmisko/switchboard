@@ -61,6 +61,16 @@ type Request struct {
 	// with no tool (UserPromptSubmit/Stop/SessionStart), which just disables the
 	// fast path and falls back to the transcript check.
 	ToolName string `json:"tool_name,omitempty"`
+	// ToolInputHash is a short, canonicalized sha256 prefix of the hook's
+	// tool_input, computed at the ctl edge (see cmdHook's hashToolInput) — the raw
+	// input is never forwarded or persisted, since it can be large and can carry
+	// sensitive content. tool_input rides both PermissionRequest and PostToolUse,
+	// so this is the "which call" correlator that sits between AgentID ("which
+	// writer") and ToolName ("which kind" — Bash collides constantly). Empty means
+	// NO SIGNAL, not "a hash that failed to match": events with no tool_input, and
+	// inputs that are absent/unparseable/null/empty, all send "". Consumers must
+	// never treat two empty hashes as a match.
+	ToolInputHash string `json:"tool_input_hash,omitempty"`
 
 	// AgentID/AgentType identify the subagent on a SubagentStart/SubagentStop hook.
 	// AgentID is the stable agent-<id> the subagents/ dir and the hook share (the
