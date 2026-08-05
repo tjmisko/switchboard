@@ -14,17 +14,26 @@
 //     woken by a background teammate) fires no working hook, so an "idle"
 //     (orange) chip never returns to green. NewestSignal recovers both.
 //
-// Detecting resolution from the transcript needs care: Claude Code does **not**
-// flush an interactive tool_use to the .jsonl until it *resolves*, and while the
-// prompt waits the session keeps writing — a background teammate/subagent and any
-// sibling auto-approved tool in the same turn flush tool_results dated *after* the
-// chip went red. So "a tool_result newer than the prompt" cannot tell a resolved
-// prompt from one still pending amid concurrent work; counting it demotes the red
-// chip the instant any background work lands. The reliable signal is the *main
-// conversation thread* advancing past the prompt: an assistant message dated after
-// the prompt (the blocked turn resumed → the awaited tool was approved) or a user
-// interrupt notice (declined / Esc). Tool_results — which subagents and parallel
-// tools emit while the prompt still waits — are deliberately ignored.
+// Detecting resolution from the transcript needs care, and NOT for the reason
+// this comment used to give. Claude Code *does* flush an interactive tool_use to
+// the .jsonl while the prompt waits — measured at ~5 s after the PermissionRequest
+// hook and minutes-to-hours before the user answers, in the main transcript as
+// well as a subagent's own file (docs/subagent-permission-plan.md §9.7, V4). What
+// it does not do is flush it *before* the hook: the pending tool_use and its
+// pre-prompt thinking/text turn-mates land a beat late, dated at generation time,
+// which is the H7/H8 flush race (docs/timing-hazards.md) that AnchorSince defuses
+// by anchoring a permission edge to wall-clock now.
+//
+// The real difficulty is concurrency. While the prompt waits the session keeps
+// writing — a background teammate/subagent and any sibling auto-approved tool in
+// the same turn flush tool_results dated *after* the chip went red. So "a
+// tool_result newer than the prompt" cannot tell a resolved prompt from one still
+// pending amid concurrent work; counting it demotes the red chip the instant any
+// background work lands. The reliable signal is the *main conversation thread*
+// advancing past the prompt: an assistant message dated after the prompt (the
+// blocked turn resumed → the awaited tool was approved) or a user interrupt notice
+// (declined / Esc). Tool_results — which subagents and parallel tools emit while
+// the prompt still waits — are deliberately ignored.
 package transcript
 
 import (
