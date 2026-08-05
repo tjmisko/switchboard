@@ -637,6 +637,9 @@ func recordReconcileTransition(sink *history.Sink, sess *state.Session, c *state
 		Ts: now, Type: history.EventTransition,
 		SessionID: c.SessionID, PID: sess.PID, Agent: sess.Agent, CWD: sess.CWD,
 		From: c.Status, To: to, Rule: rule, Reason: reason,
+		// The history event's `pending` is a TOOL name (docs/state-schema.md), so it
+		// takes the derived scalar rather than the decision log's multi-writer
+		// summary — a structured field must not start carrying a "+N" suffix.
 		Subagents: c.InFlightSubagents, Pending: c.PendingTool,
 		DurPrevMs: history.HeldMs(c.StatusSince, now),
 	})
@@ -728,12 +731,18 @@ func selfHealStaleAttention(m map[int]*state.Session, now time.Time, tun statust
 		statustune.Decision{
 			PID: sess.PID, Session: shortSessionID(c.SessionID),
 			From: state.StatusPermission, To: exit, Rule: rule, Reason: reason,
-			Subagents: c.InFlightSubagents, Pending: c.PendingTool, Age: age,
+			Subagents: c.InFlightSubagents, Pending: c.PendingSummary(), Age: age,
 		}.Log()
 		recordReconcileTransition(sink, sess, c, exit, rule, reason, now)
 		c.Status = exit
 		c.StatusSince = now
-		c.PendingTool = ""
+		// Whole-session release, matching the verdict above: ResolveKind was asked
+		// about c.Transcript — the MAIN file — so it answered for the session, not
+		// for any one writer. Plan T9 routes this per prompt (resolve each Pending[a]
+		// against a's own jsonl and drop only that entry), at which point this
+		// becomes a targeted DropPending and the loop keeps the chip red for the
+		// writers the main transcript says nothing about.
+		c.ClearPending()
 	}
 }
 
@@ -848,7 +857,7 @@ func logStuck(sink *history.Sink, sess *state.Session, c *state.AgentInfo, to, r
 	statustune.Decision{
 		PID: sess.PID, Session: shortSessionID(c.SessionID),
 		From: c.Status, To: to, Rule: rule, Reason: reason,
-		Subagents: c.InFlightSubagents, Pending: c.PendingTool,
+		Subagents: c.InFlightSubagents, Pending: c.PendingSummary(),
 		Age: now.Sub(c.StatusSince),
 	}.Log()
 	recordReconcileTransition(sink, sess, c, to, rule, reason, now)

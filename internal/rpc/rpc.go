@@ -55,7 +55,8 @@ type Request struct {
 	// the event→status mapping.
 	Agent string `json:"agent,omitempty"`
 	// ToolName is the hook's tool_name when the event carries one (PermissionRequest,
-	// PostToolUse). It is stashed at red-onset (PendingTool) and matched on a later
+	// PostToolUse). It is stashed at red-onset (state.PendingPrompt.Tool, under the
+	// writer that raised the prompt) and matched on a later
 	// PostToolUse to clear red at hook speed when the approved tool completes —
 	// while a non-matching/Task PostToolUse keeps the chip red. Empty for events
 	// with no tool (UserPromptSubmit/Stop/SessionStart), which just disables the
@@ -411,7 +412,26 @@ func (s *Server) handleHook(req Request) {
 			(req.Event == "PermissionRequest" || (req.Event == "PostToolUse" && info.Status == state.StatusPermission)) {
 			log.Printf("hook-identity: pid=%d %s event=%s agent_id=%q agent_type=%q tool=%q chip=%s pending=%q S=%d",
 				pid, sessionLabel(sess, req.SessionID), req.Event, req.AgentID, req.AgentType,
-				req.ToolName, info.Status, info.PendingTool, info.InFlightSubagents)
+				req.ToolName, info.Status, info.PendingSummary(), info.InFlightSubagents)
+		}
+
+		// Session rotation (plan T5, absorbing T15). A /clear or a fork keeps the
+		// pid but takes a NEW session_id and a new transcript file, and every prompt
+		// recorded under the retired session dies with it: nothing in the new session
+		// will ever resolve one, because the writer that raised it no longer exists.
+		//
+		// Detected here, before the hold gate, because T3 broadened the hold to cover
+		// SessionStart — which is exactly the event a rotation announces itself with.
+		// Without this clause the retired session's red is held against the new
+		// session's own transcript, which of course shows nothing resolving it, and
+		// the chip latches red into a session that never had a prompt.
+		//
+		// The empty guards matter in both directions: an empty req.SessionID is a
+		// hook that simply did not carry one (most of them), and an empty
+		// info.SessionID is a first assignment, not a rotation.
+		rotated := req.SessionID != "" && info.SessionID != "" && req.SessionID != info.SessionID
+		if rotated {
+			info.ClearPending()
 		}
 
 		// T17 — defect 2 (docs/subagent-permission-oscillation.md §2.4/§3.2): a
@@ -491,21 +511,40 @@ func (s *Server) handleHook(req Request) {
 		// is evidence the user is at the keyboard, but queueing a message while a
 		// prompt waits is common enough that treating it as an answer would
 		// reintroduce the missed RED. Revisit only if it produces a felt stale red.
+		//
+		// A ROTATED session is exempt: the red the gate would hold belongs to the
+		// session that just retired, and nothing in the new one can ever resolve it
+		// (see the `rotated` clause above).
 		gateLogged := false
 		// transitionRule/Reason carry the permission-gate's decision into the
 		// history event below, so an approve-cleared edge records WHY it cleared
 		// (the plain hook edges leave them empty).
 		var transitionRule, transitionReason string
-		if agent == state.AgentKindClaude && info.Status == state.StatusPermission &&
+		if agent == state.AgentKindClaude && !rotated && info.Status == state.StatusPermission &&
 			status != "" && status != state.StatusPermission {
 			clear, rule, reason := s.clearsPermission(info, req.Event, req.ToolName)
 			d := statustune.Decision{
 				PID: pid, Session: shortID(coalesce(req.SessionID, info.SessionID)),
 				From: state.StatusPermission, To: state.StatusPermission, Rule: rule, Reason: reason,
-				Pending: info.PendingTool, Subagents: info.InFlightSubagents,
+				Pending: info.PendingSummary(), Subagents: info.InFlightSubagents,
 				Age: time.Since(info.StatusSince),
 			}
 			if clear {
+				// T5 note for whoever lands T7/T9: clearsPermission is a WHOLE-SESSION
+				// verdict today — it answers "is this session's red resolved", not "is
+				// writer a's prompt resolved" — so the faithful translation onto the map
+				// is to drop every entry with it. Narrowing this to the writer the
+				// evidence names is T9's job (and T7's for the hook-speed match); when it
+				// lands, the len(Pending) fold below starts holding red for the writers
+				// that were NOT named, which is case 18.
+				info.ClearPending()
+			}
+			// The fold (plan §3.3): red is owned by Pending, so the chip may leave
+			// "permission" only when no writer still holds a prompt. The second
+			// conjunct is redundant today for the reason just given, and becomes
+			// load-bearing the moment resolution is routed per writer — which is why it
+			// is written here rather than left for T9 to remember.
+			if clear && len(info.Pending) == 0 {
 				d.To = status
 				transitionRule, transitionReason = rule, reason
 			} else {
@@ -546,7 +585,11 @@ func (s *Server) handleHook(req Request) {
 				DurPrevMs: history.HeldMs(info.StatusSince, evNow),
 			})
 			if info.Status == state.StatusPermission && status != state.StatusPermission {
-				info.PendingTool = "" // leaving red: forget the captured prompt tool
+				// Leaving red: forget who owned the prompt. Redundant for a claude chip
+				// (the gate above already emptied the map to get here) but not for codex,
+				// which is exempt from the gate entirely and walks out of permission on
+				// its own next hook.
+				info.ClearPending()
 			}
 			info.Status = status
 			// Date the transition per the anchoring policy (transcript.AnchorSince):
@@ -574,9 +617,25 @@ func (s *Server) handleHook(req Request) {
 			now := time.Now()
 			prevStatusSince := info.StatusSince
 			info.StatusSince = transcript.AnchorSince(info.Transcript, now, prevStatusSince, status == state.StatusWorking, s.tun.TailBytes)
-			if status == state.StatusPermission {
-				info.PendingTool = req.ToolName // capture the tool the prompt is for (A2)
-			}
+		}
+
+		// Entry (plan §3.2): a PermissionRequest records the prompt under the WRITER
+		// that raised it — req.AgentID, already normalized at the top of this
+		// function, empty meaning the main thread.
+		//
+		// Deliberately OUTSIDE the transition block above. A second writer blocking
+		// while the chip is already red produces status == info.Status, so that block
+		// is skipped, and a prompt recorded there would be lost — which is precisely
+		// the case the scalar could not represent and the map exists for (case 18: two
+		// writers blocked, one resolving must not clear the chip).
+		//
+		// Claude-only. Codex records no approvals in its rollout and is exempt from
+		// the hold gate, so an entry written for it would never be resolved by
+		// anything and would latch a hydrated red forever after the next restart.
+		if agent == state.AgentKindClaude && req.Event == "PermissionRequest" {
+			info.SetPending(req.AgentID, state.PendingPrompt{
+				Tool: req.ToolName, InputHash: req.ToolInputHash, Since: time.Now(),
+			})
 		}
 		// Keep the stored identity on the LIVE session, last-hook-wins — the same
 		// rule info.Transcript already follows above. A session can rotate its id
@@ -675,6 +734,22 @@ func normalizeAgentID(id string) string {
 // the wrong color) — the reconciler demotes it to idle/orange instead. Anything
 // else holds red (case 12: a bare/sibling/teammate tool_result is not resolution,
 // and neither is an unrelated lifecycle event).
+//
+// ⚠ Two properties of the T5 map this rule now sits on, both of which plan T7
+// must preserve when it replaces the name match with (agent_id, tool_name,
+// inputHash):
+//
+//   - info.PendingTool is DERIVED from state.AgentInfo.Pending, so a prompt
+//     rebuilt at hydrate — which persists ownership only, never the correlators —
+//     leaves it empty. The `toolName != ""` guard therefore already makes a
+//     hydrated entry unmatchable, which is correct: it must resolve by transcript.
+//     Do NOT "fix" that by relaxing the rule to an agent_id-only match. Same-writer
+//     matching reads as sound ("a blocked writer runs no tools") and is not —
+//     Claude Code emits parallel tool_use blocks in one assistant message, so a
+//     writer can complete an auto-approved sibling while its own prompt still
+//     waits. That is the 2026-08-05 bug at a narrower radius.
+//   - the verdict is whole-SESSION, not per-writer. handleHook translates a clear
+//     into "drop every entry" for exactly that reason; narrowing it is T7/T9's.
 func (s *Server) clearsPermission(info *state.AgentInfo, event, toolName string) (clear bool, rule, reason string) {
 	nameMatch := s.tun.EarlyClearApproveByToolName && toolName != "" && toolName == info.PendingTool
 	teammateCollision := nameMatch && info.InFlightSubagents > 0
