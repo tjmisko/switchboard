@@ -450,8 +450,18 @@ func (s *Server) handleHook(req Request) {
 			// transcript anchor would let them read as post-transition signals and
 			// falsely re-green the chip (or release a still-pending red one). All
 			// three skew classes are in docs/timing-hazards.md (H1, H7, H8).
+			//
+			// The working anchor is floored at the chip's PREVIOUS StatusSince,
+			// captured here before the assignment overwrites it. info.Transcript is
+			// always the MAIN transcript, but a subagent's hooks are attributed to
+			// this session, so a teammate's PostToolUse would otherwise date the edge
+			// from whatever the main thread last wrote — minutes ago while it sits
+			// blocked — and an arbitrarily stale StatusSince defeats the reconciler's
+			// idle-title grace, which is the orange half of the oscillation in
+			// docs/subagent-permission-oscillation.md §3.3.
 			now := time.Now()
-			info.StatusSince = transcript.AnchorSince(info.Transcript, now, status == state.StatusWorking, s.tun.TailBytes)
+			prevStatusSince := info.StatusSince
+			info.StatusSince = transcript.AnchorSince(info.Transcript, now, prevStatusSince, status == state.StatusWorking, s.tun.TailBytes)
 			if status == state.StatusPermission {
 				info.PendingTool = req.ToolName // capture the tool the prompt is for (A2)
 			}
