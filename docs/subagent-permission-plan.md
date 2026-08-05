@@ -310,8 +310,8 @@ a persisted entry, never to manufacture one.
 persist   Pending's keys           → claude.pending_writers: ["main", "af5b…"]
 drop      Tool, InputHash          → re-earned from the next hook; loss costs latency only
 re-stamp  Since := startup         → unchanged from today's dropStaleSessions rule
-falsify   at hydrate, per writer   → a subagent whose jsonl shows no unmatched
-                                     trailing tool_use is dropped immediately
+falsify   at hydrate, per writer   → a writer whose own file shows NO unmatched
+                                     tool_use anywhere in the tail is dropped
 ```
 
 The one-line justification: **losing ownership is error #1, losing the
@@ -419,7 +419,7 @@ hold there either: the main jsonl carries the pending `tool_use` within ~5 s of
 the hook and keeps it unmatched for the whole wait. The claim is simply false and
 is scheduled for correction wherever it appears.
 
-But an unmatched trailing `tool_use` means "a tool is dispatched and has not
+But an unmatched `tool_use` means "a tool is dispatched and has not
 returned," which covers *awaiting approval* **and** *executing right now*. There
 is no third field that separates them. Re-deriving `Pending` from this signature
 would therefore raise a false RED on every session that happened to be mid-tool
@@ -429,8 +429,9 @@ with duration). Restarts land at arbitrary points in a session's life, so the
 false-positive rate is roughly the duty cycle of tool execution: high.
 
 The asymmetry is the whole decision: **the same check is unsound as a source and
-sound as a falsifier.** An unmatched trailing `tool_use` does not prove a prompt
-is pending, but its *absence* does prove the writer is no longer blocked — the
+sound as a falsifier.** An unmatched `tool_use` does not prove a prompt
+is pending, but its *absence anywhere in the tail* does prove the writer is no
+longer blocked — the
 tool returned, so whatever gate it was behind opened. Applied only to entries we
 already persisted, the check can only remove, so its worst outcome is shortening
 a red (#2/#3), never inventing or missing one.
