@@ -195,7 +195,7 @@ func TestObserveUsageEmitsOneSamplePerModel(t *testing.T) {
 	store.Apply(func(m map[int]*state.Session) { m[sess.PID] = sess })
 
 	// First pass primes the usage cursor to EOF — no sample for the baseline.
-	rs.sampleUsage(store.Snapshot(), sink, time.Now())
+	rs.sampleUsage(store.Snapshot(), nil, sink, time.Now())
 
 	// Two models accrue tokens while we watch.
 	f, _ := os.OpenFile(tpath, os.O_APPEND|os.O_WRONLY, 0o644)
@@ -204,7 +204,7 @@ func TestObserveUsageEmitsOneSamplePerModel(t *testing.T) {
 	f.WriteString(assistantUsageModelLine("claude-opus-4-8", 20, 8) + "\n")
 	f.Close()
 
-	rs.sampleUsage(store.Snapshot(), sink, time.Now())
+	rs.sampleUsage(store.Snapshot(), nil, sink, time.Now())
 	sink.Close()
 
 	samples := eventsOfType(readEvents(t, histDir), history.EventUsageSample)
@@ -463,14 +463,14 @@ func TestObserveUsagePrimesThenSamples(t *testing.T) {
 	store.Apply(func(m map[int]*state.Session) { m[sess.PID] = sess })
 
 	// First pass primes the usage cursor to EOF — no sample for the backlog.
-	rs.sampleUsage(store.Snapshot(), sink, time.Now())
+	rs.sampleUsage(store.Snapshot(), nil, sink, time.Now())
 
 	// New usage accrues while we watch.
 	f, _ := os.OpenFile(tpath, os.O_APPEND|os.O_WRONLY, 0o644)
 	f.WriteString(`{"type":"assistant","message":{"role":"assistant","content":[],"usage":{"input_tokens":120,"output_tokens":34}}}` + "\n")
 	f.Close()
 
-	rs.sampleUsage(store.Snapshot(), sink, time.Now())
+	rs.sampleUsage(store.Snapshot(), nil, sink, time.Now())
 	sink.Close()
 
 	samples := eventsOfType(readEvents(t, histDir), history.EventUsageSample)
@@ -479,5 +479,41 @@ func TestObserveUsagePrimesThenSamples(t *testing.T) {
 	}
 	if samples[0].TokIn != 120 || samples[0].TokOut != 34 {
 		t.Errorf("usage sample = %+v, want only the post-priming delta (120/34)", samples[0])
+	}
+}
+
+// Usage sampling used to run inside the Apply, AFTER sweepDeadSessions, whose
+// contract is that a dead session earns none of the tick's work. Moving it before
+// the lock moved it out from behind that sweep, so it has to carry the rule with
+// it: on the tick that discovers a claude has exited, the sweep closes its lane
+// with a session_end, and a usage_sample emitted in the same tick would attribute
+// tokens to a lane that is closing.
+func TestSampleUsageSkipsASessionWhoseProcessIsGone(t *testing.T) {
+	dir := t.TempDir()
+	tpath := filepath.Join(dir, "t.jsonl")
+	writeLines(t, tpath, `{"type":"system"}`)
+
+	histDir := t.TempDir()
+	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+	sess := &state.Session{PID: 9, Agent: "claude", CWD: "/home/u/proj",
+		Claude: &state.AgentInfo{SessionID: "s9", Transcript: tpath}}
+
+	store := state.New(filepath.Join(t.TempDir(), "state.json"))
+	store.Apply(func(m map[int]*state.Session) { m[sess.PID] = sess })
+
+	// Prime the cursor while the session is still alive.
+	rs.sampleUsage(store.Snapshot(), nil, sink, time.Now())
+
+	// The turn's last tokens land, and then the process exits before the next tick.
+	f, _ := os.OpenFile(tpath, os.O_APPEND|os.O_WRONLY, 0o644)
+	f.WriteString(assistantUsageModelLine("claude-opus-4-8", 77, 11) + "\n")
+	f.Close()
+
+	rs.sampleUsage(store.Snapshot(), map[int]bool{9: true}, sink, time.Now())
+	sink.Close()
+
+	if samples := eventsOfType(readEvents(t, histDir), history.EventUsageSample); len(samples) != 0 {
+		t.Fatalf("got %d usage samples for a session whose process is gone, want 0: %+v", len(samples), samples)
 	}
 }

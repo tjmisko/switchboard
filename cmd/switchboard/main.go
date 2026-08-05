@@ -212,6 +212,28 @@ func sessionDead(src osproc.Source, pid int) bool {
 	return discovery.Classify(info) == discovery.AgentNone
 }
 
+// deadSessions is the tick's liveness verdict for every session in its pre-lock
+// snapshot, by the same predicate sweepDeadSessions uses.
+//
+// It exists because sampling moved OUT of the Apply and therefore out from behind
+// sweepDeadSessions, which is what enforces "a dead session earns none of it".
+// Anything that samples before the lock and emits history has to carry that rule
+// with it; see sampleUsage, the one sampler that emits rather than staging.
+//
+// Read before the lock, one process read per session, which is where that read
+// belongs. A pid absent from the result is alive as far as this tick knows —
+// including a session that appeared after the snapshot, which is the safe default
+// (liveness is judged only on positive evidence of death, L4).
+func deadSessions(snap state.Snapshot, src osproc.Source) map[int]bool {
+	dead := map[int]bool{}
+	for _, sess := range snap.Sessions {
+		if sessionDead(src, sess.PID) {
+			dead[sess.PID] = true
+		}
+	}
+	return dead
+}
+
 // sweepDeadSessions closes the lane of every tracked session whose process is
 // definitively gone. It is the DURABLE backstop for session_end, and the reason
 // the daemon no longer depends on a death-watch surviving anything.
@@ -655,8 +677,11 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 	// used to happen inside the Apply below. See sampleFanout.
 	rstate.sampleFanout(snap)
 	// Usage moves out entirely rather than being sampled-then-applied: it mutates
-	// no session state, so nothing about it needs the lock. See sampleUsage.
-	rstate.sampleUsage(snap, sink, now)
+	// no session state, so nothing about it needs the lock. It is also the only
+	// sampler that EMITS out here rather than staging a result for the Apply, so it
+	// is the one that has to carry sweepDeadSessions' liveness rule out with it.
+	// See sampleUsage and deadSessions.
+	rstate.sampleUsage(snap, deadSessions(snap, stack.OSProc), sink, now)
 	// The two status self-heals' transcript reads. Their DECISIONS stay under the
 	// lock — only the reads move. See signalSample.
 	signals := sampleSignals(snap, tun)

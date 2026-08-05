@@ -340,6 +340,22 @@ func writeTranscript(t *testing.T, lines ...string) string {
 	return path
 }
 
+// appendTranscript adds lines to an existing transcript, modelling the file
+// growing under the daemon rather than being replaced.
+func appendTranscript(t *testing.T, path string, lines ...string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("append transcript: %v", err)
+	}
+	defer f.Close()
+	for _, l := range lines {
+		if _, err := f.WriteString(l + "\n"); err != nil {
+			t.Fatalf("append transcript: %v", err)
+		}
+	}
+}
+
 // permMap builds a session map holding a single "permission" session, as the
 // reconcile Apply would pass to selfHealStaleAttention.
 func permMap(transcriptPath string, since time.Time) map[int]*state.Session {

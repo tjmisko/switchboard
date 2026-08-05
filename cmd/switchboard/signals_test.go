@@ -31,8 +31,12 @@ func signalEnv(t *testing.T, status string, statusSince time.Time) (*state.Sessi
 }
 
 // The point of the hoist: the decision comes from reads taken before the lock.
-// The transcript is deleted after sampling, so an inline read would find nothing
-// and leave the chip green.
+//
+// Proving "did not read again" needs a change the sample survives, since the
+// guard now rejects a sample whose transcript moved (see freshFor). Making the
+// file unreadable is exactly that: os.Stat still answers, so the stamp is
+// unchanged and the sample stays valid, while an inline re-read would fail to
+// open the file and leave the chip green.
 func TestSelfHealStuckStatusUsesThePreLockSample(t *testing.T) {
 	since := time.Now().Add(-time.Minute)
 	sess, m, tpath := signalEnv(t, state.StatusWorking, since)
@@ -41,15 +45,49 @@ func TestSelfHealStuckStatusUsesThePreLockSample(t *testing.T) {
 	store.Apply(func(sm map[int]*state.Session) { sm[sess.PID] = sess })
 	signals := sampleSignals(store.Snapshot(), testTune)
 
-	if err := os.Remove(tpath); err != nil {
+	if err := os.Chmod(tpath, 0o000); err != nil {
 		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(tpath, 0o644) })
+	if f, err := os.Open(tpath); err == nil {
+		f.Close()
+		t.Skip("the transcript is still readable at mode 0000 — running as root?")
 	}
 
 	selfHealStuckStatus(m, time.Now(), testTune, nil, signals)
 
 	if sess.Claude.Status != state.StatusIdle {
-		t.Fatalf("status = %q, want idle from the sampled interrupt notice; an inline read would have found no file",
+		t.Fatalf("status = %q, want idle from the sampled interrupt notice; an inline read could not have opened the file",
 			sess.Claude.Status)
+	}
+}
+
+// The transcript is what both self-heals actually read, and the user can move it
+// without moving any of the session fields the guard compares. Answering a
+// permission prompt is exactly that: the file grows while Status stays
+// "permission" and StatusSince stays put — nothing has released the chip, which is
+// what the self-heal is for. A sample computed before the answer landed must not
+// be applied after it, or the red chip stays red for another whole tick.
+func TestSelfHealStaleAttentionRejectsASampleTakenBeforeTheAnswerLanded(t *testing.T) {
+	prompt := mustParse(t, "2026-06-01T21:39:00Z")
+	// Sampled while the prompt is genuinely unanswered: no resolution in the file.
+	tpath := writeTranscript(t, tResult("2026-06-01T21:39:10Z"))
+	m := permMap(tpath, prompt)
+	sess := m[100]
+
+	store := state.New(filepath.Join(t.TempDir(), "state.json"))
+	store.Apply(func(sm map[int]*state.Session) { sm[sess.PID] = sess })
+	signals := sampleSignals(store.Snapshot(), testTune)
+
+	// The user declines DURING the pre-lock window. Status, StatusSince and the
+	// path are all untouched — only the file moved.
+	appendTranscript(t, tpath, tInterrupt("2026-06-01T21:39:30Z"))
+
+	selfHealStaleAttention(m, prompt.Add(time.Minute), testTune, nil, signals)
+
+	if got := sess.Claude.Status; got == "permission" {
+		t.Fatal("the chip is still red a full tick after the prompt was declined: " +
+			"the sample was applied even though the transcript moved under it")
 	}
 }
 

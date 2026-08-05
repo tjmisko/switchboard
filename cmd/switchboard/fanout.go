@@ -197,11 +197,24 @@ func (rs *reconcileState) observeFanout(sink *history.Sink, sess *state.Session,
 // and returns without reading — so an audit that only looks at a newly-appeared
 // session concludes, wrongly, that this path is already cold-safe. Every tick
 // AFTER that reads the delta, and during an active turn the delta is real bytes.
-func (rs *reconcileState) sampleUsage(snap state.Snapshot, sink *history.Sink, now time.Time) {
+//
+// dead is the tick's liveness verdict, and skipping a dead session is not an
+// optimization — it is the one thing that moved out of the Apply and had to be
+// carried out with it. Under the lock this ran AFTER sweepDeadSessions, whose
+// contract is that "a dead session earns none of it": on the tick that discovers
+// a claude has exited, the sweep closes its lane with a session_end. Out here,
+// ungated, it would first read the dead session's transcript, advance a cursor
+// for a pid that no longer exists, and record a usage_sample — tokens attributed
+// to a lane that the same Apply then closes.
+//
+// A session that dies between the liveness read and the Apply still samples, and
+// that is the correct worst case: the sample is recorded before the session_end
+// (same tick clock, earlier in the sink), never after it.
+func (rs *reconcileState) sampleUsage(snap state.Snapshot, dead map[int]bool, sink *history.Sink, now time.Time) {
 	for _, s := range snap.Sessions {
 		sess := s
 		c := sess.Claude
-		if c == nil || c.Transcript == "" {
+		if c == nil || c.Transcript == "" || dead[sess.PID] {
 			continue
 		}
 		rs.observeUsage(sink, &sess, c, now)
