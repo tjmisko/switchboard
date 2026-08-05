@@ -16,6 +16,19 @@ const (
 	// RuleHoldBareResult — a PostToolUse was NOT allowed to clear red: it was a
 	// sibling/Task completion, not the prompt resolving. The missed-RED guard.
 	RuleHoldBareResult = "case12-hold-bare-result"
+	// RuleHoldTeammateCollision — a PostToolUse whose tool_name DID match the
+	// pending prompt's was still refused the fast path, because subagents are in
+	// flight and tool_name is a tool *kind*, not a tool *identity*: a teammate
+	// running the same kind of tool (Bash, constantly) satisfies the match. The
+	// 2026-08-05 lost-RED edge (docs/subagent-permission-oscillation.md §3.1).
+	RuleHoldTeammateCollision = "case12-hold-teammate-collision"
+	// RuleHoldNonToolEvent — a non-tool hook event (Stop / UserPromptSubmit /
+	// SessionStart) tried to move the chip off permission and was held: it carries
+	// no evidence about the prompt at all, and the transcript did not show the turn
+	// resumed. Defect 5 of the same incident (§3.5) — the hold gate used to guard
+	// only PostToolUse, so the main thread merely finishing its turn discarded a
+	// teammate's red.
+	RuleHoldNonToolEvent = "case12-hold-nontool-event"
 
 	// RuleApproveResume — reconciler exit: an assistant message advanced past the
 	// prompt → working (green), directly, no orange bounce.
@@ -60,18 +73,20 @@ type KnobHint struct {
 // exhaustive over the Rule* constants (TestRuleKnobCoverage enforces it) so the
 // diagnose command can always answer "what do I change?".
 var ruleKnobs = map[string]KnobHint{
-	RuleApproveToolMatch:  {"EarlyClearApproveByToolName", "set false to require the transcript to confirm resume before clearing red (slower, but no tool-name guessing)"},
-	RuleApproveTranscript: {"ResumeExitStatus", "the color a red chip exits to when the turn resumes (default working/green)"},
-	RuleApproveResume:     {"ResumeExitStatus", "the color a red chip exits to when the turn resumes (default working/green)"},
-	RuleDeclineIdle:       {"InterruptExitStatus", "the color a red chip exits to when interrupted/declined with no teammates (default idle/orange)"},
-	RuleDeclineDelegating: {"EscWithTeammatesStatus", "the color when interrupted/declined while teammates are in flight (default delegating/green)"},
-	RuleTTLBackstop:       {"PermissionDecayTTL", "how long an unreadable-transcript red chip waits before the backstop releases it (default 30s)"},
-	RuleDelegating:        {"DelegatingEnabled", "set false to keep an idle-with-teammates chip orange instead of green"},
-	RuleDrained:           {"DelegatingEnabled", "set false to disable the delegating state entirely"},
-	RuleHoldBareResult:    {"", "intentional missed-RED guard: a bare/Task PostToolUse must not clear a pending prompt — there is no knob, and loosening it risks the worst error (a blocked agent shown not-red)"},
-	RuleResumeActivity:    {"", "pure transcript-signal edge (idle→working on fresh activity); not tunable — adjust upstream signal classification in package transcript if it misfires"},
-	RuleInterrupt:         {"", "pure transcript-signal edge (working→idle on an interrupt notice); not tunable — see package transcript"},
-	RuleIdleTitle:         {"IdleTitleDemotionEnabled", "set false to never demote a green chip on an idle pane title; IdleTitleGrace delays it, IdleTitleGlyphs names the glyphs that count as idle"},
+	RuleApproveToolMatch:      {"EarlyClearApproveByToolName", "set false to require the transcript to confirm resume before clearing red (slower, but no tool-name guessing)"},
+	RuleApproveTranscript:     {"ResumeExitStatus", "the color a red chip exits to when the turn resumes (default working/green)"},
+	RuleApproveResume:         {"ResumeExitStatus", "the color a red chip exits to when the turn resumes (default working/green)"},
+	RuleDeclineIdle:           {"InterruptExitStatus", "the color a red chip exits to when interrupted/declined with no teammates (default idle/orange)"},
+	RuleDeclineDelegating:     {"EscWithTeammatesStatus", "the color when interrupted/declined while teammates are in flight (default delegating/green)"},
+	RuleTTLBackstop:           {"PermissionDecayTTL", "how long an unreadable-transcript red chip waits before the backstop releases it (default 30s)"},
+	RuleDelegating:            {"DelegatingEnabled", "set false to keep an idle-with-teammates chip orange instead of green"},
+	RuleDrained:               {"DelegatingEnabled", "set false to disable the delegating state entirely"},
+	RuleHoldBareResult:        {"", "intentional missed-RED guard: a bare/Task PostToolUse must not clear a pending prompt — there is no knob, and loosening it risks the worst error (a blocked agent shown not-red)"},
+	RuleHoldTeammateCollision: {"", "intentional missed-RED guard: with subagents in flight a tool_name match is a tool KIND collision, not the approved tool completing — there is no knob (EarlyClearApproveByToolName only turns the fast path further off). It costs approve-path latency in fanned-out sessions until (agent_id, tool_name, input) matching lands; a missed RED is the worse error"},
+	RuleHoldNonToolEvent:      {"", "intentional missed-RED guard: Stop/UserPromptSubmit/SessionStart carry no evidence about the pending prompt, so they may not repaint the chip — there is no knob. A queued message during a pending prompt is common, which is why UserPromptSubmit is not exempt (plan Q6)"},
+	RuleResumeActivity:        {"", "pure transcript-signal edge (idle→working on fresh activity); not tunable — adjust upstream signal classification in package transcript if it misfires"},
+	RuleInterrupt:             {"", "pure transcript-signal edge (working→idle on an interrupt notice); not tunable — see package transcript"},
+	RuleIdleTitle:             {"IdleTitleDemotionEnabled", "set false to never demote a green chip on an idle pane title; IdleTitleGrace delays it, IdleTitleGlyphs names the glyphs that count as idle"},
 }
 
 // RuleKnob returns the tuning hint for a rule id. An unknown rule yields a zero

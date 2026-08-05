@@ -368,33 +368,67 @@ func (s *Server) handleHook(req Request) {
 			info.Transcript = req.Transcript
 		}
 
+		// T1 instrumentation (docs/subagent-permission-plan.md): the one empirical
+		// gap in the hook-schema work is whether agent_id is actually non-empty
+		// end-to-end for a subagent-raised prompt. Log it where it decides
+		// something and nowhere else, so the journal stays readable: every
+		// PermissionRequest (rare), and a PostToolUse only while the chip is
+		// already red (the window in which the id would gate the clear).
+		// Deliberately NOT the `status: pid=` shape — switchboard-ctl diagnose
+		// parses that format via statustune.ParseDecision.
+		if agent == state.AgentKindClaude &&
+			(req.Event == "PermissionRequest" || (req.Event == "PostToolUse" && info.Status == state.StatusPermission)) {
+			log.Printf("hook-identity: pid=%d %s event=%s agent_id=%q agent_type=%q tool=%q chip=%s pending=%q S=%d",
+				pid, sessionLabel(sess, req.SessionID), req.Event, req.AgentID, req.AgentType,
+				req.ToolName, info.Status, info.PendingTool, info.InFlightSubagents)
+		}
+
 		// A "permission" chip must stay red until the *prompt itself* resolves —
-		// not merely until some tool finishes. PostToolUse fires for EVERY tool
-		// that completes, including a sibling tool in the same turn or a background
-		// subagent's Task that lands while an interactive prompt (AskUserQuestion /
-		// plan / approval) is still waiting on the user. Honoring it blindly flips
-		// the red chip green the instant any such tool completes. clearsPermission
-		// gates it two ways (see there): the identity-correlated fast path (the
-		// approved tool's own PostToolUse, by tool_name) clears at hook speed; else
-		// the transcript must show the turn resumed. A bare/Task tool_result is not
-		// resolution, so the chip holds red — the reconciler's TTL backstop decays a
-		// truly stuck one. Codex is exempt: it records no approvals in its rollout,
-		// so a codex PostToolUse advances straight to working without this guard.
+		// not merely until some tool finishes, and not merely because some other
+		// hook fired. PostToolUse fires for EVERY tool that completes, including a
+		// sibling tool in the same turn or a teammate subagent's tool that lands
+		// while an interactive prompt (AskUserQuestion / plan / approval) is still
+		// waiting on the user; and Stop / UserPromptSubmit / SessionStart carry no
+		// evidence about the prompt at all. Honoring any of them blindly repaints
+		// the red chip the instant unrelated work happens.
+		//
+		// So the gate covers EVERY event that would move the chip off permission,
+		// not just PostToolUse (defect 5 of docs/subagent-permission-oscillation.md
+		// §3.5: with a teammate blocked, the main thread merely finishing its turn
+		// used to repaint the chip orange and discard the red). clearsPermission is
+		// the single door out: the fast path (the approved tool's own PostToolUse,
+		// by tool_name) clears at hook speed, else the transcript must show the turn
+		// resumed. Anything else holds red — the reconciler's TTL backstop decays a
+		// truly stuck one.
+		//
+		// Three behaviors are preserved deliberately:
+		//   - codex is exempt (it records no approvals in its rollout, so a codex
+		//     PostToolUse advances straight to working without this guard);
+		//   - a fresh PermissionRequest is not gated — it maps to "permission"
+		//     itself, so it never moves the chip OFF red;
+		//   - SubagentStart/Stop map to "" (status unchanged) and so fall through
+		//     to the fanout re-scan below, untouched.
+		//
+		// UserPromptSubmit is NOT exempt (plan Q6). Typing during a pending prompt
+		// is evidence the user is at the keyboard, but queueing a message while a
+		// prompt waits is common enough that treating it as an answer would
+		// reintroduce the missed RED. Revisit only if it produces a felt stale red.
 		gateLogged := false
 		// transitionRule/Reason carry the permission-gate's decision into the
 		// history event below, so an approve-cleared edge records WHY it cleared
 		// (the plain hook edges leave them empty).
 		var transitionRule, transitionReason string
-		if agent == state.AgentKindClaude && status == "working" && req.Event == "PostToolUse" && info.Status == "permission" {
-			clear, rule, reason := s.clearsPermission(info, req.ToolName)
+		if agent == state.AgentKindClaude && info.Status == state.StatusPermission &&
+			status != "" && status != state.StatusPermission {
+			clear, rule, reason := s.clearsPermission(info, req.Event, req.ToolName)
 			d := statustune.Decision{
 				PID: pid, Session: shortID(coalesce(req.SessionID, info.SessionID)),
-				From: "permission", To: "permission", Rule: rule, Reason: reason,
+				From: state.StatusPermission, To: state.StatusPermission, Rule: rule, Reason: reason,
 				Pending: info.PendingTool, Subagents: info.InFlightSubagents,
 				Age: time.Since(info.StatusSince),
 			}
 			if clear {
-				d.To = "working"
+				d.To = status
 				transitionRule, transitionReason = rule, reason
 			} else {
 				status = "" // hold red
@@ -487,26 +521,50 @@ func (s *Server) handleHook(req Request) {
 	})
 }
 
-// clearsPermission decides whether a PostToolUse should release a red chip and
+// clearsPermission decides whether a hook event should release a red chip and
 // names the rule/reason for the forensic decision log. Two gates, fast first:
 //
-//   - identity-correlated fast path (A2): the PostToolUse's tool_name matches the
-//     tool the prompt was raised for (PendingTool), i.e. the *approved* tool just
+//   - tool-name fast path (A2): the PostToolUse's tool_name matches the tool the
+//     prompt was raised for (PendingTool), i.e. the *approved* tool just
 //     completed. Clears at hook speed — the fix for the ~26s approve-path lag.
+//     Refused while subagents are in flight, see below.
 //   - transcript fallback: the main thread produced an assistant message after the
 //     prompt (ResolutionResumed), i.e. the turn resumed. Covers the case where the
-//     tool_name was not forwarded.
+//     tool_name was not forwarded, and every non-tool event (Stop /
+//     UserPromptSubmit / SessionStart), which carries no tool_name at all.
+//
+// ⚠ The fast path is a comparison on a tool *kind*, not a tool *identity*. With
+// any subagent in flight, a teammate running the same kind of tool satisfies it —
+// and the tool in question is usually Bash, the most frequently executed tool
+// there is. That is the 2026-08-05 lost RED verbatim: at 12:38:20 this guard
+// correctly held, and one second later a teammate's Bash cleared the same pending
+// Bash prompt (docs/subagent-permission-oscillation.md §2.2/§3.1). So with
+// InFlightSubagents > 0 the fast path is refused outright and the transcript
+// fallback decides. This deliberately trades back some of the approve-path
+// latency the fast path bought, but only in sessions with teammates in flight,
+// and only until (agent_id, tool_name, tool_input) matching lands (plan T7): a
+// missed RED is the worst error and a slow-but-correct clear is the cheapest.
 //
 // A decline/interrupt deliberately does NOT clear here (it fires no PostToolUse;
 // and exiting a hook-driven *working* edge to green on an interrupt would paint
 // the wrong color) — the reconciler demotes it to idle/orange instead. Anything
-// else holds red (case 12: a bare/sibling/Task tool_result is not resolution).
-func (s *Server) clearsPermission(info *state.AgentInfo, toolName string) (clear bool, rule, reason string) {
-	if s.tun.EarlyClearApproveByToolName && toolName != "" && toolName == info.PendingTool {
+// else holds red (case 12: a bare/sibling/teammate tool_result is not resolution,
+// and neither is an unrelated lifecycle event).
+func (s *Server) clearsPermission(info *state.AgentInfo, event, toolName string) (clear bool, rule, reason string) {
+	nameMatch := s.tun.EarlyClearApproveByToolName && toolName != "" && toolName == info.PendingTool
+	teammateCollision := nameMatch && info.InFlightSubagents > 0
+	if nameMatch && !teammateCollision {
 		return true, statustune.RuleApproveToolMatch, "tool-name match: " + toolName
 	}
 	if k, _ := transcript.ResolveKind(info.Transcript, info.StatusSince, s.tun.TailBytes); k == transcript.ResolutionResumed {
 		return true, statustune.RuleApproveTranscript, "transcript: turn resumed"
+	}
+	if teammateCollision {
+		return false, statustune.RuleHoldTeammateCollision,
+			fmt.Sprintf("tool-name match on %s but %d subagent(s) in flight — kind, not identity", toolName, info.InFlightSubagents)
+	}
+	if event != "PostToolUse" {
+		return false, statustune.RuleHoldNonToolEvent, "prompt still pending; " + event + " is not evidence"
 	}
 	return false, statustune.RuleHoldBareResult, "prompt still pending"
 }
