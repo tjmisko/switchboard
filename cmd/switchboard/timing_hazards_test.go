@@ -234,8 +234,8 @@ func TestTimingHazards(t *testing.T) {
 				m[100].Agent = state.AgentKindClaude
 				m[100].Wezterm = &state.WeztermInfo{Title: h.title, TitleAt: reconcileNow.Add(-time.Second)}
 			}
-			selfHealStaleAttention(m, reconcileNow, testTune, nil)
-			selfHealStuckStatus(m, reconcileNow, testTune, nil)
+			selfHealStaleAttention(m, reconcileNow, testTune, nil, noSignals)
+			selfHealStuckStatus(m, reconcileNow, testTune, nil, noSignals)
 
 			if got := m[100].Claude.Status; got != h.want {
 				t.Errorf("status = %q, want %q", got, h.want)
@@ -294,7 +294,7 @@ func TestIdleTitleDemotion(t *testing.T) {
 			}
 			tun := testTune
 			tun.IdleTitleDemotionEnabled = !tc.disabled
-			selfHealStuckStatus(m, now, tun, nil)
+			selfHealStuckStatus(m, now, tun, nil, noSignals)
 			if got := m[100].Claude.Status; got != tc.want {
 				t.Errorf("status = %q, want %q", got, tc.want)
 			}

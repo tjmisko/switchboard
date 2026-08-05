@@ -18,6 +18,13 @@ import (
 // delegating on, resume→working, interrupt→idle).
 var testTune = statustune.Default()
 
+// noSignals means "no pre-lock sample for any session", which makes both
+// self-heals read the transcript inline — the path they took before the reads
+// were hoisted. The decision logic is identical either way, so the existing
+// self-heal tests deliberately exercise the inline path; the sampled path has its
+// own tests in signals_test.go.
+var noSignals map[int]signalSample
+
 // TestPermissionExit pins the §5 case table for how a red chip exits: resolution
 // KIND (not just "resolved?") plus the subagent count select the exit color.
 func TestPermissionExit(t *testing.T) {
@@ -89,7 +96,7 @@ func TestSelfHealStaleAttentionLogsDecay(t *testing.T) {
 
 	m := permMap(writeTranscript(t, tInterrupt("2026-06-01T21:39:30Z")), since)
 	m[100].Claude.SessionID = "ce13c0f2-aaaa"
-	selfHealStaleAttention(m, now, testTune, nil)
+	selfHealStaleAttention(m, now, testTune, nil, noSignals)
 	if !strings.Contains(buf.String(), "status: pid=100 session=ce13c0f2 permission->idle rule=case10-decline-idle") {
 		t.Errorf("missing decay log line in:\n%s", buf.String())
 	}
@@ -98,7 +105,7 @@ func TestSelfHealStaleAttentionLogsDecay(t *testing.T) {
 	// resolve it, so the chip stays red and nothing is logged.
 	buf.Reset()
 	m = permMap(writeTranscript(t, tResult("2026-06-01T21:39:30Z")), since)
-	selfHealStaleAttention(m, now, testTune, nil)
+	selfHealStaleAttention(m, now, testTune, nil, noSignals)
 	if buf.Len() != 0 {
 		t.Errorf("preserved chip logged %q, want silence", buf.String())
 	}
@@ -114,7 +121,7 @@ func TestSelfHealStuckStatus(t *testing.T) {
 		log.SetOutput(&buf)
 
 		m := stuckMap("idle", writeTranscript(t, tResult("2026-06-01T21:39:30Z")), since)
-		selfHealStuckStatus(m, now, testTune, nil)
+		selfHealStuckStatus(m, now, testTune, nil, noSignals)
 		if got := m[100].Claude.Status; got != "working" {
 			t.Fatalf("status = %q, want working", got)
 		}
@@ -128,7 +135,7 @@ func TestSelfHealStuckStatus(t *testing.T) {
 
 	t.Run("should keep idle when the newest activity predates the chip", func(t *testing.T) {
 		m := stuckMap("idle", writeTranscript(t, tAssistant("2026-06-01T21:38:00Z")), since)
-		selfHealStuckStatus(m, now, testTune, nil)
+		selfHealStuckStatus(m, now, testTune, nil, noSignals)
 		if got := m[100].Claude.Status; got != "idle" {
 			t.Errorf("status = %q, want idle (no fresh activity)", got)
 		}
@@ -141,7 +148,7 @@ func TestSelfHealStuckStatus(t *testing.T) {
 		// chip back to green — where it latched, since a `!` command fires no Stop hook
 		// to bring it back down. A local command must not count as a resume signal.
 		m := stuckMap("idle", writeTranscript(t, tAssistant("2026-06-01T21:38:00Z"), tBash("2026-06-01T21:39:40Z")), since)
-		selfHealStuckStatus(m, now, testTune, nil)
+		selfHealStuckStatus(m, now, testTune, nil, noSignals)
 		if got := m[100].Claude.Status; got != "idle" {
 			t.Errorf("status = %q, want idle (a bash command is not agent activity)", got)
 		}
@@ -152,7 +159,7 @@ func TestSelfHealStuckStatus(t *testing.T) {
 		// no timestamp; the newest conversational entry predates the chip, so it
 		// must not be mistaken for fresh activity.
 		m := stuckMap("idle", writeTranscript(t, tAssistant("2026-06-01T21:38:00Z"), tMeta), since)
-		selfHealStuckStatus(m, now, testTune, nil)
+		selfHealStuckStatus(m, now, testTune, nil, noSignals)
 		if got := m[100].Claude.Status; got != "idle" {
 			t.Errorf("status = %q, want idle (metadata is not activity)", got)
 		}
@@ -164,7 +171,7 @@ func TestSelfHealStuckStatus(t *testing.T) {
 		log.SetOutput(&buf)
 
 		m := stuckMap("working", writeTranscript(t, tInterrupt("2026-06-01T21:39:30Z")), since)
-		selfHealStuckStatus(m, now, testTune, nil)
+		selfHealStuckStatus(m, now, testTune, nil, noSignals)
 		if got := m[100].Claude.Status; got != "idle" {
 			t.Fatalf("status = %q, want idle", got)
 		}
@@ -177,7 +184,7 @@ func TestSelfHealStuckStatus(t *testing.T) {
 		// A long tool run / active turn writes activity, never the interrupt marker,
 		// so a busy session is never falsely decayed.
 		m := stuckMap("working", writeTranscript(t, tAssistant("2026-06-01T21:39:30Z"), tResult("2026-06-01T21:39:40Z")), since)
-		selfHealStuckStatus(m, now, testTune, nil)
+		selfHealStuckStatus(m, now, testTune, nil, noSignals)
 		if got := m[100].Claude.Status; got != "working" {
 			t.Errorf("status = %q, want working (no interrupt → no decay)", got)
 		}
@@ -192,7 +199,7 @@ func TestSelfHealStuckStatus(t *testing.T) {
 			t.Fatalf("chtimes: %v", err)
 		}
 		m := stuckMap("idle", path, since)
-		selfHealStuckStatus(m, now, testTune, nil)
+		selfHealStuckStatus(m, now, testTune, nil, noSignals)
 		if got := m[100].Claude.Status; got != "idle" {
 			t.Errorf("status = %q, want idle (mtime pre-gate skips the read)", got)
 		}
@@ -200,7 +207,7 @@ func TestSelfHealStuckStatus(t *testing.T) {
 
 	t.Run("should leave a permission session untouched", func(t *testing.T) {
 		m := stuckMap("permission", writeTranscript(t, tResult("2026-06-01T21:39:30Z")), since)
-		selfHealStuckStatus(m, now, testTune, nil)
+		selfHealStuckStatus(m, now, testTune, nil, noSignals)
 		if got := m[100].Claude.Status; got != "permission" {
 			t.Errorf("status = %q, want permission (owned by selfHealStaleAttention)", got)
 		}
@@ -211,8 +218,8 @@ func TestSelfHealStuckStatus(t *testing.T) {
 		// StatusSince=now, and the resolving interrupt notice (older than now) must
 		// not then be read as fresh activity by selfHealStuckStatus.
 		m := permMap(writeTranscript(t, tInterrupt("2026-06-01T21:39:30Z")), since)
-		selfHealStaleAttention(m, now, testTune, nil)
-		selfHealStuckStatus(m, now, testTune, nil)
+		selfHealStaleAttention(m, now, testTune, nil, noSignals)
+		selfHealStuckStatus(m, now, testTune, nil, noSignals)
 		if got := m[100].Claude.Status; got != "idle" {
 			t.Errorf("status = %q, want idle (no immediate re-flip to working)", got)
 		}
@@ -235,7 +242,7 @@ func TestSelfHealStuckStatus(t *testing.T) {
 		}
 		m := stuckMap("idle", path, since)
 		m[100].Claude.InFlightSubagents = 2
-		selfHealStuckStatus(m, now, testTune, nil)
+		selfHealStuckStatus(m, now, testTune, nil, noSignals)
 		if got := m[100].Claude.Status; got != "delegating" {
 			t.Fatalf("status = %q, want delegating", got)
 		}
@@ -247,7 +254,7 @@ func TestSelfHealStuckStatus(t *testing.T) {
 	t.Run("should revert delegating to idle when the last teammate drains", func(t *testing.T) {
 		m := stuckMap("delegating", writeTranscript(t, tAssistant("2026-06-01T21:30:00Z")), since)
 		m[100].Claude.InFlightSubagents = 0
-		selfHealStuckStatus(m, now, testTune, nil)
+		selfHealStuckStatus(m, now, testTune, nil, noSignals)
 		if got := m[100].Claude.Status; got != "idle" {
 			t.Errorf("status = %q, want idle (subagents drained)", got)
 		}
@@ -256,7 +263,7 @@ func TestSelfHealStuckStatus(t *testing.T) {
 	t.Run("should keep delegating while subagents remain in flight", func(t *testing.T) {
 		m := stuckMap("delegating", writeTranscript(t, tAssistant("2026-06-01T21:30:00Z")), since)
 		m[100].Claude.InFlightSubagents = 1
-		selfHealStuckStatus(m, now, testTune, nil)
+		selfHealStuckStatus(m, now, testTune, nil, noSignals)
 		if got := m[100].Claude.Status; got != "delegating" {
 			t.Errorf("status = %q, want delegating (still in flight)", got)
 		}
@@ -267,7 +274,7 @@ func TestSelfHealStuckStatus(t *testing.T) {
 		tun.DelegatingEnabled = false
 		m := stuckMap("idle", writeTranscript(t, tAssistant("2026-06-01T21:30:00Z")), since)
 		m[100].Claude.InFlightSubagents = 2
-		selfHealStuckStatus(m, now, tun, nil)
+		selfHealStuckStatus(m, now, tun, nil, noSignals)
 		if got := m[100].Claude.Status; got != "idle" {
 			t.Errorf("status = %q, want idle (delegating disabled)", got)
 		}
@@ -354,7 +361,7 @@ func TestSelfHealStaleAttention(t *testing.T) {
 
 	t.Run("should demote permission to idle when an interrupt notice lands after the prompt (declined)", func(t *testing.T) {
 		m := permMap(writeTranscript(t, tInterrupt("2026-06-01T21:39:30Z")), since)
-		selfHealStaleAttention(m, now, testTune, nil)
+		selfHealStaleAttention(m, now, testTune, nil, noSignals)
 		if got := m[100].Claude.Status; got != "idle" {
 			t.Errorf("status = %q, want idle", got)
 		}
@@ -364,7 +371,7 @@ func TestSelfHealStaleAttention(t *testing.T) {
 		// A1/P3: an approved prompt's turn resuming goes straight to green, not
 		// through orange — work is happening again, no action needed.
 		m := permMap(writeTranscript(t, tAssistant("2026-06-01T21:39:30Z")), since)
-		selfHealStaleAttention(m, now, testTune, nil)
+		selfHealStaleAttention(m, now, testTune, nil, noSignals)
 		if got := m[100].Claude.Status; got != "working" {
 			t.Errorf("status = %q, want working (approved → resumed → green)", got)
 		}
@@ -373,7 +380,7 @@ func TestSelfHealStaleAttention(t *testing.T) {
 	t.Run("should exit permission to DELEGATING (green) when interrupted with teammates still in flight (case 11/Q3)", func(t *testing.T) {
 		m := permMap(writeTranscript(t, tInterrupt("2026-06-01T21:39:30Z")), since)
 		m[100].Claude.InFlightSubagents = 1
-		selfHealStaleAttention(m, now, testTune, nil)
+		selfHealStaleAttention(m, now, testTune, nil, noSignals)
 		if got := m[100].Claude.Status; got != "delegating" {
 			t.Errorf("status = %q, want delegating (interrupt but work continues)", got)
 		}
@@ -385,7 +392,7 @@ func TestSelfHealStaleAttention(t *testing.T) {
 		// genuinely pending. None of that is the user's decision, so the chip must
 		// stay red — even long after, since pending must keep nagging.
 		m := permMap(writeTranscript(t, tResult("2026-06-01T21:39:30Z"), tResult("2026-06-01T21:40:00Z")), since)
-		selfHealStaleAttention(m, now.Add(time.Hour), testTune, nil)
+		selfHealStaleAttention(m, now.Add(time.Hour), testTune, nil, noSignals)
 		if got := m[100].Claude.Status; got != "permission" {
 			t.Errorf("status = %q, want permission (concurrent work is not a decision)", got)
 		}
@@ -396,7 +403,7 @@ func TestSelfHealStaleAttention(t *testing.T) {
 		// previous assistant turn, dated before the chip went red. This is the
 		// nginx-template-setup over-demotion regression.
 		m := permMap(writeTranscript(t, tAssistant("2026-06-01T21:36:45Z")), since)
-		selfHealStaleAttention(m, now.Add(time.Hour), testTune, nil) // even long after
+		selfHealStaleAttention(m, now.Add(time.Hour), testTune, nil, noSignals) // even long after
 		if got := m[100].Claude.Status; got != "permission" {
 			t.Errorf("status = %q, want permission (pending must keep nagging)", got)
 		}
@@ -404,7 +411,7 @@ func TestSelfHealStaleAttention(t *testing.T) {
 
 	t.Run("should demote when the transcript is unreadable and the ttl elapsed", func(t *testing.T) {
 		m := permMap("/no/such/transcript.jsonl", now.Add(-2*testTune.PermissionDecayTTL))
-		selfHealStaleAttention(m, now, testTune, nil)
+		selfHealStaleAttention(m, now, testTune, nil, noSignals)
 		if got := m[100].Claude.Status; got != "idle" {
 			t.Errorf("status = %q, want idle (fail-soft backstop)", got)
 		}
@@ -412,7 +419,7 @@ func TestSelfHealStaleAttention(t *testing.T) {
 
 	t.Run("should keep permission when the transcript is unreadable but within the ttl", func(t *testing.T) {
 		m := permMap("", now) // empty path, fresh
-		selfHealStaleAttention(m, now, testTune, nil)
+		selfHealStaleAttention(m, now, testTune, nil, noSignals)
 		if got := m[100].Claude.Status; got != "permission" {
 			t.Errorf("status = %q, want permission (too soon to give up)", got)
 		}
@@ -424,7 +431,7 @@ func TestSelfHealStaleAttention(t *testing.T) {
 			2: {PID: 2, Claude: &state.ClaudeInfo{Status: "idle"}},
 			3: {PID: 3}, // no Claude block at all
 		}
-		selfHealStaleAttention(m, now, testTune, nil)
+		selfHealStaleAttention(m, now, testTune, nil, noSignals)
 		if got := m[1].Claude.Status; got != "working" {
 			t.Errorf("working session changed to %q", got)
 		}

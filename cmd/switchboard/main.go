@@ -582,6 +582,9 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 	// Usage moves out entirely rather than being sampled-then-applied: it mutates
 	// no session state, so nothing about it needs the lock. See sampleUsage.
 	rstate.sampleUsage(store, sink, now)
+	// The two status self-heals' transcript reads. Their DECISIONS stay under the
+	// lock — only the reads move. See signalSample.
+	signals := sampleSignals(store, tun)
 	store.Apply(func(m map[int]*state.Session) {
 		// Close the lanes of any session whose process is gone, BEFORE the per-tick
 		// work below — a dead session earns none of it.
@@ -630,8 +633,8 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 		// the live socket2 stream missed) and record a focus edge on a real change.
 		// Runs after the resolve loop so every session's Hyprland address is current.
 		applyFocus(m, active, sink, now)
-		selfHealStaleAttention(m, now, tun, sink)
-		selfHealStuckStatus(m, now, tun, sink)
+		selfHealStaleAttention(m, now, tun, sink, signals)
+		selfHealStuckStatus(m, now, tun, sink, signals)
 		rstate.prune(m)
 	})
 }
@@ -715,15 +718,18 @@ func enrichmentID(s *state.Session) string {
 // directly (no shared-pointer race) and folds into the tick's single persist.
 // The bounded transcript read under the lock is consistent with the per-session
 // /proc and WM I/O the same loop already performs.
-func selfHealStaleAttention(m map[int]*state.Session, now time.Time, tun statustune.Tuning, sink *history.Sink) {
+func selfHealStaleAttention(m map[int]*state.Session, now time.Time, tun statustune.Tuning, sink *history.Sink, samples map[int]signalSample) {
 	for _, sess := range m {
 		c := sess.Claude
 		if c == nil || c.Status != state.StatusPermission {
 			continue
 		}
 		age := now.Sub(c.StatusSince)
-		kind, err := transcript.ResolveKind(c.Transcript, c.StatusSince, tun.TailBytes)
-		exit, rule, reason, ok := permissionExit(kind, err != nil, age, c.InFlightSubagents, tun)
+		s := samples[sess.PID]
+		if !s.freshFor(c) || !s.resolved {
+			s = readSignals(c, tun) // no usable sample: read inline, as this always did
+		}
+		exit, rule, reason, ok := permissionExit(s.resolution, s.resolutionErr, age, c.InFlightSubagents, tun)
 		if !ok {
 			continue // still pending (or too soon to give up) → keep red, silently
 		}
@@ -766,7 +772,7 @@ func selfHealStaleAttention(m map[int]*state.Session, now time.Time, tun statust
 // multi-minute tool run writes nothing to the transcript for the duration, so a
 // TTL would wrongly decay a genuinely busy session; the marker has no such
 // false-positive (a completed tool records "interrupted":false, not a text block).
-func selfHealStuckStatus(m map[int]*state.Session, now time.Time, tun statustune.Tuning, sink *history.Sink) {
+func selfHealStuckStatus(m map[int]*state.Session, now time.Time, tun statustune.Tuning, sink *history.Sink, samples map[int]signalSample) {
 	for _, sess := range m {
 		c := sess.Claude
 		if c == nil {
@@ -823,15 +829,18 @@ func selfHealStuckStatus(m map[int]*state.Session, now time.Time, tun statustune
 		if c.Status != state.StatusIdle && c.Status != state.StatusWorking {
 			continue
 		}
-		// A cheap stat short-circuits the quiescent case: if nothing was written
-		// since the chip transitioned, no signal can be newer than it. (Delegating
-		// is handled above precisely because this gate would skip it.)
-		fi, err := os.Stat(c.Transcript)
-		if err != nil || !fi.ModTime().After(c.StatusSince) {
+		// The stat short-circuit and the tail read both happen in readSignals now,
+		// before the lock. (Delegating is handled above precisely because the stat
+		// gate would skip it.)
+		s := samples[sess.PID]
+		if !s.freshFor(c) {
+			s = readSignals(c, tun) // no usable sample: read inline, as this always did
+		}
+		if s.quiescent {
 			continue
 		}
-		kind, ts, err := transcript.NewestSignal(c.Transcript, tun.TailBytes)
-		if err != nil || kind == transcript.SignalNone || !ts.After(c.StatusSince) {
+		kind, ts := s.kind, s.kindTs
+		if s.kindErr || kind == transcript.SignalNone || !ts.After(c.StatusSince) {
 			continue
 		}
 		switch {
