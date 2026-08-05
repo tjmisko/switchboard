@@ -460,6 +460,13 @@ Two deliberate separations, each protecting an existing guarantee:
   lazily when a tooltip is opened — the same treatment session summaries get.
   `timeline --json` is byte-for-byte unaffected by this feature.
 
+What the two surfaces *do* share is **the bound**: `memory` truncates its clock
+read onto the same 30s `nowQuantum` grid, so both decide where a lane stopped
+being believed at the same instant. The series is clipped at that lane's
+`suspect_since`, and a hover drawing points past the end of the bar it annotates —
+or stopping short of one the timeline still credits in full — would contradict
+the very view it is read against.
+
 ### Volume
 
 A sample per live session per reconcile tick (~5 s) is roughly **12× the
