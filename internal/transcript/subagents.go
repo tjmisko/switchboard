@@ -67,12 +67,76 @@ type subagentMeta struct {
 
 // subagentFilePrefix/subagentMetaSuffix/subagentJSONLSuffix bracket the AgentID in
 // the two filenames a spawn writes: agent-<id>.meta.json and agent-<id>.jsonl. The
-// <id> between prefix and suffix is the universal key.
+// <id> between prefix and suffix is the universal key. subagentsDirName is the dir
+// those two files live in, under the session's own sibling directory.
 const (
 	subagentFilePrefix  = "agent-"
 	subagentMetaSuffix  = ".meta.json"
 	subagentJSONLSuffix = ".jsonl"
+	subagentsDirName    = "subagents"
 )
+
+// subagentsDirForTranscript derives <dir>/<session-id>/subagents/ from a parent
+// transcript path <dir>/<session-id>.jsonl. It is the SINGLE derivation in this
+// package: SubagentsForTranscript and SubagentPath both route through it so the
+// two can never drift apart.
+//
+// The dir is derived from the PASSED path and nothing else — never from cwd, a
+// project slug, or any re-derivation of either. That is what keeps it correct for
+// a session running in a git worktree (its records still live beside the
+// transcript switchboard already stores), for a /name-renamed session, and under
+// an XDG-relocated ~/.claude (subagent-fanout-detection-plan.md, G10).
+//
+// TrimSuffix is a no-op when the path lacks the .jsonl suffix, which simply leaves
+// the derived dir absent rather than inventing one. An empty path yields "" rather
+// than the bare relative "subagents" that filepath.Join would otherwise produce.
+func subagentsDirForTranscript(mainTranscript string) string {
+	if mainTranscript == "" {
+		return ""
+	}
+	return filepath.Join(strings.TrimSuffix(mainTranscript, subagentJSONLSuffix), subagentsDirName)
+}
+
+// SubagentPath returns the transcript file a given writer's OWN entries land in,
+// given the parent (main-thread) transcript path:
+//
+//	agentID == ""  → mainTranscript, unchanged (the main thread writes there)
+//	agentID != ""  → <dir>/<session-id>/subagents/agent-<agentID>.jsonl
+//
+// A subagent's writes are NOT in the parent transcript, and a hook fired from
+// inside a subagent still reports the PARENT's transcript_path
+// (claude-code-hook-schema.md §3) — so while a teammate works, the parent file can
+// be arbitrarily stale and this sibling file is the only evidence of that
+// teammate's activity.
+//
+// The empty-agentID case returning mainTranscript unchanged is deliberate: it lets
+// a caller resolve a pending writer with no branch, passing whatever agent_id the
+// hook carried (empty ⇒ main thread) straight through.
+//
+// agentID is the hook's agent_id, which equals the agent-<id> filename stem that
+// agent-<id>.meta.json and agent-<id>.jsonl share; Subagent.AgentID stores that
+// stem with the "agent-" prefix already removed. Because it is not settled
+// empirically whether the hook's agent_id carries the prefix, an agentID given
+// EITHER way ("a1b2" or "agent-a1b2") resolves to the same file — the prefix is
+// never doubled. A trailing ".jsonl" is tolerated the same way.
+//
+// Returns "" when there is nothing sane to derive: an empty mainTranscript, an
+// agentID that is only the prefix, or an agentID containing a path separator (a
+// hook-supplied value must not be able to escape the subagents dir).
+func SubagentPath(mainTranscript, agentID string) string {
+	if agentID == "" {
+		return mainTranscript // main thread: its writes are the parent transcript
+	}
+	dir := subagentsDirForTranscript(mainTranscript)
+	if dir == "" {
+		return ""
+	}
+	id := strings.TrimSuffix(strings.TrimPrefix(agentID, subagentFilePrefix), subagentJSONLSuffix)
+	if id == "" || strings.ContainsRune(id, filepath.Separator) || strings.ContainsRune(id, '/') {
+		return ""
+	}
+	return filepath.Join(dir, subagentFilePrefix+id+subagentJSONLSuffix)
+}
 
 // subagentTerminalReason is the assistant stop_reason that marks a subagent's own
 // transcript as finished: its final turn ended naturally. A still-running agent's
@@ -107,9 +171,10 @@ func SubagentsForTranscript(transcriptPath string) ([]Subagent, error) {
 	if transcriptPath == "" {
 		return nil, errors.New("transcript: empty path")
 	}
-	// <dir>/<session-id>.jsonl → <dir>/<session-id>/subagents/. TrimSuffix is a
-	// no-op (leaving the dir absent → nil,nil) if the path lacks the .jsonl suffix.
-	dir := filepath.Join(strings.TrimSuffix(transcriptPath, ".jsonl"), "subagents")
+	// <dir>/<session-id>.jsonl → <dir>/<session-id>/subagents/, via the one shared
+	// derivation SubagentPath also uses (a path lacking .jsonl simply leaves the dir
+	// absent → nil,nil).
+	dir := subagentsDirForTranscript(transcriptPath)
 	dirents, err := os.ReadDir(dir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
