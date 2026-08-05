@@ -174,8 +174,11 @@ prompt** after `StatusSince` (the moment the chip went red), and the *kind* of
 resolution now selects the **exit color**:
 
 - an **assistant message** (the blocked turn resumed → the awaited tool was
-  approved; Claude Code withholds the pending tool_use's assistant message until
-  it resolves) exits to **`working`** (green) **directly** — no orange bounce;
+  approved) exits to **`working`** (green) **directly** — no orange bounce.
+  (An earlier revision added "Claude Code withholds the pending tool_use's
+  assistant message until it resolves" here. That is false and has been removed —
+  see `subagent-permission-plan.md` §9.7. The pending `tool_use` *is* on disk
+  while the prompt waits; what arrives late is the *next* assistant message.);
 - a **user interrupt notice** (`[Request interrupted by user…]` → declined / Esc)
   exits to **`idle`** (orange), or to **`delegating`** (green) if subagents are
   still in flight (work continues).

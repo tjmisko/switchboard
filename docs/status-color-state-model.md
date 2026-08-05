@@ -96,10 +96,20 @@ Empirical (journal `switchboard.service`, 2026-05-30 → 06-23, 43 red episodes)
 
 So the **only** clear path is `transcript.ResolutionState` seeing the *main
 thread advance past the prompt* — an **assistant message** newer than
-`StatusSince` (`transcript.go:292`, `:305`). Claude Code withholds the pending
-tool_use's assistant message until it resolves, and the *next* assistant message
-arrives only after **model latency (≈5–25 s)**. That model-latency window + the
-5 s tick granularity **is** the 10–30 s band.
+`StatusSince` (`transcript.go:292`, `:305`). The *next* assistant message arrives
+only after **model latency (≈5–25 s)**. That model-latency window + the 5 s tick
+granularity **is** the 10–30 s band.
+
+> **Correction (2026-08-05).** This passage previously attributed the band partly
+> to Claude Code "withholding the pending tool_use's assistant message until it
+> resolves." **That is false** — the pending `tool_use` *is* written to the main
+> transcript while the prompt waits, measured contemporaneously against a
+> byte-cursor reader that cannot be fooled by timestamp back-dating
+> (`subagent-permission-plan.md` §9.7, V4). The latency band itself is real; only
+> the stated cause was wrong. The withholding claim also appeared in
+> `state-schema.md` and in `internal/transcript`'s package comment, both now
+> corrected. This matters beyond bookkeeping: a hydrate-time falsifier built on
+> the withholding assumption would have dropped live main-thread prompts.
 
 > The conservatism is **correct** (see §4: missed-RED is the most expensive
 > error). The bug is that the resolution *signal* is later than it needs to be.
