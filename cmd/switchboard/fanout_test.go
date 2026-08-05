@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -138,6 +139,63 @@ func TestObserveLabelEmitsOnChangeOnly(t *testing.T) {
 	}
 	if labels[0].SessionID != "s1" || labels[0].PID != 424242 {
 		t.Errorf("label event identity = %+v, want session s1 / pid 424242", labels[0])
+	}
+}
+
+// The authoritative name lives in ~/.claude/sessions/<pid>.json, and `/name`
+// rewrites it under a running session. observeLabel memoizes that read against
+// the file's stamp, so this pins the invalidation: a rename must still produce a
+// second session_label event on the next tick.
+func TestObserveLabelEmitsAgainWhenTheSessionFileIsRenamed(t *testing.T) {
+	dir := t.TempDir()
+	tpath := filepath.Join(dir, "t.jsonl")
+	writeLines(t, tpath, `{"type":"system"}`)
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sessDir := filepath.Join(home, ".claude", "sessions")
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	spath := filepath.Join(sessDir, "424243.json")
+	writeSessionName := func(name string) {
+		t.Helper()
+		body := fmt.Sprintf(`{"pid":424243,"name":%q,"status":"busy"}`, name)
+		if err := os.WriteFile(spath, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeSessionName("aaa-name")
+
+	histDir := t.TempDir()
+	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+	sess := &state.Session{PID: 424243, Agent: "claude", CWD: "/home/u/proj",
+		Wezterm: &state.WeztermInfo{WindowTitle: "ignored-window-title"},
+		Claude:  &state.AgentInfo{SessionID: "s1", Transcript: tpath}}
+
+	rs.observe(sink, sess, sess.Claude, time.Now()) // emit "aaa-name"
+	rs.observe(sink, sess, sess.Claude, time.Now()) // unchanged → no emit
+
+	// `/name bbb-name`. Same length as the old name, so the file's size does not
+	// move and mtime alone has to carry the invalidation; forced forward so the
+	// test does not depend on the filesystem's timestamp granularity.
+	writeSessionName("bbb-name")
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(spath, future, future); err != nil {
+		t.Fatal(err)
+	}
+
+	rs.observe(sink, sess, sess.Claude, time.Now()) // emit "bbb-name"
+	rs.observe(sink, sess, sess.Claude, time.Now()) // unchanged → no emit
+	sink.Close()
+
+	labels := eventsOfType(readEvents(t, histDir), history.EventSessionLabel)
+	if len(labels) != 2 {
+		t.Fatalf("got %d session_label events, want 2 (one per distinct name): %+v", len(labels), labels)
+	}
+	if labels[0].Label != "aaa-name" || labels[1].Label != "bbb-name" {
+		t.Errorf("labels = %q, %q; want aaa-name, bbb-name — the rename did not reach the timeline", labels[0].Label, labels[1].Label)
 	}
 }
 

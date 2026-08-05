@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/barlayout"
+	sblabel "github.com/tjmisko/switchboard/internal/label"
 	"github.com/tjmisko/switchboard/internal/projectname"
 	"github.com/tjmisko/switchboard/internal/state"
 )
@@ -28,7 +29,7 @@ func TestSessionTooltipShowsStatusDuration(t *testing.T) {
 		PID: 4821, CWD: "/home/u/proj",
 		Claude: &state.ClaudeInfo{Status: "permission", StatusSinceWire: &since},
 	}
-	tip := sessionTooltip(projectname.Config{}, s, now)
+	tip := sessionTooltip(projectname.Config{}, nil, s, now)
 	if !strings.Contains(tip, "permission · 45s") {
 		t.Errorf("tooltip should show the permission-wait duration:\n%s", tip)
 	}
@@ -41,7 +42,7 @@ func TestSessionTooltipSuspendedShowsNoDuration(t *testing.T) {
 		PID: 4821, CWD: "/home/u/proj", Suspended: true,
 		Claude: &state.ClaudeInfo{Status: "working", StatusSinceWire: &since},
 	}
-	tip := sessionTooltip(projectname.Config{}, s, now)
+	tip := sessionTooltip(projectname.Config{}, nil, s, now)
 	// Suspended status (and its clock) is stale; show "suspended", not a counter.
 	if strings.Contains(tip, "5m") {
 		t.Errorf("suspended session should not show a stale duration:\n%s", tip)
@@ -57,7 +58,7 @@ func TestRenderSlotStatusAndFlags(t *testing.T) {
 			{PID: 4821, CWD: "/home/u/proj", Focused: true, Claude: &state.ClaudeInfo{Status: "working"}},
 		},
 	}
-	out := renderSlot(snap, 0, testAvail, testMetrics, &nameConfig{})
+	out := renderSlot(snap, 0, testAvail, testMetrics, &nameConfig{}, &sblabel.NameCache{})
 	if !slices.Contains(out.Class, "working") {
 		t.Errorf("class missing status 'working': %v", out.Class)
 	}
@@ -75,7 +76,7 @@ func TestRenderSlotSuspended(t *testing.T) {
 			{PID: 4821, CWD: "/home/u/proj", Suspended: true, Claude: &state.ClaudeInfo{Status: "working"}},
 		},
 	}
-	out := renderSlot(snap, 0, testAvail, testMetrics, &nameConfig{})
+	out := renderSlot(snap, 0, testAvail, testMetrics, &nameConfig{}, &sblabel.NameCache{})
 	if !slices.Contains(out.Class, "suspended") {
 		t.Errorf("suspended session missing 'suspended' class: %v", out.Class)
 	}
@@ -89,7 +90,7 @@ func TestRenderSlotSuspended(t *testing.T) {
 }
 
 func TestRenderSlotEmpty(t *testing.T) {
-	out := renderSlot(state.Snapshot{}, 0, testAvail, testMetrics, &nameConfig{})
+	out := renderSlot(state.Snapshot{}, 0, testAvail, testMetrics, &nameConfig{}, &sblabel.NameCache{})
 	if !slices.Contains(out.Class, "empty") {
 		t.Errorf("out-of-range slot should be 'empty': %v", out.Class)
 	}
@@ -109,11 +110,11 @@ func TestRenderSlotAbbreviatesWhenCrowded(t *testing.T) {
 	}}
 	unit := barlayout.Metrics{CharPx: 1, ChipFixedPx: 0}
 
-	if full := renderSlot(snap, 0, 100000, unit, &nameConfig{}); strings.HasSuffix(full.Text, "…") {
+	if full := renderSlot(snap, 0, 100000, unit, &nameConfig{}, &sblabel.NameCache{}); strings.HasSuffix(full.Text, "…") {
 		t.Errorf("a wide bar should not abbreviate: %q", full.Text)
 	}
 
-	narrow := renderSlot(snap, 0, 10, unit, &nameConfig{})
+	narrow := renderSlot(snap, 0, 10, unit, &nameConfig{}, &sblabel.NameCache{})
 	if !strings.HasSuffix(narrow.Text, "…") {
 		t.Errorf("a crowded bar should abbreviate with an ellipsis: %q", narrow.Text)
 	}
@@ -134,7 +135,7 @@ func TestRenderSlotDelegating(t *testing.T) {
 			}},
 		},
 	}
-	out := renderSlot(snap, 0, testAvail, testMetrics, &nameConfig{})
+	out := renderSlot(snap, 0, testAvail, testMetrics, &nameConfig{}, &sblabel.NameCache{})
 	if !slices.Contains(out.Class, "working") {
 		t.Errorf("delegating chip must carry the green 'working' class: %v", out.Class)
 	}
@@ -194,7 +195,8 @@ func TestNameConfigShouldReloadWhenConfigFileChanges(t *testing.T) {
 	writeAbbrev(t, cfgPath, root, "aaa")
 
 	names := &nameConfig{}
-	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names); got.Text != "aaa-proj" {
+	labels := &sblabel.NameCache{}
+	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels); got.Text != "aaa-proj" {
 		t.Fatalf("chip text = %q, want aaa-proj", got.Text)
 	}
 
@@ -206,7 +208,7 @@ func TestNameConfigShouldReloadWhenConfigFileChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names)
+	got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels)
 	if got.Text != "zzz-proj" {
 		t.Errorf("chip text = %q, want zzz-proj — the rewritten config was not picked up", got.Text)
 	}
@@ -228,7 +230,8 @@ func TestNameConfigShouldServeCachedConfigWhenFileStampUnchanged(t *testing.T) {
 	}
 
 	names := &nameConfig{}
-	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names); got.Text != "aaa-proj" {
+	labels := &sblabel.NameCache{}
+	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels); got.Text != "aaa-proj" {
 		t.Fatalf("chip text = %q, want aaa-proj", got.Text)
 	}
 
@@ -237,7 +240,7 @@ func TestNameConfigShouldServeCachedConfigWhenFileStampUnchanged(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names); got.Text != "aaa-proj" {
+	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels); got.Text != "aaa-proj" {
 		t.Errorf("chip text = %q, want the cached aaa-proj — the config was re-read despite an unchanged stamp", got.Text)
 	}
 }
@@ -249,14 +252,139 @@ func TestNameConfigShouldPickUpAConfigFileCreatedAfterFirstRender(t *testing.T) 
 	cfgPath, root := newNameConfigFixture(t)
 
 	names := &nameConfig{}
-	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names); got.Text != "proj" {
+	labels := &sblabel.NameCache{}
+	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels); got.Text != "proj" {
 		t.Fatalf("chip text = %q, want the unprefixed proj (no user config)", got.Text)
 	}
 
 	writeAbbrev(t, cfgPath, root, "zzz")
-	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names); got.Text != "zzz-proj" {
+	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels); got.Text != "zzz-proj" {
 		t.Errorf("chip text = %q, want zzz-proj — a newly created config was not picked up", got.Text)
 	}
+}
+
+// --- session-name cache ----------------------------------------------------
+
+// writeSessionName drops ~/.claude/sessions/<pid>.json carrying name under the
+// test's HOME, which is what `/name` writes and what label.RawName prefers over
+// the window title. Returns the path so a test can rewrite it.
+func writeSessionName(t *testing.T, pid int, name string) string {
+	t.Helper()
+	dir := filepath.Join(os.Getenv("HOME"), ".claude", "sessions")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, fmt.Sprintf("%d.json", pid))
+	body := fmt.Sprintf(`{"pid":%d,"name":%q,"status":"busy"}`, pid, name)
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// `/name bbb` rewrites the session file out from under a running chip, and the
+// bar is expected to show the new name on the next snapshot. Caching the lookup
+// must not cost that.
+func TestRenderSlotShouldShowARenamedSessionOnTheNextSnapshot(t *testing.T) {
+	_, root := newNameConfigFixture(t)
+	path := writeSessionName(t, 4821, "aaa")
+
+	names := &nameConfig{}
+	labels := &sblabel.NameCache{}
+	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels); got.Text != "proj-aaa" {
+		t.Fatalf("chip text = %q, want proj-aaa", got.Text)
+	}
+
+	// The rename, with a forced later mtime so the test does not depend on the
+	// filesystem's timestamp granularity. The new name is the same length as the
+	// old, so the size is unchanged and mtime alone carries the invalidation.
+	writeSessionName(t, 4821, "bbb")
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(path, future, future); err != nil {
+		t.Fatal(err)
+	}
+
+	got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels)
+	if got.Text != "proj-bbb" {
+		t.Errorf("chip text = %q, want proj-bbb — the rename did not reach the chip", got.Text)
+	}
+	if !strings.Contains(got.Tooltip, "bbb") {
+		t.Errorf("tooltip kept the stale name: %q", got.Tooltip)
+	}
+}
+
+// A session that exits and a new one that starts must not share a name just
+// because renderSlot names them through one cache.
+func TestRenderSlotShouldNameEachSessionFromItsOwnFile(t *testing.T) {
+	_, root := newNameConfigFixture(t)
+	writeSessionName(t, 4821, "first")
+	writeSessionName(t, 4822, "second")
+	snap := state.Snapshot{Sessions: []state.Session{
+		{PID: 4821, CWD: root, Claude: &state.ClaudeInfo{Status: "working"}},
+		{PID: 4822, CWD: root, Claude: &state.ClaudeInfo{Status: "working"}},
+	}}
+
+	names := &nameConfig{}
+	labels := &sblabel.NameCache{}
+	for pass := range 2 {
+		if got := renderSlot(snap, 0, testAvail, testMetrics, names, labels); got.Text != "proj-first" {
+			t.Errorf("pass %d: slot 0 text = %q, want proj-first", pass, got.Text)
+		}
+		if got := renderSlot(snap, 1, testAvail, testMetrics, names, labels); got.Text != "proj-second" {
+			t.Errorf("pass %d: slot 1 text = %q, want proj-second", pass, got.Text)
+		}
+	}
+}
+
+// BenchmarkRenderSlotUncachedNames is the pre-change cost of one emission: every
+// slot names EVERY session in the snapshot so the abbreviation agrees across
+// chips, and each of those names was a read plus an unmarshal. Passing a nil
+// cache is exactly the old behavior. BenchmarkRenderSlotCachedNames is what
+// replaces it. Multiply either by the bar's ten slot processes for the real
+// per-snapshot cost.
+func BenchmarkRenderSlotUncachedNames(b *testing.B) {
+	snap := benchSnapshot(b)
+	names := &nameConfig{}
+	names.config()
+	b.ResetTimer()
+	for b.Loop() {
+		_ = renderSlot(snap, 0, testAvail, testMetrics, names, nil)
+	}
+}
+
+func BenchmarkRenderSlotCachedNames(b *testing.B) {
+	snap := benchSnapshot(b)
+	names := &nameConfig{}
+	names.config()
+	labels := &sblabel.NameCache{}
+	renderSlot(snap, 0, testAvail, testMetrics, names, labels) // prime
+	b.ResetTimer()
+	for b.Loop() {
+		_ = renderSlot(snap, 0, testAvail, testMetrics, names, labels)
+	}
+}
+
+// benchSnapshot is a snapshot at this machine's usual live session count, each
+// session named by a file on disk the way a real one is.
+func benchSnapshot(b *testing.B) state.Snapshot {
+	b.Helper()
+	home := b.TempDir()
+	b.Setenv("HOME", home)
+	b.Setenv("XDG_CONFIG_HOME", b.TempDir())
+	dir := filepath.Join(home, ".claude", "sessions")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		b.Fatal(err)
+	}
+	sessions := make([]state.Session, 13)
+	for i := range sessions {
+		pid := 7000 + i
+		body := fmt.Sprintf(`{"pid":%d,"sessionId":"b5c7fd65-5733-4ce2-a0fa-932b91d2c02%d","cwd":"/home/u/Projects/Arachne","startedAt":1785950796170,"kind":"interactive","name":"assess-npm-vulnerabilities","nameSource":"derived","status":"busy","updatedAt":1785957054072}`, pid, i%10)
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%d.json", pid)), []byte(body), 0o644); err != nil {
+			b.Fatal(err)
+		}
+		sessions[i] = state.Session{PID: pid, CWD: "/home/u/Projects/Arachne", Claude: &state.ClaudeInfo{Status: "working"}}
+	}
+	return state.Snapshot{Sessions: sessions}
 }
 
 // --- emission dedupe -------------------------------------------------------
@@ -342,14 +470,15 @@ func TestEmitterShouldSuppressRepeatsInAggregateMode(t *testing.T) {
 	var buf bytes.Buffer
 	e := &emitter{w: &buf}
 	names := &nameConfig{}
+	labels := &sblabel.NameCache{}
 	snap := state.Snapshot{Sessions: []state.Session{
 		{PID: 4821, CWD: "/home/u/proj", Claude: &state.ClaudeInfo{Status: "working"}},
 	}}
 
-	if !e.emit(renderAggregate(snap, names)) {
+	if !e.emit(renderAggregate(snap, names, labels)) {
 		t.Fatal("the first aggregate emission must be written")
 	}
-	if e.emit(renderAggregate(snap, names)) {
+	if e.emit(renderAggregate(snap, names, labels)) {
 		t.Error("an unchanged aggregate snapshot should be suppressed")
 	}
 }
@@ -443,7 +572,8 @@ func TestNameConfigShouldPickUpARenameWrittenBySetAbbrev(t *testing.T) {
 	}
 
 	names := &nameConfig{}
-	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names); got.Text != "aaa-proj" {
+	labels := &sblabel.NameCache{}
+	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels); got.Text != "aaa-proj" {
 		t.Fatalf("chip text = %q, want aaa-proj", got.Text)
 	}
 
@@ -451,7 +581,7 @@ func TestNameConfigShouldPickUpARenameWrittenBySetAbbrev(t *testing.T) {
 	if err := projectname.SetAbbrev(root, "zzz"); err != nil {
 		t.Fatal(err)
 	}
-	got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names)
+	got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels)
 	if got.Text != "zzz-proj" {
 		t.Errorf("chip text = %q, want zzz-proj — the middle-click rename did not reach the chip", got.Text)
 	}

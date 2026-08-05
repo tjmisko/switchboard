@@ -52,10 +52,13 @@ func main() {
 	metrics := barlayout.DefaultMetrics()
 
 	names := &nameConfig{}
+	// One cache for the process lifetime: every emission names every session in
+	// the snapshot, and the files behind those names barely ever move.
+	labels := &sblabel.NameCache{}
 	out := &emitter{w: os.Stdout}
 
 	for {
-		runOnce(*socketPath, *slot, availPx, metrics, names, out)
+		runOnce(*socketPath, *slot, availPx, metrics, names, labels, out)
 		// Daemon socket dropped — emit a degraded chip so waybar shows
 		// something while we wait, then retry.
 		if *slot >= 0 {
@@ -89,7 +92,7 @@ func resolveAvailPx(widthPx float64) float64 {
 	return barlayout.ScreenWidthPx()
 }
 
-func runOnce(socketPath string, slot int, availPx float64, metrics barlayout.Metrics, names *nameConfig, out *emitter) {
+func runOnce(socketPath string, slot int, availPx float64, metrics barlayout.Metrics, names *nameConfig, labels *sblabel.NameCache, out *emitter) {
 	c, err := rpc.Dial(socketPath)
 	if err != nil {
 		return
@@ -115,9 +118,9 @@ func runOnce(socketPath string, slot int, availPx float64, metrics barlayout.Met
 			continue
 		}
 		if slot >= 0 {
-			out.emit(renderSlot(*resp.Snapshot, slot, availPx, metrics, names))
+			out.emit(renderSlot(*resp.Snapshot, slot, availPx, metrics, names, labels))
 		} else {
-			out.emit(renderAggregate(*resp.Snapshot, names))
+			out.emit(renderAggregate(*resp.Snapshot, names, labels))
 		}
 	}
 }
@@ -181,15 +184,17 @@ func (n *nameConfig) config() projectname.Config {
 //
 // The chip text is the session's label abbreviated (with an ellipsis) so the
 // whole set fits the bar; the tooltip keeps the full name. Every slot fits the
-// same label set, so the abbreviation agrees across chips.
-func renderSlot(snap state.Snapshot, slot int, availPx float64, metrics barlayout.Metrics, names *nameConfig) waybarOutput {
+// same label set, so the abbreviation agrees across chips — which is why this
+// names EVERY session, not just its own, and why the name lookup behind it is
+// worth caching (see sblabel.NameCache).
+func renderSlot(snap state.Snapshot, slot int, availPx float64, metrics barlayout.Metrics, names *nameConfig, cache *sblabel.NameCache) waybarOutput {
 	if slot >= len(snap.Sessions) {
 		return waybarOutput{Text: "", Class: []string{"empty"}}
 	}
 	cfg := names.config()
 	labels := make([]string, len(snap.Sessions))
 	for i := range snap.Sessions {
-		labels[i] = sblabel.Chip(cfg, snap.Sessions[i])
+		labels[i] = cache.Chip(cfg, snap.Sessions[i])
 	}
 	labels = barlayout.Fit(labels, availPx, metrics)
 	s := snap.Sessions[slot]
@@ -216,7 +221,7 @@ func renderSlot(snap state.Snapshot, slot int, availPx float64, metrics barlayou
 	}
 	return waybarOutput{
 		Text:    labels[slot],
-		Tooltip: sessionTooltip(cfg, s, time.Now()),
+		Tooltip: sessionTooltip(cfg, cache, s, time.Now()),
 		Class:   classes,
 		Alt:     chipClass(status),
 	}
@@ -233,7 +238,7 @@ func chipClass(status string) string {
 
 // renderAggregate is the original single-module mode. Kept for ad-hoc
 // inspection (`switchboard-waybar | jq .`) but not driven by the live bar.
-func renderAggregate(snap state.Snapshot, names *nameConfig) waybarOutput {
+func renderAggregate(snap state.Snapshot, names *nameConfig, cache *sblabel.NameCache) waybarOutput {
 	if len(snap.Sessions) == 0 {
 		return waybarOutput{Text: "", Tooltip: "no claude sessions", Class: []string{"empty"}}
 	}
@@ -244,7 +249,7 @@ func renderAggregate(snap state.Snapshot, names *nameConfig) waybarOutput {
 		if s.Focused {
 			mark = "*"
 		}
-		parts = append(parts, mark+sblabel.Chip(cfg, s))
+		parts = append(parts, mark+cache.Chip(cfg, s))
 	}
 	return waybarOutput{
 		Text:  strings.Join(parts, "  "),
@@ -270,9 +275,9 @@ func sessionStatus(s state.Session) string {
 // Line 1 is the project abbreviation + a status-colored dot; line 2 is the bare
 // task name (the project prefix stripped, since the abbrev already shows it);
 // line 3 is dimmed metadata.
-func sessionTooltip(cfg projectname.Config, s state.Session, now time.Time) string {
+func sessionTooltip(cfg projectname.Config, cache *sblabel.NameCache, s state.Session, now time.Time) string {
 	abbrev := projectname.CanonicalForDir(cfg, s.CWD)
-	task := projectname.TaskForDir(cfg, s.CWD, sblabel.RawName(s))
+	task := projectname.TaskForDir(cfg, s.CWD, cache.RawName(s))
 	status := sessionStatus(s)
 
 	statusText := status
