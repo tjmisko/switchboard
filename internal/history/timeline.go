@@ -529,7 +529,7 @@ func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
 	// Focus (C1): the focus stream is global (keyed by the focused session id, not
 	// pid), so it is replayed separately and attached to each lane by session id,
 	// clamped to the lane's lifetime.
-	focusBySession := buildFocusSpans(evs, end)
+	focusBySession := buildFocusSpans(evs, end, laneEnds(done))
 	for i := range done {
 		if id := done[i].SessionID; id != "" {
 			done[i].Focus = clampFocus(focusBySession[id], done[i].Start, done[i].End)
@@ -595,7 +595,7 @@ func isSlug(s string) bool {
 // event opens a span for its session that the next focus event — to a different
 // session, or to none (empty SessionID) — closes; a still-open span caps at
 // `end`. Consecutive events for the same session are coalesced.
-func buildFocusSpans(evs []Event, end time.Time) map[string][]FocusSpan {
+func buildFocusSpans(evs []Event, end time.Time, laneEnd map[string]time.Time) map[string][]FocusSpan {
 	out := map[string][]FocusSpan{}
 	var curSession string
 	var curStart time.Time
@@ -615,7 +615,39 @@ func buildFocusSpans(evs []Event, end time.Time) map[string][]FocusSpan {
 		curSession = ev.SessionID
 		curStart = ev.Ts
 	}
-	closeCur(end)
+	// The span still open at the horizon closes at the lane's end, not at `end`,
+	// whenever the lane reaches further. finish() never closes a lane before its
+	// own last evidence, so on a quantized render a session that emitted anything
+	// inside the current bucket is drawn past the horizon — and its focus has to be
+	// allowed to follow it there. Closed at `end` alone, the tail of a bar you are
+	// demonstrably watching carries no focus at all, and Summarize reads focus-less
+	// agent-active time as DELEGATED rather than attended: up to a quantum of every
+	// live lane, on every render, silently charged to the wrong side of the ratio.
+	//
+	// Only the trailing span is lifted. A focus change earlier in the stream closes
+	// at the instant focus actually moved, which is evidence, not inference.
+	last := end
+	if le, ok := laneEnd[curSession]; ok && le.After(last) {
+		last = le
+	}
+	closeCur(last)
+	return out
+}
+
+// laneEnds is the latest instant each session's lanes were closed at. Used to let
+// the focus stream reach the end of a lane that outlived the render horizon; see
+// the trailing close in buildFocusSpans. Derived from evidence rather than from a
+// clock, so it moves only when the log does.
+func laneEnds(lanes []Swimlane) map[string]time.Time {
+	out := map[string]time.Time{}
+	for _, lane := range lanes {
+		if lane.SessionID == "" {
+			continue
+		}
+		if cur, ok := out[lane.SessionID]; !ok || lane.End.After(cur) {
+			out[lane.SessionID] = lane.End
+		}
+	}
 	return out
 }
 
