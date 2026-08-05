@@ -30,20 +30,24 @@ type Metrics struct {
 	ChipFixedPx float64 // per-chip overhead: padding + border + margin + inter-chip gap
 }
 
-// DefaultMetrics returns the chip footprint, calibrated by measuring rendered
-// chip widths on the live bottom bar (grim screenshot, logical px):
+// DefaultMetrics returns the chip footprint. Both numbers are derived from the
+// bar's CSS box and confirmed against rendered chip widths measured on the live
+// bar (grim screenshot, logical px):
 //
-//	chars  width      chars  width
-//	  23   206          32   277
-//	  25   221          34   293
-//	  27   237
+//	a 14-glyph chip renders 133px wide; subtracting the 22px CSS box
+//	(padding 2×7 + border 2×1... see below) leaves 7.93px per glyph.
 //
-// A linear fit gives ~7.95 px per glyph and ~22.7px of chip overhead
-// (padding+border+margin); the chips sit ~9.5px apart, so folding that gap into
-// the per-chip footprint gives ChipFixedPx ≈ 32. CharPx is rounded up slightly
-// so the estimate errs toward abbreviating rather than overflowing.
+// ChipFixedPx is the non-text part of one chip plus its share of the gap to the
+// next one, straight out of ~/.config/waybar/style.css and claude.jsonc:
+//
+//	padding 2×7 = 14 · border 2×1 = 2 · margin 2×2 = 4 · spacing = 2  →  22
+//
+// CharPx is set slightly above the measured 7.93 because the ellipsis glyph
+// comes from a fallback font and is ~1.7px wider than a monospace cell;
+// amortized over a ~20-rune chip that is ~0.1px per glyph. Rounding up here
+// makes the estimate err toward abbreviating rather than overflowing the row.
 func DefaultMetrics() Metrics {
-	return Metrics{CharPx: 8.0, ChipFixedPx: 32}
+	return Metrics{CharPx: 8.05, ChipFixedPx: 22}
 }
 
 // chipWidth estimates the pixel width of a chip whose label has the given rune
@@ -62,76 +66,122 @@ func chipWidth(label string, m Metrics) float64 {
 // are trimmed with a trailing ellipsis (max-min fairness): short labels are
 // left intact and only the long ones are shortened, each only as much as
 // needed. The returned slice has the same length and order as labels.
+//
+// The fit is computed in runes, not pixels. Every chip pays the same fixed
+// overhead, so once that is deducted the row is a single pool of glyph cells to
+// share out — and sharing whole cells means no chip rounds its allowance down
+// and silently donates the remainder back to the bar's empty margin.
 func Fit(labels []string, availPx float64, m Metrics) []string {
 	n := len(labels)
 	if n == 0 {
 		return labels
 	}
-	widths := make([]float64, n)
-	total := 0.0
+	lens := make([]int, n)
+	total := 0
 	for i, l := range labels {
-		widths[i] = chipWidth(l, m)
-		total += widths[i]
+		lens[i] = utf8.RuneCountInString(l)
+		total += lens[i]
 	}
-	if total <= availPx {
+	budget := runeBudget(n, availPx, m)
+	if total <= budget {
 		return labels
 	}
 
-	capPx := fairCap(widths, availPx)
+	allow := allowances(lens, budget)
 	out := make([]string, n)
 	for i, l := range labels {
-		if widths[i] <= capPx {
+		if allow[i] >= lens[i] {
 			out[i] = l
 			continue
 		}
-		out[i] = abbreviate(l, capPx, m)
+		out[i] = string([]rune(l)[:allow[i]-1]) + ellipsis
 	}
 	return out
 }
 
-// fairCap returns the max-min fair per-chip width cap: the largest cap such
-// that giving every chip min(naturalWidth, cap) keeps the total within availPx.
-// Chips narrower than the cap keep their full width; the freed space is shared
-// among the wider chips. Assumes the labels do not already fit (total > avail),
-// so the loop always finds a binding cap.
-func fairCap(widths []float64, availPx float64) float64 {
-	asc := append([]float64(nil), widths...)
-	sort.Float64s(asc)
-
-	remaining := availPx
-	n := len(asc)
-	for i, w := range asc {
-		cap := remaining / float64(n-i)
-		if w <= cap {
-			remaining -= w // this chip fits under the cap; it keeps its width
-			continue
-		}
-		return cap // this and every wider chip are capped here
+// runeBudget is how many glyph cells the whole row can show once every chip has
+// paid its fixed overhead. It never drops below the point where each chip can
+// still render minLabelRunes: past that we accept a little overflow rather than
+// a row of bare ellipses.
+func runeBudget(n int, availPx float64, m Metrics) int {
+	if m.CharPx <= 0 {
+		return n * minLabelRunes
 	}
-	// Unreachable when total > avail, but return a sane value defensively.
-	return remaining / float64(n)
+	budget := int((availPx - float64(n)*m.ChipFixedPx) / m.CharPx)
+	if floor := n * minLabelRunes; budget < floor {
+		return floor
+	}
+	return budget
 }
 
-// abbreviate trims label to fit within capPx, ending in an ellipsis. It never
-// shrinks below minLabelRunes runes (ellipsis included), accepting slight
-// overflow when the row is extremely crowded rather than rendering an
-// unreadable stub.
-func abbreviate(label string, capPx float64, m Metrics) string {
-	runes := []rune(label)
-	maxRunes := int((capPx - m.ChipFixedPx) / m.CharPx)
-	if maxRunes < minLabelRunes {
-		maxRunes = minLabelRunes
+// allowances shares budget glyph cells among labels of the given natural
+// lengths, max-min fair: every label under the cap keeps its full length and
+// the cells it did not need are pooled for the longer ones. Assumes the labels
+// do not already fit (sum(lens) > budget), so a binding cap always exists.
+func allowances(lens []int, budget int) []int {
+	n := len(lens)
+	asc := append([]int(nil), lens...)
+	sort.Ints(asc)
+
+	capRunes := 0
+	remaining := budget
+	for i, l := range asc {
+		c := remaining / (n - i)
+		if l <= c {
+			remaining -= l // fits under the cap; keeps its full length
+			continue
+		}
+		capRunes = c // this and every longer label are capped here
+		break
 	}
-	if maxRunes >= len(runes) {
-		return label
+	if capRunes < minLabelRunes {
+		capRunes = minLabelRunes
 	}
-	return string(runes[:maxRunes-1]) + ellipsis
+
+	out := make([]int, n)
+	spent := 0
+	for i, l := range lens {
+		out[i] = min(l, capRunes)
+		spent += out[i]
+	}
+	grow(out, lens, budget-spent)
+	return out
+}
+
+// grow hands out the cells left over after the integer cap — the fair cap is a
+// whole number, so up to one cell per capped chip is still unclaimed. A chip one
+// cell short of its full label is served first: that cell buys back two
+// characters, since it also retires the ellipsis. The rest go round-robin by
+// index, which keeps the result stable across renders (every slot process
+// computes this independently, so an unstable rule would flicker).
+func grow(out, lens []int, left int) {
+	for left > 0 {
+		gave := false
+		for i := range out {
+			if left > 0 && out[i] == lens[i]-1 {
+				out[i]++
+				left--
+				gave = true
+			}
+		}
+		for i := range out {
+			if left > 0 && out[i] < lens[i] {
+				out[i]++
+				left--
+				gave = true
+			}
+		}
+		if !gave {
+			return // every label is already full
+		}
+	}
 }
 
 // safetyMarginPx is trimmed off the monitor's logical width so chips packed
-// right up to the edge are not clipped by the bar's rounding/insets, and so the
-// abbreviation errs toward fitting.
-const safetyMarginPx = 32
+// right up to the edge are not clipped by the bar's rounding/insets. The chip
+// metrics are calibrated against the live bar and err high by ~1px per chip, so
+// this only has to absorb the bar's own insets, not model error.
+const safetyMarginPx = 12
 
 // fallbackWidthPx is the usable width assumed when the monitor cannot be
 // queried (e.g. hyprctl missing). Chosen on the wide side so an unknown
