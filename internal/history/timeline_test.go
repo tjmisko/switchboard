@@ -57,6 +57,30 @@ func TestBuildSwimlanesClampsOpenLaneToEnd(t *testing.T) {
 	}
 }
 
+// A caller may quantize its bound (switchboard-ctl truncates `now` so a polled
+// render is byte-stable), which puts `end` BEHIND a session that started inside
+// the current quantum. The lane must still end at its last evidence rather than
+// before its own start — an End < Start lane is a negative-width bar to every
+// consumer downstream.
+func TestBuildSwimlanesNeverEndsBeforeLastEvidence(t *testing.T) {
+	evs := []Event{
+		{Ts: ts(40), Type: EventSessionStart, PID: 1, SessionID: "s1"},
+		{Ts: ts(45), Type: EventUsageSample, PID: 1, SessionID: "s1", Model: "claude-opus-4-8", TokIn: 100},
+		// no session_end — still running
+	}
+	lanes := BuildSwimlanes(evs, ts(30)) // bound quantized back behind the session
+	if len(lanes) != 1 {
+		t.Fatalf("got %d lanes, want 1", len(lanes))
+	}
+	l := lanes[0]
+	if l.End.Before(l.Start) {
+		t.Fatalf("lane closed before it opened: start %v, end %v", l.Start, l.End)
+	}
+	if !l.End.Equal(ts(45)) {
+		t.Errorf("lane end = %v, want the last evidence %v", l.End, ts(45))
+	}
+}
+
 func TestBuildSwimlanesSplitsOnPidReuse(t *testing.T) {
 	evs := []Event{
 		{Ts: ts(0), Type: EventSessionStart, PID: 1, SessionID: ""},
@@ -842,6 +866,53 @@ func TestBuildSwimlanesFocusOpenSpanCapsAtLaneEnd(t *testing.T) {
 	want := []FocusSpan{{Start: ts(5), End: ts(40)}}
 	if !equalFocus(lanes[0].Focus, want) {
 		t.Errorf("focus = %+v, want %+v (capped at lane end 40, not stream end 99)", lanes[0].Focus, want)
+	}
+}
+
+func TestBuildSwimlanesFocusFollowsALaneThatOutlivesTheBound(t *testing.T) {
+	// A quantized render's bound lags the newest evidence — here the caller passes
+	// ts(30) while the lane's last transition is at ts(45) — and finish() closes a
+	// lane at its own last evidence rather than behind it. Focus held across that
+	// stretch has to reach the same instant: the tail IS drawn, and Summarize reads
+	// agent-active time with no focus over it as delegated rather than attended.
+	evs := []Event{
+		{Ts: ts(0), Type: EventSessionStart, PID: 1, SessionID: "s1"},
+		focusEv(5, "s1"),
+		tr(1, "s1", 10, "idle", "working", 0),
+		tr(1, "s1", 45, "working", "idle", 0), // evidence past the bound
+	}
+	lanes := BuildSwimlanes(evs, ts(30))
+	want := []FocusSpan{{Start: ts(5), End: ts(45)}}
+	if !equalFocus(lanes[0].Focus, want) {
+		t.Errorf("focus = %+v, want %+v — the lane closes at its own last evidence 45, and its focus stopped at the bound 30",
+			lanes[0].Focus, want)
+	}
+}
+
+func TestBuildSwimlanesFocusChangeIsNotLiftedToTheLaneEnd(t *testing.T) {
+	// Only the span still open at the horizon follows the lane. A focus change
+	// earlier in the stream closed at the instant focus actually moved, which is
+	// evidence, not inference — lifting it too would credit s1 with attention it
+	// demonstrably lost at 15.
+	evs := []Event{
+		{Ts: ts(0), Type: EventSessionStart, PID: 1, SessionID: "s1"},
+		{Ts: ts(0), Type: EventSessionStart, PID: 2, SessionID: "s2"},
+		focusEv(5, "s1"),
+		tr(1, "s1", 10, "idle", "working", 0),
+		focusEv(15, "s2"),
+		tr(1, "s1", 45, "working", "idle", 0),
+	}
+	byID := map[string]Swimlane{}
+	for _, l := range BuildSwimlanes(evs, ts(30)) {
+		byID[l.SessionID] = l
+	}
+	if want := []FocusSpan{{Start: ts(5), End: ts(15)}}; !equalFocus(byID["s1"].Focus, want) {
+		t.Errorf("s1 focus = %+v, want %+v (closed where focus moved, not at the lane end)", byID["s1"].Focus, want)
+	}
+	// s2 logged nothing after its start, so its lane ends at the bound and the
+	// trailing span has nothing further to reach.
+	if want := []FocusSpan{{Start: ts(15), End: ts(30)}}; !equalFocus(byID["s2"].Focus, want) {
+		t.Errorf("s2 focus = %+v, want %+v", byID["s2"].Focus, want)
 	}
 }
 

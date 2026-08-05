@@ -17,7 +17,7 @@ func atSec(sec int) time.Time {
 }
 
 func TestResolveWindowDay(t *testing.T) {
-	from, to, label := resolveWindow("2026-06-26", "", "")
+	from, to, label := resolveWindow(atSec(0), "2026-06-26", "", "")
 	// Days are local calendar days, so the window bounds are local midnights.
 	if !from.Equal(time.Date(2026, 6, 26, 0, 0, 0, 0, time.Local)) {
 		t.Errorf("from = %v", from)
@@ -31,7 +31,7 @@ func TestResolveWindowDay(t *testing.T) {
 }
 
 func TestResolveWindowRangeUntilInclusive(t *testing.T) {
-	_, to, _ := resolveWindow("", "2026-06-20", "2026-06-26")
+	_, to, _ := resolveWindow(atSec(0), "", "2026-06-20", "2026-06-26")
 	// until is inclusive → exclusive bound is the next local day.
 	if !to.Equal(time.Date(2026, 6, 27, 0, 0, 0, 0, time.Local)) {
 		t.Errorf("until should be inclusive; to = %v, want 2026-06-27", to)
@@ -165,6 +165,91 @@ func writeDay(t *testing.T, dir, day string, evs ...history.Event) {
 	}
 	if err := os.WriteFile(history.DayPath(dir, day), b.Bytes(), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// renderTimelineAt runs `timeline --json` over dir with the render clock pinned
+// to `at`, so a test can poll the same window twice from two different instants.
+func renderTimelineAt(t *testing.T, dir, day string, at time.Time, extra ...string) string {
+	t.Helper()
+	orig := timeNow
+	timeNow = func() time.Time { return at }
+	defer func() { timeNow = orig }()
+	return captureStdout(t, func() {
+		cmdTimeline(append([]string{"--dir", dir, "--day", day, "--json"}, extra...))
+	})
+}
+
+// TestTimelineJSONStableWithinQuantum is the regression test for the poll churn:
+// a dashboard re-reading an unchanged live day must get the same bytes back, so
+// its "changed?" guard can short-circuit instead of re-parsing and repainting the
+// whole timeline every 3 seconds. The lane here is deliberately still RUNNING —
+// no session_end — because that is the lane BuildSwimlanes closes at the caller's
+// bound, and therefore the only one whose end moves when `now` does.
+func TestTimelineJSONStableWithinQuantum(t *testing.T) {
+	dir := t.TempDir()
+	// A fixed instant mid-day, on the quantum grid: both reads below land in the
+	// same bucket by construction, and the real clock never enters the test.
+	base := time.Date(2026, 6, 26, 12, 0, 0, 0, time.Local)
+	day := base.Format("2006-01-02")
+	writeDay(t, dir, day,
+		history.Event{Ts: base.Add(-10 * time.Minute), Type: history.EventSessionStart, PID: 1, SessionID: "s1", Project: "demo"},
+		history.Event{Ts: base.Add(-10 * time.Minute), Type: history.EventTransition, PID: 1, SessionID: "s1", To: "working"},
+	)
+
+	first := renderTimelineAt(t, dir, day, base.Add(time.Second))
+	second := renderTimelineAt(t, dir, day, base.Add(4*time.Second)) // one poll later
+	if first != second {
+		t.Errorf("two renders of an unchanged live window differ:\n--- first ---\n%s\n--- second ---\n%s", first, second)
+	}
+
+	// The quantum must not cost the payload its liveness: the moment something
+	// actually happens, the bytes have to move.
+	writeDay(t, dir, day,
+		history.Event{Ts: base.Add(-10 * time.Minute), Type: history.EventSessionStart, PID: 1, SessionID: "s1", Project: "demo"},
+		history.Event{Ts: base.Add(-10 * time.Minute), Type: history.EventTransition, PID: 1, SessionID: "s1", To: "working"},
+		history.Event{Ts: base.Add(-1 * time.Minute), Type: history.EventTransition, PID: 1, SessionID: "s1", To: "idle"},
+	)
+	changed := renderTimelineAt(t, dir, day, base.Add(4*time.Second))
+	if changed == second {
+		t.Errorf("a new transition did not change the payload:\n%s", changed)
+	}
+}
+
+// TestTimelineJSONAdvancesAcrossQuantum is the other half of the contract: the
+// bound is quantized, not frozen. A render a full quantum later must show the
+// live lane having grown, or a stalled clock would read as a stalled session.
+func TestTimelineJSONAdvancesAcrossQuantum(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 6, 26, 12, 0, 0, 0, time.Local)
+	day := base.Format("2006-01-02")
+	writeDay(t, dir, day,
+		history.Event{Ts: base.Add(-10 * time.Minute), Type: history.EventSessionStart, PID: 1, SessionID: "s1", Project: "demo"},
+		history.Event{Ts: base.Add(-10 * time.Minute), Type: history.EventTransition, PID: 1, SessionID: "s1", To: "working"},
+	)
+
+	laneEnd := func(out string) time.Time {
+		t.Helper()
+		var env struct {
+			Lanes []history.Swimlane `json:"lanes"`
+		}
+		if err := json.Unmarshal([]byte(out), &env); err != nil {
+			t.Fatalf("unmarshal envelope: %v\n%s", err, out)
+		}
+		if len(env.Lanes) != 1 {
+			t.Fatalf("lanes = %d, want 1\n%s", len(env.Lanes), out)
+		}
+		return env.Lanes[0].End
+	}
+
+	at := base.Add(time.Second)
+	before := laneEnd(renderTimelineAt(t, dir, day, at))
+	after := laneEnd(renderTimelineAt(t, dir, day, at.Add(nowQuantum)))
+	if !before.Equal(base) {
+		t.Errorf("live lane end = %v, want the quantum boundary %v", before, base)
+	}
+	if !after.Equal(base.Add(nowQuantum)) {
+		t.Errorf("a quantum later, live lane end = %v, want %v", after, base.Add(nowQuantum))
 	}
 }
 

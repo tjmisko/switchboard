@@ -37,8 +37,13 @@ func cmdMemory(args []string) {
 		"clip a session's series at the point its lane stopped being trusted (0 disables the post-check)")
 	_ = fs.Parse(args)
 
-	from, to, label := resolveWindow(*day, *since, *until)
-	now := time.Now()
+	// The same quantized read of the present a timeline render takes (see
+	// nowQuantum), for a different reason: this document's clip point must be the
+	// instant the lane was closed at, not one an arbitrary fraction of a second
+	// later. The hover draws this series against that bar, and the clip below
+	// exists precisely so the two cannot disagree about where evidence ended.
+	now := timeNow().Truncate(nowQuantum)
+	from, to, label := resolveWindow(now, *day, *since, *until)
 	end := to
 	if end.After(now) {
 		end = now

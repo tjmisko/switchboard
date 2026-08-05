@@ -306,6 +306,16 @@ always present and read `0` on a clean day:
 }
 ```
 
+**The live bound is quantized.** Anything still running when you render is closed
+at "now", and that instant is truncated onto a 30s grid (`nowQuantum`) before it
+reaches a single field — the live lanes' `end`, the last `interval.end` under
+them, `summary.to`, and `plan_window.from`/`to`. So **two renders of an unchanged
+window inside the same 30s bucket are byte-identical**, which is what lets a
+polling consumer diff the raw bytes and skip the parse and repaint entirely. The
+bound is truncated, never rounded up: a lane never extends past the present, and
+never ends before its own last recorded evidence either, so `end >= start` holds
+even for a session that began inside the current bucket.
+
 **Delegation (C3)** splits agent-active time by whether you were *attending* it —
 focused on that session while active at the keyboard. It needs the `focus` stream
 (Hyprland) **and** the `activity` stream (an idle daemon, e.g. hypridle); with
@@ -449,6 +459,21 @@ Two deliberate separations, each protecting an existing guarantee:
   poll, so memory is served on its own endpoint at its own cadence and read
   lazily when a tooltip is opened — the same treatment session summaries get.
   `timeline --json` is byte-for-byte unaffected by this feature.
+
+What the two surfaces *do* share is **the bound**: `memory` truncates its clock
+read onto the same 30s `nowQuantum` grid, so both decide where a lane stopped
+being believed at the same instant. The series is clipped at that lane's
+`suspect_since`, and a hover drawing points past the end of the bar it annotates —
+or stopping short of one the timeline still credits in full — would contradict
+the very view it is read against.
+
+That clip has **no right edge**. Everything a flagged lane recorded from its
+`suspect_since` onward is dropped, not merely everything up to the render
+horizon: the horizon is quantized, so it trails the newest reading by up to a
+bucket, and a hung container holding its pages keeps sampling straight through
+that gap — which is precisely the shape the clip exists to catch. The one thing
+that stops a tail is the same session's **next lane** opening, so a session
+resumed after its process died keeps the readings of its second run.
 
 ### Volume
 

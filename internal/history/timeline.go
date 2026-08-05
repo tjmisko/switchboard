@@ -289,7 +289,10 @@ func (b *laneBuilder) closeLabel(t time.Time) {
 //
 // A lane still open at the end of the stream is closed at `end` — pass `now` for
 // a live day so a running session's last interval extends to the present; pass
-// the window's upper bound otherwise. Events need not be pre-sorted.
+// the window's upper bound otherwise. `end` may lag the newest event (a caller
+// quantizing `now` for a stable render); a lane is still never closed before its
+// own last evidence, so End >= Start holds whatever bound is passed. Events need
+// not be pre-sorted.
 //
 // Beyond the status intervals it also derives, per lane: the session-name spans
 // (session_label), the launched-subagent spans (subagent_spawn↔stop by
@@ -304,6 +307,18 @@ func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
 	pidLane := map[int]string{} // pid → the lane key it currently feeds
 	var done []Swimlane
 	finish := func(b *laneBuilder, t time.Time) {
+		// A lane can never end before the last event it was seen to emit. Against an
+		// unquantized wall clock that is vacuous — `end` is past every event — but a
+		// caller may pass a COARSER bound: switchboard-ctl truncates `now` onto a
+		// grid so a polled render is byte-stable, and a session that started inside
+		// the current quantum would otherwise be closed before it opened, putting a
+		// lane with End < Start on the wire. Clamping here rather than in the caller
+		// keeps the invariant next to the routing rules that decide what counts as
+		// evidence in the first place — the global streams (focus, activity) never
+		// route to a lane, so they can never hold one open past its session.
+		if b.lastEvidence.After(t) {
+			t = b.lastEvidence
+		}
 		b.closeInterval(t)
 		b.closeLabel(t)
 		for id, sp := range b.openSubs {
@@ -514,7 +529,7 @@ func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
 	// Focus (C1): the focus stream is global (keyed by the focused session id, not
 	// pid), so it is replayed separately and attached to each lane by session id,
 	// clamped to the lane's lifetime.
-	focusBySession := buildFocusSpans(evs, end)
+	focusBySession := buildFocusSpans(evs, end, laneEnds(done))
 	for i := range done {
 		if id := done[i].SessionID; id != "" {
 			done[i].Focus = clampFocus(focusBySession[id], done[i].Start, done[i].End)
@@ -580,7 +595,7 @@ func isSlug(s string) bool {
 // event opens a span for its session that the next focus event — to a different
 // session, or to none (empty SessionID) — closes; a still-open span caps at
 // `end`. Consecutive events for the same session are coalesced.
-func buildFocusSpans(evs []Event, end time.Time) map[string][]FocusSpan {
+func buildFocusSpans(evs []Event, end time.Time, laneEnd map[string]time.Time) map[string][]FocusSpan {
 	out := map[string][]FocusSpan{}
 	var curSession string
 	var curStart time.Time
@@ -600,7 +615,39 @@ func buildFocusSpans(evs []Event, end time.Time) map[string][]FocusSpan {
 		curSession = ev.SessionID
 		curStart = ev.Ts
 	}
-	closeCur(end)
+	// The span still open at the horizon closes at the lane's end, not at `end`,
+	// whenever the lane reaches further. finish() never closes a lane before its
+	// own last evidence, so on a quantized render a session that emitted anything
+	// inside the current bucket is drawn past the horizon — and its focus has to be
+	// allowed to follow it there. Closed at `end` alone, the tail of a bar you are
+	// demonstrably watching carries no focus at all, and Summarize reads focus-less
+	// agent-active time as DELEGATED rather than attended: up to a quantum of every
+	// live lane, on every render, silently charged to the wrong side of the ratio.
+	//
+	// Only the trailing span is lifted. A focus change earlier in the stream closes
+	// at the instant focus actually moved, which is evidence, not inference.
+	last := end
+	if le, ok := laneEnd[curSession]; ok && le.After(last) {
+		last = le
+	}
+	closeCur(last)
+	return out
+}
+
+// laneEnds is the latest instant each session's lanes were closed at. Used to let
+// the focus stream reach the end of a lane that outlived the render horizon; see
+// the trailing close in buildFocusSpans. Derived from evidence rather than from a
+// clock, so it moves only when the log does.
+func laneEnds(lanes []Swimlane) map[string]time.Time {
+	out := map[string]time.Time{}
+	for _, lane := range lanes {
+		if lane.SessionID == "" {
+			continue
+		}
+		if cur, ok := out[lane.SessionID]; !ok || lane.End.After(cur) {
+			out[lane.SessionID] = lane.End
+		}
+	}
 	return out
 }
 
@@ -794,23 +841,47 @@ func memAgentBytes(ev Event) int64 { return ev.MemAgentPssBytes + ev.MemAgentSwa
 func memTreeBytes(ev Event) int64  { return ev.MemTreePssBytes + ev.MemTreeSwapBytes }
 
 // suspectTails collects, per session, the stretches of a flagged lane whose
-// length is inference rather than observation: [SuspectSince, End]. Keyed by
-// lane rather than by a single per-session instant because one session id can own
-// two lanes (a second run after a session_end), and clipping the second run at
-// the first one's bound would delete real data.
+// length is inference rather than observation: [SuspectSince, …). Keyed by lane
+// rather than by a single per-session instant because one session id can own two
+// lanes (a second run after a session_end), and clipping the second run at the
+// first one's tail would delete real data — so a tail stops where the session's
+// next lane begins, and only there.
+//
+// It deliberately does NOT stop at the flagged lane's own End. That end is the
+// render horizon, which switchboard-ctl truncates onto nowQuantum, so it lags the
+// newest sample by up to a quantum. Bounded there, every reading a hung container
+// produced inside the current bucket walked straight back into the reported peak
+// and average — the one figure this clip exists to protect, and the sampler fires
+// every few seconds, so it was never just one reading. A lane nothing ever closed
+// has no instant at which its readings become believable again; the tail runs on.
 func suspectTails(lanes []Swimlane) map[string][]span {
+	starts := map[string][]time.Time{}
+	for _, lane := range lanes {
+		if lane.SessionID != "" {
+			starts[lane.SessionID] = append(starts[lane.SessionID], lane.Start)
+		}
+	}
 	out := map[string][]span{}
 	for _, lane := range lanes {
 		if lane.SessionID == "" || !lane.Suspect || lane.SuspectSince.IsZero() {
 			continue
 		}
-		out[lane.SessionID] = append(out[lane.SessionID], span{lane.SuspectSince, lane.End})
+		var stop time.Time // zero: nothing of this session's follows, so it runs on
+		for _, s := range starts[lane.SessionID] {
+			if s.After(lane.Start) && (stop.IsZero() || s.Before(stop)) {
+				stop = s
+			}
+		}
+		out[lane.SessionID] = append(out[lane.SessionID], span{lane.SuspectSince, stop})
 	}
 	return out
 }
 
-// dropInSpans removes events landing inside any of the spans. Both ends are
-// inclusive: a sample AT SuspectSince is already past the last thing observed.
+// dropInSpans removes events landing inside any of the spans. The left edge is
+// inclusive — a sample AT SuspectSince is already past the last thing observed —
+// and the right edge is exclusive, so a reading taken at the instant the session's
+// next lane opens belongs to that lane. A zero right edge means the span has no
+// end: see suspectTails.
 func dropInSpans(evs []Event, drop []span) []Event {
 	if len(drop) == 0 {
 		return evs
@@ -819,10 +890,14 @@ func dropInSpans(evs []Event, drop []span) []Event {
 	for _, ev := range evs {
 		inside := false
 		for _, d := range drop {
-			if !ev.Ts.Before(d.start) && !ev.Ts.After(d.end) {
-				inside = true
-				break
+			if ev.Ts.Before(d.start) {
+				continue
 			}
+			if !d.end.IsZero() && !ev.Ts.Before(d.end) {
+				continue
+			}
+			inside = true
+			break
 		}
 		if !inside {
 			out = append(out, ev)

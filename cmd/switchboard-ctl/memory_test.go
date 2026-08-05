@@ -328,6 +328,145 @@ func TestTimelineJSONIsUnaffectedByMemoryEvents(t *testing.T) {
 	})
 }
 
+// runMemoryJSONAt runs `memory --json` with the clock pinned to `at`, so a test
+// can read a LIVE day — one whose window has not closed — from a chosen instant.
+func runMemoryJSONAt(t *testing.T, dir, day string, at time.Time) memoryDoc {
+	t.Helper()
+	orig := timeNow
+	timeNow = func() time.Time { return at }
+	defer func() { timeNow = orig }()
+	var doc memoryDoc
+	out := captureStdout(t, func() {
+		cmdMemory([]string{"--dir", dir, "--day", day, "--json"})
+	})
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatalf("unmarshal memory document: %v\n%s", err, out)
+	}
+	return doc
+}
+
+// The two surfaces are read together — the hover draws this series against that
+// bar — so they have to stop believing a lane at the SAME instant. That means
+// reading the clock through the same quantum: unquantized, `memory` measured
+// silence from a raw `now` up to a full quantum ahead of the bound `timeline`
+// closed the lane at, and anywhere near the trailing cap the two disagreed. The
+// series was clipped while the bar it annotates was still credited in full.
+func TestMemoryAndTimelineShareTheLiveBound(t *testing.T) {
+	// A fixed instant ON the grid, so "the bound" and "the bucket" are the same
+	// thing here and the real clock never enters the test.
+	base := time.Date(2026, 6, 26, 12, 0, 0, 0, time.Local)
+	day := base.Format("2006-01-02")
+	// Silence measured from the bucket boundary falls 10s SHORT of the cap;
+	// measured from the raw instant each render is taken at, it runs 10s past it.
+	// Every assertion below turns on which of the two the surface used.
+	lastEvidence := base.Add(-history.DefaultSuspectTrailingCap + 10*time.Second)
+	sid := "dddd4444-5555-4666-8777-888888888888"
+
+	dir := t.TempDir()
+	writeDay(t, dir, day,
+		history.Event{Ts: base.Add(-5 * time.Hour), Type: history.EventSessionStart, PID: 7001, Agent: "claude"},
+		history.Event{Ts: base.Add(-5 * time.Hour), Type: history.EventTransition, PID: 7001, SessionID: sid, To: "working"},
+		history.Event{Ts: lastEvidence.Add(-10 * time.Minute), Type: history.EventMemorySample, SessionID: sid, PID: 7001,
+			Agent: "claude", Project: "sb", MemAgentPssBytes: 200 * MiB, MemTreePssBytes: 200 * MiB, MemTreeProcs: 1},
+		// The last thing the session was actually heard doing.
+		history.Event{Ts: lastEvidence, Type: history.EventUsageSample, PID: 7001, SessionID: sid,
+			Model: "claude-opus-4-8", TokIn: 1000, TokOut: 500},
+		// A sample from the tail. The sampler keeps reporting whether or not the
+		// session is still believed, so this point survives exactly as long as the
+		// lane does — which is the disagreement this test is about.
+		history.Event{Ts: lastEvidence.Add(time.Minute), Type: history.EventMemorySample, SessionID: sid, PID: 7001,
+			Agent: "claude", Project: "sb", MemAgentPssBytes: 900 * MiB, MemTreePssBytes: 900 * MiB, MemTreeProcs: 9},
+	)
+
+	suspect := func(at time.Time) bool {
+		t.Helper()
+		var env struct {
+			Lanes []history.Swimlane `json:"lanes"`
+		}
+		out := renderTimelineAt(t, dir, day, at)
+		if err := json.Unmarshal([]byte(out), &env); err != nil {
+			t.Fatalf("unmarshal envelope: %v\n%s", err, out)
+		}
+		if len(env.Lanes) != 1 {
+			t.Fatalf("lanes = %d, want 1\n%s", len(env.Lanes), out)
+		}
+		return env.Lanes[0].Suspect
+	}
+	samples := func(at time.Time) int {
+		t.Helper()
+		doc := runMemoryJSONAt(t, dir, day, at)
+		if len(doc.Sessions) != 1 {
+			t.Fatalf("sessions = %d, want 1: %+v", len(doc.Sessions), doc.Sessions)
+		}
+		return len(doc.Sessions[0].Mem)
+	}
+
+	t.Run("should keep the tail sample when the timeline still credits the lane", func(t *testing.T) {
+		// Mid-bucket: raw silence is past the cap, quantized silence is not.
+		at := base.Add(20 * time.Second)
+		if suspect(at) {
+			t.Fatalf("timeline flagged the lane %s before the cap — fixture no longer straddles the boundary",
+				history.DefaultSuspectTrailingCap-10*time.Second)
+		}
+		if got := samples(at); got != 2 {
+			t.Errorf("memory kept %d samples, want 2 — the series was clipped at an instant the lane is still credited at", got)
+		}
+	})
+
+	t.Run("should clip the tail sample once the timeline stops crediting the lane", func(t *testing.T) {
+		// The next bucket: both surfaces now measure the silence as past the cap.
+		at := base.Add(nowQuantum)
+		if !suspect(at) {
+			t.Fatalf("timeline did not flag the lane a quantum later, at silence %s >= cap %s",
+				history.DefaultSuspectTrailingCap+10*time.Second, history.DefaultSuspectTrailingCap)
+		}
+		if got := samples(at); got != 1 {
+			t.Errorf("memory kept %d samples, want 1 — the tail outlived the evidence the lane was clipped at", got)
+		}
+	})
+}
+
+// The ghost-lane clip must not stop at the render horizon. That horizon is
+// truncated onto nowQuantum, so it lags the newest reading by up to a quantum —
+// and a hung container holding its pages keeps sampling right through the gap,
+// which is the entire shape the clip exists to catch. Bounded there, the readings
+// taken in the current bucket walked back into the reported peak.
+func TestMemoryClipDropsReadingsRecordedAfterTheQuantizedBound(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 6, 26, 12, 0, 0, 0, time.Local)
+	day := base.Format("2006-01-02")
+	sid := "eeee5555-6666-4777-8888-999999999999"
+	at := func(d time.Duration) time.Time { return base.Add(d) }
+	sample := func(ts time.Time, mib int64, procs int) history.Event {
+		return history.Event{Ts: ts, Type: history.EventMemorySample, SessionID: sid, PID: 8001,
+			Agent: "claude", Project: "sb", MemAgentPssBytes: mib * MiB, MemTreePssBytes: mib * MiB, MemTreeProcs: procs}
+	}
+
+	writeDay(t, dir, day,
+		history.Event{Ts: at(-5 * time.Hour), Type: history.EventSessionStart, PID: 8001, Agent: "claude"},
+		history.Event{Ts: at(-5 * time.Hour), Type: history.EventTransition, PID: 8001, SessionID: sid, To: "working"},
+		sample(at(-4*time.Hour-50*time.Minute), 200, 1),
+		// Last real evidence, 4h30m before the bound: the lane is flagged.
+		history.Event{Ts: at(-4*time.Hour - 30*time.Minute), Type: history.EventUsageSample, PID: 8001, SessionID: sid,
+			Model: "claude-opus-4-8", TokIn: 1000, TokOut: 500},
+		sample(at(-2*time.Hour), 3000, 12),   // squarely inside the tail
+		sample(at(18*time.Second), 5000, 14), // past the bound, before the wall clock
+	)
+
+	doc := runMemoryJSONAt(t, dir, day, base.Add(20*time.Second))
+	if len(doc.Sessions) != 1 {
+		t.Fatalf("sessions = %d, want 1", len(doc.Sessions))
+	}
+	s := doc.Sessions[0]
+	if len(s.Mem) != 1 {
+		t.Errorf("series has %d points, want 1 — only the 200 MiB reading predates the last evidence: %+v", len(s.Mem), s.Mem)
+	}
+	if got, want := *s.PeakTreeBytes, int64(200*MiB); got != want {
+		t.Errorf("peak_tree_bytes = %d MiB, want %d MiB — a reading taken after the truncated bound escaped the clip",
+			got/MiB, want/MiB)
+	}
+}
+
 func rawInt(t *testing.T, m map[string]json.RawMessage, field string) int64 {
 	t.Helper()
 	raw, ok := m[field]
