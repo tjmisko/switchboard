@@ -413,9 +413,11 @@ files (`agent-af5bd126402ac16c7.jsonl`, the blocked `escalate-cleanup`):
 A subagent's own jsonl **does** record the pending `tool_use`, with its
 `tool_name` and `tool_input`, and simply never receives the matching
 `tool_result`. ⚠ This contradicts `status-color-state-model.md`'s "Claude Code
-withholds the pending tool_use's assistant message until it resolves" — that
-claim was made about the **main** transcript and does not hold for a subagent's
-own file. Whether it holds for the main thread is unverified (V4 below).
+withholds the pending tool_use's assistant message until it resolves". That claim
+was made about the **main** transcript, and V4 (§9.7) has since shown it does not
+hold there either: the main jsonl carries the pending `tool_use` within ~5 s of
+the hook and keeps it unmatched for the whole wait. The claim is simply false and
+is scheduled for correction wherever it appears.
 
 But an unmatched trailing `tool_use` means "a tool is dispatched and has not
 returned," which covers *awaiting approval* **and** *executing right now*. There
@@ -509,19 +511,25 @@ Non-obvious enough that the follow-up task should be written from this list.
    one assistant message, so a writer can complete an auto-approved sibling while
    its own prompt is still pending. That is the incident's bug at a narrower
    radius. A hydrated entry resolves by transcript only.
-3. **Do not falsify main-thread entries until V4.** The unmatched-trailing-
-   `tool_use` signature is verified for *subagent* jsonls only (§9.3). If the
-   main transcript really does withhold the pending `tool_use`, then a genuinely
-   pending main-thread prompt shows **no** unmatched tail and the falsifier would
-   drop it — a missed RED, the exact error this task exists to prevent. Gate the
-   falsifier on `a != main` until V4 lands. Unreadable, truncated-tail, or
-   tail-window-missed-the-`tool_use` all mean *keep*, matching
-   `permissionExit`'s `unreadable` handling.
+3. **Falsify main-thread entries too — V4 settled it (§9.7).** The unmatched-
+   `tool_use` signature was verified for *subagent* jsonls first (§9.3); V4 has
+   since verified it for the **main** transcript, contemporaneously and inside
+   three real pending windows, so the `a != main` gate this trap once demanded is
+   **not** needed and should not be built. Two constraints survive and are
+   load-bearing: (a) test for **any** unmatched `tool_use` in the tail, never the
+   trailing one alone — a gated tool with an auto-approved parallel sibling
+   leaves the *last* `tool_use` matched while the prompt still waits, and
+   dropping on that is the missed RED this trap was written to prevent; (b)
+   falsify each writer against **its own** file (main → `<session>.jsonl`,
+   subagent → `<session>/subagents/agent-*.jsonl`) — a subagent-raised prompt
+   leaves the main tail fully matched, so crossing the two inverts the answer.
+   Unreadable, truncated-tail, or tail-window-missed-the-`tool_use` all mean
+   *keep*, matching `permissionExit`'s `unreadable` handling.
 4. **Handle the three hydrate combinations explicitly.**
 
    | persisted `Status` | persisted `pending_writers` | action |
    |---|---|---|
-   | `permission` | non-empty | rebuild `Pending`, `Since := startup`, falsify subagent entries |
+   | `permission` | non-empty | rebuild `Pending`, `Since := startup`, falsify every entry against its own writer's jsonl (main included — §9.7) |
    | `permission` | empty / absent | a pre-T12 `state.json`. Seed `Pending{main}` — this reproduces today's behavior exactly and is the honest downgrade across the version boundary |
    | not `permission` | non-empty | should be unreachable. `Pending` is the authority post-T5: keep it, re-fold to RED, and log it — a silent disagreement here is how a missed RED hides |
 
@@ -551,6 +559,12 @@ Tests, in the §5 style:
   still ends in an unmatched `tool_use`
 - should drop a hydrated entry when the subagent's jsonl shows the matching
   `tool_result` (answered while the daemon was down)
+- should keep a main-owned red across a hydrate when `<session>.jsonl` holds an
+  unmatched `tool_use` (V4, §9.7)
+- should keep a main-owned red when the tail's *trailing* `tool_use` is matched
+  but an earlier parallel sibling is not (trap 3a — the missed-RED case)
+- should keep a main-owned red when only a *subagent* jsonl shows a matching
+  `tool_result` (trap 3b — writers are falsified against their own file)
 - should not clear a hydrated red on a `PostToolUse` from the owning writer
   carrying a *different* tool (trap 2)
 - should seed `Pending{main}` from a `state.json` written before this field
@@ -558,16 +572,108 @@ Tests, in the §5 style:
 - should produce a byte-identical change key for two snapshots whose `Pending`
   maps are equal but iterate in different orders (trap 1)
 
-### 9.7 New verification step
+### 9.7 V4 — RESOLVED: the main transcript *does* record a pending `tool_use`
 
 - **V4 — does the main transcript record a pending main-thread `tool_use`?**
-  Raise a main-thread permission prompt, leave it unanswered, and inspect the
-  tail of `<session>.jsonl`. If the pending `tool_use` is present and unmatched,
-  extend the §9.6 trap-3 falsifier to `a == main`. If it is withheld, the
-  falsifier stays subagent-only permanently and
-  `status-color-state-model.md`'s "withholds the pending tool_use" note should be
-  scoped to the main transcript rather than deleted. Joins V1–V3 in the
-  oscillation doc §6.
+  **Yes.** The pending `tool_use` is a complete, newline-terminated line in the
+  main `<session>.jsonl` within ~5 s of the `PermissionRequest` hook and stays
+  there, unmatched, for the whole wait. The "Claude Code withholds the pending
+  tool_use's assistant message until it resolves" claim is **false about the main
+  transcript**, not merely about subagent files (§9.3). **Trap 3's gate can be
+  lifted: extend the falsifier to `a == main`.** Confidence: high — the decisive
+  measurement is contemporaneous, not reconstructed.
+
+**Why the naive check could not settle it.** "The entry is in the file now" does
+not prove it was in the file while the prompt waited; H7/H8 (`docs/timing-hazards.md`)
+document exactly that skew, and every one of the seven long main-thread windows
+below has its `tool_result` on the *very next line*, so file order alone proves
+nothing. Under wall-clock anchoring the daemon's own `ResolveKind` reads cannot
+settle it either — the anchor was moved to `now` precisely so the prompt's own
+turn-mates (dated before the hook) stop registering. The reader that *can* settle
+it is the one that ignores timestamps entirely.
+
+**The measurement — `usage_sample` as a line counter.** `UsageSince` /
+`UsageSinceByModel` (`transcript.go:524`, `:552`) walk a **byte cursor** over
+`c.Transcript` — the *main* jsonl (`fanout.go:137`) — sum `message.usage` over
+every assistant line appended since the last offset, and emit one `usage_sample`
+history event per non-zero delta. Two properties make it a proof instrument:
+
+- `readNewLines` truncates at the last `\n`, so **a counted line was complete and
+  newline-terminated on disk at sample time**; a line caught mid-write is
+  excluded and re-read next call.
+- Claude Code splits one assistant message into one jsonl line per content block
+  (thinking / text / `tool_use`), and **repeats the identical message-level
+  `usage` on each**. So a sample that counted *N* lines of message *M* reports
+  exactly *N* × *M*`.usage`. The ratio is a line count.
+
+Each blocked turn below is a 3-line message — thinking, text, `tool_use` — and
+the `tool_use` is the **last** of the three. A sample of exactly 3× therefore
+counted the `tool_use` line, and it did so at a wall-clock the history log
+records independently of any transcript timestamp.
+
+| session | project | hook (local) | sample | sample − hook | sample → user's answer | `got/unit` |
+|---|---|---|---|---|---|---|
+| `f4aff00a` | zettel-llm | 2026-07-22 13:50:32.637 | 13:50:37.197 | **+4.56 s** | **−453.4 s (7 m 33 s)** | 3.0 / 3.0 / 3.0 / 3.0 |
+| `e57df9f4` | resume | 2026-08-03 09:42:23.901 | 09:42:28.778 | **+4.88 s** | **−703.4 s (11 m 43 s)** | 3.0 / 3.0 / 3.0 / 3.0 |
+| `77baa90a` | arachne | 2026-08-05 10:32:13.153 | 10:32:18.177 | **+5.02 s** | **−275.5 s (4 m 36 s)** | 3.0 / 3.0 / 3.0 / 3.0 |
+
+`got/unit` is (`tok_in`, `tok_out`, `tok_cache_read`, `tok_cache_create`) divided
+by the pending message's per-line usage — four independent fields, exact integer
+3× in all three cases, no rounding. Worked example (`f4aff00a`, the 2026-07-22
+zettel episode H8 already cites): lines 249/250/251 are `thinking` / `text` /
+`tool_use(AskUserQuestion)` of message `…pC6FE8`, each carrying
+`usage = (2, 2504, 154510, 889)`; the 13:50:37.197 sample recorded
+`(6, 7512, 463530, 2667)`. The `tool_result` did not land until 13:58:10.632.
+Corroborating: that episode's `age=40s` on a 5 s-old red pins the pre-fix
+`AnchorTime` to line 248 (`ts 20:49:57.055Z`), i.e. lines 249–251 were **not** on
+disk when the hook was processed and **were** ~4.6 s later — the flush lands
+seconds into the wait, not at resolution. Two further windows (`6169e789`
+13 m 20 s, `4286c0d4` 10 m 48 s) show the same exact 3×, but their sample fell
+~1 s *after* the answer, so they corroborate the 3×-means-3-lines reading without
+being in-window. Reproduce with the history log
+(`$XDG_STATE_HOME/switchboard/history/<day>.jsonl`) plus the journal's
+`working->permission` edges.
+
+**Independent confirmations that the writer never withholds a `tool_use`:**
+
+- *Live sampling* — 90 s polling every live session's main jsonl at ~0.28 s
+  produced **8 distinct moments** where a main transcript's on-disk tail ended in
+  an unmatched assistant `tool_use` (`stop_reason:"tool_use"`) while the tool was
+  in flight, held 0.65–10.9 s, file mtime 0.008–0.213 s old (sessions `067e9f45`,
+  `4efbd84c`). The main transcript is written at **dispatch**.
+- *A durable frozen tail* — `d15e58ff…jsonl` (switchboard, cc 2.1.218) ends at
+  line 231 on a main-thread (`isSidechain:false`) `tool_use(Bash)` dated
+  `2026-07-23T03:29:01.537Z`, mtime `03:29:02.439Z` (**+0.902 s**), no
+  `tool_result` ever, untouched since. The write of a main-thread `tool_use` does
+  not wait on its result.
+- *Entry dating* — across all seven main-thread windows the pending `tool_use`
+  entry is dated **6–374 ms before** its `PermissionRequest` hook and its
+  `tool_result` **20–101 ms after** the clearing edge. Nothing in the entry
+  depends on the approval; only its flush instant was ever in question, and the
+  `usage_sample` measures that directly.
+
+**Two carry-overs for the implementer, both empirical, both in the same files.**
+
+1. **Falsify on *any* unmatched `tool_use` in the tail, not the trailing one.**
+   Parallel dispatch is common — `f4aff00a` 245/246, `d15e58ff` 210/211 and
+   219/220, `20f63439` 624/625 all show two `tool_use` lines from one message.
+   With a gated tool and an auto-approved sibling, file order is
+   `tool_use(gated)`, `tool_use(sibling)`, `tool_result(sibling)`: the *trailing*
+   `tool_use` is matched while the prompt still waits, so a trailing-only test
+   would drop a live red. This is trap 2's hazard on the transcript path, and it
+   applies to subagent jsonls equally.
+2. **Falsify a writer only against that writer's own file.** Live capture of
+   subagent-raised prompts in sessions `d053f268` and `40f2f003` shows the main
+   tail fully **matched** throughout, while the raising `agent-*.jsonl` under
+   `<session>/subagents/` carried the unmatched `tool_use`. A main-keyed entry
+   checked against a subagent file (or the reverse) inverts the answer.
+
+**Follow-ups this verdict obliges** (outside this task's file scope):
+`status-color-state-model.md:99` and `state-schema.md:177` both assert the
+withholding as fact and must be corrected — the resolution latency they explain
+is real, but its cause is model latency to the *next* assistant message plus tick
+granularity, not a withheld write. `transcript.go`'s package comment is corrected
+here. Joins V1–V3 in the oscillation doc §6.
 
 ### 9.8 What would change this decision
 
@@ -589,7 +695,10 @@ Tests, in the §5 style:
   — the load-bearing premise of the whole decision — collapses. Then drop the
   wire field and let the hook rebuild `Pending` after a restart. Worth a
   standing recheck at each Claude Code version bump alongside
-  `claude-code-hook-schema.md`.
+  `claude-code-hook-schema.md` — and recheck V4 (§9.7) there too: it is a fact
+  about Claude Code's transcript writer, not about switchboard, so a writer
+  change could restore the `a != main` gate. The `usage_sample` 3×-ratio method
+  in §9.7 re-runs in minutes against the history log.
 - **Not a mind-changer:** the cost of the hydrate reads (§9.4), or discomfort
   with a new field on the frozen contract. The field is additive, it is the
   minimum that guards #1, and it is information a renderer wants anyway (T11).
