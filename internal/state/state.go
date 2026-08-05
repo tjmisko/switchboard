@@ -7,9 +7,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -292,6 +296,43 @@ var lockHoldWarn = func() time.Duration {
 	return d
 }()
 
+// lockWarnOut is where the lock-hold warning goes. A variable only so the test
+// can read what was written; production never changes it.
+var lockWarnOut io.Writer = os.Stderr
+
+// applyCaller names the function that called Apply, for the lock-hold warning.
+//
+// "Which Apply?" is the question the duration alone cannot answer, and getting it
+// wrong wastes the whole audit: the reconcile tick, the hook handler and the WM
+// layout path all call Apply, they hold it for very different reasons, and
+// hoisting the wrong one moves nothing. The reconcile tick was the obvious
+// suspect; the hook handler also reads the transcript under the lock, at hook
+// frequency.
+//
+// runtime.Caller is only ever reached on a hold that already tripped the
+// threshold, so it costs nothing on the hot path — an Apply fast enough not to
+// warn never walks a stack.
+//
+// Skip 2, counted from inside this function: 0 is applyCaller, 1 is Apply, 2 is
+// the function containing the store.Apply(...) call. Skip 1 looks right and is
+// not — it reports `state.(*Store).Apply` for every warning, which is true,
+// useless, and quiet about being wrong.
+func applyCaller() string {
+	pc, _, line, ok := runtime.Caller(2)
+	if !ok {
+		return "unknown"
+	}
+	fn := runtime.FuncForPC(pc)
+	if fn == nil {
+		return "unknown"
+	}
+	name := fn.Name()
+	if i := strings.LastIndex(name, "/"); i >= 0 {
+		name = name[i+1:] // drop the module path, keep pkg.Func
+	}
+	return name + ":" + strconv.Itoa(line)
+}
+
 // Apply mutates the store under lock, then — only when the mutation actually
 // changed something a consumer can see — notifies subscribers and persists.
 //
@@ -313,8 +354,8 @@ func (s *Store) Apply(fn func(map[int]*Session)) {
 			// Deliberately still under the lock: this reports the hold, and a hold
 			// long enough to trip the threshold has already done its damage. The
 			// write is one Fprintf on a path that by definition fires rarely.
-			fmt.Fprintf(os.Stderr, "state: Apply held the write lock %v (> %v) sessions=%d\n",
-				held.Round(time.Microsecond), lockHoldWarn, len(s.sessions))
+			fmt.Fprintf(lockWarnOut, "state: Apply held the write lock %v (> %v) sessions=%d caller=%s\n",
+				held.Round(time.Microsecond), lockHoldWarn, len(s.sessions), applyCaller())
 		}
 	}
 	s.mu.Unlock()
