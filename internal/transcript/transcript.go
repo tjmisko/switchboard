@@ -419,6 +419,111 @@ func resolutionKindOf(e entry) ResolutionKind {
 	return ResolutionNone
 }
 
+// BlockedEvidence is what one writer's OWN transcript tail says about whether it
+// is still waiting on a dispatched tool. It exists for exactly one caller — the
+// daemon's hydrate, which rebuilds prompt ownership from state.json after a
+// restart (docs/subagent-permission-plan.md §9) — and it is deliberately shaped as
+// a FALSIFIER, never a source.
+//
+// The asymmetry is the whole point. An unmatched tool_use means "a tool is
+// dispatched and has not returned," which covers *awaiting approval* and
+// *executing right now* with no third field to separate them, so deriving a
+// pending prompt from it would raise a false RED on every session that happened to
+// be mid-tool when the daemon restarted. But its ABSENCE — every dispatched tool
+// in the window has its result — does prove the writer is no longer blocked: the
+// tool returned, so whatever gate it sat behind opened. Applied only to ownership
+// we already persisted, the check can only REMOVE, so its worst outcome is
+// shortening a red, never inventing or missing one.
+type BlockedEvidence int
+
+const (
+	// BlockedUnknown means the tail cannot answer: the file is missing, unreadable,
+	// empty, or simply holds no tool_use at all (the pending one may have scrolled
+	// past the window). The caller must KEEP the entry — this is the same
+	// fail-closed reading permissionExit gives an unreadable transcript.
+	BlockedUnknown BlockedEvidence = iota
+	// BlockedYes means at least one tool_use in the tail has no matching
+	// tool_result. The writer still has a tool in flight, so a prompt recorded
+	// against it may well still be waiting. KEEP.
+	BlockedYes
+	// BlockedNo means the tail held tool_use blocks and EVERY one of them is
+	// matched by a tool_result. The writer is demonstrably not waiting on a tool,
+	// so a persisted prompt against it was answered — most likely while the daemon
+	// was down, a window the Since := startup re-stamp would otherwise hide. DROP.
+	BlockedNo
+)
+
+func (e BlockedEvidence) String() string {
+	switch e {
+	case BlockedYes:
+		return "blocked"
+	case BlockedNo:
+		return "unblocked"
+	default:
+		return "unknown"
+	}
+}
+
+// BlockedByPendingTool reports whether the writer that owns the transcript at
+// `path` still has a tool dispatched and unanswered. Pass the writer's OWN file —
+// SubagentPath(mainTranscript, agentID) — never the parent's.
+//
+// Two constraints, both measured, both a real missed RED if dropped
+// (docs/subagent-permission-plan.md §9.7):
+//
+//   - It tests for ANY unmatched tool_use in the window, never the trailing one.
+//     Claude Code emits parallel tool_use blocks from a single assistant message
+//     routinely, so with a gated tool beside an auto-approved sibling the file
+//     order is tool_use(gated), tool_use(sibling), tool_result(sibling): the
+//     *trailing* tool_use is matched while the prompt still waits, and a
+//     trailing-only test would drop a live red.
+//   - It applies to the MAIN transcript exactly as it does to a subagent's. The
+//     "Claude Code withholds the pending tool_use until it resolves" claim is
+//     false — the main jsonl carries the pending tool_use within ~5 s of the hook
+//     and keeps it unmatched for the whole wait (§9.7, V4). What it must NOT do is
+//     cross the two: a subagent-raised prompt leaves the main tail fully matched,
+//     so checking a subagent's entry against the parent file inverts the answer.
+//
+// The error is returned for the caller's logs only; every failure mode already
+// maps to BlockedUnknown, which means keep.
+func BlockedByPendingTool(path string, maxBytes int64) (BlockedEvidence, error) {
+	entries, err := readTailEntries(path, maxBytes)
+	if err != nil {
+		return BlockedUnknown, err
+	}
+	// Collect the two sides across the WHOLE window before comparing. A result can
+	// only follow its use, but the pairing is per-id and not per-line, so anything
+	// that decides as it scans would be answering a different question.
+	dispatched := map[string]bool{}
+	answered := map[string]bool{}
+	for _, e := range entries {
+		for _, b := range e.blocks() {
+			switch b.Type {
+			case "tool_use":
+				if b.ID != "" {
+					dispatched[b.ID] = true
+				}
+			case "tool_result":
+				if b.ToolUseID != "" {
+					answered[b.ToolUseID] = true
+				}
+			}
+		}
+	}
+	if len(dispatched) == 0 {
+		// Nothing to falsify against. A truncated tail, a window that missed the
+		// tool_use, or a writer that has genuinely dispatched nothing all land here,
+		// and they are indistinguishable — so keep.
+		return BlockedUnknown, nil
+	}
+	for id := range dispatched {
+		if !answered[id] {
+			return BlockedYes, nil
+		}
+	}
+	return BlockedNo, nil
+}
+
 // taskToolNames are the tool_use names whose invocation spawns a subagent. Work
 // done inside such a subagent is "work happening" for the delegating-green rule
 // (docs/status-color-state-model.md §5 cases 5/14): a main thread that has ended

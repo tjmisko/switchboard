@@ -103,7 +103,7 @@ func main() {
 	// use, so there is exactly one process-reading backend. Runs before the live
 	// scan starts; the scanner re-adds survivors on the first tick.
 	scanner := discovery.New(procSrc)
-	dropStaleSessions(store, procSrc, sink, scanner.Forget)
+	dropStaleSessions(store, procSrc, sink, scanner.Forget, tun.TailBytes)
 	resolver := mapping.NewResolver(term, manager)
 
 	onAgentAppeared := func(info osproc.Info) {
@@ -247,8 +247,19 @@ func sweepDeadSessions(m map[int]*state.Session, src osproc.Source, sink *histor
 // ever existed to observe it. Recording its session_end here is what closes its
 // lane; without it the lane stays open forever and the reader stretches its last
 // interval to `now` — a ghost lane (L2, session-lifecycle-hazards.md).
-func dropStaleSessions(store *state.Store, procSrc osproc.Source, sink *history.Sink, forget func(int)) {
+//
+// It is also where a surviving session's PROMPT OWNERSHIP is rebuilt (plan T12,
+// §9). That belongs on these same lines and for the same stated reason: the
+// startup instant re-stamped onto StatusSince is re-stamped onto every hydrated
+// prompt, and the alternative — trusting the pre-restart clock — would make every
+// pre-restart transcript entry read as "resolved after" and demote a red that was
+// live across the restart. See hydratePending.
+func dropStaleSessions(store *state.Store, procSrc osproc.Source, sink *history.Sink, forget func(int), tailBytes int64) {
 	now := time.Now()
+	// Sampled BEFORE the lock, per the direction the recent perf work established
+	// (§9.4). Nothing is serving yet so there is no contention to create, but the
+	// rule that transcript I/O stays outside store.Apply is worth keeping absolute.
+	verdicts := hydratePendingVerdicts(store.Snapshot(), tailBytes)
 	store.Apply(func(m map[int]*state.Session) {
 		for pid := range m {
 			info, err := procSrc.Read(pid)
@@ -262,6 +273,7 @@ func dropStaleSessions(store *state.Store, procSrc osproc.Source, sink *history.
 				if info := m[pid].Enrichment(); info != nil {
 					info.StatusSince = now
 				}
+				hydratePending(m[pid], verdicts[pid], now)
 				continue
 			}
 			// Definitively dead (gone, or the pid recycled to a non-agent): record the
@@ -274,6 +286,116 @@ func dropStaleSessions(store *state.Store, procSrc osproc.Source, sink *history.
 			delete(m, pid)
 		}
 	})
+}
+
+// hydratePendingVerdicts asks each hydrated session's transcripts whether the
+// writers it persisted as blocked still have a tool in flight, returning
+// pid → writer key → KEEP. It is pure I/O and pure reading: it runs before
+// store.Apply, mutates nothing, and its verdicts can only ever remove ownership.
+//
+// Each writer is falsified against its OWN file — main against <session>.jsonl,
+// a subagent against <session>/subagents/agent-<id>.jsonl (SubagentPath, from the
+// stored transcript path, never re-derived from cwd). Crossing the two inverts the
+// answer: live capture of subagent-raised prompts shows the MAIN tail fully
+// matched throughout while the raising agent-*.jsonl carries the unmatched
+// tool_use (§9.7, carry-over 2).
+//
+// Anything short of proof keeps the entry, so an unreadable file, a truncated
+// tail, or a window that missed the tool_use all fail closed — the same reading
+// permissionExit gives an unreadable transcript.
+func hydratePendingVerdicts(snap state.Snapshot, tailBytes int64) map[int]map[string]bool {
+	verdicts := map[int]map[string]bool{}
+	for _, sess := range snap.Sessions {
+		c := sess.Claude
+		if c == nil || len(c.Pending) == 0 {
+			continue
+		}
+		keep := make(map[string]bool, len(c.Pending))
+		for _, writer := range c.PendingWriterKeys() {
+			path := transcript.SubagentPath(c.Transcript, writer)
+			evidence, err := transcript.BlockedByPendingTool(path, tailBytes)
+			keep[writer] = evidence != transcript.BlockedNo
+			if !keep[writer] {
+				log.Printf("hydrate: pid=%d session=%s writer=%s resolved while the daemon was down (%s), dropping its prompt",
+					sess.PID, shortSessionID(c.SessionID), hydrateWriterLabel(writer), path)
+			} else if err != nil {
+				log.Printf("hydrate: pid=%d session=%s writer=%s transcript unreadable (%v), keeping its prompt",
+					sess.PID, shortSessionID(c.SessionID), hydrateWriterLabel(writer), err)
+			}
+		}
+		verdicts[sess.PID] = keep
+	}
+	return verdicts
+}
+
+// hydratePending rebuilds one session's prompt ownership from what Load decoded,
+// applying the verdicts sampled outside the lock. Claude-only: codex records no
+// approvals in its rollout, so it has no ownership to restore and nothing that
+// could ever resolve one.
+//
+// The three combinations §9.6 (trap 4) enumerates, all handled explicitly:
+//
+//	persisted status | pending_writers | action
+//	permission       | non-empty       | keep the survivors, re-stamp Since := now
+//	permission       | empty / absent  | a pre-T12 mirror: seed the main thread, which
+//	                                     reproduces today's behavior exactly and is the
+//	                                     honest downgrade across the version boundary
+//	not permission   | non-empty       | unreachable by construction. Pending is the
+//	                                     authority post-T5, so keep it, re-fold to RED,
+//	                                     and log — a silent disagreement is how a
+//	                                     missed RED hides
+//
+// Note the seed is keyed off whether writers were PERSISTED, not off whether the
+// map is empty now: a set that the falsifier emptied has been proven resolved, and
+// re-seeding it would manufacture the very red the falsifier just subtracted.
+//
+// Since is re-stamped rather than restored, deliberately. A true pre-restart onset
+// makes every pre-restart transcript entry read as "resolved after," and running
+// two clocks (true onset for T10's cap, restart for the resolution window) buys a
+// marginal gain. The consequence, stated plainly: a prompt raised ten minutes
+// before a restart gets a fresh full cap after it — the same #1-over-#2 trade the
+// StatusSince re-stamp above already makes.
+func hydratePending(sess *state.Session, keep map[string]bool, now time.Time) {
+	c := sess.Claude
+	if c == nil {
+		return
+	}
+	persisted := len(c.Pending) > 0
+	for _, writer := range c.PendingWriterKeys() {
+		if !keep[writer] {
+			c.DropPending(writer)
+		}
+	}
+	switch {
+	case c.Status == state.StatusPermission && !persisted:
+		// Pre-T12 state.json: the red survived (status is on the wire and always
+		// was) but its owner never did. Seeding the main thread restores exactly the
+		// behavior this daemon had before the field existed — the red resolves
+		// against the main transcript — instead of leaving an ownerless red that the
+		// fold would read as not-red.
+		c.SetPending("", state.PendingPrompt{Since: now})
+		log.Printf("hydrate: pid=%d session=%s permission chip with no persisted owner; seeding the main thread (pre-T12 state.json)",
+			sess.PID, shortSessionID(c.SessionID))
+	case c.Status != state.StatusPermission && len(c.Pending) > 0:
+		log.Printf("hydrate: pid=%d session=%s status=%q disagrees with %d persisted pending writer(s); Pending is the authority, re-folding to permission",
+			sess.PID, shortSessionID(c.SessionID), c.Status, len(c.Pending))
+		c.Status = state.StatusPermission
+		c.StatusSince = now
+	}
+	for _, writer := range c.PendingWriterKeys() {
+		p := c.Pending[writer]
+		p.Since = now
+		c.Pending[writer] = p
+	}
+}
+
+// hydrateWriterLabel names a Pending key for a log line, since the main thread's
+// key is the empty string and an empty writer= reads as a bug.
+func hydrateWriterLabel(writer string) string {
+	if writer == "" {
+		return state.PendingWriterMain
+	}
+	return writer
 }
 
 // layoutDebounce is the window a burst of layout events is coalesced into.
