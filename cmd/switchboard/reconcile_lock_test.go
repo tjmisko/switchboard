@@ -170,7 +170,7 @@ func TestShouldNotHoldTheStoreLockAcrossEnumerationOnTheWMLayoutPath(t *testing.
 	store, loc, resolver, _ := reconcileFixture(t, 8)
 
 	got := measureWorstReaderWait(store, func() {
-		reresolveAll(context.Background(), store, resolver)
+		reresolveAll(context.Background(), store, resolver, nil)
 	})
 
 	// Found in production, not in a unit test: hoisting only the reconciler left
@@ -210,5 +210,103 @@ func TestShouldFallBackToPerSessionResolveWhenTheBackendCannotBatch(t *testing.T
 	snap := store.Snapshot()
 	if len(snap.Sessions) != 1 || snap.Sessions[0].PID != 6000 {
 		t.Fatalf("session did not survive a no-batch tick: %+v", snap.Sessions)
+	}
+}
+
+// overlapDetectingLocator records whether two enumerations were ever in flight
+// at the same moment.
+type overlapDetectingLocator struct {
+	mu       sync.Mutex
+	inFlight int
+	overlap  bool
+	panes    map[string]terminal.PaneRef
+}
+
+func (l *overlapDetectingLocator) Name() string    { return "overlap" }
+func (l *overlapDetectingLocator) Available() bool { return true }
+
+func (l *overlapDetectingLocator) Snapshot(context.Context) (map[string]terminal.PaneRef, error) {
+	l.mu.Lock()
+	l.inFlight++
+	if l.inFlight > 1 {
+		l.overlap = true
+	}
+	l.mu.Unlock()
+
+	time.Sleep(enumDelay)
+
+	l.mu.Lock()
+	l.inFlight--
+	l.mu.Unlock()
+	return l.panes, nil
+}
+
+func (l *overlapDetectingLocator) Locate(context.Context, string) (*terminal.PaneRef, error) {
+	return nil, nil
+}
+func (l *overlapDetectingLocator) Activate(context.Context, *terminal.PaneRef) error { return nil }
+
+func (l *overlapDetectingLocator) overlapped() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.overlap
+}
+
+// runConcurrentResolves drives the reconciler tick and the WM layout re-resolve
+// at the same time through the given turn, and reports whether their
+// enumerations overlapped.
+func runConcurrentResolves(t *testing.T, turn *resolveTurn) bool {
+	t.Helper()
+
+	store := state.New("")
+	panes := map[string]terminal.PaneRef{"/dev/pts/7": {Backend: "overlap", TTY: "/dev/pts/7"}}
+	store.Apply(func(m map[int]*state.Session) {
+		m[7000] = &state.Session{PID: 7000, TTY: "/dev/pts/7", CWD: "/home/test", StartedAt: time.Now()}
+	})
+
+	loc := &overlapDetectingLocator{panes: panes}
+	manager := stubManager{}
+	stack := detect.Stack{OSProc: fakeProcSource{st: map[int]procState{7000: procAlive}}, Terminal: loc, WM: manager}
+	resolver := mapping.NewResolver(loc, manager)
+	rstate := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		turn.Do(func() {
+			reconcileOnce(context.Background(), store, resolver, manager, stack,
+				statustune.Default(), nil, rstate, func(int) {})
+		})
+	}()
+	go func() {
+		defer wg.Done()
+		reresolveAll(context.Background(), store, resolver, turn)
+	}()
+	wg.Wait()
+
+	return loc.overlapped()
+}
+
+func TestShouldNotEnumerateConcurrentlyFromBothResolvePaths(t *testing.T) {
+	// Both paths now sample BEFORE taking the store lock, which is what made them
+	// fast and also what let an enumeration taken at T0 land after one taken at
+	// T1 > T0 — reverting a chip's workspace to the older reading. Serializing
+	// enumerate-and-apply means the loser waits and then re-enumerates fresh, so
+	// the last write always carries the freshest observation. It also stops the two
+	// paths doing duplicate concurrent enumerations, the very cost being removed.
+	if runConcurrentResolves(t, &resolveTurn{}) {
+		t.Error("the reconciler and the WM layout path enumerated concurrently while sharing " +
+			"a turn; an older enumeration can then land after a newer one")
+	}
+}
+
+func TestShouldOverlapWithoutATurn_negativeControl(t *testing.T) {
+	// Guards the test above from becoming vacuous: without the turn the same
+	// harness MUST show the overlap. If this ever stops overlapping, the harness
+	// has stopped exercising concurrency and the assertion above proves nothing.
+	if !runConcurrentResolves(t, nil) {
+		t.Error("the harness did not produce concurrent enumerations even without a turn, " +
+			"so the serialization test above is not proving anything")
 	}
 }

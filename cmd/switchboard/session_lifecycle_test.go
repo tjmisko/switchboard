@@ -272,7 +272,7 @@ func TestWindowClosedClosesTheLaneOnlyWhenTheProcessIsGone(t *testing.T) {
 			var forgotten []int
 			handleWMEvent(context.Background(), store, nil,
 				wm.Event{Kind: wm.EventWindowClosed, Address: address},
-				sink, src, func(p int) { forgotten = append(forgotten, p) })
+				sink, src, func(p int) { forgotten = append(forgotten, p) }, nil)
 			sink.Close()
 
 			ends := eventsOfType(readEvents(t, histDir), history.EventSessionEnd)

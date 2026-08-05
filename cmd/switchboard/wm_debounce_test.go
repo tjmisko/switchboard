@@ -80,7 +80,7 @@ func debounceHarness(t *testing.T) (*state.Store, chan wm.Event, *countingLocato
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		drainWMEvents(ctx, store, resolver, events, nil, nil, nil, testDebounce)
+		drainWMEvents(ctx, store, resolver, events, nil, nil, nil, nil, testDebounce)
 	}()
 	return store, events, loc, func() {
 		cancel()
@@ -152,4 +152,73 @@ func TestShouldFlushAPendingCoalesceWhenTheEventStreamCloses(t *testing.T) {
 	if got := loc.count(); got != 1 {
 		t.Errorf("re-resolved %d times after the stream closed mid-window, want 1", got)
 	}
+}
+
+// The three cases below pin the findings an adversarial review of the original
+// debounce turned up. None of the four tests above can catch any of them: they
+// exercise bursts that STOP, and every defect here needs a burst that does not.
+
+func TestShouldStillReresolveWhenLayoutEventsNeverStopArriving(t *testing.T) {
+	_, events, loc, stop := debounceHarness(t)
+	defer stop()
+
+	// Events spaced well inside the window, sustained for several windows. A
+	// trailing-edge debounce that re-arms on every event has NO maximum wait: the
+	// timer is reset before it can fire and the layout path re-resolves ZERO times
+	// for as long as the stream keeps up. That is the shape a terminal repainting
+	// its window title at animation rate produces during a turn.
+	// The assertion MUST be made while events are still flowing. Letting the burst
+	// stop first defeats the test entirely: the final Reset then fires during the
+	// quiet period and the buggy code looks correct. (It did, on the first draft
+	// of this test.)
+	sending := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-sending:
+				return
+			case events <- wm.Event{Kind: wm.EventLayoutChanged}:
+				time.Sleep(testDebounce / 8)
+			}
+		}
+	}()
+
+	time.Sleep(testDebounce * 4)
+	got := loc.count()
+	close(sending)
+	<-done
+
+	if got == 0 {
+		t.Error("no re-resolve happened across four debounce windows of continuous layout events; " +
+			"the timer is being re-armed before it can fire, so staleness is bounded by the " +
+			"reconcile interval rather than the debounce window")
+	}
+}
+
+func TestShouldLandAPendingLayoutReresolveBeforeDispatchingAFocusEvent(t *testing.T) {
+	store, events, loc, stop := debounceHarness(t)
+	defer stop()
+
+	events <- wm.Event{Kind: wm.EventLayoutChanged}
+	events <- wm.Event{Kind: wm.EventFocusChanged, Address: "0xdead"}
+
+	// The focus event must have been preceded by the pending re-resolve. Ordering
+	// is what the old `for evt := range events` loop gave for free, and it is
+	// load-bearing: every wezterm window shares one mux pid, so a layout event
+	// carrying a title change is often the only thing that disambiguates a session
+	// well enough for applyFocus to match its address. Let focus overtake it and
+	// applyFocus finds no holder, unfocuses everything, and records a focus edge
+	// with an empty session id.
+	deadline := time.Now().Add(testDebounce / 2)
+	for time.Now().Before(deadline) {
+		if loc.count() > 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	snap := store.Snapshot()
+	t.Errorf("focus was dispatched without first landing the pending layout re-resolve "+
+		"(re-resolves=%d, sessions=%+v)", loc.count(), snap.Sessions)
 }
