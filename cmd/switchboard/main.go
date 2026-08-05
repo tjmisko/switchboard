@@ -271,6 +271,17 @@ func dropStaleSessions(store *state.Store, procSrc osproc.Source, sink *history.
 	})
 }
 
+// layoutDebounce is the window a burst of layout events is coalesced into.
+// Three raw Hyprland events map to EventLayoutChanged — movewindowv2,
+// windowtitlev2, openwindow (internal/wm/hyprland.go) — and each one re-resolves
+// EVERY session, which costs a full terminal + WM enumeration. windowtitlev2 is
+// the hazard: a running agent CLI repaints its pane title as it works, so an
+// uncoalesced stream multiplies that enumeration by the title rate.
+//
+// Trailing edge, so the burst's LAST state always lands. The cost is at most one
+// window of staleness on a chip's workspace, which the reconciler bounds anyway.
+const layoutDebounce = 200 * time.Millisecond
+
 func runWMLoop(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, sink *history.Sink, src osproc.Source, forget func(int)) {
 	for ctx.Err() == nil {
 		events, err := manager.Subscribe(ctx)
@@ -283,10 +294,54 @@ func runWMLoop(ctx context.Context, store *state.Store, resolver *mapping.Resolv
 				continue
 			}
 		}
-		for evt := range events {
-			handleWMEvent(ctx, store, resolver, evt, sink, src, forget)
-		}
+		drainWMEvents(ctx, store, resolver, events, sink, src, forget, layoutDebounce)
 		// channel closed (connection EOF or ctx cancel) — loop will retry
+	}
+}
+
+// drainWMEvents dispatches one subscription's events until the stream closes,
+// coalescing EventLayoutChanged (see layoutDebounce) and passing everything else
+// straight through.
+//
+// ONLY layout is delayed. EventFocusChanged drives the chip highlight and the
+// click-to-focus round trip, and EventWindowClosed drives session teardown;
+// debouncing either would be a user-visible regression, not an optimization.
+//
+// debounce is a parameter rather than the layoutDebounce constant so tests can
+// drive the coalescing without sleeping a real 200ms per case.
+func drainWMEvents(ctx context.Context, store *state.Store, resolver *mapping.Resolver, events <-chan wm.Event, sink *history.Sink, src osproc.Source, forget func(int), debounce time.Duration) {
+	// Go 1.23+ timer semantics: Stop/Reset never leave a stale value on the
+	// channel, so the classic stop-and-drain dance is unnecessary. `pending`
+	// tracks whether the timer is armed — the channel itself cannot answer that.
+	timer := time.NewTimer(debounce)
+	timer.Stop()
+	defer timer.Stop()
+	pending := false
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case evt, ok := <-events:
+			if !ok {
+				// Stream closed (connection EOF or cancel). Flush a pending coalesce
+				// rather than dropping it: the burst's last state is exactly what a
+				// reconnect would otherwise have to rediscover on its next tick.
+				if pending {
+					reresolveAll(ctx, store, resolver)
+				}
+				return
+			}
+			if evt.Kind != wm.EventLayoutChanged {
+				handleWMEvent(ctx, store, resolver, evt, sink, src, forget)
+				continue
+			}
+			timer.Reset(debounce)
+			pending = true
+		case <-timer.C:
+			pending = false
+			reresolveAll(ctx, store, resolver)
+		}
 	}
 }
 
@@ -330,13 +385,25 @@ func handleWMEvent(ctx context.Context, store *state.Store, resolver *mapping.Re
 		})
 	case wm.EventLayoutChanged:
 		// Something changed — kick a reconcile on any session that might match.
-		// Cheap: just iterate live sessions and re-resolve.
-		store.Apply(func(m map[int]*state.Session) {
-			for _, sess := range m {
-				resolver.Reconcile(ctx, sess)
-			}
-		})
+		// The live stream reaches this through drainWMEvents' debounce; the direct
+		// call is kept for callers that dispatch a single event.
+		reresolveAll(ctx, store, resolver)
 	}
+}
+
+// reresolveAll re-runs the terminal + WM match for every live session.
+//
+// This used to be commented "cheap: just iterate live sessions and re-resolve",
+// which was the bug: resolver.Reconcile enumerates the terminal AND the WM once
+// PER SESSION, so this is O(sessions) subprocess spawns — measured at 71% of the
+// daemon's CPU — and it runs inside store.Apply, holding the lock every RPC
+// reader and every hook queues behind. layoutDebounce exists to ration it.
+func reresolveAll(ctx context.Context, store *state.Store, resolver *mapping.Resolver) {
+	store.Apply(func(m map[int]*state.Session) {
+		for _, sess := range m {
+			resolver.Reconcile(ctx, sess)
+		}
+	})
 }
 
 // runReconciler periodically re-resolves every session's wezterm + hyprland
