@@ -270,14 +270,24 @@ func TestHandleHookHoldsRedForAHydratedEntry(t *testing.T) {
 		}
 	})
 
-	t.Run("should still clear a hydrated red once the transcript proves the turn resumed", func(t *testing.T) {
+	t.Run("should still clear a hydrated MAIN-thread entry once the main transcript shows the turn resumed", func(t *testing.T) {
 		// The cost §9.5 accepts: a hydrated entry loses the hook-speed early clear
 		// and resolves on the transcript path instead — one tick, bounded.
+		//
+		// The entry is keyed on "" (the main thread) deliberately. This subtest
+		// originally keyed it on a SUBAGENT while proving resolution from the MAIN
+		// transcript, which asserted that main-thread activity resolves a teammate's
+		// prompt — defect 4 itself, encoded as an expectation. That was written when
+		// clearsPermission was still a whole-session verdict; T7/T9 made resolution
+		// writer-routed, so the old fixture correctly stopped passing. The intent it
+		// was reaching for — a hydrated entry has no correlators, so only the
+		// transcript can resolve it — is preserved here, with writer and evidence
+		// finally referring to the same thread.
 		store, s := redSession(t, "", 0, turnResumed)
 		store.Apply(func(m map[int]*state.Session) {
 			c := m[42].Claude
 			c.ClearPending()
-			c.SetPending("af5bd126402ac16c7", state.PendingPrompt{Since: time.Now()})
+			c.SetPending("", state.PendingPrompt{Since: promptSince})
 		})
 
 		s.handleHook(Request{Cmd: "hook", Event: "PostToolUse", PID: 42, ToolName: "Read"})
