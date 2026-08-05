@@ -72,11 +72,25 @@ type Request struct {
 	// never treat two empty hashes as a match.
 	ToolInputHash string `json:"tool_input_hash,omitempty"`
 
-	// AgentID/AgentType identify the subagent on a SubagentStart/SubagentStop hook.
-	// AgentID is the stable agent-<id> the subagents/ dir and the hook share (the
-	// universal key); AgentType names the kind. They are best-effort context — the
-	// hook's job is only to TRIGGER a fanout re-scan, which is keyed off the dir, so
-	// neither is required for correctness. Empty on every non-subagent event.
+	// AgentID/AgentType identify the subagent a hook fired from. Claude Code puts
+	// agent_id on EVERY hook event (docs/claude-code-hook-schema.md §1), not just
+	// SubagentStart/Stop, and populates it ONLY inside a subagent — so empty AgentID
+	// means the MAIN THREAD (true even in --agent sessions, where agent_type is set
+	// but agent_id is not). Empty is therefore a load-bearing discriminator, never
+	// merely "unknown". AgentType names the kind.
+	//
+	// ⚠ The daemon keys on the BARE id: handleHook runs the incoming value through
+	// normalizeAgentID exactly once, stripping one leading "agent-" if the hook
+	// happens to send the on-disk file spelling (which shape it sends is still
+	// unobserved — plan T1). That bare form is what transcript.Subagent.AgentID and
+	// history.Event.AgentID already hold, both derived from the agent-<id>.* file
+	// names, so hook-keyed and scan-keyed maps join whichever spelling arrives. Do
+	// NOT strip again at a use site: a second pass would eat an "agent-" that is
+	// genuinely part of the id.
+	//
+	// On SubagentStart/Stop both fields are best-effort context — the hook's job
+	// there is only to TRIGGER a fanout re-scan, which is keyed off the dir, so
+	// neither is required for correctness.
 	AgentID   string `json:"agent_id,omitempty"`
 	AgentType string `json:"agent_type,omitempty"`
 
@@ -356,6 +370,13 @@ func byIndex(sessions []state.Session, idx int) *state.Session {
 // session or an unrecognized event is silently ignored, so a misconfigured
 // hook can never corrupt state.
 func (s *Server) handleHook(req Request) {
+	// THE choke point for hook identity: every consumer below (and every future
+	// one — the T5 Pending map, the T7 clear rule, the T8/T9 subagent transcript
+	// routing) sees the canonical bare id, so none of them can key a map on a
+	// spelling the Observer never writes. req is a value copy, so this rewrite is
+	// local to the call. Nothing downstream may strip again — see normalizeAgentID.
+	req.AgentID = normalizeAgentID(req.AgentID)
+
 	agent := req.Agent
 	if agent == "" {
 		agent = state.AgentKindClaude
@@ -539,6 +560,43 @@ func (s *Server) handleHook(req Request) {
 			}
 		}
 	})
+}
+
+// agentIDPrefix is the "agent-" that brackets a subagent id in its on-disk file
+// names (agent-<id>.meta.json / agent-<id>.jsonl). transcript.Subagent.AgentID
+// and history.Event.AgentID both store the id with this prefix already removed.
+const agentIDPrefix = "agent-"
+
+// normalizeAgentID canonicalizes a hook's agent_id to the bare form the rest of
+// the daemon keys on, stripping one leading "agent-" if present.
+//
+// The join it protects: the fanout Observer writes the PREFIX-STRIPPED id (it
+// derives it from the agent-<id>.* file names), while a hook sends whatever
+// Claude Code puts in agent_id — a shape nobody has yet read off a live payload
+// (plan T1). If those two spellings disagree, nothing crashes: a map keyed by the
+// hook value simply never joins the Observer's seen-set, and every correlation
+// between a pending prompt and fanout state fails in silence. Normalizing here
+// makes T1's eventual answer stop mattering.
+//
+// Three properties the callers depend on:
+//
+//   - AT MOST ONE strip. Subagent ids are themselves `a`-initial (file
+//     agent-a158b13da3d13b0ea ⇒ id a158b13da3d13b0ea), so a doubled prefix is
+//     plausible on the wire; an id that legitimately reads "agent-…" after the
+//     strip keeps it. This is why the daemon must normalize in exactly one place —
+//     a second call at a use site would eat that second prefix.
+//   - EMPTY STAYS EMPTY. Empty agent_id means main thread, so this must never
+//     manufacture a non-empty id from one.
+//   - NON-EMPTY STAYS NON-EMPTY, for the same reason read the other way. A
+//     degenerate bare "agent-" is left intact rather than stripped to "", which
+//     would silently re-attribute a subagent's hook to the main thread — exactly
+//     the class of invisible failure this function exists to close.
+func normalizeAgentID(id string) string {
+	rest, ok := strings.CutPrefix(id, agentIDPrefix)
+	if !ok || rest == "" {
+		return id
+	}
+	return rest
 }
 
 // clearsPermission decides whether a hook event should release a red chip and
