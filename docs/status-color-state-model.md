@@ -226,6 +226,15 @@ mistake the rule is protecting against.
 The rows that change today's behavior: **5, 9, 11, 14** (subagent-awareness and
 direct red→green), and the *latency* of **8→9/10** (earlier resolution).
 
+> **⚠ Cases 12 and 16 are violated in practice.** The shipped
+> `case9-approve-toolmatch` clears red on a bare teammate `PostToolUse` whenever
+> that teammate's `tool_name` collides with the pending prompt's — routine when
+> the tool is `Bash`. A subagent-raised prompt then renders green/orange instead
+> of RED, and flaps between them on the reconcile tick. The table is right; the
+> implementation cannot currently distinguish case 12 from case 9. Diagnosis,
+> evidence and fixes:
+> [subagent-permission-oscillation.md](subagent-permission-oscillation.md).
+
 ---
 
 ## 6. Target state machine, transitions & frequencies
@@ -369,6 +378,12 @@ the unreadable-transcript backstop only.
 - **Q2 — Approve early-clear mechanism:** tool-name match (no settings change,
   covers common cases) vs wiring `PreToolUse` for exact `tool_use_id`
   (most precise, needs a settings + hook change). Recommend tool-name first.
+  **⚠ Reopened by the 2026-08-05 incident** — tool-name matching false-cleared a
+  genuinely-pending RED because a *teammate's* `Bash` collided with the pending
+  prompt's `Bash`, and the resulting green/orange limit cycle ran for 95 s. The
+  correlator to use is `agent_id`, which the hook payload already carries on
+  tool events and which `rpc.Request` already receives unread. See
+  [subagent-permission-oscillation.md](subagent-permission-oscillation.md).
 - **Q3 — Case 7 (Esc with teammates still in flight):** GREEN (follow
   "work-happening") or ORANGE (Esc signals "I want control")? Low frequency,
   low cost either way. Recommend GREEN for consistency with P4.
