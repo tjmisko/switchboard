@@ -16,20 +16,24 @@ import (
 // ticks. The usage cursor is daemon-internal and keyed by pid; the label cursor
 // is keyed by session id (see observeLabel) and carries the pid it belongs to, so
 // both are pruned when the process they track dies. Subagent fanout detection is
-// delegated to the
-// Observer, which owns InFlightSubagents and the subagent_spawn/stop events and
-// keys its own durable state by session-id (so it survives a daemon restart or a
-// `claude --resume` rather than re-emitting historical spawns).
-// Memory is the odd one out: it is sampled BEFORE the lock is taken rather than
-// inside the loop below, because its /proc reads are milliseconds rather than
-// microseconds (see memorySampler). nil when memory sampling is off.
+// delegated to the Observer, which owns InFlightSubagents and the
+// subagent_spawn/stop events and keys its own durable state by session-id (so it
+// survives a daemon restart or a `claude --resume` rather than re-emitting
+// historical spawns).
+//
+// Every read a tick needs now happens BEFORE the store lock is taken — memory,
+// the fanout seed/cursor/dir scan, the usage delta, the session name, and both
+// self-heals' transcript reads. What runs under the lock is the writing: applying
+// the sampled results to the session map. Memory was the first to move (its /proc
+// reads are milliseconds, not microseconds) and the rest followed for the same
+// reason, one measured stall at a time.
 type reconcileState struct {
 	fanout      *fanout.Observer
-	memory      *memorySampler
+	memory      *memorySampler           // nil when memory sampling is off
 	usageOffset map[int]int64            // pid -> transcript bytes already summed for usage
 	labels      map[string]labelCursor   // labelKey -> last-emitted session label (change dedup)
 	names       *label.NameCache         // pid -> Claude session name, memoized against the file's stamp
-	samples     map[string]fanout.Sample // session id -> this tick's pre-lock fanout reads (see sampleFanout)
+	samples     map[string]fanout.Sample // sampleKey -> this tick's pre-lock fanout reads (see sampleFanout)
 }
 
 // labelCursor is the last name emitted for one session, plus the pid hosting it.

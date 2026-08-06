@@ -817,10 +817,17 @@ func enrichmentID(s *state.Session) string {
 // the chip green the instant any concurrent work landed. A pending decision stays
 // red even while subagents work.
 //
-// It runs inside the reconcile Apply, so it operates on the locked session map
-// directly (no shared-pointer race) and folds into the tick's single persist.
-// The bounded transcript read under the lock is consistent with the per-session
-// /proc and WM I/O the same loop already performs.
+// The DECISION runs inside the reconcile Apply, so it operates on the locked
+// session map directly (no shared-pointer race) and folds into the tick's single
+// persist. The READ does not: sampleSignals takes it before the lock and this
+// consumes the result, reading inline only when the sample no longer describes
+// the session (signalSample.freshFor).
+//
+// This comment used to say the read happened under the lock and justify it as
+// "consistent with the per-session /proc and WM I/O the same loop already
+// performs" — a precedent that was itself the thing being removed. Nothing that
+// touches a disk belongs inside store.Apply: it blocks every RPC reader, every
+// hook, and every chip click for as long as it holds.
 func selfHealStaleAttention(m map[int]*state.Session, now time.Time, tun statustune.Tuning, sink *history.Sink, samples map[int]signalSample) {
 	for _, sess := range m {
 		c := sess.Claude
@@ -866,10 +873,11 @@ func selfHealStaleAttention(m map[int]*state.Session, now time.Time, tun statust
 //
 // A cheap stat short-circuits the common quiescent case: if nothing has been
 // written since the chip's last transition, no signal can be newer than it, so
-// the tail read is skipped. The read itself is bounded and runs inside the
-// reconcile Apply, exactly like selfHealStaleAttention. Every flip re-stamps
-// StatusSince, so the entry that triggered it is older than the new StatusSince
-// on the next tick and cannot cause a reverse flip — no flapping.
+// the tail read is skipped. That stat and the bounded tail read both happen in
+// sampleSignals, BEFORE the lock — only the decision below runs under it, and
+// only a sample the session has moved past is re-read inline. Every flip
+// re-stamps StatusSince, so the entry that triggered it is older than the new
+// StatusSince on the next tick and cannot cause a reverse flip — no flapping.
 //
 // Deliberately keyed on the interrupt marker, not a no-activity TTL: a
 // multi-minute tool run writes nothing to the transcript for the duration, so a

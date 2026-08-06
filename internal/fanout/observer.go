@@ -18,8 +18,15 @@
 // reset on /clear or compaction can never lose a spawn.
 //
 // The Observer is called from BOTH the reconcile tick and the SubagentStart/Stop
-// hook handler — single source of truth, two triggers. Every call must hold the
-// store lock, but a mutex guards the maps in case a future caller does not.
+// hook handler — single source of truth, two triggers — and its own mutex guards
+// its maps, so it does not depend on the caller's locking.
+//
+// Its reads are split from its writes: Sample/Prime do the I/O with no store lock
+// held, and ReconcileFrom applies the result with the lock held and no I/O under
+// it. The tick uses that split; the hook trigger has no pre-lock phase, so it
+// calls Reconcile, which reads inline. Both triggers reconcile the same durable
+// per-session state, and a sample that state has moved past is rejected rather
+// than applied (Sample.usableFor).
 package fanout
 
 import (
@@ -100,8 +107,13 @@ func (o *Observer) SetStaleCap(d time.Duration) {
 // The file read deliberately happens with NO lock held, not even o.mu. Holding
 // o.mu across it would hand the stall straight back: Reconcile takes o.mu while
 // the caller holds the store lock, so a hook-triggered Reconcile would block on
-// this read with the store lock in hand. Two callers racing the same cold session
-// both read and both install the same answer, which is harmless.
+// this read with the store lock in hand.
+//
+// The cost is that two callers can race the same cold session and both read. Only
+// the FIRST result is installed — see the seeded check below, which is
+// load-bearing rather than an optimization: the winner may already have advanced
+// the cursor past what the loser measured, so installing the loser's read would
+// rewind it.
 func (o *Observer) Prime(sessionID, transcript string) {
 	if o == nil || sessionID == "" {
 		return
