@@ -118,7 +118,7 @@ func TestPriorSubagentStateByAgentIDExcludesOtherSessions(t *testing.T) {
 	}
 }
 
-// The tests below pin the behavior the byte pre-filter in scanSubagentLines
+// The tests below pin the behavior the byte pre-filter in scanCandidateLines
 // must not change. Both mutations below were actually run.
 //
 // Only ONE of the filter's two parts is load-bearing for correctness: the
@@ -221,6 +221,151 @@ func TestPriorSubagentStateEmptySessionIsEmpty(t *testing.T) {
 	}
 	if len(spawned) != 0 || len(stopped) != 0 {
 		t.Errorf("empty session id should yield empty sets, got spawned=%v stopped=%v", spawned, stopped)
+	}
+}
+
+// PriorWorkflowState carries the same byte pre-filter as PriorSubagentState, and
+// the tests below are its half of the contract that pre-filter must not change.
+// They were written against the unfiltered (ReadRange) implementation and pass
+// against both, which is the claim being made: the filter is a cost change, not a
+// behavior change.
+//
+// One asymmetry is worth stating, because it is the reason the type needle here
+// is weaker than `subagent_`: `workflow_run_id` is a FIELD NAME, so every event a
+// workflow's agents emit contains the `workflow_` needle. ...SkipsNonWorkflowEvents
+// is the test that pins it — a subagent_spawn carrying a run id passes both byte
+// scans and is rejected only by the switch on ev.Type.
+
+func TestPriorWorkflowStateByRunIDExcludesOtherSessions(t *testing.T) {
+	dir := t.TempDir()
+	writeDay(t, dir, "2026-06-25",
+		`{"ts":"2026-06-25T10:00:00Z","type":"workflow_start","session_id":"s1","workflow_run_id":"r1"}`,
+		`{"ts":"2026-06-25T10:05:00Z","type":"workflow_stop","session_id":"s1","workflow_run_id":"r1"}`,
+	)
+	writeDay(t, dir, "2026-06-26",
+		`{"ts":"2026-06-26T10:00:00Z","type":"workflow_start","session_id":"s1","workflow_run_id":"r2"}`, // started, still running
+		`{"ts":"2026-06-26T10:02:00Z","type":"workflow_start","session_id":"s2","workflow_run_id":"r9"}`, // a DIFFERENT session — must be excluded
+	)
+
+	started, stopped, err := PriorWorkflowState(dir, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(started) != 2 || !started["r1"] || !started["r2"] {
+		t.Errorf("started = %v, want exactly {r1,r2}", started)
+	}
+	if started["r9"] {
+		t.Errorf("started must exclude the other session's r9: %v", started)
+	}
+	if len(stopped) != 1 || !stopped["r1"] {
+		t.Errorf("stopped = %v, want exactly {r1}", stopped)
+	}
+}
+
+func TestPriorWorkflowStateExcludesASessionWhoseIDIsAPrefixOfAnother(t *testing.T) {
+	dir := t.TempDir()
+	writeDay(t, dir, "2026-06-26",
+		`{"ts":"2026-06-26T10:00:00Z","type":"workflow_start","session_id":"s1","workflow_run_id":"mine"}`,
+		`{"ts":"2026-06-26T10:01:00Z","type":"workflow_start","session_id":"s10","workflow_run_id":"theirs"}`,
+		`{"ts":"2026-06-26T10:02:00Z","type":"workflow_stop","session_id":"s10","workflow_run_id":"theirs"}`,
+	)
+
+	started, stopped, err := PriorWorkflowState(dir, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(started) != 1 || !started["mine"] {
+		t.Errorf("started = %v, want exactly {mine}: s10 is a different session that merely starts with s1", started)
+	}
+	if len(stopped) != 0 {
+		t.Errorf("stopped = %v, want empty: the only stop belongs to s10", stopped)
+	}
+}
+
+func TestPriorWorkflowStateIgnoresTheIDAppearingInAnotherField(t *testing.T) {
+	dir := t.TempDir()
+	// A different session's start, carrying our session id as the value of some
+	// other field. It passes both byte scans; only the post-decode SessionID check
+	// can reject it.
+	writeDay(t, dir, "2026-06-26",
+		`{"ts":"2026-06-26T10:00:00Z","type":"workflow_start","session_id":"other","workflow_run_id":"theirs","cwd":"s1"}`,
+		`{"ts":"2026-06-26T10:01:00Z","type":"workflow_start","session_id":"s1","workflow_run_id":"mine"}`,
+	)
+
+	started, _, err := PriorWorkflowState(dir, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(started) != 1 || !started["mine"] {
+		t.Errorf("started = %v, want exactly {mine}: a substring hit in another field is not a session match", started)
+	}
+}
+
+func TestPriorWorkflowStateSkipsNonWorkflowEventsForTheSameSession(t *testing.T) {
+	dir := t.TempDir()
+	writeDay(t, dir, "2026-06-26",
+		`{"ts":"2026-06-26T10:00:00Z","type":"transition","session_id":"s1","from":"idle","to":"working"}`,
+		// A workflow agent's own spawn: same session, and it CARRIES a run id, so it
+		// passes both needles. Only the type switch keeps it out of the started set.
+		`{"ts":"2026-06-26T10:01:00Z","type":"subagent_spawn","session_id":"s1","agent_id":"a1","workflow_run_id":"r1"}`,
+		`{"ts":"2026-06-26T10:02:00Z","type":"workflow_start","session_id":"s1","workflow_run_id":"r1"}`,
+	)
+
+	started, stopped, err := PriorWorkflowState(dir, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(started) != 1 || !started["r1"] {
+		t.Errorf("started = %v, want exactly {r1}: only workflow_start seeds the set", started)
+	}
+	if len(stopped) != 0 {
+		t.Errorf("stopped = %v, want empty", stopped)
+	}
+}
+
+func TestPriorWorkflowStateIgnoresAnEventWithoutARunID(t *testing.T) {
+	dir := t.TempDir()
+	writeDay(t, dir, "2026-06-26",
+		`{"ts":"2026-06-26T10:00:00Z","type":"workflow_start","session_id":"s1"}`,
+		`{"ts":"2026-06-26T10:01:00Z","type":"workflow_start","session_id":"s1","workflow_run_id":"r1"}`,
+	)
+
+	started, _, err := PriorWorkflowState(dir, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(started) != 1 || !started["r1"] {
+		t.Errorf("started = %v, want exactly {r1}: a start with no run id names nothing", started)
+	}
+}
+
+func TestPriorWorkflowStateToleratesATornLine(t *testing.T) {
+	dir := t.TempDir()
+	writeDay(t, dir, "2026-06-26",
+		`{"ts":"2026-06-26T10:00:00Z","type":"workflow_start","session_id":"s1","workflow_run_id":"r1"}`,
+		`{"ts":"2026-06-26T10:01:00Z","type":"workflow_start","session_id":"s1","workflow_run_`, // torn mid-append
+	)
+
+	started, _, err := PriorWorkflowState(dir, "s1")
+	if err != nil {
+		t.Fatalf("a torn final line must not be an error: %v", err)
+	}
+	if len(started) != 1 || !started["r1"] {
+		t.Errorf("started = %v, want exactly {r1} with the torn line skipped", started)
+	}
+}
+
+func TestPriorWorkflowStateEmptySessionIsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	writeDay(t, dir, "2026-06-26",
+		`{"ts":"2026-06-26T10:00:00Z","type":"workflow_start","session_id":"s1","workflow_run_id":"r1"}`,
+	)
+	started, stopped, err := PriorWorkflowState(dir, "")
+	if err != nil {
+		t.Fatalf("empty session id should not error: %v", err)
+	}
+	if len(started) != 0 || len(stopped) != 0 {
+		t.Errorf("empty session id should yield empty sets, got started=%v stopped=%v", started, stopped)
 	}
 }
 

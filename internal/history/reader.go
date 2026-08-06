@@ -132,7 +132,7 @@ func PriorSubagentState(dir, sessionID string) (spawned, stopped map[string]bool
 		return nil, nil, err
 	}
 	for _, day := range days {
-		if err := scanSubagentLines(DayPath(dir, day), needle, func(ev Event) {
+		if err := scanCandidateLines(DayPath(dir, day), needle, subagentNeedle, func(ev Event) {
 			if ev.SessionID != sessionID {
 				return
 			}
@@ -157,24 +157,31 @@ func PriorSubagentState(dir, sessionID string) (spawned, stopped map[string]bool
 // in its `type`, and no other event type does.
 var subagentNeedle = []byte("subagent_")
 
-// scanSubagentLines streams one day-file and decodes ONLY the lines that could
-// possibly be a subagent event for the session `idNeedle` names, handing each to
-// fn.
+// workflowNeedle is the same guard for workflow_start/workflow_stop. Unlike
+// subagentNeedle it is NOT exclusive to the two types that matter: `workflow_run_id`
+// is a field name, so every event a workflow's agents emit matches it too. That
+// costs decodes, never correctness — the pre-filter only needs a necessary
+// condition, and the switch on ev.Type rejects the rest.
+var workflowNeedle = []byte("workflow_")
+
+// scanCandidateLines streams one day-file and decodes ONLY the lines that could
+// possibly be an event of the type `typeNeedle` names, for the session `idNeedle`
+// names, handing each to fn.
 //
 // The two byte-scans before the unmarshal are the whole point. The caller's
-// question is about one session's subagents, but a day-file is dominated by other
-// sessions' transitions and usage samples, so decoding every line to discard
-// nearly all of them made the cost of the answer scale with total retained
-// history rather than with the session. Both needles are necessary conditions for
-// a line to matter — a matching event must carry the quoted id and must carry a
-// `subagent_` type — so skipping a line that lacks either drops nothing. The
-// converse is not assumed: a line that contains both is still decoded and still
-// checked against SessionID and Type, because the needles can appear in other
-// fields (a cwd, a subject) and a substring match is not a parse.
+// question is about one session, but a day-file is dominated by other sessions'
+// transitions and usage samples, so decoding every line to discard nearly all of
+// them made the cost of the answer scale with total retained history rather than
+// with the session. Both needles are necessary conditions for a line to matter —
+// a matching event must carry the quoted id and must carry the type substring —
+// so skipping a line that lacks either drops nothing. The converse is not
+// assumed: a line that contains both is still decoded and still checked against
+// SessionID and Type, because the needles can appear in other fields (a cwd, a
+// subject) and a substring match is not a parse.
 //
 // A torn final line is tolerated exactly as ReadDay tolerates it, and a file that
 // vanished between the Days listing and the open is not an error.
-func scanSubagentLines(path string, idNeedle []byte, fn func(Event)) error {
+func scanCandidateLines(path string, idNeedle, typeNeedle []byte, fn func(Event)) error {
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -188,7 +195,7 @@ func scanSubagentLines(path string, idNeedle []byte, fn func(Event)) error {
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
 		line := sc.Bytes()
-		if !bytes.Contains(line, idNeedle) || !bytes.Contains(line, subagentNeedle) {
+		if !bytes.Contains(line, idNeedle) || !bytes.Contains(line, typeNeedle) {
 			continue
 		}
 		var ev Event
@@ -206,31 +213,40 @@ func scanSubagentLines(path string, idNeedle []byte, fn func(Event)) error {
 // not re-emit workflow_start for a run whose records it is seeing again for the
 // first time (the run dirs, like subagent metas, are never deleted).
 //
-// It is a TWIN in contract only, not yet in cost: this still answers a
-// one-session question by decoding the entire archive, which is exactly the
-// shape scanSubagentLines above exists to undo (see BenchmarkPriorSubagentState).
-// Both halves of the seed now run outside the store lock, so the cost no longer
-// blocks a reader — but the seed itself is still paid per newly-seen session,
-// and giving this the same byte pre-filter is the obvious follow-up.
+// It is a twin in cost as well as in contract: it runs the same byte pre-filter,
+// for the same reason. It used to answer this one-session question by decoding
+// the entire archive, and because seedFor calls BOTH halves, that single
+// unfiltered read set the price of the whole seed no matter how cheap the
+// subagent half became. The seed is paid per newly-seen session and one of its
+// two call sites — the lazy backstop in Observer.reconcile, which a hook trigger
+// or a session discovered mid-tick reaches — runs with the store lock held.
 func PriorWorkflowState(dir, sessionID string) (started, stopped map[string]bool, err error) {
 	started = map[string]bool{}
 	stopped = map[string]bool{}
 	if sessionID == "" {
 		return started, stopped, nil
 	}
-	events, err := ReadRange(dir, time.Time{}, time.Time{})
+	days, err := Days(dir)
 	if err != nil {
 		return nil, nil, err
 	}
-	for _, ev := range events {
-		if ev.SessionID != sessionID || ev.WorkflowRunID == "" {
-			continue
-		}
-		switch ev.Type {
-		case EventWorkflowStart:
-			started[ev.WorkflowRunID] = true
-		case EventWorkflowStop:
-			stopped[ev.WorkflowRunID] = true
+	needle, err := json.Marshal(sessionID) // the JSON-ENCODED id; see PriorSubagentState
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, day := range days {
+		if err := scanCandidateLines(DayPath(dir, day), needle, workflowNeedle, func(ev Event) {
+			if ev.SessionID != sessionID || ev.WorkflowRunID == "" {
+				return
+			}
+			switch ev.Type {
+			case EventWorkflowStart:
+				started[ev.WorkflowRunID] = true
+			case EventWorkflowStop:
+				stopped[ev.WorkflowRunID] = true
+			}
+		}); err != nil {
+			return nil, nil, err
 		}
 	}
 	return started, stopped, nil
