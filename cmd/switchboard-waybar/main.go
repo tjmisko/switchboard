@@ -282,9 +282,14 @@ func sessionTooltip(cfg projectname.Config, cache *sblabel.NameCache, s state.Se
 
 	statusText := status
 	// A delegating chip is green but idle on the main thread; spell out why so the
-	// green reads as "N agents working" rather than looking stuck.
+	// green reads as "N agents working" rather than looking stuck. An ultracode
+	// workflow run is the richer answer to the same question — name the workflow
+	// and its progress ("workflow simplification-audit · 7/17 agents") instead of
+	// the bare count, mirroring the CLI's own "N/M agents done" line.
 	if status == state.StatusDelegating {
-		if n := subagentCount(s); n > 0 {
+		if wf := workflowAnnotation(s); wf != "" {
+			statusText = wf
+		} else if n := subagentCount(s); n > 0 {
 			statusText = fmt.Sprintf("delegating · %d agent%s", n, plural(n))
 		}
 	}
@@ -373,6 +378,30 @@ func subagentCount(s state.Session) int {
 		return info.InFlightSubagents
 	}
 	return 0
+}
+
+// workflowAnnotation renders the delegating detail for a session running an
+// ultracode Workflow: "workflow <name> · <done>/<started> agents", the first
+// active run leading and any others folded into a "+N more" (concurrent runs
+// are rare and the tooltip is one line). Empty when no run is active, letting
+// the caller fall back to the generic delegating count. A run whose script
+// name could not be resolved shows its run id — an opaque handle beats no
+// handle.
+func workflowAnnotation(s state.Session) string {
+	info := s.Enrichment()
+	if info == nil || len(info.Workflows) == 0 {
+		return ""
+	}
+	w := info.Workflows[0]
+	name := w.Name
+	if name == "" {
+		name = w.RunID
+	}
+	text := fmt.Sprintf("workflow %s · %d/%d agents", name, w.AgentsDone, w.AgentsStarted)
+	if extra := len(info.Workflows) - 1; extra > 0 {
+		text += fmt.Sprintf(" (+%d more)", extra)
+	}
+	return text
 }
 
 // statusSince returns the wire timestamp the current status began (nil when no
