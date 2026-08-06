@@ -366,6 +366,41 @@ the lock-hold report may barely change while the thing users feel does. That is
 a reason to add a reader-wait measurement to the harness, not a reason to
 discount A.
 
+## Baseline result — 2026-08-06, 30 min, `a3ee08c`
+
+Arm `baseline` (`main` + cherry-picked `28ced0d`), binary `d5899d99`, window
+10:48:05–11:18:05 on an otherwise-idle box carrying 3–6 sessions.
+
+| caller | count | p50 | p90 | p99 | max |
+|---|---|---|---|---|---|
+| `main.reconcileOnce:700` | 261 | 10.0 ms | 23.0 ms | 2117 ms | **5270 ms** |
+| `rpc.(*Server).handleHook:397` | 1 | 0.0 ms | 0.0 ms | 0.0 ms | 6.1 ms |
+
+Three findings, none of which the pre-measurement framing predicted:
+
+**The tail is recurring, not a cold-start artifact.** Nine holds exceeded one
+second, and they are spread across the whole window — three of them at
+11:05–11:07, nineteen minutes in, on an idle box. The seed is per *newly-seen*
+session, and sessions churn continuously on a machine whose whole purpose is
+watching sessions come and go. So the 1.81 s is not paid once at startup; it is
+paid again every time a session appears. The startup case is merely the worst
+(5.27 s, five sessions seeded in a single tick).
+
+**Production agrees with the bench.** Observed per-seed holds run 1.57–2.36 s
+against a bench figure of 1.81 s. The archive decode is the cost, as diagnosed.
+
+**`handleHook` is not currently a problem.** One warning, 6.1 ms, in thirty
+minutes. Issue #56 (the hook handler reading the transcript inside the lock) is
+real but is not what users are feeling; it should not be prioritized off this
+number. Attribution is what makes that claim sayable at all, which is the
+justification for cherry-picking `28ced0d` onto the baseline arm.
+
+The distribution is bimodal — a ~10 ms body that is the terminal enumeration,
+and a multi-second tail that is the seed. #57 hoists both. A prediction worth
+writing down before the `merged` arm runs: if the merge is correct, the
+nine-hold tail goes to **zero** and p50 drops toward the sub-millisecond floor.
+A tail that survives the merge means a read was missed.
+
 ## Rules, from the script headers
 
 Both cost this work a wrong number already, so they are rules and not advice:
