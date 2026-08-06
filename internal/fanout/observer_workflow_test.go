@@ -259,3 +259,72 @@ func TestReconcile_shouldNotReannounceWorkflowAfterDaemonRestart(t *testing.T) {
 		t.Fatalf("Workflows = %+v, want the seeded run still summarized", e.c.Workflows)
 	}
 }
+
+// The two tests below pin the WHERE, not the what: workflow observation reads a
+// run-dir listing, a journal delta and a fistful of mtimes, and none of that may
+// happen while the store lock is held. "Did not read under the lock" is
+// unobservable from outside, so both use the technique the rest of this package
+// already uses for it — take the pre-lock read, delete what it read, and require
+// the answer to come out anyway. A pass proves the fact came from the sample; a
+// failure means the read went back to disk in the apply phase.
+
+func TestReconcileFrom_shouldApplyWorkflowsFromTheSampleWhenTheRunDirIsGone(t *testing.T) {
+	e := newEnv(t)
+	runDir := writeWorkflowRun(t, e, "wf_hoist-1", "seed-hoist")
+	writeJournal(t, runDir, []string{wfStarted("wh1")})
+	writeWorkflowAgent(t, runDir, "wh1")
+	obs := NewObserver(e.historyDir)
+
+	s := obs.Sample(e.c.SessionID, e.c.Transcript)
+
+	// Everything the workflow pass reads lives under <base>/<sid>: the run dir,
+	// its journal, the agent jsonl whose mtime decides staleness, and the scripts
+	// dir the run's name comes from. Remove the lot.
+	if err := os.RemoveAll(filepath.Join(e.base, e.sid)); err != nil {
+		t.Fatal(err)
+	}
+
+	ev := obs.ReconcileFrom(s, e.sess, e.c, time.Now())
+	if !hasWorkflowEvent(ev, history.EventWorkflowStart, "wf_hoist-1") {
+		t.Fatalf("the run was listed before the lock; its workflow_start should come from the sample; got %+v", ev)
+	}
+	if !hasEvent(ev, history.EventSubagentSpawn, "wh1") {
+		t.Fatalf("the journal delta was read before the lock; wh1's spawn should come from the sample; got %+v", ev)
+	}
+	if e.c.InFlightSubagents != 1 {
+		t.Fatalf("inflight = %d, want 1 from the sampled journal and mtimes", e.c.InFlightSubagents)
+	}
+	if len(e.c.Workflows) != 1 || e.c.Workflows[0].Name != "seed-hoist" {
+		t.Fatalf("Workflows = %+v, want the sampled run summarized as seed-hoist", e.c.Workflows)
+	}
+}
+
+func TestPrime_shouldSeedWorkflowRunsBeforeTheLock(t *testing.T) {
+	e := newEnv(t)
+	runDir := writeWorkflowRun(t, e, "wf_primed-1", "big-audit")
+	writeJournal(t, runDir, []string{wfStarted("wp1")})
+	writeWorkflowAgent(t, runDir, "wp1")
+	// The prior daemon already announced this run, so a restart must not
+	// re-announce it — and the archive read that establishes that is the seed.
+	day := filepath.Join(e.historyDir, "2026-08-05.jsonl")
+	lines := `{"ts":"2026-08-05T12:00:00Z","type":"workflow_start","session_id":"sess-abc123","workflow_run_id":"wf_primed-1"}
+`
+	if err := os.WriteFile(day, []byte(lines), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	obs := NewObserver(e.historyDir)
+
+	obs.Prime(e.c.SessionID, e.c.Transcript)
+	if err := os.Remove(day); err != nil {
+		t.Fatal(err)
+	}
+
+	ev := obs.Reconcile(e.sess, e.c, time.Now())
+	if hasWorkflowEvent(ev, history.EventWorkflowStart, "wf_primed-1") {
+		t.Fatalf("wf_primed-1 was re-announced, so the workflow half of the seed ran after Prime "+
+			"rather than inside it — under the store lock, where the subagent half no longer is; got %+v", ev)
+	}
+	if e.c.InFlightSubagents != 1 {
+		t.Fatalf("inflight = %d, want 1 — suppressing the re-announce must not lose the running agent", e.c.InFlightSubagents)
+	}
+}
