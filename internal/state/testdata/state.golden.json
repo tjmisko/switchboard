@@ -31,6 +31,15 @@
         "status": "working",
         "status_since": "2026-05-28T09:01:00Z",
         "in_flight_subagents": 2,
+        "workflows": [
+          {
+            "run_id": "wf_5e3cb808-2ac",
+            "name": "simplification-audit",
+            "agents_started": 17,
+            "agents_done": 7,
+            "in_flight": 2
+          }
+        ],
         "pending_writers": [
           "af5bd126402ac16c7",
           "main"
