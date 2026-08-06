@@ -1,6 +1,9 @@
 package main
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -18,7 +21,7 @@ func TestRenderSnapshotShowsStatusDuration(t *testing.T) {
 			}},
 		},
 	}
-	got := renderSnapshot(snap, "/home/u", false, now)
+	got := renderSnapshot(snap, "/home/u", false, now, nil)
 	if !strings.Contains(got, "3m") {
 		t.Errorf("session line should carry the idle duration '3m':\n%s", got)
 	}
@@ -37,7 +40,7 @@ func TestRenderSnapshotListsSessions(t *testing.T) {
 		Capabilities: &state.Capabilities{Observe: true, Navigate: true, WM: "hyprland", Terminal: "wezterm"},
 	}
 
-	got := renderSnapshot(snap, "/home/u", false, time.Now())
+	got := renderSnapshot(snap, "/home/u", false, time.Now(), nil)
 
 	for _, want := range []string{
 		"2 sessions",
@@ -73,11 +76,11 @@ func TestRenderSnapshotDelegatingIsGreen(t *testing.T) {
 			}},
 		},
 	}
-	plain := renderSnapshot(snap, "/home/u", false, time.Now())
+	plain := renderSnapshot(snap, "/home/u", false, time.Now(), nil)
 	if !strings.Contains(plain, "delegating") {
 		t.Errorf("plain frame missing 'delegating' label:\n%s", plain)
 	}
-	colored := renderSnapshot(snap, "/home/u", true, time.Now())
+	colored := renderSnapshot(snap, "/home/u", true, time.Now(), nil)
 	if !strings.Contains(colored, colGreen) {
 		t.Errorf("delegating session should be painted green:\n%q", colored)
 	}
@@ -95,7 +98,7 @@ func TestRenderSnapshotGreysSuspended(t *testing.T) {
 
 	// Plain (no color): suspended sessions read "suspended", not their stale
 	// underlying status.
-	plain := renderSnapshot(snap, "/home/u", false, time.Now())
+	plain := renderSnapshot(snap, "/home/u", false, time.Now(), nil)
 	if !strings.Contains(plain, "suspended") {
 		t.Errorf("plain frame missing 'suspended' label:\n%s", plain)
 	}
@@ -104,14 +107,14 @@ func TestRenderSnapshotGreysSuspended(t *testing.T) {
 	}
 
 	// Colored: the line is painted grey (the suspended treatment).
-	colored := renderSnapshot(snap, "/home/u", true, time.Now())
+	colored := renderSnapshot(snap, "/home/u", true, time.Now(), nil)
 	if !strings.Contains(colored, colGrey) {
 		t.Errorf("colored suspended frame missing grey escape:\n%q", colored)
 	}
 }
 
 func TestRenderSnapshotEmptyAndNoCaps(t *testing.T) {
-	got := renderSnapshot(state.Snapshot{UpdatedAt: time.Now()}, "/home/u", false, time.Now())
+	got := renderSnapshot(state.Snapshot{UpdatedAt: time.Now()}, "/home/u", false, time.Now(), nil)
 	if !strings.Contains(got, "0 sessions") {
 		t.Errorf("want '0 sessions', got:\n%s", got)
 	}
@@ -121,6 +124,87 @@ func TestRenderSnapshotEmptyAndNoCaps(t *testing.T) {
 	// nil capabilities → bare "observe" tier, no panic.
 	if !strings.Contains(got, "observe") {
 		t.Errorf("want 'observe' tier with nil caps, got:\n%s", got)
+	}
+}
+
+// --- naming the writer behind a red row -----------------------------------
+
+// blockedSnapshot builds a one-session red snapshot with `writers` blocked (wire
+// spelling; "main" = the main thread) and a real subagents/ dir carrying a
+// teammate meta per entry of `names` (bare agent id -> teammate name).
+func blockedSnapshot(t *testing.T, writers []string, inflight int, names map[string]string) state.Snapshot {
+	t.Helper()
+	dir := t.TempDir()
+	transcriptPath := filepath.Join(dir, "sess.jsonl")
+	subagentsDir := filepath.Join(dir, "sess", "subagents")
+	if err := os.MkdirAll(subagentsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for id, name := range names {
+		body := fmt.Sprintf(`{"agentType":"general-purpose","name":%q,"taskKind":"in_process_teammate"}`, name)
+		if err := os.WriteFile(filepath.Join(subagentsDir, "agent-"+id+".meta.json"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return state.Snapshot{Sessions: []state.Session{{
+		PID: 4821, CWD: "/home/u/proj",
+		Claude: &state.ClaudeInfo{
+			Status:            state.StatusPermission,
+			Transcript:        transcriptPath,
+			PendingWriters:    writers,
+			InFlightSubagents: inflight,
+		},
+	}}}
+}
+
+// The reference renderer is the only surface a headless/SSH user has, and a red
+// row that says "permission" and nothing else has exactly the incident's defect:
+// it does not say which of the session's writers is stuck.
+func TestRenderSnapshotShouldNameTheBlockedTeammateOnAPermissionRow(t *testing.T) {
+	snap := blockedSnapshot(t, []string{"af5bd126402ac16c7"}, 4,
+		map[string]string{"af5bd126402ac16c7": "escalate-cleanup"})
+	got := renderSnapshot(snap, "/home/u", false, time.Now(), nil)
+	if !strings.Contains(got, "blocked: escalate-cleanup") {
+		t.Errorf("permission row should name the blocked teammate:\n%s", got)
+	}
+}
+
+func TestRenderSnapshotShouldNameEveryWriterWhenTwoAreBlockedAtOnce(t *testing.T) {
+	snap := blockedSnapshot(t, []string{"af5bd126402ac16c7", "main"}, 2,
+		map[string]string{"af5bd126402ac16c7": "escalate-cleanup"})
+	got := renderSnapshot(snap, "/home/u", false, time.Now(), nil)
+	if !strings.Contains(got, "blocked: escalate-cleanup, main") {
+		t.Errorf("permission row should name both blocked writers:\n%s", got)
+	}
+}
+
+// Solo session, main thread blocked: the red row already says this, so the
+// annotation stays off rather than spending a word on "main".
+func TestRenderSnapshotShouldLeaveASoloPermissionRowUnannotated(t *testing.T) {
+	snap := blockedSnapshot(t, []string{"main"}, 0, nil)
+	got := renderSnapshot(snap, "/home/u", false, time.Now(), nil)
+	if strings.Contains(got, "blocked:") {
+		t.Errorf("solo permission row should carry no blocked-writer annotation:\n%s", got)
+	}
+}
+
+// The annotation is last on the line, after every fixed-width column, so a
+// name of any length cannot push the cwd/pid columns out of alignment.
+func TestRenderSnapshotShouldKeepColumnsAlignedWhenAWriterIsNamed(t *testing.T) {
+	snap := blockedSnapshot(t, []string{"af5bd126402ac16c7"}, 4,
+		map[string]string{"af5bd126402ac16c7": "a-very-long-teammate-name-indeed"})
+	got := renderSnapshot(snap, "/home/u", false, time.Now(), nil)
+	line := ""
+	for _, l := range strings.Split(got, "\r\n") {
+		if strings.Contains(l, "pid 4821") {
+			line = l
+		}
+	}
+	if line == "" {
+		t.Fatalf("no session row in frame:\n%s", got)
+	}
+	if strings.Index(line, "blocked:") < strings.Index(line, "pid 4821") {
+		t.Errorf("the blocked-writer annotation must follow the fixed-width columns: %q", line)
 	}
 }
 
