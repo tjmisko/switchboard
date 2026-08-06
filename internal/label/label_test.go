@@ -397,3 +397,249 @@ func TestNameCache_RawName_servesConcurrentCallersTheSameName(t *testing.T) {
 		}
 	}
 }
+
+// --- naming the writers behind a red chip ---------------------------------
+
+// blockedFixture builds a session whose enrichment is red with `writers` blocked
+// (wire spelling: "main" for the main thread), alongside a real subagents/ dir it
+// can resolve names out of. metas maps a bare agent id to its meta.json body.
+// Returns the session and the subagents dir, so a test can rewrite a meta.
+func blockedFixture(t *testing.T, writers []string, inflight int, metas map[string]string) (state.Session, string) {
+	t.Helper()
+	dir := t.TempDir()
+	transcriptPath := filepath.Join(dir, "sess.jsonl")
+	subagentsDir := filepath.Join(dir, "sess", "subagents")
+	if err := os.MkdirAll(subagentsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for id, body := range metas {
+		if err := os.WriteFile(filepath.Join(subagentsDir, "agent-"+id+".meta.json"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return state.Session{
+		PID: 4821, CWD: "/home/u/proj",
+		Claude: &state.ClaudeInfo{
+			Status:            state.StatusPermission,
+			Transcript:        transcriptPath,
+			PendingWriters:    writers,
+			InFlightSubagents: inflight,
+		},
+	}, subagentsDir
+}
+
+// teammateMeta is the fuller in-process-teammate meta shape, which carries a name.
+func teammateMeta(name, description string) string {
+	return fmt.Sprintf(`{"agentType":"general-purpose","name":%q,"description":%q,"taskKind":"in_process_teammate"}`, name, description)
+}
+
+// The incident: the chip read "digestdownloads-status-update-request" while the
+// actual state was "the escalate-cleanup teammate is waiting on approval". The
+// session name is unchanged; what was missing is the writer's.
+func TestBlockedWriters_namesTheTeammateWhenASubagentRaisedThePrompt(t *testing.T) {
+	s, _ := blockedFixture(t, []string{"af5bd126402ac16c7"}, 4, map[string]string{
+		"af5bd126402ac16c7": teammateMeta("escalate-cleanup", "Clean up escalation duplication"),
+	})
+	if got := BlockedWriters(s); got != "escalate-cleanup" {
+		t.Errorf("BlockedWriters = %q, want escalate-cleanup", got)
+	}
+}
+
+// Case 18: the main thread and a teammate are both blocked, and the red now holds
+// for both. Naming only one of them would send the user to the wrong decision.
+func TestBlockedWriters_namesEveryWriterWhenTwoAreBlockedAtOnce(t *testing.T) {
+	s, _ := blockedFixture(t, []string{"af5bd126402ac16c7", "main"}, 2, map[string]string{
+		"af5bd126402ac16c7": teammateMeta("escalate-cleanup", "Clean up escalation duplication"),
+	})
+	if got := BlockedWriters(s); got != "escalate-cleanup, main" {
+		t.Errorf("BlockedWriters = %q, want \"escalate-cleanup, main\"", got)
+	}
+}
+
+// pending_writers arrives sorted on the wire, and the rendering must preserve that
+// rather than re-order by resolved name: an unstable projection would make the
+// tooltip flicker between snapshots of identical state.
+func TestBlockedWriters_followsTheWireOrderRatherThanTheResolvedNames(t *testing.T) {
+	s, _ := blockedFixture(t, []string{"aaa1", "bbb2"}, 2, map[string]string{
+		"aaa1": teammateMeta("zebra", ""),
+		"bbb2": teammateMeta("alpha", ""),
+	})
+	if got := BlockedWriters(s); got != "zebra, alpha" {
+		t.Errorf("BlockedWriters = %q, want \"zebra, alpha\" (wire order, not alphabetical)", got)
+	}
+}
+
+func TestBlockedWriters_saysMainWhenTheMainThreadIsBlockedAlongsideRunningTeammates(t *testing.T) {
+	// With teammates in flight the main thread is no longer the obvious suspect,
+	// so naming it is what tells the user where to go.
+	s, _ := blockedFixture(t, []string{"main"}, 3, nil)
+	if got := BlockedWriters(s); got != "main" {
+		t.Errorf("BlockedWriters = %q, want main", got)
+	}
+}
+
+func TestBlockedWriters_saysNothingWhenASoloSessionsMainThreadIsBlocked(t *testing.T) {
+	// No teammates: "main" would restate exactly what the red chip already means.
+	s, _ := blockedFixture(t, []string{"main"}, 0, nil)
+	if got := BlockedWriters(s); got != "" {
+		t.Errorf("BlockedWriters = %q, want \"\" (the red chip already says this)", got)
+	}
+}
+
+func TestBlockedWriters_saysNothingWhenNoWriterIsBlocked(t *testing.T) {
+	cases := map[string]state.Session{
+		"no pending writers": {PID: 1, Claude: &state.ClaudeInfo{Status: state.StatusWorking}},
+		"no enrichment":      {PID: 2},
+	}
+	for what, s := range cases {
+		if got := BlockedWriters(s); got != "" {
+			t.Errorf("%s: BlockedWriters = %q, want \"\"", what, got)
+		}
+	}
+}
+
+func TestBlockedWriters_fallsBackToTheAgentTypeWhenTheMetaIsMinimal(t *testing.T) {
+	// Most metas carry only agentType. It names a kind rather than an instance,
+	// but it is still a word the user recognizes where a hex id is not.
+	s, _ := blockedFixture(t, []string{"c001"}, 1, map[string]string{
+		"c001": `{"agentType":"Explore"}`,
+	})
+	if got := BlockedWriters(s); got != "Explore" {
+		t.Errorf("BlockedWriters = %q, want Explore", got)
+	}
+}
+
+func TestBlockedWriters_fallsBackToAShortIDWhenTheMetaCannotBeRead(t *testing.T) {
+	// A writer whose name will not resolve must still be COUNTED — dropping it
+	// would understate how many decisions are waiting.
+	s, _ := blockedFixture(t, []string{"af5bd126402ac16c7"}, 1, nil)
+	if got := BlockedWriters(s); got != "af5bd126…" {
+		t.Errorf("BlockedWriters = %q, want the truncated id", got)
+	}
+}
+
+func TestBlockedWriters_capsTheRosterWhenManyWritersAreBlocked(t *testing.T) {
+	// Past a few names the actionable message is "several are blocked"; the exact
+	// roster is what switching to the pane is for. The count must stay exact.
+	metas := map[string]string{}
+	writers := []string{}
+	for _, id := range []string{"a1", "a2", "a3", "a4", "a5"} {
+		writers = append(writers, id)
+		metas[id] = teammateMeta("w-"+id, "")
+	}
+	s, _ := blockedFixture(t, writers, 5, metas)
+	if got := BlockedWriters(s); got != "w-a1, w-a2, w-a3 +2" {
+		t.Errorf("BlockedWriters = %q, want \"w-a1, w-a2, w-a3 +2\"", got)
+	}
+}
+
+func TestNameCache_BlockedWriters_matchesTheUncachedLookup(t *testing.T) {
+	s, _ := blockedFixture(t, []string{"af5bd126402ac16c7", "main"}, 2, map[string]string{
+		"af5bd126402ac16c7": teammateMeta("escalate-cleanup", ""),
+	})
+	want := BlockedWriters(s)
+	if got := (&NameCache{}).BlockedWriters(s); got != want {
+		t.Errorf("cached BlockedWriters = %q, uncached = %q", got, want)
+	}
+}
+
+func TestNameCache_BlockedWriters_readsTheDiskWhenTheCacheIsNil(t *testing.T) {
+	s, _ := blockedFixture(t, []string{"b17"}, 1, map[string]string{
+		"b17": teammateMeta("probe-flake", ""),
+	})
+	var c *NameCache
+	if got := c.BlockedWriters(s); got != "probe-flake" {
+		t.Errorf("nil cache BlockedWriters = %q, want probe-flake", got)
+	}
+}
+
+// The bar renders a tooltip for its slot on EVERY emission, ten slot processes
+// deep, for the whole life of a prompt. Re-reading each blocked writer's meta
+// every time is precisely the per-render I/O this cache exists to remove — and a
+// meta.json is written once at spawn, so the stamp makes it a permanent hit.
+func TestNameCache_BlockedWriters_servesTheCachedNameWhenTheStampHasNotMoved(t *testing.T) {
+	s, subagentsDir := blockedFixture(t, []string{"b17"}, 1, map[string]string{
+		"b17": teammateMeta("probe-flake", ""),
+	})
+	c := &NameCache{}
+	if got := c.BlockedWriters(s); got != "probe-flake" {
+		t.Fatalf("first BlockedWriters = %q, want probe-flake", got)
+	}
+	// Rewrite the meta while restoring its (mtime, size) stamp: the one edit a
+	// stamp-keyed cache is entitled to miss, and how a test observes a cache hit.
+	metaPath := filepath.Join(subagentsDir, "agent-b17.meta.json")
+	backdate(t, metaPath, teammateMeta("probe-XXXXX", ""))
+	if got := c.BlockedWriters(s); got != "probe-flake" {
+		t.Errorf("second BlockedWriters = %q, want the cached probe-flake", got)
+	}
+}
+
+func TestNameCache_BlockedWriters_readsTheMetaOnceItAppears(t *testing.T) {
+	// A prompt can be observed before the spawn's meta lands (or in a session
+	// hydrated across a daemon restart). Caching the miss must not be permanent.
+	s, subagentsDir := blockedFixture(t, []string{"b17"}, 1, nil)
+	c := &NameCache{}
+	if got := c.BlockedWriters(s); got != "b17" {
+		t.Fatalf("first BlockedWriters = %q, want the id fallback", got)
+	}
+	metaPath := filepath.Join(subagentsDir, "agent-b17.meta.json")
+	if err := os.WriteFile(metaPath, []byte(teammateMeta("probe-flake", "")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.BlockedWriters(s); got != "probe-flake" {
+		t.Errorf("BlockedWriters = %q, want probe-flake once the meta exists", got)
+	}
+}
+
+func TestNameCache_BlockedWriters_keepsWritersIndependent(t *testing.T) {
+	s, _ := blockedFixture(t, []string{"a1", "a2"}, 2, map[string]string{
+		"a1": teammateMeta("first", ""),
+		"a2": teammateMeta("second", ""),
+	})
+	c := &NameCache{}
+	for range 3 {
+		if got := c.BlockedWriters(s); got != "first, second" {
+			t.Fatalf("BlockedWriters = %q, want \"first, second\"", got)
+		}
+	}
+}
+
+func TestNameCache_BlockedWriters_boundsWhatItRetainsAcrossManyWriters(t *testing.T) {
+	// The daemon and the bar run for days while teammates come and go; the writer
+	// map must not accumulate one entry per agent that has ever blocked.
+	c := &NameCache{}
+	for i := range maxNameCacheEntries + 20 {
+		s, _ := blockedFixture(t, []string{fmt.Sprintf("w%d", i)}, 1, nil)
+		c.BlockedWriters(s)
+	}
+	c.mu.Lock()
+	n := len(c.writers)
+	c.mu.Unlock()
+	if n > maxNameCacheEntries {
+		t.Errorf("writer cache holds %d entries, want at most %d", n, maxNameCacheEntries)
+	}
+}
+
+func TestNameCache_BlockedWriters_servesConcurrentCallersTheSameName(t *testing.T) {
+	s, _ := blockedFixture(t, []string{"b17"}, 1, map[string]string{
+		"b17": teammateMeta("probe-flake", ""),
+	})
+	c := &NameCache{}
+	var wg sync.WaitGroup
+	got := make([]string, 8)
+	for i := range got {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 20 {
+				got[i] = c.BlockedWriters(s)
+			}
+		}()
+	}
+	wg.Wait()
+	for i, name := range got {
+		if name != "probe-flake" {
+			t.Errorf("goroutine %d saw BlockedWriters = %q, want probe-flake", i, name)
+		}
+	}
+}

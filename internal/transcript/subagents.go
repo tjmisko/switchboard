@@ -41,6 +41,7 @@ import (
 type Subagent struct {
 	AgentID     string    // <id> from the agent-<id>.{meta.json,jsonl} FILENAME — the universal key/join (matches the SubagentStart/Stop hook agent_id)
 	AgentType   string    // agentType from the meta; "" for an orphan jsonl that has no sibling meta
+	Name        string    // name — the human-readable teammate name (e.g. "escalate-cleanup"); best-effort (only the fuller in-process-teammate metas carry it)
 	Description string    // description — best-effort (absent in minimal metas)
 	ToolUseID   string    // toolUseId — best-effort (absent ~36% of metas); for parent-transcript cross-check only
 	SpawnDepth  int       // spawnDepth — best-effort (absent → 0; 0 = launched by the main thread)
@@ -59,6 +60,7 @@ type Subagent struct {
 // key).
 type subagentMeta struct {
 	AgentType   string `json:"agentType"`
+	Name        string `json:"name"`
 	Description string `json:"description"`
 	ToolUseID   string `json:"toolUseId"`
 	SpawnDepth  int    `json:"spawnDepth"`
@@ -67,12 +69,161 @@ type subagentMeta struct {
 
 // subagentFilePrefix/subagentMetaSuffix/subagentJSONLSuffix bracket the AgentID in
 // the two filenames a spawn writes: agent-<id>.meta.json and agent-<id>.jsonl. The
-// <id> between prefix and suffix is the universal key.
+// <id> between prefix and suffix is the universal key. subagentsDirName is the dir
+// those two files live in, under the session's own sibling directory.
 const (
 	subagentFilePrefix  = "agent-"
 	subagentMetaSuffix  = ".meta.json"
 	subagentJSONLSuffix = ".jsonl"
+	subagentsDirName    = "subagents"
 )
+
+// subagentsDirForTranscript derives <dir>/<session-id>/subagents/ from a parent
+// transcript path <dir>/<session-id>.jsonl. It is the SINGLE derivation in this
+// package: SubagentsForTranscript and SubagentPath both route through it so the
+// two can never drift apart.
+//
+// The dir is derived from the PASSED path and nothing else — never from cwd, a
+// project slug, or any re-derivation of either. That is what keeps it correct for
+// a session running in a git worktree (its records still live beside the
+// transcript switchboard already stores), for a /name-renamed session, and under
+// an XDG-relocated ~/.claude (subagent-fanout-detection-plan.md, G10).
+//
+// TrimSuffix is a no-op when the path lacks the .jsonl suffix, which simply leaves
+// the derived dir absent rather than inventing one. An empty path yields "" rather
+// than the bare relative "subagents" that filepath.Join would otherwise produce.
+func subagentsDirForTranscript(mainTranscript string) string {
+	if mainTranscript == "" {
+		return ""
+	}
+	return filepath.Join(strings.TrimSuffix(mainTranscript, subagentJSONLSuffix), subagentsDirName)
+}
+
+// SubagentPath returns the transcript file a given writer's OWN entries land in,
+// given the parent (main-thread) transcript path:
+//
+//	agentID == ""  → mainTranscript, unchanged (the main thread writes there)
+//	agentID != ""  → <dir>/<session-id>/subagents/agent-<agentID>.jsonl
+//
+// A subagent's writes are NOT in the parent transcript, and a hook fired from
+// inside a subagent still reports the PARENT's transcript_path
+// (claude-code-hook-schema.md §3) — so while a teammate works, the parent file can
+// be arbitrarily stale and this sibling file is the only evidence of that
+// teammate's activity.
+//
+// The empty-agentID case returning mainTranscript unchanged is deliberate: it lets
+// a caller resolve a pending writer with no branch, passing whatever agent_id the
+// hook carried (empty ⇒ main thread) straight through.
+//
+// agentID must be BARE: the <id> between "agent-" and the suffix in the filename
+// pair agent-<id>.meta.json / agent-<id>.jsonl — exactly what Subagent.AgentID
+// holds. This function does NOT strip a leading "agent-", and no caller may strip
+// one on its behalf. Normalization of the hook's agent_id happens ONCE, at the RPC
+// boundary (normalizeAgentID), which removes at most one leading prefix; a second
+// strip anywhere downstream would eat a legitimate prefix.
+//
+// That is not hypothetical. A named subagent's id is shaped a<name><hex>, and the
+// name is user-supplied — a subagent named "gent-foo" gets id "agent-foo-<hex>",
+// stored on disk as agent-agent-foo-<hex>.jsonl. Stripping here would resolve it to
+// agent-foo-<hex>.jsonl, a DIFFERENT agent's transcript. A resolver would then read
+// that other agent's activity and clear a prompt this agent is still blocked on: a
+// missed RED, silent and unrecoverable.
+//
+// The two failure modes are deliberately asymmetric. Over-stripping is silent and
+// wrong. Under-stripping is not: a caller that mistakenly passes a still-prefixed
+// id derives agent-agent-<id>.jsonl, which does not exist, so the read fails and the
+// caller keeps its pending entry. Fail-safe is the direction to err in, so the
+// prefix is left alone.
+//
+// A trailing ".jsonl" IS tolerated — an id and its filename are interchangeable at
+// call sites, and ".jsonl" is a suffix no bare id carries.
+//
+// Returns "" when there is nothing sane to derive: an empty mainTranscript, an
+// agentID that is only the ".jsonl" suffix, or an agentID containing a path
+// separator (a hook-supplied value must not be able to escape the subagents dir).
+func SubagentPath(mainTranscript, agentID string) string {
+	if agentID == "" {
+		return mainTranscript // main thread: its writes are the parent transcript
+	}
+	return subagentFilePath(mainTranscript, agentID, subagentJSONLSuffix)
+}
+
+// SubagentMetaPath is SubagentPath's twin for the OTHER file a spawn writes:
+//
+//	<dir>/<session-id>/subagents/agent-<agentID>.meta.json
+//
+// It is the file that carries a teammate's human-readable `name`, so a renderer
+// that wants to name a blocked writer reads exactly this one path rather than
+// listing (and tail-reading) the whole subagents dir the way
+// SubagentsForTranscript does.
+//
+// Unlike SubagentPath there is NO main-thread case: the main thread is not a
+// spawn and has no meta, so an empty agentID returns "" — which is the natural
+// discriminator for a caller resolving a pending-writer key ("" = main thread).
+//
+// Every other rule is SubagentPath's, shared through the same derivation: the
+// agentID must be BARE (no second "agent-" strip — see SubagentPath for the
+// missed-RED hazard that would create), a trailing ".jsonl" is tolerated so an id
+// and its transcript filename are interchangeable at call sites, and a path
+// separator or an empty derived id yields "".
+func SubagentMetaPath(mainTranscript, agentID string) string {
+	if agentID == "" {
+		return "" // the main thread is not a spawn: no meta file exists for it
+	}
+	return subagentFilePath(mainTranscript, agentID, subagentMetaSuffix)
+}
+
+// subagentFilePath is the shared derivation behind SubagentPath and
+// SubagentMetaPath: the sibling subagents dir plus agent-<bare id><suffix>, or ""
+// when there is nothing sane to derive. Keeping it in one place is what stops the
+// two exported spellings from drifting on the id-safety rules.
+func subagentFilePath(mainTranscript, agentID, suffix string) string {
+	dir := subagentsDirForTranscript(mainTranscript)
+	if dir == "" {
+		return ""
+	}
+	// No TrimPrefix: agentID is already bare (see the contract above). Stripping a
+	// second "agent-" here would silently retarget another agent's files.
+	id := strings.TrimSuffix(agentID, subagentJSONLSuffix)
+	if id == "" || strings.ContainsRune(id, filepath.Separator) || strings.ContainsRune(id, '/') {
+		return ""
+	}
+	return filepath.Join(dir, subagentFilePrefix+id+suffix)
+}
+
+// SubagentDisplayName reads the most human-readable identifier an
+// agent-<id>.meta.json carries, given that meta's path:
+//
+//  1. `name` — the teammate name the user themselves typed or saw (e.g.
+//     "escalate-cleanup"). Present on the fuller in-process-teammate metas.
+//  2. `agentType` — the only field present in EVERY meta (e.g. "Explore",
+//     "general-purpose"). It names a kind rather than an instance, so two
+//     concurrent Explores are indistinguishable by it — but it is still a word
+//     the user recognizes, which a hex id is not.
+//  3. "" — a missing, unreadable, non-JSON, or nameless meta. The caller decides
+//     what to show instead; this function never invents a name.
+//
+// The fallback order lives HERE, beside subagentMeta, because it is a fact about
+// the heterogeneous on-disk shape (only agentType is universal) rather than a
+// rendering policy. Callers add presentation on top: how to spell the main
+// thread, and what to fall back to when this returns "".
+func SubagentDisplayName(metaPath string) string {
+	if metaPath == "" {
+		return ""
+	}
+	raw, err := os.ReadFile(metaPath)
+	if err != nil {
+		return ""
+	}
+	var m subagentMeta
+	if json.Unmarshal(raw, &m) != nil {
+		return "" // tolerate a non-JSON meta exactly as SubagentsForTranscript does
+	}
+	if n := strings.TrimSpace(m.Name); n != "" {
+		return n
+	}
+	return strings.TrimSpace(m.AgentType)
+}
 
 // subagentTerminalReason is the assistant stop_reason that marks a subagent's own
 // transcript as finished: its final turn ended naturally. A still-running agent's
@@ -107,9 +258,10 @@ func SubagentsForTranscript(transcriptPath string) ([]Subagent, error) {
 	if transcriptPath == "" {
 		return nil, errors.New("transcript: empty path")
 	}
-	// <dir>/<session-id>.jsonl → <dir>/<session-id>/subagents/. TrimSuffix is a
-	// no-op (leaving the dir absent → nil,nil) if the path lacks the .jsonl suffix.
-	dir := filepath.Join(strings.TrimSuffix(transcriptPath, ".jsonl"), "subagents")
+	// <dir>/<session-id>.jsonl → <dir>/<session-id>/subagents/, via the one shared
+	// derivation SubagentPath also uses (a path lacking .jsonl simply leaves the dir
+	// absent → nil,nil).
+	dir := subagentsDirForTranscript(transcriptPath)
 	dirents, err := os.ReadDir(dir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -120,6 +272,11 @@ func SubagentsForTranscript(transcriptPath string) ([]Subagent, error) {
 
 	// Union the metadata and transcript files by their agent-<id> stem, preserving
 	// first-seen (= filename) order for a stable result.
+	//
+	// The TrimPrefix below parses a FILENAME — it is what MAKES Subagent.AgentID bare,
+	// and is unrelated to normalizing a hook-supplied agent_id. Do not read it as
+	// license to strip again in SubagentPath: an id that itself begins with "agent-"
+	// lives in agent-agent-<id>.jsonl, and exactly one strip recovers it.
 	byID := map[string]*Subagent{}
 	var order []string
 	upsert := func(id string) *Subagent {
@@ -152,6 +309,7 @@ func SubagentsForTranscript(transcriptPath string) ([]Subagent, error) {
 			var m subagentMeta
 			if json.Unmarshal(raw, &m) == nil { // tolerate a non-JSON meta: id stays reported, fields zero
 				s.AgentType = m.AgentType
+				s.Name = m.Name
 				s.Description = m.Description
 				s.ToolUseID = m.ToolUseID
 				s.SpawnDepth = m.SpawnDepth

@@ -384,3 +384,336 @@ func TestSubagentsModTimePrefersJSONL(t *testing.T) {
 		t.Errorf("ModTime = %v, want the jsonl mtime %v (not the meta's %v)", subs[0].ModTime, jsonlTime, metaTime)
 	}
 }
+
+// TestSubagentPath locks the writer→transcript resolution the permission path
+// depends on: a subagent's own entries live in the sibling
+// <session>/subagents/agent-<id>.jsonl and never in the parent transcript, while
+// an empty agent id (the hook's main-thread marker) must resolve to the parent
+// transcript itself so callers stay branch-free.
+func TestSubagentPath(t *testing.T) {
+	t.Run("should return the main transcript unchanged when the agent id is empty", func(t *testing.T) {
+		// The hook omits agent_id on the main thread, so "" means "the writer is the
+		// main thread" — whose entries ARE the parent transcript.
+		main := "/home/u/.claude/projects/-home-u-Projects-switchboard/sess-uuid.jsonl"
+		if got := SubagentPath(main, ""); got != main {
+			t.Errorf("SubagentPath(main, \"\") = %q, want the main transcript %q", got, main)
+		}
+	})
+
+	t.Run("should resolve the sibling subagents jsonl when the agent id names a teammate", func(t *testing.T) {
+		// The real on-disk shape: <projects>/<slug>/<session-uuid>.jsonl beside
+		// <projects>/<slug>/<session-uuid>/subagents/agent-<id>.jsonl.
+		main := "/home/u/.claude/projects/-home-u-Tools-DigestDownloads/5318eb5b-79df-4dee-a9f8-c80df4eca79e.jsonl"
+		want := "/home/u/.claude/projects/-home-u-Tools-DigestDownloads/5318eb5b-79df-4dee-a9f8-c80df4eca79e/subagents/agent-af5bd126402ac16c7.jsonl"
+		if got := SubagentPath(main, "af5bd126402ac16c7"); got != want {
+			t.Errorf("SubagentPath = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("should resolve from the stored transcript alone when the session runs in a git worktree", func(t *testing.T) {
+		// G10: derive from the passed path, never from cwd or a project slug. A
+		// worktree session's cwd is <repo>/.claude/worktrees/agent-<id>, unrelated to
+		// where its records live — so chdir somewhere else entirely and the answer
+		// must not move.
+		root := t.TempDir()
+		slug := "-home-u-Projects-switchboard--claude-worktrees-agent-ad471f23b56b4c180"
+		main := filepath.Join(root, "projects", slug, "d053f268-983c-4dfe-9e61-c9cf3ad55ce1.jsonl")
+		subagentsDir := filepath.Join(root, "projects", slug, "d053f268-983c-4dfe-9e61-c9cf3ad55ce1", "subagents")
+		if err := os.MkdirAll(subagentsDir, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		want := filepath.Join(subagentsDir, "agent-ad471f23b56b4c180.jsonl")
+		writeFile(t, want, []string{subagentWorkingLine("2026-08-05T12:38:21Z")})
+
+		t.Chdir(t.TempDir()) // an unrelated cwd: the derivation must ignore it
+		got := SubagentPath(main, "ad471f23b56b4c180")
+		if got != want {
+			t.Errorf("SubagentPath = %q, want %q", got, want)
+		}
+		if _, err := os.Stat(got); err != nil {
+			t.Errorf("resolved path is not the file on disk: %v", err)
+		}
+	})
+
+	t.Run("should tolerate a trailing .jsonl when the agent id is spelled as its filename", func(t *testing.T) {
+		// An id and its transcript filename are interchangeable at call sites; ".jsonl"
+		// is a suffix no bare id carries, so trimming it cannot destroy information.
+		main := "/p/sess.jsonl"
+		want := "/p/sess/subagents/agent-a1b2.jsonl"
+		if got := SubagentPath(main, "a1b2"); got != want {
+			t.Errorf("bare id: SubagentPath = %q, want %q", got, want)
+		}
+		if got := SubagentPath(main, "a1b2.jsonl"); got != want {
+			t.Errorf("suffixed id: SubagentPath = %q, want %q (suffix must not be doubled)", got, want)
+		}
+	})
+
+	t.Run("should derive a distinct non-existent path when the agent id still carries the agent- prefix", func(t *testing.T) {
+		// The inverse of the old contract, and deliberately so. agentID is BARE by
+		// contract; normalization happens once, at the RPC boundary. A second strip
+		// here would be indistinguishable from a legitimate id that begins with
+		// "agent-", so a still-prefixed id is treated as the literal id it claims to
+		// be. It derives a path that does not exist, the read fails, and the caller
+		// keeps its pending entry — fail-safe, and never another agent's transcript.
+		main := "/p/sess.jsonl"
+		bare := SubagentPath(main, "a1b2")
+		prefixed := SubagentPath(main, "agent-a1b2")
+		if want := "/p/sess/subagents/agent-agent-a1b2.jsonl"; prefixed != want {
+			t.Errorf("prefixed id: SubagentPath = %q, want %q (the prefix is part of the id, not decoration)", prefixed, want)
+		}
+		if prefixed == bare {
+			t.Errorf("a prefixed id collapsed onto the bare id's path %q; over-stripping would let one agent resolve to another's transcript", bare)
+		}
+	})
+
+	t.Run("should resolve two agents whose ids differ only by an agent- prefix to two different files", func(t *testing.T) {
+		// The concrete missed-RED hazard. Named subagents get ids shaped a<name><hex>
+		// and the name is user-supplied, so a subagent named "gent-foo" yields the id
+		// "agent-foo-7152e6a858d30551" — which can coexist with an unrelated agent
+		// whose id is "foo-7152e6a858d30551". Stripping in SubagentPath would alias the
+		// former onto the latter, and a resolver reading the wrong agent's activity
+		// would clear a prompt that is still pending.
+		dir := t.TempDir()
+		main := filepath.Join(dir, "sess.jsonl")
+		subagentsDir := filepath.Join(dir, "sess", "subagents")
+		if err := os.MkdirAll(subagentsDir, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		victim := "foo-7152e6a858d30551"      // an unrelated agent, sitting in the strip's shadow
+		named := "agent-foo-7152e6a858d30551" // the "gent-foo" teammate's real, bare id
+		for _, id := range []string{victim, named} {
+			writeFile(t, filepath.Join(subagentsDir, "agent-"+id+".jsonl"), []string{subagentWorkingLine("2026-08-05T12:38:21Z")})
+		}
+
+		gotVictim := SubagentPath(main, victim)
+		gotNamed := SubagentPath(main, named)
+		if want := filepath.Join(subagentsDir, "agent-"+victim+".jsonl"); gotVictim != want {
+			t.Errorf("unrelated agent: SubagentPath = %q, want %q", gotVictim, want)
+		}
+		if want := filepath.Join(subagentsDir, "agent-"+named+".jsonl"); gotNamed != want {
+			t.Errorf("named teammate: SubagentPath = %q, want %q (its id legitimately begins with agent-)", gotNamed, want)
+		}
+		if gotNamed == gotVictim {
+			t.Fatal("both ids resolved to one file: the named teammate would read another agent's activity and clear a still-pending prompt")
+		}
+		for _, p := range []string{gotVictim, gotNamed} {
+			if _, err := os.Stat(p); err != nil {
+				t.Errorf("resolved path is not the file on disk: %v", err)
+			}
+		}
+	})
+
+	t.Run("should treat the whole path as the session stem when the transcript lacks the .jsonl suffix", func(t *testing.T) {
+		// TrimSuffix is a no-op; the result stays inside a plausible sibling dir
+		// rather than becoming a path outside the session tree.
+		if got, want := SubagentPath("/p/sess", "a1b2"), "/p/sess/subagents/agent-a1b2.jsonl"; got != want {
+			t.Errorf("SubagentPath = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("should return empty when there is nothing sane to derive", func(t *testing.T) {
+		// "agent-" is deliberately NOT here any more: with no TrimPrefix it is an id
+		// like any other, deriving the non-existent agent-agent-.jsonl rather than "".
+		// Only an id that trims to nothing, or one that could escape the dir, is empty.
+		cases := []struct{ name, main, agent string }{
+			{"empty transcript with a teammate id", "", "a1b2"},
+			{"id that is only the .jsonl suffix", "/p/sess.jsonl", ".jsonl"},
+			{"id that would escape the subagents dir", "/p/sess.jsonl", "../../../etc/passwd"},
+		}
+		for _, c := range cases {
+			if got := SubagentPath(c.main, c.agent); got != "" {
+				t.Errorf("%s: SubagentPath = %q, want \"\"", c.name, got)
+			}
+		}
+	})
+}
+
+// TestSubagentPathAgreesWithSubagentsForTranscript is the anti-drift test: both
+// callers share one derivation, so every agent the dir scan reports must be
+// resolvable by SubagentPath from the same transcript path — including a
+// named-teammate id and an orphan jsonl with no meta.
+//
+// It is also what pins the two remaining "agent-" strips as NON-symmetric. The scan
+// strips the prefix off a FILENAME to recover the bare id; SubagentPath puts it back
+// and strips nothing. Round-tripping an id that itself begins with "agent-" only
+// closes if exactly one of the two strips exists — a second strip in SubagentPath
+// breaks this test.
+func TestSubagentPathAgreesWithSubagentsForTranscript(t *testing.T) {
+	dir := t.TempDir()
+	transcriptPath := filepath.Join(dir, "d053f268-983c-4dfe-9e61-c9cf3ad55ce1.jsonl")
+	subagentsDir := filepath.Join(dir, "d053f268-983c-4dfe-9e61-c9cf3ad55ce1", "subagents")
+	if err := os.MkdirAll(subagentsDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Four id shapes: a hex id with meta+jsonl, a named in-process teammate, an
+	// orphan jsonl with no meta, and a named teammate whose own bare id begins with
+	// "agent-" (the "gent-foo" case) — stored as agent-agent-foo-<hex>.jsonl, and the
+	// one that only round-trips because SubagentPath no longer strips.
+	ids := []string{"ad471f23b56b4c180", "aauth-tests-7152e6a858d30551", "aorphan9c0", "agent-foo-7152e6a858d30551"}
+	writeFile(t, filepath.Join(subagentsDir, "agent-"+ids[0]+".meta.json"), []string{`{"agentType":"general-purpose","spawnDepth":1}`})
+	for _, id := range ids {
+		writeFile(t, filepath.Join(subagentsDir, "agent-"+id+".jsonl"), []string{subagentTerminalLine("2026-08-05T12:38:21Z")})
+	}
+
+	subs, err := SubagentsForTranscript(transcriptPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(subs) != len(ids) {
+		t.Fatalf("got %d subagents, want %d: %+v", len(subs), len(ids), subs)
+	}
+	for _, s := range subs {
+		got := SubagentPath(transcriptPath, s.AgentID)
+		want := filepath.Join(subagentsDir, "agent-"+s.AgentID+".jsonl")
+		if got != want {
+			t.Errorf("agent %q: SubagentPath = %q, want %q", s.AgentID, got, want)
+		}
+		if _, err := os.Stat(got); err != nil {
+			t.Errorf("agent %q: SubagentPath does not point at the scanned file: %v", s.AgentID, err)
+		}
+	}
+}
+
+// --- naming a blocked writer ---------------------------------------------
+//
+// A red chip that names the blocked teammate has to get that name from
+// somewhere, and the only place it exists is the spawn's meta.json. These pin
+// the single-file path derivation and the fallback chain a renderer resolves
+// through, without paying SubagentsForTranscript's whole-directory scan.
+
+func TestSubagentMetaPath(t *testing.T) {
+	const parent = "/home/u/.claude/projects/-home-u-proj/sess.jsonl"
+	const dir = "/home/u/.claude/projects/-home-u-proj/sess/subagents"
+
+	t.Run("should resolve the sibling meta file when the agent id names a teammate", func(t *testing.T) {
+		want := dir + "/agent-af5bd126402ac16c7.meta.json"
+		if got := SubagentMetaPath(parent, "af5bd126402ac16c7"); got != want {
+			t.Errorf("SubagentMetaPath = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("should return nothing when the writer is the main thread", func(t *testing.T) {
+		// Unlike SubagentPath, which hands the main thread its parent transcript,
+		// there is no meta for a thread that was never spawned. "" is the caller's
+		// discriminator, not an error.
+		if got := SubagentMetaPath(parent, ""); got != "" {
+			t.Errorf("SubagentMetaPath(main) = %q, want \"\"", got)
+		}
+	})
+
+	t.Run("should tolerate a trailing .jsonl so an id and its filename are interchangeable", func(t *testing.T) {
+		want := dir + "/agent-a1b2.meta.json"
+		if got := SubagentMetaPath(parent, "a1b2.jsonl"); got != want {
+			t.Errorf("SubagentMetaPath = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("should not strip a second agent- prefix when the id legitimately carries one", func(t *testing.T) {
+		// The missed-RED hazard SubagentPath documents, in the meta namespace: an
+		// agent named "gent-foo" has id "agent-foo-<hex>" and lives in
+		// agent-agent-foo-<hex>.meta.json. Stripping would name a DIFFERENT agent.
+		want := dir + "/agent-agent-foo-9f.meta.json"
+		if got := SubagentMetaPath(parent, "agent-foo-9f"); got != want {
+			t.Errorf("SubagentMetaPath = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("should return nothing when the id could escape the subagents dir", func(t *testing.T) {
+		for _, id := range []string{"../../etc/passwd", "a/b", ".jsonl"} {
+			if got := SubagentMetaPath(parent, id); got != "" {
+				t.Errorf("SubagentMetaPath(%q) = %q, want \"\" (must not escape the dir)", id, got)
+			}
+		}
+	})
+
+	t.Run("should return nothing when there is no transcript to derive from", func(t *testing.T) {
+		if got := SubagentMetaPath("", "a1b2"); got != "" {
+			t.Errorf("SubagentMetaPath = %q, want \"\"", got)
+		}
+	})
+
+	t.Run("should point at the same spawn as SubagentPath", func(t *testing.T) {
+		// The two exported spellings share one derivation; this is the tripwire if
+		// they ever stop agreeing on which spawn they mean.
+		jsonl := SubagentPath(parent, "a1b2")
+		meta := SubagentMetaPath(parent, "a1b2")
+		if strings.TrimSuffix(jsonl, ".jsonl") != strings.TrimSuffix(meta, ".meta.json") {
+			t.Errorf("SubagentPath %q and SubagentMetaPath %q name different spawns", jsonl, meta)
+		}
+	})
+}
+
+func TestSubagentDisplayName(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		writeFile(t, path, []string{body})
+		return path
+	}
+
+	t.Run("should prefer the teammate name when the meta carries one", func(t *testing.T) {
+		p := write("full.meta.json", `{"agentType":"general-purpose","name":"escalate-cleanup","description":"Clean up escalation duplication","taskKind":"in_process_teammate"}`)
+		if got := SubagentDisplayName(p); got != "escalate-cleanup" {
+			t.Errorf("SubagentDisplayName = %q, want escalate-cleanup", got)
+		}
+	})
+
+	t.Run("should fall back to the agent type when the meta is the minimal shape", func(t *testing.T) {
+		// Only agentType is present in EVERY meta; a Task-spawned agent has no name.
+		p := write("minimal.meta.json", `{"agentType":"Explore"}`)
+		if got := SubagentDisplayName(p); got != "Explore" {
+			t.Errorf("SubagentDisplayName = %q, want Explore", got)
+		}
+	})
+
+	t.Run("should trim surrounding whitespace from the name it reports", func(t *testing.T) {
+		p := write("padded.meta.json", `{"agentType":"Explore","name":"  spaced-out  "}`)
+		if got := SubagentDisplayName(p); got != "spaced-out" {
+			t.Errorf("SubagentDisplayName = %q, want spaced-out", got)
+		}
+	})
+
+	t.Run("should report nothing rather than invent a name when the meta is unusable", func(t *testing.T) {
+		cases := map[string]string{
+			"missing":  filepath.Join(dir, "nope.meta.json"),
+			"empty id": "",
+			"non-JSON": write("junk.meta.json", `not json at all`),
+			"nameless": write("bare.meta.json", `{"toolUseId":"toolu_x"}`),
+			"blank":    write("blank.meta.json", `{"agentType":"","name":"   "}`),
+		}
+		for what, p := range cases {
+			if got := SubagentDisplayName(p); got != "" {
+				t.Errorf("%s: SubagentDisplayName = %q, want \"\"", what, got)
+			}
+		}
+	})
+}
+
+func TestSubagentsForTranscriptShouldReportTheTeammateName(t *testing.T) {
+	dir := t.TempDir()
+	transcriptPath := filepath.Join(dir, "sess.jsonl")
+	subagentsDir := filepath.Join(dir, "sess", "subagents")
+	if err := os.MkdirAll(subagentsDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeFile(t, filepath.Join(subagentsDir, "agent-named.meta.json"),
+		[]string{`{"agentType":"general-purpose","name":"escalate-cleanup","description":"Clean up escalation duplication"}`})
+	writeFile(t, filepath.Join(subagentsDir, "agent-anon.meta.json"),
+		[]string{`{"agentType":"Explore"}`})
+
+	subs, err := SubagentsForTranscript(transcriptPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	byID := map[string]Subagent{}
+	for _, s := range subs {
+		byID[s.AgentID] = s
+	}
+	if got := byID["named"].Name; got != "escalate-cleanup" {
+		t.Errorf("named agent: Name = %q, want escalate-cleanup", got)
+	}
+	if got := byID["anon"].Name; got != "" {
+		t.Errorf("minimal meta should leave Name empty, got %q", got)
+	}
+}

@@ -14,17 +14,26 @@
 //     woken by a background teammate) fires no working hook, so an "idle"
 //     (orange) chip never returns to green. NewestSignal recovers both.
 //
-// Detecting resolution from the transcript needs care: Claude Code does **not**
-// flush an interactive tool_use to the .jsonl until it *resolves*, and while the
-// prompt waits the session keeps writing — a background teammate/subagent and any
-// sibling auto-approved tool in the same turn flush tool_results dated *after* the
-// chip went red. So "a tool_result newer than the prompt" cannot tell a resolved
-// prompt from one still pending amid concurrent work; counting it demotes the red
-// chip the instant any background work lands. The reliable signal is the *main
-// conversation thread* advancing past the prompt: an assistant message dated after
-// the prompt (the blocked turn resumed → the awaited tool was approved) or a user
-// interrupt notice (declined / Esc). Tool_results — which subagents and parallel
-// tools emit while the prompt still waits — are deliberately ignored.
+// Detecting resolution from the transcript needs care, and NOT for the reason
+// this comment used to give. Claude Code *does* flush an interactive tool_use to
+// the .jsonl while the prompt waits — measured at ~5 s after the PermissionRequest
+// hook and minutes-to-hours before the user answers, in the main transcript as
+// well as a subagent's own file (docs/subagent-permission-plan.md §9.7, V4). What
+// it does not do is flush it *before* the hook: the pending tool_use and its
+// pre-prompt thinking/text turn-mates land a beat late, dated at generation time,
+// which is the H7/H8 flush race (docs/timing-hazards.md) that AnchorSince defuses
+// by anchoring a permission edge to wall-clock now.
+//
+// The real difficulty is concurrency. While the prompt waits the session keeps
+// writing — a background teammate/subagent and any sibling auto-approved tool in
+// the same turn flush tool_results dated *after* the chip went red. So "a
+// tool_result newer than the prompt" cannot tell a resolved prompt from one still
+// pending amid concurrent work; counting it demotes the red chip the instant any
+// background work lands. The reliable signal is the *main conversation thread*
+// advancing past the prompt: an assistant message dated after the prompt (the
+// blocked turn resumed → the awaited tool was approved) or a user interrupt notice
+// (declined / Esc). Tool_results — which subagents and parallel tools emit while
+// the prompt still waits — are deliberately ignored.
 package transcript
 
 import (
@@ -410,6 +419,111 @@ func resolutionKindOf(e entry) ResolutionKind {
 	return ResolutionNone
 }
 
+// BlockedEvidence is what one writer's OWN transcript tail says about whether it
+// is still waiting on a dispatched tool. It exists for exactly one caller — the
+// daemon's hydrate, which rebuilds prompt ownership from state.json after a
+// restart (docs/subagent-permission-plan.md §9) — and it is deliberately shaped as
+// a FALSIFIER, never a source.
+//
+// The asymmetry is the whole point. An unmatched tool_use means "a tool is
+// dispatched and has not returned," which covers *awaiting approval* and
+// *executing right now* with no third field to separate them, so deriving a
+// pending prompt from it would raise a false RED on every session that happened to
+// be mid-tool when the daemon restarted. But its ABSENCE — every dispatched tool
+// in the window has its result — does prove the writer is no longer blocked: the
+// tool returned, so whatever gate it sat behind opened. Applied only to ownership
+// we already persisted, the check can only REMOVE, so its worst outcome is
+// shortening a red, never inventing or missing one.
+type BlockedEvidence int
+
+const (
+	// BlockedUnknown means the tail cannot answer: the file is missing, unreadable,
+	// empty, or simply holds no tool_use at all (the pending one may have scrolled
+	// past the window). The caller must KEEP the entry — this is the same
+	// fail-closed reading permissionExit gives an unreadable transcript.
+	BlockedUnknown BlockedEvidence = iota
+	// BlockedYes means at least one tool_use in the tail has no matching
+	// tool_result. The writer still has a tool in flight, so a prompt recorded
+	// against it may well still be waiting. KEEP.
+	BlockedYes
+	// BlockedNo means the tail held tool_use blocks and EVERY one of them is
+	// matched by a tool_result. The writer is demonstrably not waiting on a tool,
+	// so a persisted prompt against it was answered — most likely while the daemon
+	// was down, a window the Since := startup re-stamp would otherwise hide. DROP.
+	BlockedNo
+)
+
+func (e BlockedEvidence) String() string {
+	switch e {
+	case BlockedYes:
+		return "blocked"
+	case BlockedNo:
+		return "unblocked"
+	default:
+		return "unknown"
+	}
+}
+
+// BlockedByPendingTool reports whether the writer that owns the transcript at
+// `path` still has a tool dispatched and unanswered. Pass the writer's OWN file —
+// SubagentPath(mainTranscript, agentID) — never the parent's.
+//
+// Two constraints, both measured, both a real missed RED if dropped
+// (docs/subagent-permission-plan.md §9.7):
+//
+//   - It tests for ANY unmatched tool_use in the window, never the trailing one.
+//     Claude Code emits parallel tool_use blocks from a single assistant message
+//     routinely, so with a gated tool beside an auto-approved sibling the file
+//     order is tool_use(gated), tool_use(sibling), tool_result(sibling): the
+//     *trailing* tool_use is matched while the prompt still waits, and a
+//     trailing-only test would drop a live red.
+//   - It applies to the MAIN transcript exactly as it does to a subagent's. The
+//     "Claude Code withholds the pending tool_use until it resolves" claim is
+//     false — the main jsonl carries the pending tool_use within ~5 s of the hook
+//     and keeps it unmatched for the whole wait (§9.7, V4). What it must NOT do is
+//     cross the two: a subagent-raised prompt leaves the main tail fully matched,
+//     so checking a subagent's entry against the parent file inverts the answer.
+//
+// The error is returned for the caller's logs only; every failure mode already
+// maps to BlockedUnknown, which means keep.
+func BlockedByPendingTool(path string, maxBytes int64) (BlockedEvidence, error) {
+	entries, err := readTailEntries(path, maxBytes)
+	if err != nil {
+		return BlockedUnknown, err
+	}
+	// Collect the two sides across the WHOLE window before comparing. A result can
+	// only follow its use, but the pairing is per-id and not per-line, so anything
+	// that decides as it scans would be answering a different question.
+	dispatched := map[string]bool{}
+	answered := map[string]bool{}
+	for _, e := range entries {
+		for _, b := range e.blocks() {
+			switch b.Type {
+			case "tool_use":
+				if b.ID != "" {
+					dispatched[b.ID] = true
+				}
+			case "tool_result":
+				if b.ToolUseID != "" {
+					answered[b.ToolUseID] = true
+				}
+			}
+		}
+	}
+	if len(dispatched) == 0 {
+		// Nothing to falsify against. A truncated tail, a window that missed the
+		// tool_use, or a writer that has genuinely dispatched nothing all land here,
+		// and they are indistinguishable — so keep.
+		return BlockedUnknown, nil
+	}
+	for id := range dispatched {
+		if !answered[id] {
+			return BlockedYes, nil
+		}
+	}
+	return BlockedNo, nil
+}
+
 // taskToolNames are the tool_use names whose invocation spawns a subagent. Work
 // done inside such a subagent is "work happening" for the delegating-green rule
 // (docs/status-color-state-model.md §5 cases 5/14): a main thread that has ended
@@ -682,7 +796,8 @@ func AnchorTime(path string, maxBytes int64) (ts time.Time, ok bool) {
 
 // AnchorSince picks the time a status transition should be dated from
 // (StatusSince), given the wall-clock instant `now` the daemon processed the
-// triggering hook and whether the transition is into working. There are two
+// triggering hook, the chip's PREVIOUS StatusSince (`prev`, the clamp floor —
+// see below), and whether the transition is into working. There are two
 // opposite clock-skew risks, one per direction — see docs/timing-hazards.md:
 //
 //   - Into working: the hook reaches us AFTER Claude wrote the entry that
@@ -713,14 +828,45 @@ func AnchorTime(path string, maxBytes int64) (ts time.Time, ok bool) {
 //
 // The pull-back never runs `now` backward: it applies only when the anchor is
 // strictly before `now`, and a missing/unreadable transcript falls back to `now`.
-func AnchorSince(path string, now time.Time, intoWorking bool, maxBytes int64) time.Time {
+//
+// It is also floored at `prev`, the chip's StatusSince before this edge, so the
+// result is max(anchor, prev) (itself capped at `now`). H1 wants an anchor
+// slightly behind `now` — the entry that caused THIS hook. It does not want an
+// arbitrarily old one, and `path` can supply exactly that: a subagent's hooks
+// are attributed to the parent session and carry the PARENT's transcript_path,
+// so when a teammate's PostToolUse drives the edge, the newest entry in the main
+// transcript is whatever the main thread last wrote — possibly minutes ago,
+// possibly never during this turn. Dating the edge from it makes StatusSince
+// arbitrarily stale, which in turn defeats every "has it been in this state long
+// enough?" damper downstream: the idle-title demotion's freshness gate and its
+// IdleTitleGrace both go trivially true, so a chip re-greened one second ago is
+// demoted on the very next reconcile tick and the pair oscillates
+// (docs/subagent-permission-oscillation.md §3.3, §3.4 — a 13-minute-stale
+// anchor drove a 95-second orange/green limit cycle).
+//
+// The floor keeps H1's whole benefit — an anchor between `prev` and `now` is
+// still a genuine same-turn pull-back and is returned unchanged — while bounding
+// the staleness by the one timestamp that is definitionally not stale: where the
+// chip already sat. StatusSince then never moves backward across an edge, so
+// each state gets its full grace period. A zero `prev` (the first transition an
+// AgentInfo ever makes) is a no-op: no real transcript timestamp precedes it.
+func AnchorSince(path string, now, prev time.Time, intoWorking bool, maxBytes int64) time.Time {
 	if !intoWorking {
 		return now
 	}
-	if anchor, ok := AnchorTime(path, maxBytes); ok && anchor.Before(now) {
-		return anchor
+	anchor, ok := AnchorTime(path, maxBytes)
+	if !ok || !anchor.Before(now) {
+		return now
 	}
-	return now
+	if anchor.Before(prev) {
+		// Floor at prev, but never past `now` — a prev at or ahead of the hook's
+		// wall clock (skew, a restored chip) must not date the edge into the future.
+		if prev.Before(now) {
+			return prev
+		}
+		return now
+	}
+	return anchor
 }
 
 // classify maps an entry to its status signal: an assistant message is activity;

@@ -103,7 +103,7 @@ func main() {
 	// use, so there is exactly one process-reading backend. Runs before the live
 	// scan starts; the scanner re-adds survivors on the first tick.
 	scanner := discovery.New(procSrc)
-	dropStaleSessions(store, procSrc, sink, scanner.Forget)
+	dropStaleSessions(store, procSrc, sink, scanner.Forget, tun.TailBytes)
 	resolver := mapping.NewResolver(term, manager)
 
 	onAgentAppeared := func(info osproc.Info) {
@@ -247,8 +247,19 @@ func sweepDeadSessions(m map[int]*state.Session, src osproc.Source, sink *histor
 // ever existed to observe it. Recording its session_end here is what closes its
 // lane; without it the lane stays open forever and the reader stretches its last
 // interval to `now` — a ghost lane (L2, session-lifecycle-hazards.md).
-func dropStaleSessions(store *state.Store, procSrc osproc.Source, sink *history.Sink, forget func(int)) {
+//
+// It is also where a surviving session's PROMPT OWNERSHIP is rebuilt (plan T12,
+// §9). That belongs on these same lines and for the same stated reason: the
+// startup instant re-stamped onto StatusSince is re-stamped onto every hydrated
+// prompt, and the alternative — trusting the pre-restart clock — would make every
+// pre-restart transcript entry read as "resolved after" and demote a red that was
+// live across the restart. See hydratePending.
+func dropStaleSessions(store *state.Store, procSrc osproc.Source, sink *history.Sink, forget func(int), tailBytes int64) {
 	now := time.Now()
+	// Sampled BEFORE the lock, per the direction the recent perf work established
+	// (§9.4). Nothing is serving yet so there is no contention to create, but the
+	// rule that transcript I/O stays outside store.Apply is worth keeping absolute.
+	verdicts := hydratePendingVerdicts(store.Snapshot(), tailBytes)
 	store.Apply(func(m map[int]*state.Session) {
 		for pid := range m {
 			info, err := procSrc.Read(pid)
@@ -262,6 +273,7 @@ func dropStaleSessions(store *state.Store, procSrc osproc.Source, sink *history.
 				if info := m[pid].Enrichment(); info != nil {
 					info.StatusSince = now
 				}
+				hydratePending(m[pid], verdicts[pid], now)
 				continue
 			}
 			// Definitively dead (gone, or the pid recycled to a non-agent): record the
@@ -274,6 +286,116 @@ func dropStaleSessions(store *state.Store, procSrc osproc.Source, sink *history.
 			delete(m, pid)
 		}
 	})
+}
+
+// hydratePendingVerdicts asks each hydrated session's transcripts whether the
+// writers it persisted as blocked still have a tool in flight, returning
+// pid → writer key → KEEP. It is pure I/O and pure reading: it runs before
+// store.Apply, mutates nothing, and its verdicts can only ever remove ownership.
+//
+// Each writer is falsified against its OWN file — main against <session>.jsonl,
+// a subagent against <session>/subagents/agent-<id>.jsonl (SubagentPath, from the
+// stored transcript path, never re-derived from cwd). Crossing the two inverts the
+// answer: live capture of subagent-raised prompts shows the MAIN tail fully
+// matched throughout while the raising agent-*.jsonl carries the unmatched
+// tool_use (§9.7, carry-over 2).
+//
+// Anything short of proof keeps the entry, so an unreadable file, a truncated
+// tail, or a window that missed the tool_use all fail closed — the same reading
+// permissionExit gives an unreadable transcript.
+func hydratePendingVerdicts(snap state.Snapshot, tailBytes int64) map[int]map[string]bool {
+	verdicts := map[int]map[string]bool{}
+	for _, sess := range snap.Sessions {
+		c := sess.Claude
+		if c == nil || len(c.Pending) == 0 {
+			continue
+		}
+		keep := make(map[string]bool, len(c.Pending))
+		for _, writer := range c.PendingWriterKeys() {
+			path := transcript.SubagentPath(c.Transcript, writer)
+			evidence, err := transcript.BlockedByPendingTool(path, tailBytes)
+			keep[writer] = evidence != transcript.BlockedNo
+			if !keep[writer] {
+				log.Printf("hydrate: pid=%d session=%s writer=%s resolved while the daemon was down (%s), dropping its prompt",
+					sess.PID, shortSessionID(c.SessionID), pendingWriterLabel(writer), path)
+			} else if err != nil {
+				log.Printf("hydrate: pid=%d session=%s writer=%s transcript unreadable (%v), keeping its prompt",
+					sess.PID, shortSessionID(c.SessionID), pendingWriterLabel(writer), err)
+			}
+		}
+		verdicts[sess.PID] = keep
+	}
+	return verdicts
+}
+
+// hydratePending rebuilds one session's prompt ownership from what Load decoded,
+// applying the verdicts sampled outside the lock. Claude-only: codex records no
+// approvals in its rollout, so it has no ownership to restore and nothing that
+// could ever resolve one.
+//
+// The three combinations §9.6 (trap 4) enumerates, all handled explicitly:
+//
+//	persisted status | pending_writers | action
+//	permission       | non-empty       | keep the survivors, re-stamp Since := now
+//	permission       | empty / absent  | a pre-T12 mirror: seed the main thread, which
+//	                                     reproduces today's behavior exactly and is the
+//	                                     honest downgrade across the version boundary
+//	not permission   | non-empty       | unreachable by construction. Pending is the
+//	                                     authority post-T5, so keep it, re-fold to RED,
+//	                                     and log — a silent disagreement is how a
+//	                                     missed RED hides
+//
+// Note the seed is keyed off whether writers were PERSISTED, not off whether the
+// map is empty now: a set that the falsifier emptied has been proven resolved, and
+// re-seeding it would manufacture the very red the falsifier just subtracted.
+//
+// Since is re-stamped rather than restored, deliberately. A true pre-restart onset
+// makes every pre-restart transcript entry read as "resolved after," and running
+// two clocks (true onset for T10's cap, restart for the resolution window) buys a
+// marginal gain. The consequence, stated plainly: a prompt raised ten minutes
+// before a restart gets a fresh full cap after it — the same #1-over-#2 trade the
+// StatusSince re-stamp above already makes.
+func hydratePending(sess *state.Session, keep map[string]bool, now time.Time) {
+	c := sess.Claude
+	if c == nil {
+		return
+	}
+	persisted := len(c.Pending) > 0
+	for _, writer := range c.PendingWriterKeys() {
+		if !keep[writer] {
+			c.DropPending(writer)
+		}
+	}
+	switch {
+	case c.Status == state.StatusPermission && !persisted:
+		// Pre-T12 state.json: the red survived (status is on the wire and always
+		// was) but its owner never did. Seeding the main thread restores exactly the
+		// behavior this daemon had before the field existed — the red resolves
+		// against the main transcript — instead of leaving an ownerless red that the
+		// fold would read as not-red.
+		c.SetPending("", state.PendingPrompt{Since: now})
+		log.Printf("hydrate: pid=%d session=%s permission chip with no persisted owner; seeding the main thread (pre-T12 state.json)",
+			sess.PID, shortSessionID(c.SessionID))
+	case c.Status != state.StatusPermission && len(c.Pending) > 0:
+		log.Printf("hydrate: pid=%d session=%s status=%q disagrees with %d persisted pending writer(s); Pending is the authority, re-folding to permission",
+			sess.PID, shortSessionID(c.SessionID), c.Status, len(c.Pending))
+		c.Status = state.StatusPermission
+		c.StatusSince = now
+	}
+	for _, writer := range c.PendingWriterKeys() {
+		p := c.Pending[writer]
+		p.Since = now
+		c.Pending[writer] = p
+	}
+}
+
+// pendingWriterLabel names a Pending key for a log line, since the main thread's
+// key is the empty string and an empty writer= reads as a bug.
+func pendingWriterLabel(writer string) string {
+	if writer == "" {
+		return state.PendingWriterMain
+	}
+	return writer
 }
 
 // layoutDebounce is the window a burst of layout events is coalesced into.
@@ -632,12 +754,20 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 // recordReconcileTransition mirrors a hookless reconciler status edge into the
 // activity log, computing the closed interval's length from the still-current
 // StatusSince (call it BEFORE re-stamping StatusSince). A no-op on a disabled sink.
-func recordReconcileTransition(sink *history.Sink, sess *state.Session, c *state.AgentInfo, to, rule, reason string, now time.Time) {
+//
+// pendingTool is passed rather than read off c because the permission exit removes
+// the prompts BEFORE it records the edge (it cannot know the chip is leaving red
+// until every entry is gone), and an exit edge whose `pending` reads empty loses
+// the one thing that edge exists to explain: which tool the released red was for.
+// The history event's `pending` is a TOOL name (docs/state-schema.md), so it takes
+// the derived scalar rather than the decision log's multi-writer summary — a
+// structured field must not start carrying a "+N" suffix.
+func recordReconcileTransition(sink *history.Sink, sess *state.Session, c *state.AgentInfo, to, rule, reason, pendingTool string, now time.Time) {
 	sink.Record(history.Event{
 		Ts: now, Type: history.EventTransition,
 		SessionID: c.SessionID, PID: sess.PID, Agent: sess.Agent, CWD: sess.CWD,
 		From: c.Status, To: to, Rule: rule, Reason: reason,
-		Subagents: c.InFlightSubagents, Pending: c.PendingTool,
+		Subagents: c.InFlightSubagents, Pending: pendingTool,
 		DurPrevMs: history.HeldMs(c.StatusSince, now),
 	})
 }
@@ -694,20 +824,47 @@ func enrichmentID(s *state.Session) string {
 // selfHealStaleAttention releases a "permission" chip that Claude Code left
 // latched. Declining a question — or interrupting a turn — fires no clearing
 // hook (PostToolUse only fires on success; Stop not on interrupt), so the red
-// state has nothing to release it. For each permission session it reads the tail
-// of the transcript and asks whether the main conversation thread advanced past
-// the prompt after StatusSince (when the chip went red): an assistant message or
-// a user interrupt notice means it was answered/declined → demote to idle;
-// otherwise it is still pending → stay red. Crucially, a bare tool_result is not
-// treated as resolution — a background teammate/subagent or a sibling auto-tool
-// keeps writing tool_results while the prompt waits, and counting them would flash
-// the chip green the instant any concurrent work landed. A pending decision stays
-// red even while subagents work.
+// state has nothing to release it. For each blocked WRITER it reads the tail of
+// that writer's transcript and asks whether the writer's own thread advanced past
+// its prompt: an assistant message or a user interrupt notice means it was
+// answered/declined → drop that writer's entry; otherwise it is still pending →
+// stay red. Crucially, a bare tool_result is not treated as resolution — a
+// background teammate/subagent or a sibling auto-tool keeps writing tool_results
+// while the prompt waits, and counting them would flash the chip green the instant
+// any concurrent work landed. A pending decision stays red even while subagents
+// work.
+//
+// # T9 — resolution is routed to the writer that raised the prompt
+//
+// Each Pending[a] is resolved against transcript.SubagentPath(c.Transcript, a),
+// which returns the main transcript unchanged for a == "". Asking the MAIN file
+// about every prompt (what this did before) is defect 4 of the 2026-08-05 incident
+// (docs/subagent-permission-oscillation.md §3.5): ResolveKind reports
+// ResolutionResumed for ANY assistant message dated after the prompt, so a main
+// thread that merely keeps working while a teammate is blocked emits a stream of
+// messages that read as "the prompt resolved." That is the single reason a red
+// could not survive a working main thread. Main-thread activity is not evidence
+// about a subagent's prompt, and a teammate's is not evidence about the main
+// thread's — the measured shape of a blocked writer is the mirror image: it goes
+// quiescent within ~1s of its PermissionRequest and stays quiescent while the
+// other writers keep advancing (§4.3).
+//
+// Removal is therefore per writer (DropPending, never ClearPending), and the chip
+// leaves "permission" only once the map is empty (plan §3.3) — case 18: with the
+// main thread and a teammate both blocked, answering one keeps the chip red.
+//
+// # T10 — the per-prompt liveness backstop
+//
+// A writer that is gone, or whose own file has been quiescent past
+// PendingWriterStaleCap, has its entry dropped as unanswerable (case 19). Without
+// it the generalized hold (T3) lets a crashed teammate's prompt latch red forever
+// — plan risk R3, which T3 widened. See writerQuiescentPastCap.
 //
 // It runs inside the reconcile Apply, so it operates on the locked session map
 // directly (no shared-pointer race) and folds into the tick's single persist.
-// The bounded transcript read under the lock is consistent with the per-session
-// /proc and WM I/O the same loop already performs.
+// The bounded transcript reads under the lock are consistent with the per-session
+// /proc and WM I/O the same loop already performs; the read count is bounded by
+// the number of BLOCKED writers, which is one in every case but case 18.
 func selfHealStaleAttention(m map[int]*state.Session, now time.Time, tun statustune.Tuning, sink *history.Sink) {
 	for _, sess := range m {
 		c := sess.Claude
@@ -715,11 +872,43 @@ func selfHealStaleAttention(m map[int]*state.Session, now time.Time, tun statust
 			continue
 		}
 		age := now.Sub(c.StatusSince)
-		kind, err := transcript.ResolveKind(c.Transcript, c.StatusSince, tun.TailBytes)
-		exit, rule, reason, ok := permissionExit(kind, err != nil, age, c.InFlightSubagents, tun)
-		if !ok {
-			continue // still pending (or too soon to give up) → keep red, silently
+		// Snapshot before any drop so the exit line and the exit history event report
+		// the state the decision was made against, exactly as the pre-T9 pair did.
+		summary, pendingTool := c.PendingSummary(), c.PendingTool
+
+		// Two passes, so the outcome does not depend on which writer happened to be
+		// visited first: decide every writer against the map as the tick found it,
+		// then remove them together.
+		var resolved []writerVerdict
+		for _, writer := range pendingWriters(c) {
+			v, ok := resolveWriterPrompt(c, writer, now, tun)
+			if !ok {
+				continue // this writer is still blocked → its entry, and the red, stay
+			}
+			resolved = append(resolved, v)
 		}
+		if len(resolved) == 0 {
+			continue // nothing resolved → keep red, silently
+		}
+		for _, v := range resolved {
+			c.DropPending(v.writer)
+		}
+		if len(c.Pending) > 0 {
+			// Case 18: a real answer landed, and the chip still must not change color.
+			// Logged as a hold — silence here is exactly how "I approved it and it is
+			// still red" becomes unanswerable from the journal.
+			statustune.Decision{
+				PID: sess.PID, Session: shortSessionID(c.SessionID),
+				From: state.StatusPermission, To: state.StatusPermission,
+				Rule:      statustune.RuleHoldOtherWriters,
+				Reason:    fmt.Sprintf("%s resolved; %d writer(s) still blocked", verdictWriters(resolved), len(c.Pending)),
+				Subagents: c.InFlightSubagents, Pending: c.PendingSummary(), Age: age,
+			}.Log()
+			continue
+		}
+		// The map is empty, so the red is genuinely over. The exit color comes from
+		// the LAST prompt's resolution kind (plan §3.3, the existing P3 rule).
+		last := resolved[len(resolved)-1]
 		// This transition has no Claude Code hook behind it (a declined or
 		// interrupted prompt fires none), so unlike the hook-driven edges it would
 		// otherwise leave no trace. The decision log records WHICH rule fired and
@@ -727,14 +916,137 @@ func selfHealStaleAttention(m map[int]*state.Session, now time.Time, tun statust
 		// is fully reconstructable from the journal.
 		statustune.Decision{
 			PID: sess.PID, Session: shortSessionID(c.SessionID),
-			From: state.StatusPermission, To: exit, Rule: rule, Reason: reason,
-			Subagents: c.InFlightSubagents, Pending: c.PendingTool, Age: age,
+			From: state.StatusPermission, To: last.exit, Rule: last.rule, Reason: last.reason,
+			Subagents: c.InFlightSubagents, Pending: summary, Age: age,
 		}.Log()
-		recordReconcileTransition(sink, sess, c, exit, rule, reason, now)
-		c.Status = exit
+		recordReconcileTransition(sink, sess, c, last.exit, last.rule, last.reason, pendingTool, now)
+		c.Status = last.exit
 		c.StatusSince = now
-		c.PendingTool = ""
 	}
+}
+
+// writerVerdict is one blocked writer's resolution: which writer, and the exit
+// color/rule/reason its evidence selected.
+type writerVerdict struct {
+	writer string
+	exit   string
+	rule   string
+	reason string
+}
+
+// verdictWriters names the resolved writers for a log line, in the deterministic
+// order they were decided.
+func verdictWriters(vs []writerVerdict) string {
+	names := make([]string, 0, len(vs))
+	for _, v := range vs {
+		names = append(names, pendingWriterLabel(v.writer))
+	}
+	return strings.Join(names, ",")
+}
+
+// pendingWriters is the writer set selfHealStaleAttention resolves for one red
+// chip: Pending's keys in their deterministic order (PendingWriterKeys — never a
+// bare map range, whose order Go randomizes), or the MAIN THREAD alone when the
+// chip is red with nothing recorded against it.
+//
+// The fallback is the same reading hydratePending gives an ownerless red: red is
+// owned by Pending post-T5, so an entry-less permission chip is a pre-T5 artifact
+// (a hand-seeded status, a mirror written by an older daemon), and resolving it
+// against the main transcript reproduces exactly the behavior this daemon had
+// before the map existed. Skipping it instead would strand such a chip red with
+// nothing able to release it.
+func pendingWriters(c *state.AgentInfo) []string {
+	if keys := c.PendingWriterKeys(); len(keys) > 0 {
+		return keys
+	}
+	return []string{""}
+}
+
+// resolveWriterPrompt decides one blocked writer's prompt against that writer's
+// OWN transcript, returning ok=false to keep it (and the red).
+//
+// The prompt's own Since dates the read, not the chip's StatusSince: with two
+// writers blocked the chip's stamp belongs to whichever went red first, and a
+// prompt raised later must not be resolved by entries that predate it. It falls
+// back to StatusSince for an entry that carries no onset — a hand-seeded chip, or
+// the ownerless main writer pendingWriters synthesizes.
+//
+// The unreadable branch (case 15's TTL backstop) is deliberately restricted to the
+// MAIN writer. c.Transcript is the file the daemon derives every other signal
+// from, so its unreadability is a session-level fault and case 15 is the
+// session-level fail-soft. A missing agent-<id>.jsonl means nothing of the sort:
+// it is the normal state for a just-spawned teammate and for any id the mapping
+// cannot resolve, and SubagentPath's contract is explicit that a failed read must
+// leave the caller's entry in place (an under-stripped id derives a path that does
+// not exist, and fail-safe is the direction to err in). So a subagent's unreadable
+// file falls through to ResolutionNone — keep — and is bounded by T10's cap
+// instead, which is 60× longer than the TTL.
+func resolveWriterPrompt(c *state.AgentInfo, writer string, now time.Time, tun statustune.Tuning) (writerVerdict, bool) {
+	since := c.Pending[writer].Since
+	if since.IsZero() {
+		since = c.StatusSince
+	}
+	path := transcript.SubagentPath(c.Transcript, writer)
+	kind, err := transcript.ResolveKind(path, since, tun.TailBytes)
+	exit, rule, reason, ok := permissionExit(kind, err != nil && writer == "", now.Sub(since), c.InFlightSubagents, tun)
+	if ok {
+		return writerVerdict{writer, exit, rule, reason}, true
+	}
+	if !writerQuiescentPastCap(path, since, now, tun.PendingWriterStaleCap) {
+		return writerVerdict{}, false
+	}
+	return writerVerdict{
+		writer: writer,
+		exit:   tun.InterruptExitStatus,
+		rule:   statustune.RuleStaleWriterBackstop,
+		reason: fmt.Sprintf("%s quiescent past the %s cap", pendingWriterLabel(writer), tun.PendingWriterStaleCap),
+	}, true
+}
+
+// writerQuiescentPastCap is T10's per-prompt liveness backstop (case 19): it
+// reports whether writer `path`'s prompt has become unanswerable, either because
+// the writer is gone or because its own file has stopped moving for longer than
+// the cap.
+//
+// The policy is the fanout Observer's, not a second one invented here. That
+// Observer force-closes a spawned-but-unfinished subagent as completion=unknown
+// once its jsonl mtime is older than fanout.DefaultStaleCap, so in-flight cannot
+// leak (internal/fanout/observer.go). This is the same measurement applied to the
+// same file for the same reason: at the default cap the two agree, and the chip
+// never stays red for a teammate the Observer has already stopped counting.
+//
+// The clock runs from the LATER of the prompt's onset and the file's mtime:
+//
+//   - mtime later — an active writer resets it on every write, so only a genuinely
+//     stalled one accumulates age. A blocked writer stops within ~1s of its
+//     PermissionRequest, so in practice its clock starts at the prompt.
+//   - onset later — a prompt raised against a file that was already old (the
+//     hydrate path re-stamps Since to startup) gets a fresh FULL cap rather than
+//     inheriting the stale file's age. §9.6 states that trade explicitly.
+//
+// A file that cannot be stat-ed contributes nothing, so the clock runs from the
+// onset alone: "the writer is gone" and "the writer went quiet" are the same
+// verdict here, reached the same way, which is what keeps a prompt from a crashed
+// teammate from latching red forever.
+//
+// Stated plainly, because it is a real cost: a genuinely pending prompt is
+// indistinguishable from a dead one by this measurement — both are a quiescent
+// file — so a user who walks away for longer than the cap comes back to a chip
+// that stopped nagging. That is why the cap sits at 30 minutes rather than
+// anywhere near a plausible time-to-answer, and why it is a Tuning field.
+//
+// A zero onset (a chip with no Since at all) and a non-positive cap both disable
+// the backstop — the same shape as the Observer's zero-ModTime guard, and the
+// reason a mis-stamped chip fails toward red rather than away from it.
+func writerQuiescentPastCap(path string, since, now time.Time, staleCap time.Duration) bool {
+	if staleCap <= 0 || since.IsZero() {
+		return false
+	}
+	quiescentSince := since
+	if fi, err := os.Stat(path); err == nil && fi.ModTime().After(quiescentSince) {
+		quiescentSince = fi.ModTime()
+	}
+	return now.Sub(quiescentSince) >= staleCap
 }
 
 // selfHealStuckStatus recovers the two non-permission status latches the hooks
@@ -848,10 +1160,10 @@ func logStuck(sink *history.Sink, sess *state.Session, c *state.AgentInfo, to, r
 	statustune.Decision{
 		PID: sess.PID, Session: shortSessionID(c.SessionID),
 		From: c.Status, To: to, Rule: rule, Reason: reason,
-		Subagents: c.InFlightSubagents, Pending: c.PendingTool,
+		Subagents: c.InFlightSubagents, Pending: c.PendingSummary(),
 		Age: now.Sub(c.StatusSince),
 	}.Log()
-	recordReconcileTransition(sink, sess, c, to, rule, reason, now)
+	recordReconcileTransition(sink, sess, c, to, rule, reason, c.PendingTool, now)
 }
 
 // titleShowsIdleGlyph reports whether a pane title's first rune is one of the

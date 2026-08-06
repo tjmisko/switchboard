@@ -47,6 +47,29 @@ type Tuning struct {
 	// the worst error).
 	PermissionDecayTTL time.Duration
 
+	// PendingWriterStaleCap bounds how long ONE writer's pending prompt may hold
+	// the chip red while that writer's own transcript is quiescent (plan T10,
+	// case 19). It is the per-writer analogue of PermissionDecayTTL, which fires
+	// only when the transcript is UNREADABLE; this one fires when the file is
+	// perfectly readable and simply never moves again — a crashed or aborted
+	// teammate, whose prompt no hook and no transcript entry will ever resolve.
+	// Without it the generalized hold (T3) lets such a prompt latch red forever
+	// (plan risk R3).
+	//
+	// The clock runs from the LATER of the prompt's onset and the writer file's
+	// mtime, so an active writer never accumulates age and a prompt hydrated after
+	// a restart gets a fresh full cap rather than inheriting a stale file's.
+	//
+	// The default matches fanout.DefaultStaleCap deliberately (it is not imported
+	// — this package is a dependency-free leaf): at that same threshold the fanout
+	// Observer has already force-closed the subagent as completion=unknown, so
+	// keeping a red owned by a writer the Observer no longer counts as in flight
+	// would leave the two views of the same teammate disagreeing. Raising it makes
+	// a crashed teammate's red nag longer; lowering it starts truncating real
+	// human decision windows, which is a missed RED — the worse error — so it
+	// should stay far above any plausible time-to-answer.
+	PendingWriterStaleCap time.Duration
+
 	// TailBytes bounds how much transcript tail every reader consumes. The signals
 	// we need live at the end, so a small window stays cheap; too small a window
 	// can undercount InFlightTasks on pathologically long turns (see InFlightTasks).
@@ -112,6 +135,7 @@ type Tuning struct {
 func Default() Tuning {
 	return Tuning{
 		PermissionDecayTTL:          30 * time.Second,
+		PendingWriterStaleCap:       30 * time.Minute,
 		TailBytes:                   128 * 1024,
 		EarlyClearApproveByToolName: true,
 		ResumeExitStatus:            statusWorking,

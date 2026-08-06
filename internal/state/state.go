@@ -180,13 +180,197 @@ type AgentInfo struct {
 	// the first reconcile; dropStaleSessions re-stamps it to startup time).
 	StatusSince time.Time `json:"-"`
 
-	// PendingTool is the tool_name the current "permission" prompt was raised for
-	// (captured from the PermissionRequest hook at red-onset). The hold gate
-	// matches a later PostToolUse's tool_name against it to clear red at hook speed
-	// when the *approved* tool completes — distinct from a sibling/Task PostToolUse
-	// that must keep the chip red (docs/status-color-state-model.md A2/case 12).
-	// In-memory only: it is transient onset state, not part of the wire contract.
+	// Pending maps each WRITER currently blocked on a permission prompt to that
+	// prompt's correlators. A session is 1 + N concurrent writers — the main thread
+	// plus every in-flight subagent — that share a pid, a chip and a transcript_path
+	// but write to different files and can each block independently
+	// (docs/subagent-permission-plan.md §1). The scalar this replaced could hold
+	// exactly one prompt, which is why a teammate's tool could clear a prompt it had
+	// nothing to do with.
+	//
+	// The key is the NORMALIZED bare agent_id — empty means the MAIN THREAD. Keys
+	// arrive already normalized: rpc.handleHook runs every incoming agent_id through
+	// normalizeAgentID exactly once, at its entry. Nothing here (or downstream) may
+	// strip an "agent-" prefix a second time; see normalizeAgentID for why.
+	//
+	// The fold is `len(Pending) > 0 → RED`, ahead of every other rule: the chip may
+	// leave "permission" only when no writer still owns a prompt.
+	//
+	// In-memory only. Its KEY SET — and only its key set — is projected onto the wire
+	// as PendingWriters so prompt ownership survives a daemon restart (§9); the
+	// correlators below are re-earned from the next hook.
+	Pending map[string]PendingPrompt `json:"-"`
+
+	// PendingWriters is the wire projection of Pending's KEY SET: sorted ascending,
+	// with the literal "main" standing in for the empty (main-thread) key. It is
+	// DERIVED — stamped onto a per-snapshot copy of the block in enrichForWire,
+	// exactly as StatusSinceWire is — and must never be written by hook or
+	// reconciler logic, which keep using the in-memory Pending map above. The one
+	// exception is Load, the inverse codec, which rebuilds Pending from it at
+	// hydrate before any snapshot is taken.
+	//
+	// Why the keys and not the whole prompt: losing OWNERSHIP is unrecoverable.
+	// PermissionRequest is edge-triggered, no hook re-raises a live prompt, and a
+	// blocked writer runs no tools — so a dropped entry is a permanent missed RED
+	// for the rest of that prompt's life. Losing Tool/InputHash costs one reconcile
+	// tick of latency. Persist what guards the worse error; re-earn the rest (§9.5).
+	//
+	// The sort is load-bearing, not cosmetic: snapshotChangeKey JSON-encodes every
+	// tagged field to decide whether to publish, so an unsorted slice built by
+	// ranging a map would differ between snapshots of identical state and republish
+	// to every waybar slot on every reconcile tick.
+	PendingWriters []string `json:"pending_writers,omitempty"`
+
+	// PendingTool is the tool_name of the prompt the chip's red is reported under:
+	// the MAIN thread's if it has one, else the lowest-keyed writer's. It is DERIVED
+	// from Pending (see derivePendingTool) and re-stamped by every mutation of it —
+	// never assign it directly.
+	//
+	// It survives the map because two consumers still want a scalar: the hold gate's
+	// tool-name fast path (docs/status-color-state-model.md A2/case 12 — whose
+	// matching rule plan T7 owns) and the `pending=` field of the decision log, the
+	// forensic backbone this whole investigation was reconstructed from. See
+	// PendingSummary for the log's fuller rendering.
+	//
+	// In-memory only: transient onset state, not part of the wire contract.
 	PendingTool string `json:"-"`
+}
+
+// PendingWriterMain is the wire spelling of the empty (main-thread) Pending key.
+// The empty string is a load-bearing discriminator in memory but a poor value on a
+// public contract, so the projection substitutes this literal. It cannot collide
+// with a real writer: subagent ids are the <id> stem of an agent-<id>.jsonl file,
+// and no such stem is "main" (a subagent named "main" is stored as agent-main<hex>).
+const PendingWriterMain = "main"
+
+// PendingPrompt is one writer's outstanding permission prompt: which tool it was
+// raised for, which call (a hash of tool_input, computed at the ctl edge — the raw
+// input is never forwarded or stored), and when it appeared.
+//
+// Tool and InputHash are the correlators the hold gate's fast path matches a later
+// PostToolUse against; Since dates the prompt for the per-prompt liveness backstop
+// (plan T10). All three are in-memory only — a hydrated prompt carries none of them
+// and must resolve by transcript instead (§9.6, trap 2).
+type PendingPrompt struct {
+	Tool      string
+	InputHash string
+	Since     time.Time
+}
+
+// SetPending records that writer agentID (bare; "" is the main thread) is blocked
+// on prompt p, allocating the map on first use and re-deriving PendingTool.
+func (a *AgentInfo) SetPending(agentID string, p PendingPrompt) {
+	if a.Pending == nil {
+		a.Pending = make(map[string]PendingPrompt, 1)
+	}
+	a.Pending[agentID] = p
+	a.derivePendingTool()
+}
+
+// DropPending removes one writer's prompt — the resolution primitive: `P[a]` is
+// removed only by evidence from writer `a` (plan §3.3). Re-derives PendingTool.
+func (a *AgentInfo) DropPending(agentID string) {
+	delete(a.Pending, agentID)
+	a.derivePendingTool()
+}
+
+// ClearPending forgets every pending prompt. Used where the whole red is being
+// abandoned rather than resolved per writer: a session rotation (a /clear or fork
+// retires the prompts with the session that raised them) and the chip's exit from
+// "permission".
+func (a *AgentInfo) ClearPending() {
+	a.Pending = nil
+	a.PendingTool = ""
+}
+
+// PendingWriterKeys returns Pending's keys in a stable ascending order, in their
+// in-memory (bare, "" = main) spelling. Callers that iterate Pending must use this
+// rather than ranging the map: Go randomizes map iteration, and the daemon's
+// outputs — the wire projection, the decision log, the hydrate verdicts — must be
+// reproducible across ticks.
+func (a *AgentInfo) PendingWriterKeys() []string {
+	if len(a.Pending) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(a.Pending))
+	for k := range a.Pending {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// PendingSummary renders Pending for the decision log's `pending=` field: the
+// reported tool (PendingTool — the main thread's prompt if it has one, else the
+// lowest-keyed writer's) suffixed with "+N" when N further writers are also
+// blocked. One prompt therefore logs exactly what it always logged, so
+// statustune.ParseDecision and `switchboard-ctl diagnose` keep reading it, while a
+// multi-writer red no longer silently reports as a single one.
+//
+// An empty map falls through to PendingTool, which is "" for a live block and may
+// be a hand-seeded or hydrated value otherwise.
+func (a *AgentInfo) PendingSummary() string {
+	if n := len(a.Pending); n > 1 {
+		return fmt.Sprintf("%s+%d", a.PendingTool, n-1)
+	}
+	return a.PendingTool
+}
+
+// derivePendingTool re-stamps the scalar PendingTool from the map: the main
+// thread's prompt wins when it has one (it is the writer the user is most likely
+// looking at), else the lowest-keyed writer's — a deterministic choice, because
+// "any one" out of a Go map is a different one every tick.
+func (a *AgentInfo) derivePendingTool() {
+	if len(a.Pending) == 0 {
+		a.PendingTool = ""
+		return
+	}
+	if p, ok := a.Pending[""]; ok {
+		a.PendingTool = p.Tool
+		return
+	}
+	a.PendingTool = a.Pending[a.PendingWriterKeys()[0]].Tool
+}
+
+// pendingWritersForWire projects a Pending map onto its sorted wire key set,
+// substituting PendingWriterMain for the empty key. nil in / empty in yields nil,
+// so the field omits rather than emitting an empty array.
+//
+// The sort runs on the TRANSLATED names, so the wire document is sorted as a
+// reader sees it.
+func pendingWritersForWire(pending map[string]PendingPrompt) []string {
+	if len(pending) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(pending))
+	for k := range pending {
+		if k == "" {
+			k = PendingWriterMain
+		}
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// pendingFromWire is the inverse: it rebuilds a Pending map holding ownership and
+// nothing else — every PendingPrompt is zero, because Tool/InputHash/Since are
+// deliberately not persisted (§9.5). PendingWriterMain maps back to the empty key.
+//
+// It manufactures nothing: an absent/empty field yields a nil map, and the caller
+// (dropStaleSessions) decides what an empty set beside a persisted red means.
+func pendingFromWire(names []string) map[string]PendingPrompt {
+	if len(names) == 0 {
+		return nil
+	}
+	pending := make(map[string]PendingPrompt, len(names))
+	for _, n := range names {
+		if n == PendingWriterMain {
+			n = ""
+		}
+		pending[n] = PendingPrompt{}
+	}
+	return pending
 }
 
 // ClaudeInfo is the original name for AgentInfo, kept as an alias so existing
@@ -405,11 +589,17 @@ func (s *Store) invalidatePublished(gen uint64) {
 //   - WeztermInfo.Title with it: the agent CLI repaints that string continuously
 //     while a turn runs (animated spinner glyph).
 //   - AgentInfo.PendingTool — transient red-onset state, not a clock but equally
-//     invisible to consumers.
+//     invisible to consumers. AgentInfo.Pending's correlator VALUES
+//     (Tool/InputHash/Since) fall out for the same reason.
 //
 // AgentInfo.StatusSince is json:"-" too, but it is NOT a hidden field for this
 // purpose: snapshotLocked projects it onto StatusSinceWire (status_since), which
-// IS encoded and IS compared. That is correct rather than a leak — audited against
+// IS encoded and IS compared. AgentInfo.Pending's KEY SET is the same case: it is
+// projected onto PendingWriters (pending_writers) and so IS compared — which is
+// why that projection must be SORTED. A slice built by ranging the map would
+// differ between snapshots of identical state, and the gate would republish to
+// every waybar slot and rewrite state.json on every reconcile tick, reintroducing
+// exactly the wake-storm this check exists to suppress. That is correct rather than a leak — audited against
 // docs/state-schema.md ("when status last transitioned to its current value") and
 // against every writer: rpc.handleHook stamps it only inside its
 // `status != info.Status` guard, and each of the reconciler's self-heals stamps it
@@ -467,10 +657,17 @@ func (s *Store) snapshotLocked() Snapshot {
 }
 
 // enrichForWire returns a wire-ready copy of an enrichment block: a value copy
-// (so the snapshot never shares the live pointer with a concurrent Apply) with
-// the in-memory StatusSince projected onto StatusSinceWire — non-nil only once a
-// status edge has stamped it, so the wire field omits cleanly before then. nil
-// in, nil out.
+// (so the snapshot never shares the live pointer with a concurrent Apply) with the
+// two derived wire fields stamped onto that copy —
+//
+//   - StatusSinceWire from the in-memory StatusSince, non-nil only once a status
+//     edge has stamped it, so the field omits cleanly before then;
+//   - PendingWriters from the in-memory Pending map's key set, sorted and with
+//     "main" substituted for the empty key, nil while no writer is blocked.
+//
+// Both are projections and nothing else: they are recomputed here on every
+// snapshot, so a stale value on the live block (Load leaves one behind until the
+// hydrate consumes it) can never reach the wire. nil in, nil out.
 func enrichForWire(info *AgentInfo) *AgentInfo {
 	if info == nil {
 		return nil
@@ -481,6 +678,7 @@ func enrichForWire(info *AgentInfo) *AgentInfo {
 		since := cp.StatusSince
 		cp.StatusSinceWire = &since
 	}
+	cp.PendingWriters = pendingWritersForWire(cp.Pending)
 	return &cp
 }
 
@@ -607,6 +805,17 @@ func (s *Store) persist(snap Snapshot) error {
 // Load hydrates the store from the on-disk mirror. Errors are returned but
 // callers should treat them as non-fatal — the live reconciliation pass will
 // rebuild state from /proc anyway.
+//
+// It is the exact inverse of enrichForWire for the derived fields it can invert:
+// pending_writers is decoded back into the in-memory Pending map so the daemon
+// speaks one language about prompt ownership from the first instruction after
+// Load. That decode is pure translation — it restores WHICH writers were blocked
+// and asserts nothing about whether they still are. The policy (re-stamping Since
+// to startup, seeding a pre-T12 mirror, dropping writers a transcript proves
+// resolved) belongs to dropStaleSessions, which runs next.
+//
+// StatusSince is deliberately NOT recovered here; it has no wire form, and
+// dropStaleSessions stamps it to startup time on purpose.
 func (s *Store) Load() error {
 	if s.path == "" {
 		return nil
@@ -626,8 +835,24 @@ func (s *Store) Load() error {
 	s.mu.Lock()
 	for i := range snap.Sessions {
 		sess := snap.Sessions[i]
+		hydratePendingWriters(sess.Claude)
+		hydratePendingWriters(sess.Codex)
 		s.sessions[sess.PID] = &sess
 	}
 	s.mu.Unlock()
 	return nil
+}
+
+// hydratePendingWriters decodes a block's persisted pending_writers back into the
+// in-memory Pending map and drops the wire slice, so the map is the single source
+// of truth the instant Load returns (enrichForWire re-derives the slice for every
+// later snapshot). A block with no persisted writers is left with a nil map, which
+// is what tells dropStaleSessions it is reading a pre-T12 mirror.
+func hydratePendingWriters(info *AgentInfo) {
+	if info == nil {
+		return
+	}
+	info.Pending = pendingFromWire(info.PendingWriters)
+	info.PendingWriters = nil
+	info.derivePendingTool()
 }

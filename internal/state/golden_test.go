@@ -71,6 +71,13 @@ func canonicalSnapshot() Snapshot {
 					// pins the field at all; >0 with an *idle* main thread is what
 					// promotes a session to "delegating".
 					InFlightSubagents: 2,
+					// pending_writers: the wire projection of the Pending map's key
+					// set — which WRITERS are blocked on a permission prompt, with
+					// "main" standing in for the main thread. Sorted ascending, and
+					// deliberately set here in its already-projected form: this
+					// function feeds the encoder directly rather than going through
+					// enrichForWire, exactly as StatusSinceWire above does.
+					PendingWriters: []string{"af5bd126402ac16c7", "main"},
 				},
 			},
 			{

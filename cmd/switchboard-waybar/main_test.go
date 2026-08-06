@@ -150,6 +150,102 @@ func TestRenderSlotDelegating(t *testing.T) {
 	}
 }
 
+// --- naming the writer behind a red chip ----------------------------------
+
+// blockedNow anchors the blocked-writer tooltip tests, so the "· 45s" the hover
+// prints is pinned rather than racing the wall clock.
+var blockedNow = time.Date(2026, 6, 26, 14, 30, 0, 0, time.UTC)
+
+// blockedSession builds a red session with `writers` blocked (wire spelling;
+// "main" = the main thread) alongside a real subagents/ dir carrying a teammate
+// meta per entry of `names` (bare agent id -> teammate name).
+func blockedSession(t *testing.T, writers []string, inflight int, names map[string]string) state.Session {
+	t.Helper()
+	dir := t.TempDir()
+	transcriptPath := filepath.Join(dir, "sess.jsonl")
+	subagentsDir := filepath.Join(dir, "sess", "subagents")
+	if err := os.MkdirAll(subagentsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for id, name := range names {
+		body := fmt.Sprintf(`{"agentType":"general-purpose","name":%q,"taskKind":"in_process_teammate"}`, name)
+		if err := os.WriteFile(filepath.Join(subagentsDir, "agent-"+id+".meta.json"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	since := blockedNow.Add(-45 * time.Second)
+	return state.Session{
+		PID: 4821, CWD: "/home/u/proj",
+		Claude: &state.ClaudeInfo{
+			Status:            state.StatusPermission,
+			StatusSinceWire:   &since,
+			Transcript:        transcriptPath,
+			PendingWriters:    writers,
+			InFlightSubagents: inflight,
+		},
+	}
+}
+
+// The incident, end to end: the chip read the SESSION's name while the actual
+// state was "the escalate-cleanup teammate is waiting on approval". The hover now
+// names the writer, so the red is a decision the user can route without switching
+// to the pane first.
+func TestSessionTooltipShouldNameTheBlockedTeammate(t *testing.T) {
+	s := blockedSession(t, []string{"af5bd126402ac16c7"}, 4,
+		map[string]string{"af5bd126402ac16c7": "escalate-cleanup"})
+	tip := sessionTooltip(projectname.Config{}, &sblabel.NameCache{}, s, blockedNow)
+	if !strings.Contains(tip, "permission · escalate-cleanup · 45s") {
+		t.Errorf("tooltip should name the blocked teammate:\n%s", tip)
+	}
+}
+
+func TestSessionTooltipShouldNameEveryWriterWhenTwoAreBlockedAtOnce(t *testing.T) {
+	s := blockedSession(t, []string{"af5bd126402ac16c7", "main"}, 2,
+		map[string]string{"af5bd126402ac16c7": "escalate-cleanup"})
+	tip := sessionTooltip(projectname.Config{}, &sblabel.NameCache{}, s, blockedNow)
+	if !strings.Contains(tip, "permission · escalate-cleanup, main · 45s") {
+		t.Errorf("tooltip should name both blocked writers:\n%s", tip)
+	}
+}
+
+// The solo case: one session, no teammates, main thread blocked. "main" restates
+// what the red already means, so the hover stays exactly as it was.
+func TestSessionTooltipShouldLeaveASoloPermissionUnannotated(t *testing.T) {
+	s := blockedSession(t, []string{"main"}, 0, nil)
+	tip := sessionTooltip(projectname.Config{}, &sblabel.NameCache{}, s, blockedNow)
+	if !strings.Contains(tip, "permission · 45s") {
+		t.Errorf("solo permission tooltip should be status + duration only:\n%s", tip)
+	}
+	if strings.Contains(tip, "main") {
+		t.Errorf("solo permission tooltip should not name the main thread:\n%s", tip)
+	}
+}
+
+// Bar real estate is fitted as a SET (barlayout.Fit): a chip label that grew when
+// a prompt appeared would re-abbreviate every other chip on the row, twice per
+// prompt, and would break the stable chip identity the user navigates by. The
+// writer's name belongs in the hover only.
+func TestRenderSlotShouldNotPutTheBlockedWriterInTheChipLabel(t *testing.T) {
+	blocked := blockedSession(t, []string{"af5bd126402ac16c7"}, 4,
+		map[string]string{"af5bd126402ac16c7": "escalate-cleanup"})
+	quiet := state.Session{
+		PID: 4821, CWD: "/home/u/proj",
+		Claude: &state.ClaudeInfo{Status: state.StatusWorking},
+	}
+
+	red := renderSlot(state.Snapshot{Sessions: []state.Session{blocked}}, 0, testAvail, testMetrics, &nameConfig{}, &sblabel.NameCache{})
+	green := renderSlot(state.Snapshot{Sessions: []state.Session{quiet}}, 0, testAvail, testMetrics, &nameConfig{}, &sblabel.NameCache{})
+	if red.Text != green.Text {
+		t.Errorf("chip text changed when a prompt appeared: %q -> %q", green.Text, red.Text)
+	}
+	if strings.Contains(red.Text, "escalate-cleanup") {
+		t.Errorf("chip text must not carry the blocked writer: %q", red.Text)
+	}
+	if !strings.Contains(red.Tooltip, "escalate-cleanup") {
+		t.Errorf("the writer's name should still reach the hover: %q", red.Tooltip)
+	}
+}
+
 // --- project-name config cache -------------------------------------------
 
 // newNameConfigFixture points ConfigPath at a temp dir and returns (configPath,
