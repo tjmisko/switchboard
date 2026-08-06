@@ -286,8 +286,15 @@ extends it so the *history archive* is slow too:
 
 Against `main` today this fails by roughly the seed duration. Against the merged
 tree it passes, because `Prime` runs before the lock. Against a future
-`reconcileWorkflowsLocked` that reads under the lock, it fails again — which is
+`applyWorkflowsLocked` that reads under the lock, it fails again — which is
 the entire point.
+
+That name is deliberate and it changed under this plan. The merge split #61's
+`reconcileWorkflowsLocked` in two: `readWorkflowRun`, called from `readSample`
+before the lock, and `applyWorkflowsLocked`, which does no I/O at all. The
+counterexample B2 must defend against is therefore a read creeping back into
+`applyWorkflowsLocked` — the *renamed* under-lock half. Anyone writing B2 against
+the old name will be defending a function that no longer exists.
 
 Two design notes so the test is not flaky:
 
