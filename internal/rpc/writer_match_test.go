@@ -243,18 +243,35 @@ func TestClearsPermissionKeepsTheUnidentifiedWriterFloor(t *testing.T) {
 		}
 	})
 
-	t.Run("should clear red for an empty agent_id with subagents in flight when the input hash also matches", func(t *testing.T) {
-		// The floor blocks a name-ALONE clear. A hash match is not name alone, and
-		// restoring the approve path for the main thread mid-fanout is the latency
-		// win T7 buys back. No transcript exists, so this is the fast path.
+	t.Run("should hold red for an empty agent_id with subagents in flight even when the input hash matches", func(t *testing.T) {
+		// REVERSED (T21). This subtest previously expected a clear, on the reasoning
+		// that the floor blocks a name-ALONE clear and a hash match is not name alone.
+		// That treats the hash as a second, independent signal. It is not:
+		// hashToolInput digests tool_input and nothing else — no cwd, no session id,
+		// no writer — so it answers WHICH CALL, never WHO RAN IT. An absent agent_id
+		// is exactly what promotes the hash to load-bearing, and the hash measures the
+		// same axis that just failed. Two agents in two worktrees running an identical
+		// command produce identical digests, and permission grants are scoped per
+		// permission root, so a call pre-approved in one worktree can complete while
+		// the same call prompts in another — with no human having answered anything.
+		//
+		// The cost of the reversal is real but bounded: an orchestrator blocked on its
+		// own prompt with teammates in flight now waits one reconcile tick (~5s, §4 P2's
+		// own target) instead of clearing at hook speed.
 		store, s := fannedRedSession(t, 3,
 			map[string]state.PendingPrompt{"": blockedOn("Bash", pendingHash)}, nil)
+		buf := captureLog(t)
 
 		s.handleHook(Request{Cmd: "hook", Event: "PostToolUse", PID: 42, ToolName: "Bash",
 			ToolInputHash: pendingHash})
 
-		if got := claudeStatus(t, store); got.Status != state.StatusWorking {
-			t.Errorf("status = %q, want working (writer+tool+input is not a kind guess)", got.Status)
+		got := claudeStatus(t, store)
+		if got.Status != state.StatusPermission {
+			t.Errorf("status = %q, want permission (an unidentified writer cannot be told from a teammate)", got.Status)
+		}
+		wantWriters(t, got, state.PendingWriterMain)
+		if out := buf.String(); !strings.Contains(out, "rule="+statustune.RuleHoldTeammateCollision) {
+			t.Errorf("missing %s decision line in:\n%s", statustune.RuleHoldTeammateCollision, out)
 		}
 	})
 
