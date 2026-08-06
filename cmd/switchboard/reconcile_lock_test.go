@@ -3,6 +3,10 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -61,11 +65,24 @@ func (l *slowBatchLocator) counts() (snapshots, locates int) {
 	return l.snapshots, l.locates
 }
 
+// fixtureConfig is what the options below assemble. The zero value is the
+// original fixture: Claude enrichment left nil, so the tick does no transcript
+// I/O and the fixture is about the resolve alone.
+type fixtureConfig struct {
+	seed *slowSeed // non-nil once withSlowFanoutSeed is applied
+}
+
+type fixtureOption func(*testing.T, *fixtureConfig)
+
 // reconcileFixture builds a reconcileOnce call site over fakes, with sessionCount
-// sessions already tracked. Claude enrichment is left nil so the tick does no
-// transcript I/O — this fixture is about the resolve, not the fanout observer.
-func reconcileFixture(t *testing.T, sessionCount int) (*state.Store, *slowBatchLocator, *mapping.Resolver, func()) {
+// sessions already tracked.
+func reconcileFixture(t *testing.T, sessionCount int, opts ...fixtureOption) (*state.Store, *slowBatchLocator, *mapping.Resolver, func()) {
 	t.Helper()
+
+	var cfg fixtureConfig
+	for _, opt := range opts {
+		opt(t, &cfg)
+	}
 
 	panes := make(map[string]terminal.PaneRef, sessionCount)
 	store := state.New("")
@@ -75,7 +92,17 @@ func reconcileFixture(t *testing.T, sessionCount int) (*state.Store, *slowBatchL
 			pid := 5000 + i
 			tty := ttyName(i)
 			procs[pid] = procAlive
-			m[pid] = &state.Session{PID: pid, TTY: tty, CWD: "/home/test", StartedAt: time.Now()}
+			sess := &state.Session{PID: pid, TTY: tty, CWD: "/home/test", StartedAt: time.Now()}
+			if cfg.seed != nil {
+				// Never seen by the Observer, which is what makes the FIRST tick pay
+				// the first-sight seed — the cost B2 budgets.
+				sess.Agent = state.AgentKindClaude
+				sess.Claude = &state.AgentInfo{
+					SessionID:  cfg.seed.sessionID(i),
+					Transcript: cfg.seed.transcript(t, i),
+				}
+			}
+			m[pid] = sess
 			panes[tty] = terminal.PaneRef{Backend: "slowbatch", TTY: tty, PaneID: i}
 		}
 	})
@@ -84,7 +111,11 @@ func reconcileFixture(t *testing.T, sessionCount int) (*state.Store, *slowBatchL
 	manager := stubManager{}
 	stack := detect.Stack{OSProc: fakeProcSource{st: procs}, Terminal: loc, WM: manager}
 	resolver := mapping.NewResolver(loc, manager)
-	rstate := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+	historyDir := t.TempDir()
+	if cfg.seed != nil {
+		historyDir = cfg.seed.dir
+	}
+	rstate := newReconcileState(fanout.NewObserver(historyDir), nil)
 
 	tick := func() {
 		reconcileOnce(context.Background(), store, resolver, manager, stack,
@@ -131,8 +162,248 @@ func measureWorstReaderWait(store *state.Store, work func()) time.Duration {
 	return worst
 }
 
+// writerProbeInterval paces the competing writer in measureWorstWriterWait.
+const writerProbeInterval = 250 * time.Microsecond
+
+// measureWorstWriterWait runs work while a goroutine hammers store.Apply with an
+// empty mutation, and reports the longest one of those writes waited to get in.
+//
+// It is measureWorstReaderWait's twin, and after publish-and-swap it is the twin
+// with teeth. Readers now load a published pointer and never take the lock at all,
+// so the reader-side number collapses to ~0 BY CONSTRUCTION — a reader-wait budget
+// would pass no matter what the tick did under the lock, which is the exact shape
+// of the vacuous test this file already had to fix once (see the note on
+// locateOnlyLocator.Locate). Writers still queue, so the longest a competing write
+// waited is the tick's Apply hold, measured from outside.
+//
+// The ideal instrument is the hold itself, which state.Apply already times and
+// state.lockWarnOut already exposes "purely so the test can read it". Both are
+// unexported and this test lives one package out, so it asks the question in the
+// terms available here. The quantities differ by the microseconds of an empty
+// Apply, against a budget in the tens of milliseconds.
+func measureWorstWriterWait(store *state.Store, work func()) time.Duration {
+	stop := make(chan struct{})
+	var mu sync.Mutex
+	worst := time.Duration(0)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// An empty mutation changes nothing, so this neither broadcasts nor
+			// persists — it only competes for the lock, which is the measurement.
+			start := time.Now()
+			store.Apply(func(map[int]*state.Session) {})
+			waited := time.Since(start)
+			mu.Lock()
+			if waited > worst {
+				worst = waited
+			}
+			mu.Unlock()
+			// Paced, not spun, and the pacing is what makes the number readable.
+			// Every Apply builds a full snapshot and encodes it for the change key,
+			// so an unthrottled loop allocates hard enough that its own GC assists
+			// dominate the measurement — an idle store read as 7 ms of "wait" before
+			// this sleep existed, against budgets in the tens of milliseconds. The
+			// interval is far shorter than any hold worth failing on, so nothing the
+			// budget cares about can slip between two attempts.
+			time.Sleep(writerProbeInterval)
+		}
+	}()
+
+	work()
+	close(stop)
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	return worst
+}
+
 func ttyName(i int) string {
 	return "/dev/pts/" + string(rune('0'+i))
+}
+
+// ---------------------------------------------------------------------------
+// The tick budget: an injected slow seed, and a bound on what the Apply may cost
+// ---------------------------------------------------------------------------
+
+// These size the fixture's history archive. The target is a first-sight seed in
+// the tens of milliseconds — big enough that a budget has room a loaded scheduler
+// cannot erase, small enough to write in a unit test. The live archive behind the
+// 1.81 s figure this whole change set exists for was 62.6 MB over 37 days; this is
+// a scale model of it, ~28 MB over 10.
+//
+// seedArchiveMatchEvery is why it is that shape rather than a tenth the size with
+// every line matching. The seed's cost has two parts — a byte pre-filter over
+// EVERY line and a JSON decode of the few that pass it — and only the first part
+// is free of garbage. An all-matching archive reaches the same duration in a fifth
+// the bytes and allocates 40 MB doing it, and that garbage lands as multi-
+// millisecond GC pauses in the very measurement being taken: the budget's own
+// noise floor went from ~0.3 ms to ~16 ms, against a limit of 20. So the archive
+// is mostly OTHER sessions' events, which is also what a real day-file is —
+// dominated by everyone else's transitions and usage samples, and exactly the
+// shape the pre-filter was written for.
+//
+// The matching lines carry BOTH the quoted session id and the "workflow_"
+// substring. seedFor calls PriorSubagentState and PriorWorkflowState, each
+// pre-filtering on its own needle pair, so an archive satisfying only one needle
+// exercises only half the seed — which is precisely the half-measure that made an
+// earlier reading of this cost understate it by 17x.
+// seedArchiveSessions is how many sessions the budget test runs, and how many
+// distinct ids the matching lines are spread across, so every session's seed
+// decodes an equal share and the one measured probe speaks for all of them. It is
+// deliberately SMALL where the sibling enumeration tests use eight: each session
+// re-reads the whole archive on first sight, and that I/O is the measurement's own
+// noise floor. Three sessions is a real tick and keeps the floor under a
+// millisecond against a budget of tens.
+const (
+	seedArchiveDays       = 10
+	seedArchiveLines      = 16000
+	seedArchiveMatchEvery = 500
+	seedArchiveSessions   = 3
+)
+
+// minSeedCost is the vacuity floor. A budget expressed as a fraction of an
+// injected delay proves nothing if the delay stopped being injected — a faster
+// decoder, a smaller fixture, a machine with a much faster disk — so the test
+// fails loudly rather than passing on a seed that costs nothing.
+const minSeedCost = 25 * time.Millisecond
+
+// slowSeed is the injected delay: a history archive big enough that one session's
+// first-sight seed costs real time, plus the measured cost of paying it once.
+//
+// The cost is MEASURED rather than assumed because the seed's price is the
+// decoder's, not a sleep's. Budgeting against a wall-clock constant would fail on
+// a loaded CI box and pass on a fast one; budgeting against what this box actually
+// paid, on this fixture, moments ago, scales with the box.
+type slowSeed struct {
+	dir  string
+	base string
+	cost time.Duration
+}
+
+func (s *slowSeed) sessionID(i int) string { return fmt.Sprintf("s-seed-%d", i) }
+
+// transcript writes session i's transcript and returns its path. It exists so the
+// pre-lock sample's transcript reads succeed; a sample that failed to read would
+// be rejected and re-read inline, which would put I/O back under the lock for
+// reasons having nothing to do with the seed.
+func (s *slowSeed) transcript(t *testing.T, i int) string {
+	t.Helper()
+	path := filepath.Join(s.base, s.sessionID(i)+".jsonl")
+	if err := os.WriteFile(path, []byte(`{"type":"system"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// withSlowFanoutSeed gives the fixture's sessions Claude enrichment no Observer
+// has ever seen, backs that Observer with a slow history archive, and records
+// what one seed against it costs.
+//
+// This is the gap B2 closes. The fixture made only the TERMINAL ENUMERATION slow,
+// so it pinned the steady-state body of the lock hold and said nothing about its
+// multi-second tail — and the tail is what a newly-seen session pays. The live
+// 30-minute window meant to measure that never saw a session appear, so the seed
+// was never exercised at all. This is the deterministic version of the experiment
+// that window failed to run.
+func withSlowFanoutSeed(seed *slowSeed) fixtureOption {
+	return func(t *testing.T, cfg *fixtureConfig) {
+		t.Helper()
+		seed.dir, seed.base = t.TempDir(), t.TempDir()
+
+		for day := range seedArchiveDays {
+			var b strings.Builder
+			for i := range seedArchiveLines {
+				// Most lines belong to sessions this seed is not asking about and are
+				// dropped by the pre-filter without being decoded; every
+				// seedArchiveMatchEvery-th belongs to one of the fixture's own.
+				sid := fmt.Sprintf("s-bystander-%d", i)
+				if i%seedArchiveMatchEvery == 0 {
+					sid = seed.sessionID((i / seedArchiveMatchEvery) % seedArchiveSessions)
+				}
+				fmt.Fprintf(&b, `{"ts":"2026-06-%02dT12:00:00Z","type":"subagent_spawn","session_id":%q,`+
+					`"agent_id":"a%d","workflow_run_id":"wf_%d","pid":4242,"agent":"claude","cwd":"/home/test"}`+"\n",
+					day+1, sid, i, i)
+			}
+			path := filepath.Join(seed.dir, fmt.Sprintf("2026-06-%02d.jsonl", day+1))
+			if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// Time one seed on a throwaway Observer. The first call is discarded so the
+		// figure and the tick that follows meet the same warm page cache — a cold
+		// reading would over-budget the tick and let a real regression through.
+		probe := seed.transcript(t, 0)
+		fanout.NewObserver(seed.dir).Prime(seed.sessionID(0), probe)
+		start := time.Now()
+		fanout.NewObserver(seed.dir).Prime(seed.sessionID(0), probe)
+		seed.cost = time.Since(start)
+
+		cfg.seed = seed
+	}
+}
+
+// TestShouldNotHoldTheStoreLockAcrossTheFanoutSeed is the test that would have
+// caught #61 directly.
+//
+// The seed is the most expensive thing the tick does and it is paid per NEWLY-SEEN
+// session — not once at startup, as the pre-measurement framing assumed, but every
+// time a session appears on a box whose whole purpose is watching sessions come
+// and go. Production put it at 1.57-2.36 s per seed with the exclusive lock held.
+//
+// It budgets the WRITER side deliberately; see measureWorstWriterWait for why the
+// reader side went vacuous the moment readers stopped taking the lock. Post
+// publish-and-swap the assertion reads "the tick's Apply is short", which is still
+// exactly the invariant: the seed belongs in Prime, before the lock.
+func TestShouldNotHoldTheStoreLockAcrossTheFanoutSeed(t *testing.T) {
+	var seed slowSeed
+	store, _, _, tick := reconcileFixture(t, seedArchiveSessions, withSlowFanoutSeed(&seed))
+
+	if seed.cost < minSeedCost {
+		t.Fatalf("one first-sight seed against the fixture archive costs %v, under the %v this test "+
+			"needs to mean anything: the budget below is a fraction of that number, so a seed this "+
+			"cheap would pass whether or not the read is under the lock. Grow the archive.",
+			seed.cost, minSeedCost)
+	}
+
+	got := measureWorstWriterWait(store, tick)
+
+	limit := seed.cost / 3
+	if got > limit {
+		t.Errorf("a competing write waited %v during the first tick over %d newly-seen sessions, each "+
+			"of whose first-sight seed costs %v; want under %v — the history archive is being read "+
+			"with the store lock held again. It belongs in Observer.Prime, before the lock.",
+			got, seedArchiveSessions, seed.cost, limit)
+	}
+}
+
+// TestShouldMeasureAWriterBlockedByASlowApply_negativeControl guards the budget
+// above from going quietly vacuous the way a reader-wait budget already did.
+//
+// If a writer hammering the store cannot observe a deliberately slow Apply, then
+// measureWorstWriterWait reports ~0 for every tick and the budget passes no matter
+// what the tick holds the lock across.
+func TestShouldMeasureAWriterBlockedByASlowApply_negativeControl(t *testing.T) {
+	store := state.New("")
+	const hold = 200 * time.Millisecond
+
+	got := measureWorstWriterWait(store, func() {
+		store.Apply(func(map[int]*state.Session) { time.Sleep(hold) })
+	})
+
+	if got < hold/2 {
+		t.Errorf("a competing write measured %v while an Apply demonstrably held the lock for %v, so "+
+			"measureWorstWriterWait cannot see a slow Apply and every budget written against it passes "+
+			"vacuously", got, hold)
+	}
 }
 
 func TestShouldEnumerateTheTerminalOncePerTickWhateverTheSessionCount(t *testing.T) {
