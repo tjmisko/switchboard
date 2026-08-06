@@ -113,17 +113,36 @@ func sampleKey(c *state.AgentInfo) string {
 	return c.SessionID + "\x00" + c.Transcript
 }
 
+// sampleLabels resolves every session's display name BEFORE the tick takes the
+// store lock.
+//
+// label.RawName's first choice is the Claude session name on disk
+// (~/.claude/sessions/<pid>.json), so this stats a file per session per tick and,
+// whenever one changes — i.e. right after a `/name` — opens, reads and unmarshals
+// it. rs.names memoizes against the file's stamp, which made the common case one
+// stat instead of a full read, but a stat is still a filesystem round trip and the
+// uncommon case is still a read: on a slow or network $HOME both blocked the bar
+// and every hook for as long as they took. Nothing about resolving a name needs
+// the lock; only recording the change does.
+func (rs *reconcileState) sampleLabels(snap state.Snapshot) map[int]string {
+	names := make(map[int]string, len(snap.Sessions))
+	for _, sess := range snap.Sessions {
+		names[sess.PID] = rs.names.RawName(sess)
+	}
+	return names
+}
+
 // observe updates c.InFlightSubagents and emits any new subagent_spawn/stop
 // events for one claude session. It runs inside the reconcile Apply (under the
 // store lock) because it writes to c, which the store owns.
 //
-// It performs no reads of its own any more. The fanout reads come from the
-// pre-lock sample (sampleFanout), the name comes from a stamp-checked cache, and
-// the usage delta left entirely — see sampleUsage.
-func (rs *reconcileState) observe(sink *history.Sink, sess *state.Session, c *state.AgentInfo, now time.Time) {
+// It performs no reads of its own. The fanout reads come from the pre-lock sample
+// (sampleFanout), the name from sampleLabels, and the usage delta left entirely —
+// see sampleUsage.
+func (rs *reconcileState) observe(sink *history.Sink, names map[int]string, sess *state.Session, c *state.AgentInfo, now time.Time) {
 	// The session label is derived from disk/window title, not the transcript, so
 	// it is tracked even before the transcript exists.
-	rs.observeLabel(sink, sess, c, now)
+	rs.observeLabel(sink, names[sess.PID], sess, c, now)
 	if c.Transcript == "" {
 		return
 	}
@@ -147,12 +166,10 @@ func (rs *reconcileState) observe(sink *history.Sink, sess *state.Session, c *st
 // session id is also the safer key in the other direction: it never repeats, so
 // a recycled pid can never inherit a dead session's name.
 //
-// The name lookup goes through rs.names because this runs under the store lock,
-// once per session per tick, and label.RawName reads and unmarshals a file on
-// every call. The cache re-reads when the file's stamp moves, so a `/name` still
-// lands an EventSessionLabel on the next tick.
-func (rs *reconcileState) observeLabel(sink *history.Sink, sess *state.Session, c *state.AgentInfo, now time.Time) {
-	name := rs.names.RawName(*sess)
+// The name arrives from sampleLabels, resolved before the lock. A session that
+// appeared after that snapshot has no entry and is simply not announced this tick;
+// the next one names it. Announcing is the only part that needs the lock.
+func (rs *reconcileState) observeLabel(sink *history.Sink, name string, sess *state.Session, c *state.AgentInfo, now time.Time) {
 	key := labelKey(sess.PID, c)
 	if name == "" || name == rs.labels[key].name {
 		return
@@ -202,7 +219,7 @@ func (rs *reconcileState) observeFanout(sink *history.Sink, sess *state.Session,
 // session concludes, wrongly, that this path is already cold-safe. Every tick
 // AFTER that reads the delta, and during an active turn the delta is real bytes.
 //
-// dead is the tick's liveness verdict, and skipping a dead session is not an
+// procs carries the tick's liveness verdict, and skipping a dead session is not an
 // optimization — it is the one thing that moved out of the Apply and had to be
 // carried out with it. Under the lock this ran AFTER sweepDeadSessions, whose
 // contract is that "a dead session earns none of it": on the tick that discovers
@@ -214,11 +231,11 @@ func (rs *reconcileState) observeFanout(sink *history.Sink, sess *state.Session,
 // A session that dies between the liveness read and the Apply still samples, and
 // that is the correct worst case: the sample is recorded before the session_end
 // (same tick clock, earlier in the sink), never after it.
-func (rs *reconcileState) sampleUsage(snap state.Snapshot, dead map[int]bool, sink *history.Sink, now time.Time) {
+func (rs *reconcileState) sampleUsage(snap state.Snapshot, procs map[int]procSample, sink *history.Sink, now time.Time) {
 	for _, s := range snap.Sessions {
 		sess := s
 		c := sess.Claude
-		if c == nil || c.Transcript == "" || dead[sess.PID] {
+		if c == nil || c.Transcript == "" || procs[sess.PID].dead {
 			continue
 		}
 		rs.observeUsage(sink, &sess, c, now)

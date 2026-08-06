@@ -68,6 +68,15 @@ func assistantUsageModelLine(model string, in, out int64) string {
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }
 
+// tickObserve mirrors one tick for a single session: resolve the label BEFORE the
+// lock (what sampleLabels does over the whole snapshot), then apply under it. The
+// two steps are separate in production precisely so the name lookup's filesystem
+// round trip does not happen with the lock held.
+func tickObserve(rs *reconcileState, sink *history.Sink, sess *state.Session, now time.Time) {
+	names := map[int]string{sess.PID: rs.names.RawName(*sess)}
+	rs.observe(sink, names, sess, sess.Claude, now)
+}
+
 // The wiring test for the pre-lock reads. The Observer's own tests cover Sample
 // and Prime; this one covers sampleFanout actually reaching the sessions in the
 // store, since a Sample that is never taken is exactly as slow as no Sample.
@@ -115,7 +124,7 @@ func TestSampleFanoutSeedsEverySessionInTheSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rs.observe(sink, sess, sess.Claude, time.Now())
+	tickObserve(rs, sink, sess, time.Now())
 	sink.Close()
 
 	for _, ev := range eventsOfType(readEvents(t, histDir), history.EventSubagentSpawn) {
@@ -161,7 +170,7 @@ func TestObserveFanoutAppliesTheSampledDirScan(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rs.observe(sink, sess, sess.Claude, time.Now())
+	tickObserve(rs, sink, sess, time.Now())
 	sink.Close()
 
 	var spawned bool
@@ -237,12 +246,12 @@ func TestObserveLabelEmitsOnChangeOnly(t *testing.T) {
 		Wezterm: &state.WeztermInfo{WindowTitle: "first-name"},
 		Claude:  &state.AgentInfo{SessionID: "s1", Transcript: tpath}}
 
-	rs.observe(sink, sess, sess.Claude, time.Now()) // emit "first-name"
-	rs.observe(sink, sess, sess.Claude, time.Now()) // unchanged → no emit
+	tickObserve(rs, sink, sess, time.Now()) // emit "first-name"
+	tickObserve(rs, sink, sess, time.Now()) // unchanged → no emit
 
-	sess.Wezterm.WindowTitle = "second-name"        // user renamed the session
-	rs.observe(sink, sess, sess.Claude, time.Now()) // emit "second-name"
-	rs.observe(sink, sess, sess.Claude, time.Now()) // unchanged → no emit
+	sess.Wezterm.WindowTitle = "second-name" // user renamed the session
+	tickObserve(rs, sink, sess, time.Now())  // emit "second-name"
+	tickObserve(rs, sink, sess, time.Now())  // unchanged → no emit
 	sink.Close()
 
 	labels := eventsOfType(readEvents(t, histDir), history.EventSessionLabel)
@@ -289,8 +298,8 @@ func TestObserveLabelEmitsAgainWhenTheSessionFileIsRenamed(t *testing.T) {
 		Wezterm: &state.WeztermInfo{WindowTitle: "ignored-window-title"},
 		Claude:  &state.AgentInfo{SessionID: "s1", Transcript: tpath}}
 
-	rs.observe(sink, sess, sess.Claude, time.Now()) // emit "aaa-name"
-	rs.observe(sink, sess, sess.Claude, time.Now()) // unchanged → no emit
+	tickObserve(rs, sink, sess, time.Now()) // emit "aaa-name"
+	tickObserve(rs, sink, sess, time.Now()) // unchanged → no emit
 
 	// `/name bbb-name`. Same length as the old name, so the file's size does not
 	// move and mtime alone has to carry the invalidation; forced forward so the
@@ -301,8 +310,8 @@ func TestObserveLabelEmitsAgainWhenTheSessionFileIsRenamed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rs.observe(sink, sess, sess.Claude, time.Now()) // emit "bbb-name"
-	rs.observe(sink, sess, sess.Claude, time.Now()) // unchanged → no emit
+	tickObserve(rs, sink, sess, time.Now()) // emit "bbb-name"
+	tickObserve(rs, sink, sess, time.Now()) // unchanged → no emit
 	sink.Close()
 
 	labels := eventsOfType(readEvents(t, histDir), history.EventSessionLabel)
@@ -330,12 +339,12 @@ func TestObserveLabelReAnnouncesTheNameToANewSessionInTheSameProcess(t *testing.
 		Wezterm: &state.WeztermInfo{WindowTitle: "digest-status"},
 		Claude:  &state.AgentInfo{SessionID: "s1", Transcript: tpath}}
 
-	rs.observe(sink, sess, sess.Claude, time.Now()) // emit for s1
-	rs.observe(sink, sess, sess.Claude, time.Now()) // unchanged → no emit
+	tickObserve(rs, sink, sess, time.Now()) // emit for s1
+	tickObserve(rs, sink, sess, time.Now()) // unchanged → no emit
 
-	sess.Claude.SessionID = "s2"                    // /clear: same pane, same name, new session
-	rs.observe(sink, sess, sess.Claude, time.Now()) // emit for s2
-	rs.observe(sink, sess, sess.Claude, time.Now()) // unchanged → no emit
+	sess.Claude.SessionID = "s2"            // /clear: same pane, same name, new session
+	tickObserve(rs, sink, sess, time.Now()) // emit for s2
+	tickObserve(rs, sink, sess, time.Now()) // unchanged → no emit
 	sink.Close()
 
 	labels := eventsOfType(readEvents(t, histDir), history.EventSessionLabel)
@@ -391,7 +400,7 @@ func TestObserveLabelDoesNotReAnnounceAfterATickWithoutClaudeInfo(t *testing.T) 
 		Claude:  &state.AgentInfo{SessionID: "s1", Transcript: tpath}}
 	live := map[int]*state.Session{424242: sess}
 
-	rs.observe(sink, sess, sess.Claude, time.Now())
+	tickObserve(rs, sink, sess, time.Now())
 	rs.prune(live)
 
 	claude := sess.Claude
@@ -399,7 +408,7 @@ func TestObserveLabelDoesNotReAnnounceAfterATickWithoutClaudeInfo(t *testing.T) 
 	rs.prune(live)
 	sess.Claude = claude
 
-	rs.observe(sink, sess, sess.Claude, time.Now())
+	tickObserve(rs, sink, sess, time.Now())
 	sink.Close()
 
 	labels := eventsOfType(readEvents(t, histDir), history.EventSessionLabel)
@@ -510,7 +519,7 @@ func TestSampleUsageSkipsASessionWhoseProcessIsGone(t *testing.T) {
 	f.WriteString(assistantUsageModelLine("claude-opus-4-8", 77, 11) + "\n")
 	f.Close()
 
-	rs.sampleUsage(store.Snapshot(), map[int]bool{9: true}, sink, time.Now())
+	rs.sampleUsage(store.Snapshot(), map[int]procSample{9: {dead: true}}, sink, time.Now())
 	sink.Close()
 
 	if samples := eventsOfType(readEvents(t, histDir), history.EventUsageSample); len(samples) != 0 {

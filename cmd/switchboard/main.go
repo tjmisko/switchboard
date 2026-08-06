@@ -45,6 +45,10 @@ func main() {
 	historyDir := flag.String("history-dir", "", "activity-log directory (default $XDG_STATE_HOME/switchboard/history)")
 	flag.Parse()
 
+	// Before anything else logs: the daemon logs from inside store.Apply, and a
+	// blocking write there stalls every reader on the log pipe. See nonBlockingLog.
+	installNonBlockingLog()
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -212,26 +216,44 @@ func sessionDead(src osproc.Source, pid int) bool {
 	return discovery.Classify(info) == discovery.AgentNone
 }
 
-// deadSessions is the tick's liveness verdict for every session in its pre-lock
-// snapshot, by the same predicate sweepDeadSessions uses.
+// procSample is what one tick learns about one session's PROCESS, as opposed to
+// its transcript: whether it is definitively gone, and whether it is job-control
+// suspended (Ctrl-Z).
 //
-// It exists because sampling moved OUT of the Apply and therefore out from behind
-// sweepDeadSessions, which is what enforces "a dead session earns none of it".
-// Anything that samples before the lock and emits history has to carry that rule
-// with it; see sampleUsage, the one sampler that emits rather than staging.
+// Both used to be read inside store.Apply, one osproc.Read and one
+// /proc/<pid>/status per session per tick. Measured on this box at ~22-40µs and
+// ~7.5-11µs respectively, so a 12-session tick held the exclusive lock across
+// roughly half a millisecond of procfs — small next to the reads this change set
+// removed, but no longer small relative to what is left, and unbounded rather than
+// merely slow when a process is in uninterruptible-D state or procfs is contended.
+type procSample struct {
+	dead      bool // definitively gone (or the pid recycled to a non-agent)
+	suspended bool
+	stateOK   bool // the run-state read succeeded; false leaves the last-known value
+}
+
+// sampleProc reads both, once per session, BEFORE the lock.
 //
-// Read before the lock, one process read per session, which is where that read
-// belongs. A pid absent from the result is alive as far as this tick knows —
-// including a session that appeared after the snapshot, which is the safe default
-// (liveness is judged only on positive evidence of death, L4).
-func deadSessions(snap state.Snapshot, src osproc.Source) map[int]bool {
-	dead := map[int]bool{}
+// It also removes a duplicate: the liveness verdict is needed twice in a tick —
+// by sampleUsage out here (a dead session earns none of the tick's work, and usage
+// is the one sampler that emits rather than staging) and by sweepDeadSessions
+// inside the Apply. Reading it once and passing the result to both is what makes
+// the consolidation cheaper rather than just relocated.
+//
+// A pid absent from the result is alive and unchanged as far as this tick knows —
+// including a session that appeared after the snapshot. That is the safe default
+// in both directions: liveness is judged only on positive evidence of death (L4),
+// and a missing run-state leaves the last-known suspension rather than flapping it.
+func sampleProc(snap state.Snapshot, src osproc.Source) map[int]procSample {
+	out := make(map[int]procSample, len(snap.Sessions))
 	for _, sess := range snap.Sessions {
-		if sessionDead(src, sess.PID) {
-			dead[sess.PID] = true
+		p := procSample{dead: sessionDead(src, sess.PID)}
+		if st, err := proc.State(sess.PID); err == nil {
+			p.suspended, p.stateOK = proc.Suspended(st), true
 		}
+		out[sess.PID] = p
 	}
-	return dead
+	return out
 }
 
 // sweepDeadSessions closes the lane of every tracked session whose process is
@@ -243,14 +265,20 @@ func deadSessions(snap state.Snapshot, src osproc.Source) map[int]bool {
 // observed. A watch that failed to register never observes one either. In both
 // cases nothing else would ever drop the session, and the reader stretches its
 // final interval to `now` — the ghost lane this sweep exists to prevent
-// (L1/L3, session-lifecycle-hazards.md). Polling here costs one process read per
+// (L1/L3, session-lifecycle-hazards.md). Polling costs one process read per
 // session per tick and depends on no prior state at all, so it self-heals across
 // a restart within a single reconcile interval.
 //
-// Deleting from a map while ranging it is safe in Go. Runs inside store.Apply.
-func sweepDeadSessions(m map[int]*state.Session, src osproc.Source, sink *history.Sink, forget func(int), now time.Time) {
+// The verdict comes from sampleProc, taken before the lock: this runs inside
+// store.Apply, and a procfs read in here is a read every RPC reader, hook and chip
+// click waits on. A session with no verdict — one that appeared after the
+// snapshot — is left alone and swept on the next tick, which is the same "one tick
+// late beats a false end" trade the predicate itself makes.
+//
+// Deleting from a map while ranging it is safe in Go.
+func sweepDeadSessions(m map[int]*state.Session, procs map[int]procSample, sink *history.Sink, forget func(int), now time.Time) {
 	for pid := range m {
-		if !sessionDead(src, pid) {
+		if !procs[pid].dead {
 			continue
 		}
 		if endSession(m, pid, sink, forget, now) {
@@ -676,40 +704,65 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 	// history seed, the transcript cursor, and the per-session subagents/ dir scan —
 	// used to happen inside the Apply below. See sampleFanout.
 	rstate.sampleFanout(snap)
+	// Liveness and job-control suspension, one process read each per session, both
+	// of which used to happen under the lock. See procSample.
+	procs := sampleProc(snap, stack.OSProc)
+	// The session names, which used to be looked up per session under the lock —
+	// a stat every tick, and a read plus unmarshal whenever one changes. See
+	// sampleLabels.
+	names := rstate.sampleLabels(snap)
 	// Usage moves out entirely rather than being sampled-then-applied: it mutates
 	// no session state, so nothing about it needs the lock. It is also the only
 	// sampler that EMITS out here rather than staging a result for the Apply, so it
 	// is the one that has to carry sweepDeadSessions' liveness rule out with it.
-	// See sampleUsage and deadSessions.
-	rstate.sampleUsage(snap, deadSessions(snap, stack.OSProc), sink, now)
+	// See sampleUsage.
+	rstate.sampleUsage(snap, procs, sink, now)
 	// The two status self-heals' transcript reads. Their DECISIONS stay under the
 	// lock — only the reads move. See signalSample.
 	signals := sampleSignals(snap, tun)
+	// WHAT IS STILL I/O INSIDE THIS Apply, stated plainly so the next reader does
+	// not assume the answer is "nothing" and add one more:
+	//
+	//  1. One os.Stat per sampled session, in signalSample.freshFor. Deliberate:
+	//     it is what makes the guard mean what it says, since the transcript can
+	//     move without any session field moving. ~µs, and it replaced a stat AND a
+	//     bounded tail read per session per tick.
+	//  2. The inline fallbacks, when a sample no longer describes its session — a
+	//     hook reconciling mid-tick, a session that appeared after the snapshot.
+	//     Then readSignals (stat + bounded tail) or the fanout readSample
+	//     (transcript delta + subagents dir scan) runs here, exactly as all of it
+	//     used to. Bounded to the affected sessions and rare by construction, but
+	//     it is a real read under a real lock.
+	//  3. state.Apply's own lock-hold warning writes an Fprintf while holding the
+	//     lock, by design, and only when SWITCHBOARD_DEBUG_LOCK is set.
+	//
+	// Everything else is gone: the resolve enumerations, the fanout seed and dir
+	// scan, the usage delta, the session-name lookup, the self-heals' reads, and
+	// both per-session /proc reads all happen above. sink.Record drops rather than
+	// blocks, log writes go through a non-blocking writer (see nonBlockingLog), and
+	// the persist and broadcast happen after Apply releases the lock.
 	store.Apply(func(m map[int]*state.Session) {
 		// Close the lanes of any session whose process is gone, BEFORE the per-tick
 		// work below — a dead session earns none of it.
-		sweepDeadSessions(m, stack.OSProc, sink, forget, now)
+		sweepDeadSessions(m, procs, sink, forget, now)
 		for _, sess := range m {
 			// Applies the pre-lock enumeration and does no I/O — ReconcileFrom takes no
 			// context precisely so it cannot. A degraded tick arrives here with nil
 			// panes, which every session reads as a miss and leaves alone.
 			resolver.ReconcileFrom(sess, panes, clients, now)
-			// Refresh job-control suspension (Ctrl-Z). On ErrGone the sweep above has
-			// already dropped the session, so this only ever sees a live pid; leave
-			// the last-known value on any other read error rather than flapping. A
-			// change is logged to history as a suspend/resume edge (it greys/un-greys
-			// the chip in a timeline).
-			if st, err := proc.State(sess.PID); err == nil {
-				susp := proc.Suspended(st)
-				if susp != sess.Suspended {
-					evType := history.EventResume
-					if susp {
-						evType = history.EventSuspend
-					}
-					sink.Record(history.Event{Ts: now, Type: evType,
-						SessionID: enrichmentID(sess), PID: sess.PID, Agent: sess.Agent, CWD: sess.CWD})
+			// Refresh job-control suspension (Ctrl-Z) from the pre-lock read. A session
+			// whose run-state could not be read keeps its last-known value rather than
+			// flapping, and so does one that appeared after the snapshot. A change is
+			// logged to history as a suspend/resume edge (it greys/un-greys the chip in
+			// a timeline).
+			if p := procs[sess.PID]; p.stateOK && p.suspended != sess.Suspended {
+				evType := history.EventResume
+				if p.suspended {
+					evType = history.EventSuspend
 				}
-				sess.Suspended = susp
+				sink.Record(history.Event{Ts: now, Type: evType,
+					SessionID: enrichmentID(sess), PID: sess.PID, Agent: sess.Agent, CWD: sess.CWD})
+				sess.Suspended = p.suspended
 			}
 			// The session's resident cost, read outside this lock at the top of the
 			// tick. The live fields take whatever the tick has, including a repeated
@@ -729,7 +782,7 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 			// delegation, and emit fanout (subagent spawn/stop) + usage (token)
 			// history events derived from the same read. Claude-only.
 			if c := sess.Claude; c != nil {
-				rstate.observe(sink, sess, c, now)
+				rstate.observe(sink, names, sess, c, now)
 			}
 		}
 		// Re-sync focus against the active window (the backstop for any focus event
