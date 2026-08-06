@@ -199,3 +199,39 @@ func scanSubagentLines(path string, idNeedle []byte, fn func(Event)) error {
 	}
 	return sc.Err()
 }
+
+// PriorWorkflowState is PriorSubagentState's twin for workflow runs: the set of
+// WorkflowRunIDs already recorded as started and as stopped for sessionID. It
+// primes the Observer's per-run seen-set so a daemon restart mid-workflow does
+// not re-emit workflow_start for a run whose records it is seeing again for the
+// first time (the run dirs, like subagent metas, are never deleted).
+//
+// It is a TWIN in contract only, not yet in cost: this still answers a
+// one-session question by decoding the entire archive, which is exactly the
+// shape scanSubagentLines above exists to undo (see BenchmarkPriorSubagentState).
+// Both halves of the seed now run outside the store lock, so the cost no longer
+// blocks a reader — but the seed itself is still paid per newly-seen session,
+// and giving this the same byte pre-filter is the obvious follow-up.
+func PriorWorkflowState(dir, sessionID string) (started, stopped map[string]bool, err error) {
+	started = map[string]bool{}
+	stopped = map[string]bool{}
+	if sessionID == "" {
+		return started, stopped, nil
+	}
+	events, err := ReadRange(dir, time.Time{}, time.Time{})
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, ev := range events {
+		if ev.SessionID != sessionID || ev.WorkflowRunID == "" {
+			continue
+		}
+		switch ev.Type {
+		case EventWorkflowStart:
+			started[ev.WorkflowRunID] = true
+		case EventWorkflowStop:
+			stopped[ev.WorkflowRunID] = true
+		}
+	}
+	return started, stopped, nil
+}

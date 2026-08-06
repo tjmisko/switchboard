@@ -172,7 +172,21 @@ type AgentInfo struct {
 	// (green) case. Exposed on the wire (omitempty, so absent when 0 — the golden
 	// contract is unchanged) so renderers can show "N agents" in the tooltip and
 	// `switchboard-ctl list` reveals the true state behind a green chip.
+	// Subagents spawned by an ultracode Workflow run count here too (they are
+	// spawnDepth-1 children, listed per-run in Workflows below).
 	InFlightSubagents int `json:"in_flight_subagents,omitempty"`
+
+	// Workflows lists the ultracode Workflow runs currently ACTIVE in this
+	// session — fan-outs the Workflow tool orchestrates, whose subagents live
+	// under <session-dir>/subagents/workflows/wf_*/ and fire no hooks. Derived
+	// each reconcile tick by the fanout Observer from those on-disk records
+	// (journal + agent transcript mtimes) and cleared when the last run drains,
+	// so a renderer can spell out WHY a chip is green ("workflow
+	// simplification-audit · 7/17 agents") rather than showing a bare
+	// delegating. Sorted by RunID — snapshotChangeKey JSON-encodes every tagged
+	// field to decide whether to publish, so an unstable order would republish
+	// identical state every tick.
+	Workflows []WorkflowStatus `json:"workflows,omitempty"`
 
 	// StatusSince marks when Status last transitioned to its current value. The
 	// reconciler uses it to age out a "permission" chip that Claude Code left
@@ -238,6 +252,22 @@ type AgentInfo struct {
 	//
 	// In-memory only: transient onset state, not part of the wire contract.
 	PendingTool string `json:"-"`
+}
+
+// WorkflowStatus summarizes one active ultracode Workflow run for the wire —
+// the numbers behind a "workflow <name> · done/total agents" annotation. The
+// counts come from the run's journal (the authoritative per-agent ledger):
+// AgentsStarted/AgentsDone are agents launched/resulted SO FAR — the journal
+// records no plan, so "total" here grows as the script fans out, exactly like
+// the CLI's own "7/17 agents done" line. InFlight is started minus resulted
+// minus any agent the Observer force-closed as stale, so a killed run's
+// orphaned agents age out of the count rather than pinning it forever.
+type WorkflowStatus struct {
+	RunID         string `json:"run_id"`         // the run dir's basename, e.g. "wf_5e3cb808-2ac"
+	Name          string `json:"name,omitempty"` // workflow name from the persisted script; "" when unresolvable
+	AgentsStarted int    `json:"agents_started"` // journal `started` events seen so far
+	AgentsDone    int    `json:"agents_done"`    // journal `result` events seen so far
+	InFlight      int    `json:"in_flight"`      // started − resulted − force-closed
 }
 
 // PendingWriterMain is the wire spelling of the empty (main-thread) Pending key.

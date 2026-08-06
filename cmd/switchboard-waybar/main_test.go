@@ -150,6 +150,47 @@ func TestRenderSlotDelegating(t *testing.T) {
 	}
 }
 
+// A delegating chip whose session is running an ultracode Workflow names the
+// workflow and its progress instead of the bare agent count — the numbers the
+// CLI's own "N/M agents done" line shows, so the bar and the pane agree.
+func TestRenderSlotDelegatingShouldNameWorkflowAndProgressWhenRunActive(t *testing.T) {
+	snap := state.Snapshot{
+		Sessions: []state.Session{
+			{PID: 4821, CWD: "/home/u/proj", Claude: &state.ClaudeInfo{
+				Status: state.StatusDelegating, InFlightSubagents: 10,
+				Workflows: []state.WorkflowStatus{{
+					RunID: "wf_5e3cb808-2ac", Name: "simplification-audit",
+					AgentsStarted: 17, AgentsDone: 7, InFlight: 10,
+				}},
+			}},
+		},
+	}
+	out := renderSlot(snap, 0, testAvail, testMetrics, &nameConfig{}, &sblabel.NameCache{})
+	if !strings.Contains(out.Tooltip, "workflow simplification-audit · 7/17 agents") {
+		t.Errorf("tooltip should name the workflow and its progress: %q", out.Tooltip)
+	}
+}
+
+// A run whose persisted script (and so its name) is missing still annotates
+// with its opaque run id rather than falling back to the bare count.
+func TestRenderSlotDelegatingShouldFallBackToRunIDWhenWorkflowNameUnknown(t *testing.T) {
+	snap := state.Snapshot{
+		Sessions: []state.Session{
+			{PID: 4821, CWD: "/home/u/proj", Claude: &state.ClaudeInfo{
+				Status: state.StatusDelegating, InFlightSubagents: 3,
+				Workflows: []state.WorkflowStatus{
+					{RunID: "wf_9f-1", AgentsStarted: 4, AgentsDone: 1, InFlight: 3},
+					{RunID: "wf_9f-2", Name: "second", AgentsStarted: 2, AgentsDone: 2},
+				},
+			}},
+		},
+	}
+	out := renderSlot(snap, 0, testAvail, testMetrics, &nameConfig{}, &sblabel.NameCache{})
+	if !strings.Contains(out.Tooltip, "workflow wf_9f-1 · 1/4 agents (+1 more)") {
+		t.Errorf("tooltip should show the run id and fold extra runs: %q", out.Tooltip)
+	}
+}
+
 // --- naming the writer behind a red chip ----------------------------------
 
 // blockedNow anchors the blocked-writer tooltip tests, so the "· 45s" the hover

@@ -44,6 +44,11 @@ const (
 	EventActivity     = "activity"      // user went idle / active (global; To = idle|active)
 	// v3 — per-session memory.
 	EventMemorySample = "memory_sample" // the session's resident cost, sampled each reconcile tick
+	// v4 — ultracode Workflow runs. A workflow's subagents also emit ordinary
+	// subagent_spawn/stop events (AgentType "workflow-subagent", each tagged
+	// with WorkflowRunID); these two bracket the run itself.
+	EventWorkflowStart = "workflow_start" // a Workflow run's records appeared on disk (the fan-out began)
+	EventWorkflowStop  = "workflow_stop"  // the run drained: no agent in flight and its journal went quiet
 )
 
 // Detail tiers. Minimal records only what a timeline needs (ids, status, timing,
@@ -86,6 +91,14 @@ type Event struct {
 	ToolUseID  string `json:"tool_use_id,omitempty"` // links a spawn to its stop (absent on teammates/grandchildren)
 	AgentType  string `json:"agent_type,omitempty"`  // e.g. "Explore", "general-purpose"
 	Background bool   `json:"background,omitempty"`  // the fanout was launched run_in_background (best-effort; from the parent tool_use)
+
+	// Workflow payload (workflow_start / workflow_stop, and the subagent events a
+	// workflow's agents emit). WorkflowRunID is the run dir's basename
+	// (wf_<hex>) — an opaque id, minimal-safe, the key pairing a start to its
+	// stop and grouping the run's subagent spans. The workflow's NAME rides in
+	// Label on workflow_start (it names your work, so it scrubs at the minimal
+	// tier exactly as a session label does).
+	WorkflowRunID string `json:"workflow_run_id,omitempty"`
 
 	// Usage payload (usage_sample): tokens accrued since the previous sample.
 	// Model names the model the tokens were spent on (e.g. "claude-opus-4-8"),

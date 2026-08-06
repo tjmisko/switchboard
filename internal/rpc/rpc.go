@@ -20,8 +20,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/discovery"
 	"github.com/tjmisko/switchboard/internal/fanout"
 	"github.com/tjmisko/switchboard/internal/history"
+	"github.com/tjmisko/switchboard/internal/osproc"
 	"github.com/tjmisko/switchboard/internal/proc"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/statustune"
@@ -129,10 +131,16 @@ type Server struct {
 	tun        statustune.Tuning
 	hist       *history.Sink
 	fanout     *fanout.Observer
+	// readProc is the seam findTrackedAncestor walks the ppid chain through.
+	// Production is proc.Read; tests substitute a synthetic chain so hook
+	// attribution can be exercised against process shapes (a nested `claude -p`,
+	// a shell wrapper) that cannot be staged against a live /proc.
+	readProc func(int) (proc.Info, error)
 }
 
 func New(store *state.Store, socketPath string, term terminal.Locator, manager wm.Manager) *Server {
-	return &Server{store: store, socketPath: socketPath, term: term, wm: manager, tun: statustune.Default()}
+	return &Server{store: store, socketPath: socketPath, term: term, wm: manager,
+		tun: statustune.Default(), readProc: proc.Read}
 }
 
 // SetTuning overrides the status-color tuning (defaults from statustune.Default).
@@ -387,7 +395,7 @@ func (s *Server) handleHook(req Request) {
 		return
 	}
 	s.store.Apply(func(m map[int]*state.Session) {
-		pid := findTrackedAncestor(m, req.PID, proc.Read)
+		pid := findTrackedAncestor(m, req.PID, s.readProc)
 		if pid == 0 {
 			return
 		}
@@ -942,6 +950,41 @@ func coalesce(a, b string) string {
 // first PID that's a tracked session. Bounded depth keeps us out of trouble on
 // weird process states. readProc is injected (defaults to proc.Read at the call
 // site) so the walk is testable without a live /proc.
+//
+// The walk exists for ONE reason: a hook that ran inside a shell wrapper, where
+// getppid() is the wrapper rather than the agent. It stops at the nearest AGENT
+// process for the mirror reason — that process owns the hook, and if it is not
+// tracked the hook belongs to nobody the daemon knows about. Handing it to the
+// grandparent is not a fallback; it is a misattribution onto a live session.
+//
+// # A2 — the nested-headless race (docs/claude-code-hook-schema.md §6)
+//
+// A `claude -p` spawned from inside an interactive session (the session-digest
+// summarizer, a flag investigation, any nested SDK run) fires SessionStart within
+// milliseconds of exec, while discovery registers it only on the next /proc scan
+// tick (--scan-interval, default 1s). In that sub-second window its pid is not in
+// m, so the old walk sailed past it and landed on the interactive parent, which
+// then took the helper's identity: Transcript repointed at the helper's file (so
+// the reconciler derived the PARENT's status from the HELPER's transcript), a
+// false rotation clearing the parent's pending prompts, and SessionID overwritten
+// last-hook-wins and never restored.
+//
+// Measured on 2026-07-31: 35 of 102 session ids were carried by two pids, and one
+// interactive session cycled through 41 ids in 10.5 hours. In 32 of those 35 the
+// parent took the id 1-700ms BEFORE the helper's own session_start — the whole
+// distribution sits inside one scan tick, which is the signature of this race and
+// the reason it reproduces roughly three runs in four.
+//
+// This is the process-level counterpart to T17 (rpc.go, handleHook), which stops
+// a TEAMMATE's hook driving the MAIN thread's chip. T17 discriminates by agent_id
+// and suppresses only status; it cannot see this case, which is a separate
+// process and corrupts identity rather than status.
+//
+// Returning 0 drops the hook. The cost is bounded and self-correcting: the scan
+// picks the helper up within the tick and its later hooks self-match, so only the
+// hooks fired inside the window are lost. A `claude -p` shorter than one tick
+// gets no session id at all — an unnamed single-interval lane, the shape
+// switchboard already produces for a process that dies before transitioning.
 func findTrackedAncestor(m map[int]*state.Session, pid int, readProc func(int) (proc.Info, error)) int {
 	for depth := 0; pid > 1 && depth < 20; depth++ {
 		if _, ok := m[pid]; ok {
@@ -949,6 +992,9 @@ func findTrackedAncestor(m map[int]*state.Session, pid int, readProc func(int) (
 		}
 		info, err := readProc(pid)
 		if err != nil || info.PPID == 0 {
+			return 0
+		}
+		if discovery.Classify(osproc.FromProc(info)) != discovery.AgentNone {
 			return 0
 		}
 		pid = info.PPID

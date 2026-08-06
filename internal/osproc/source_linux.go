@@ -41,7 +41,7 @@ func (s *linuxSource) Enumerate() ([]Info, error) {
 		if err != nil {
 			continue // disappeared mid-scan — benign
 		}
-		out = append(out, fromProc(info))
+		out = append(out, FromProc(info))
 	}
 	return out, nil
 }
@@ -51,7 +51,7 @@ func (s *linuxSource) Read(pid int) (Info, error) {
 	if errors.Is(err, proc.ErrGone) {
 		return Info{PID: pid}, ErrGone
 	}
-	return fromProc(info), err
+	return FromProc(info), err
 }
 
 // AllPIDs lists the visible pids cheaply — one getdents over /proc, with no
@@ -61,10 +61,6 @@ func (s *linuxSource) Read(pid int) (Info, error) {
 // of the neutral Source contract; a Source that omits it is driven from
 // Enumerate instead.
 func (s *linuxSource) AllPIDs() ([]int, error) { return proc.AllPIDs() }
-
-func fromProc(p proc.Info) Info {
-	return Info{PID: p.PID, PPID: p.PPID, Comm: p.Comm, Exe: p.Exe, CWD: p.CWD, TTY: p.TTY, Args: p.Args}
-}
 
 // Watch starts polling pid's pidfd. onDeath is called exactly once, from a
 // background goroutine, when the kernel marks the process dead. A duplicate
