@@ -459,6 +459,47 @@ The baseline arm puts `handleHook` at 1 warning / 30 min, so this is a thin
 signal on an idle box; a `merged` window that shows zero `handleHook` warnings
 has not disproved the backstop, it has merely not hit it.
 
+## Merged result — 2026-08-06, 30 min, `ccd82e9`
+
+Arm `merged`, binary `4f09218b`, window 13:05:14–13:35:14, built from `ccd82e9`
+as the pass criterion above requires.
+
+| caller | count | p50 | max |
+|---|---|---|---|
+| `main.reconcileOnce:866` | 2 | 13.0 ms | 13.0 ms |
+| `rpc.(*Server).handleHook` | 0 | — | — |
+
+262 warnings became 2; the worst hold went from 5270 ms to 13 ms. The two halves
+of that number carry very different weight, and conflating them is how a
+measurement becomes folklore.
+
+**The enumeration result is sound.** Enumeration runs every tick regardless of
+what sessions are doing, so the comparison is like-for-like: 261 of ~360 ticks
+over threshold on `baseline`, 2 of ~360 on `merged`. Nothing about the window's
+composition explains that away. `reconcileOnce` met its criterion.
+
+**The tail result is not established, for a reason the table above did not
+anticipate.** The window ran at `sessions=2` from start to finish with no churn,
+so no session was ever newly seen and the seed never ran — on either path. The
+multi-second holds did not disappear; their *trigger* did not fire. The
+prediction was conditional on seeds happening, and none did. This is the same
+mistake the `handleHook` row already warns about, one row up, and it applies to
+`reconcileOnce` too: an unexercised path is not a passing path.
+
+So add a third rule to the two below: **record the session-count range a window
+saw, and treat an arm with no churn as not having tested the seed at all.** The
+report prints `sessions tracked right now`, which is the count at read time, not
+the range — the range has to come from the warning lines' `sessions=` field, and
+if there were no warnings there is nothing to read it from.
+
+What supports the seed fix independently of this arm: `PriorWorkflowState`
+measured against the live 68 MB archive at 817 ms before the pre-filter and
+104 ms after, and two tests that fail if either read moves back under the lock.
+Different route, decent evidence. But B2 is the deterministic version of exactly
+the experiment this window failed to run — inject a slow archive, discover a new
+session, assert the budget — and that is now the main reason B is worth building
+rather than a nice-to-have.
+
 ## Rules, from the script headers
 
 Both cost this work a wrong number already, so they are rules and not advice:
