@@ -133,20 +133,37 @@ func (r ProjectRule) StripKnownPrefix(name string) string {
 	return name
 }
 
+// ruleForDir is the shared prologue of the *ForDir functions: resolve dir to its
+// project root once, then match a rule against that root and its basename.
+//
+// Written this way because the obvious spelling — ruleForRoot(ProjectRoot(dir),
+// ProjectBase(dir)) — walks the tree TWICE per call: ProjectBase is defined as
+// filepath.Base(ProjectRoot(dir)), so it repeats the stat-per-level climb its
+// sibling argument just did. The bar calls these 16 times per renderSlot, ten
+// slot processes deep, on every emission.
+func (c Config) ruleForDir(dir string) (ProjectRule, string) {
+	root := ProjectRoot(dir)
+	base := filepath.Base(root)
+	return c.ruleForRoot(root, base), base
+}
+
 // ResolveForDir returns name prefixed for the project housing dir.
 func ResolveForDir(cfg Config, dir, name string) string {
-	return cfg.ruleForRoot(ProjectRoot(dir), ProjectBase(dir)).Prefix(name)
+	r, _ := cfg.ruleForDir(dir)
+	return r.Prefix(name)
 }
 
 // TaskForDir returns name with any project-alias prefix stripped, for the
 // tooltip's task line.
 func TaskForDir(cfg Config, dir, name string) string {
-	return cfg.ruleForRoot(ProjectRoot(dir), ProjectBase(dir)).StripKnownPrefix(name)
+	r, _ := cfg.ruleForDir(dir)
+	return r.StripKnownPrefix(name)
 }
 
 // CanonicalForDir returns the abbreviation that would be prepended for dir.
 func CanonicalForDir(cfg Config, dir string) string {
-	return cfg.ruleForRoot(ProjectRoot(dir), ProjectBase(dir)).Canonical
+	r, _ := cfg.ruleForDir(dir)
+	return r.Canonical
 }
 
 // FullForDir returns the pretty, human-readable display name for the project
@@ -155,8 +172,7 @@ func CanonicalForDir(cfg Config, dir string) string {
 // title-cased project basename ("my-cool-repo" -> "My Cool Repo"), falling back
 // to the Canonical when even that is empty.
 func FullForDir(cfg Config, dir string) string {
-	base := ProjectBase(dir)
-	r := cfg.ruleForRoot(ProjectRoot(dir), base)
+	r, base := cfg.ruleForDir(dir)
 	if r.Full != "" {
 		return r.Full
 	}
