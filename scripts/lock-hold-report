@@ -113,12 +113,25 @@ journalctl --user -u switchboard --since "$since" "${until_arg[@]}" --no-pager -
                 while (j >= 1 && vals[c, j] > v) { vals[c, j+1] = vals[c, j]; j-- }
                 vals[c, j+1] = v
             }
+            # A percentile needs enough samples to sit below the max. At n=30 the
+            # p99 index rounds to n itself, so the column repeats "max" while
+            # LOOKING like a tail statistic — a 2026-08-06 arm reported p99 and
+            # max both 17.3ms and it read as a suspiciously tight tail rather
+            # than as two names for one sample. Flagged rather than dropped: p99
+            # is the number you want once a window has the samples to earn it.
+            thin[c] = (int(n[c] * 0.99) + (n[c] > 1 ? 1 : 0) >= n[c])
             p50 = vals[c, int(n[c] * 0.50) + (n[c] > 1 ? 1 : 0)]
             p90 = vals[c, int(n[c] * 0.90) + (n[c] > 1 ? 1 : 0)]
             p99 = vals[c, int(n[c] * 0.99) + (n[c] > 1 ? 1 : 0)]
-            printf "%-34s %6d %8.1fms %8.1fms %8.1fms %8.1fms\n", c, n[c], p50, p90, p99, worst[c]
+            mark = thin[c] ? "*" : " "
+            printf "%-34s %6d %8.1fms %8.1fms %8.1fms%s %8.1fms\n", c, n[c], p50, p90, p99, mark, worst[c]
+            anythin = anythin || thin[c]
         }
         printf "\ntotal warnings: %d\n", total
+        if (anythin) {
+            printf "\n* too few samples for a real p99 — the index rounds to the max,\n"
+            printf "  so that column is repeating it. Read max, not p99, for those rows.\n"
+        }
     }'
 
 echo
