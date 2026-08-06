@@ -8,7 +8,13 @@
 # different reasons, and a total that mixes them cannot say which regressed.
 #
 # Usage:
+#   scripts/lock-hold-arm <arm-name>     # build + restart + record the marker
+#   ... leave the box alone >= 30 min ...
 #   scripts/lock-hold-report [--since "2026-08-05 18:00:00"] [--until "..."]
+#
+# If scripts/lock-hold-arm started the arm, this refuses to report when the
+# daemon was restarted or the binary replaced mid-window. That is not
+# hypothetical: other Claude sessions work in this repo and run `go install`.
 #
 # Default window is the current daemon's start instant, which is deliberate: the
 # startup tick is the single most expensive Apply of a run (the first tick samples
@@ -27,20 +33,54 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --since) since="$2"; shift 2 ;;
         --until) until_arg=(--until "$2"); shift 2 ;;
-        -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
 
+now_start=$(systemctl --user show switchboard -p ExecMainStartTimestamp --value)
+
+# Verify the arm still is what lock-hold-arm started. Without this the default
+# window silently TRACKS a clobber: since it is derived from the daemon's start
+# instant, a restart mid-window just moves the window, and the shortened run on
+# the replacement binary reports as a clean result. Checked before anything is
+# printed, because the failure mode being guarded against is a plausible number.
+marker="${XDG_RUNTIME_DIR:-/tmp}/switchboard/lock-hold-arm"
+if [[ -r "$marker" ]]; then
+    # Parsed, not sourced: `start` is a systemd timestamp with spaces in it, and
+    # sourcing that runs "2026-08-05" as a command.
+    arm=$(sed -n 's/^arm=//p' "$marker")
+    commit=$(sed -n 's/^commit=//p' "$marker")
+    sha=$(sed -n 's/^sha=//p' "$marker")
+    start=$(sed -n 's/^start=//p' "$marker")
+    now_sha=$(sha256sum "$HOME/go/bin/switchboard" | cut -c1-16)
+    if [[ "$now_start" != "$start" || "$now_sha" != "$sha" ]]; then
+        echo "REFUSING TO REPORT — the arm changed underneath this window." >&2
+        echo >&2
+        echo "  arm:            $arm ($commit)" >&2
+        echo "  daemon started: $start   (marker)" >&2
+        echo "                  $now_start   (now)" >&2
+        echo "  binary sha:     $sha   (marker)" >&2
+        echo "                  $now_sha   (now)" >&2
+        echo >&2
+        echo "Something restarted the daemon or ran 'go install' during the window." >&2
+        echo "Other Claude sessions work in this repo and do both. The numbers for" >&2
+        echo "this window are not attributable to the arm; re-run scripts/lock-hold-arm." >&2
+        exit 1
+    fi
+    echo "arm:    $arm ($commit) sha=$sha  [marker verified]"
+else
+    echo "arm:    (no marker — started by hand; nothing verifies the binary held still)"
+fi
+
 if [[ -z "$since" ]]; then
     # ExecMainStartTimestamp is "Wed 2026-08-05 17:22:39 PDT"; journalctl wants
     # the date and time without the weekday or zone.
-    stamp=$(systemctl --user show switchboard -p ExecMainStartTimestamp --value)
-    since=$(awk '{print $2" "$3}' <<<"$stamp")
+    since=$(awk '{print $2" "$3}' <<<"$now_start")
 fi
 
 echo "window: since $since ${until_arg[*]:-(now)}"
-echo "daemon: $(systemctl --user show switchboard -p ExecMainStartTimestamp --value)"
+echo "daemon: $now_start"
 echo "binary: $(stat -c '%y  %s bytes' "$HOME/go/bin/switchboard")"
 echo
 
