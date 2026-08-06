@@ -39,6 +39,14 @@ import (
 // jsonl mtime fresh as it works, so this only fires on genuinely stalled ones.
 const DefaultStaleCap = 30 * time.Minute
 
+// DefaultWorkflowQuietGrace is how long a workflow run with NO agent in flight
+// keeps counting as active on journal freshness alone. It bridges the
+// milliseconds-to-seconds gaps a run's script spends between fan-out waves
+// (agents all resulted, next wave not yet started) without holding a drained
+// run open for long: once the journal has been quiet this long with nothing in
+// flight, the run is over and its workflow_stop is emitted.
+const DefaultWorkflowQuietGrace = 90 * time.Second
+
 // sessionState is the durable per-session bookkeeping carried across reconcile
 // ticks. Keyed by session-id (NOT pid) so a daemon restart or `claude --resume`
 // — new pid, same session-id, same subagents/ dir — reuses it after re-seeding.
@@ -49,34 +57,67 @@ type sessionState struct {
 	stopped    map[string]bool // agent_id -> stop event already emitted
 	resultDone map[string]bool // tool_use_id -> its tool_result landed (cursor cross-check)
 	background map[string]bool // tool_use_id -> run_in_background (cursor; for timeline tagging)
+
+	// Workflow runs (subagents/workflows/wf_*/): one cursor per run, plus the
+	// start/stop already-emitted sets seeded from history so a restart mid-run
+	// re-emits neither the run's workflow_start nor (via spawned/stopped above)
+	// its agents' events.
+	workflows   map[string]*workflowCursor // run_id -> journal cursor + seen agents
+	wfAnnounced map[string]bool            // run_id -> workflow_start already emitted
+	wfEnded     map[string]bool            // run_id -> workflow_stop already emitted
 }
 
 func newSessionState() *sessionState {
 	return &sessionState{
-		spawned:    map[string]bool{},
-		stopped:    map[string]bool{},
-		resultDone: map[string]bool{},
-		background: map[string]bool{},
+		spawned:     map[string]bool{},
+		stopped:     map[string]bool{},
+		resultDone:  map[string]bool{},
+		background:  map[string]bool{},
+		workflows:   map[string]*workflowCursor{},
+		wfAnnounced: map[string]bool{},
+		wfEnded:     map[string]bool{},
 	}
+}
+
+// workflowCursor is the durable per-run bookkeeping: a byte cursor into the
+// run's journal.jsonl plus the agent sets it has yielded. The journal is the
+// authoritative ledger (started/result per agent — workflow agents fire no
+// hooks and no parent tool_use pairs them), so on first sight of a run the
+// cursor reads it from offset 0; the session-wide spawned/stopped seen-sets
+// keep that re-read idempotent across daemon restarts.
+type workflowCursor struct {
+	offset   int64
+	name     string          // workflow name from the persisted script; sticky once resolved
+	started  map[string]bool // agent_id -> journal `started` seen
+	resulted map[string]bool // agent_id -> journal `result` seen (authoritative completion)
+	closed   map[string]bool // agent_id -> force-closed as stale (a killed run's orphan)
 }
 
 // Observer holds the per-session cursor + seen-set for every tracked session.
 type Observer struct {
-	mu       sync.Mutex
-	dir      string // history dir, for first-sight seeding via PriorSubagentState
-	staleCap time.Duration
-	sessions map[string]*sessionState // keyed by session-id
+	mu         sync.Mutex
+	dir        string // history dir, for first-sight seeding via PriorSubagentState
+	staleCap   time.Duration
+	quietGrace time.Duration // workflow quiet window (DefaultWorkflowQuietGrace)
+	sessions   map[string]*sessionState // keyed by session-id
 }
 
 // NewObserver builds an Observer that seeds from the history log at historyDir.
 func NewObserver(historyDir string) *Observer {
-	return &Observer{dir: historyDir, staleCap: DefaultStaleCap, sessions: map[string]*sessionState{}}
+	return &Observer{dir: historyDir, staleCap: DefaultStaleCap, quietGrace: DefaultWorkflowQuietGrace, sessions: map[string]*sessionState{}}
 }
 
 // SetStaleCap overrides the force-close threshold (tuning/test hook).
 func (o *Observer) SetStaleCap(d time.Duration) {
 	o.mu.Lock()
 	o.staleCap = d
+	o.mu.Unlock()
+}
+
+// SetWorkflowQuietGrace overrides the workflow quiet window (tuning/test hook).
+func (o *Observer) SetWorkflowQuietGrace(d time.Duration) {
+	o.mu.Lock()
+	o.quietGrace = d
 	o.mu.Unlock()
 }
 
@@ -104,6 +145,11 @@ func (o *Observer) Reconcile(sess *state.Session, c *state.AgentInfo, now time.T
 		// so there is no need to re-read the whole transcript on every restart.
 		if sp, st, err := history.PriorSubagentState(o.dir, c.SessionID); err == nil {
 			ss.spawned, ss.stopped = sp, st
+		}
+		// Same guard for workflow runs: their dirs are never deleted either, so a
+		// restart re-sights every historical run and must not re-announce it.
+		if ws, we, err := history.PriorWorkflowState(o.dir, c.SessionID); err == nil {
+			ss.wfAnnounced, ss.wfEnded = ws, we
 		}
 		ss.offset = fileSize(c.Transcript)
 		ss.seeded = true
@@ -179,8 +225,195 @@ func (o *Observer) Reconcile(sess *state.Session, c *state.AgentInfo, now time.T
 			inflight++
 		}
 	}
+	// 3) Workflow runs (subagents/workflows/wf_*/): the fan-outs the flat scan
+	// above cannot see. Their agents are spawnDepth-1 children, so they count
+	// toward the same in-flight total — an idle main thread with a workflow
+	// running reads delegating (green) exactly like a hand-launched fanout.
+	events = append(events, o.reconcileWorkflowsLocked(sess, c, ss, now, &inflight)...)
 	c.InFlightSubagents = inflight
 	return events
+}
+
+// reconcileWorkflowsLocked brings the per-run workflow cursors up to date,
+// adds each active run's in-flight agents to *inflight, refreshes
+// c.Workflows (the wire summary renderers annotate the green chip with), and
+// returns the workflow_start/stop and per-agent subagent_spawn/stop events to
+// record. Caller holds o.mu.
+//
+// Per-agent completion is the run's JOURNAL (`result` event), never the agent
+// transcript's last line: a workflow agent that returns via structured output
+// ends its jsonl with a user tool_result, not an assistant end_turn, so the
+// flat-dir Done detection would hold it in flight forever. A killed run's
+// orphans (journal `started` with no `result`, transcript gone quiet) are
+// force-closed by the same staleCap as stalled flat-dir subagents.
+func (o *Observer) reconcileWorkflowsLocked(sess *state.Session, c *state.AgentInfo, ss *sessionState, now time.Time, inflight *int) []history.Event {
+	runs, err := transcript.WorkflowRunsForTranscript(c.Transcript)
+	if err != nil {
+		return nil // leave the last-known Workflows rather than guess
+	}
+	var events []history.Event
+	var statuses []state.WorkflowStatus
+	for _, run := range runs {
+		wc := ss.workflows[run.RunID]
+		if wc == nil {
+			wc = &workflowCursor{
+				name:     run.Name,
+				started:  map[string]bool{},
+				resulted: map[string]bool{},
+				closed:   map[string]bool{},
+			}
+			ss.workflows[run.RunID] = wc
+		}
+		if run.Name != "" {
+			wc.name = run.Name
+		}
+
+		// Advance the journal cursor. A missing journal (a just-launched run that
+		// has not started its first agent) is "nothing yet", not an error state.
+		newStarted, newResulted, newOff, jerr := transcript.WorkflowJournalSince(run.Journal, wc.offset)
+		if jerr == nil {
+			wc.offset = newOff
+		}
+		for _, id := range newStarted {
+			wc.started[id] = true
+		}
+		for _, id := range newResulted {
+			wc.resulted[id] = true
+		}
+
+		// In-flight = started − resulted − stale-closed. Staleness reads the
+		// agent's own transcript mtime (its activity heartbeat), falling back to
+		// the journal's when the transcript never appeared, so a killed run's
+		// orphans age out rather than pinning the count (journals record no
+		// terminal event, and several historical runs sit at started > resulted
+		// forever).
+		running := 0
+		for id := range wc.started {
+			if wc.resulted[id] || wc.closed[id] {
+				continue
+			}
+			if mt, ok := workflowAgentMtime(run, id); ok && now.Sub(mt) > o.staleCap {
+				wc.closed[id] = true
+				continue
+			}
+			running++
+		}
+
+		// Active = agents in flight, or a journal still fresh (bridging the
+		// between-waves instant where everything has resulted and the next wave
+		// has not started). A drained run goes inactive once the journal has been
+		// quiet past the grace.
+		active := running > 0
+		if !active {
+			if mt, ok := statMtime(run.Journal); ok && now.Sub(mt) <= o.quietGrace {
+				active = true
+			} else if !ok {
+				// No journal yet: a run dir that JUST appeared is a launching
+				// workflow; one long dead (daemon-start backfill) is not.
+				if dt, dok := statMtime(run.Dir); dok && now.Sub(dt) <= o.quietGrace {
+					active = true
+				}
+			}
+		}
+
+		// The run's own bracket events. workflow_start precedes its agents'
+		// spawns in the log; a run re-activated after a stop (journal grew again)
+		// opens a fresh start/stop episode.
+		if active && (!ss.wfAnnounced[run.RunID] || ss.wfEnded[run.RunID]) {
+			ss.wfAnnounced[run.RunID] = true
+			ss.wfEnded[run.RunID] = false
+			events = append(events, o.workflowEvent(history.EventWorkflowStart, sess, c, run.RunID, wc.name, now))
+		}
+
+		// Per-agent spawn/stop, deduped by the session-wide seen-sets (a restart
+		// re-reads the journal from 0; the seeded sets keep it idempotent).
+		for _, id := range newStarted {
+			if id == "" || ss.spawned[id] {
+				continue
+			}
+			ss.spawned[id] = true
+			s := transcript.Subagent{AgentID: id, AgentType: transcript.WorkflowAgentType, SpawnDepth: 1}
+			if mt, ok := workflowAgentMtime(run, id); ok {
+				s.ModTime = mt
+			}
+			ev := o.spawnEvent(sess, c, s, now, false)
+			ev.WorkflowRunID = run.RunID
+			events = append(events, ev)
+		}
+		for _, id := range newResulted {
+			if id == "" || ss.stopped[id] {
+				continue
+			}
+			ss.stopped[id] = true
+			ev := o.stopEvent(sess, c, transcript.Subagent{AgentID: id, AgentType: transcript.WorkflowAgentType}, now)
+			ev.WorkflowRunID = run.RunID
+			events = append(events, ev)
+		}
+		for id := range wc.closed {
+			if ss.stopped[id] {
+				continue
+			}
+			ss.stopped[id] = true
+			ev := o.stopEvent(sess, c, transcript.Subagent{AgentID: id, AgentType: transcript.WorkflowAgentType}, now)
+			ev.WorkflowRunID = run.RunID
+			events = append(events, ev)
+		}
+
+		if !active {
+			if ss.wfAnnounced[run.RunID] && !ss.wfEnded[run.RunID] {
+				ss.wfEnded[run.RunID] = true
+				events = append(events, o.workflowEvent(history.EventWorkflowStop, sess, c, run.RunID, wc.name, now))
+			}
+			continue
+		}
+
+		*inflight += running
+		statuses = append(statuses, state.WorkflowStatus{
+			RunID:         run.RunID,
+			Name:          wc.name,
+			AgentsStarted: len(wc.started),
+			AgentsDone:    len(wc.resulted),
+			InFlight:      running,
+		})
+	}
+	// statuses follows runs, which ReadDir yields in name order — already the
+	// sorted-by-RunID contract state.AgentInfo.Workflows requires. nil when no
+	// run is active, so the wire field omits cleanly.
+	c.Workflows = statuses
+	return events
+}
+
+// workflowEvent builds a workflow_start/stop bracket event. The workflow's
+// name rides in Label (scrubbed at the minimal tier — it names your work); the
+// run id is the minimal-safe pairing key.
+func (o *Observer) workflowEvent(evType string, sess *state.Session, c *state.AgentInfo, runID, name string, now time.Time) history.Event {
+	return history.Event{
+		Ts: now, Type: evType,
+		SessionID: c.SessionID, PID: sess.PID, Agent: sess.Agent, CWD: sess.CWD,
+		WorkflowRunID: runID, Label: name,
+	}
+}
+
+// workflowAgentMtime is the activity heartbeat for one workflow agent: its own
+// transcript's mtime, else the run journal's (an agent whose jsonl never
+// appeared can only be as fresh as the journal that announced it).
+func workflowAgentMtime(run transcript.WorkflowRun, agentID string) (time.Time, bool) {
+	if mt, ok := statMtime(run.AgentTranscript(agentID)); ok {
+		return mt, true
+	}
+	return statMtime(run.Journal)
+}
+
+// statMtime is a path's mtime, or false when it cannot be stat-ed.
+func statMtime(path string) (time.Time, bool) {
+	if path == "" {
+		return time.Time{}, false
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return fi.ModTime(), true
 }
 
 // Prune drops per-session state for session-ids no longer live, bounding the map
