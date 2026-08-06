@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -457,11 +458,29 @@ type Broadcast struct {
 }
 
 type Store struct {
-	path        string
-	mu          sync.RWMutex
+	path string
+	// mu guards the mutable state below. It is a WRITERS-ONLY lock now: Snapshot
+	// does not take it, so nothing a user can feel — a waybar subscriber, a hook
+	// RPC, a chip click — ever queues behind an Apply.
+	//
+	// Deliberately a plain Mutex rather than an RWMutex, so that stays true by
+	// construction: there is no RLock left to reach for, and a future reader has to
+	// go through published. The read side's cost was never the problem (Snapshot
+	// benchmarks at 0.8 µs); the problem was that it shared a lock with a writer
+	// that could hold for 1.81 s.
+	mu          sync.Mutex
 	sessions    map[int]*Session
 	subscribers map[chan Broadcast]struct{}
 	caps        *Capabilities
+	// published is the snapshot every reader sees, installed by whichever writer
+	// last finished. Loading it never blocks, whatever a writer is doing, so a slow
+	// write can only ever delay the next WRITE.
+	//
+	// It is never nil: New publishes before the store escapes, and every writer
+	// republishes before unlocking. Snapshot dereferences it without a check
+	// precisely so that a path which forgets to publish crashes loudly in a test
+	// rather than serving a silently frozen view in production.
+	published atomic.Pointer[Snapshot]
 	// publishedKey is snapshotChangeKey of the last snapshot Apply decided to
 	// publish — the reference the change check compares against. nil before the
 	// first publish (and after a failed encode or a failed persist), which compares
@@ -475,18 +494,58 @@ type Store struct {
 }
 
 func New(statePath string) *Store {
-	return &Store{
+	s := &Store{
 		path:        statePath,
 		sessions:    make(map[int]*Session),
 		subscribers: make(map[chan Broadcast]struct{}),
 	}
+	// The cold start. Readers load published without locking, so a store nothing
+	// has written to yet must already hold something loadable — and the first
+	// reader is real, not hypothetical: rpc.subscribe hands a brand-new connection
+	// its own full snapshot on connect, and a bar can attach before the first
+	// reconcile tick fires.
+	//
+	// Built by snapshotLocked rather than written out as a literal, so the empty
+	// snapshot is exactly the one this store served for the same state before the
+	// swap: `sessions: []`, never `sessions: null`. No lock is taken because
+	// nothing else can see s yet.
+	s.publishLocked(s.snapshotLocked())
+	return s
+}
+
+// publishLocked installs the snapshot every subsequent reader will see. The
+// caller holds s.mu — publishing is the last thing a writer does before it
+// unlocks, so the visible state advances in mutation order and no reader can
+// observe a snapshot older than one an earlier writer already published.
+//
+// It takes snap BY VALUE and stores the address of that copy. The pointer has to
+// be to a snapshot nobody will write to again, which a parameter copy guarantees
+// for free; storing &someLocal the caller still holds would hand every reader a
+// live variable.
+//
+// Every writer must call this before unlocking. There are four: Apply, New,
+// SetCapabilities and Load. The two that bypass Apply are the ones easy to miss —
+// see their doc comments for what breaks.
+func (s *Store) publishLocked(snap Snapshot) {
+	s.published.Store(&snap)
 }
 
 // SetCapabilities records the detected backend stack. It is included in every
-// subsequent snapshot. Set once at daemon startup, before serving.
+// subsequent snapshot.
+//
+// It republishes before unlocking, and that is not optional. This is a writer
+// that bypasses Apply, so nothing else installs its change — and the comment this
+// replaced ("set once at daemon startup, before serving") is no longer true:
+// reconcileOnce calls it on EVERY tick, because the terminal locator
+// self-redetects (detect.NewAuto) so that a terminal which came up after the
+// daemon can flip terminal/navigate off their boot-race "none" values without a
+// restart. Skip the republish and the capabilities block of state.json silently
+// freezes at whatever that boot race produced, for as long as nothing else
+// changes.
 func (s *Store) SetCapabilities(c Capabilities) {
 	s.mu.Lock()
 	s.caps = &c
+	s.publishLocked(s.snapshotLocked())
 	s.mu.Unlock()
 }
 
@@ -563,6 +622,13 @@ func (s *Store) Apply(fn func(map[int]*Session)) {
 	fn(s.sessions)
 	snap := s.snapshotLocked()
 	gen, changed := s.adoptPublishedLocked(snap)
+	// UNCONDITIONAL, unlike the broadcast and the persist below. The snapshot is
+	// already built (adoptPublishedLocked needs one for its change key) and the
+	// install is a single atomic pointer store, so gating it buys nothing — while
+	// costing the one thing readers cannot recompute: gate it on `changed` and a
+	// reader's updated_at freezes on an idle box, which is precisely the field
+	// whose job is to say when the state they are holding was current.
+	s.publishLocked(snap)
 	if lockHoldWarn > 0 {
 		if held := time.Since(heldFrom); held > lockHoldWarn {
 			// Deliberately still under the lock: this reports the hold, and a hold
@@ -697,13 +763,37 @@ func snapshotChangeKey(snap Snapshot) []byte {
 	return key
 }
 
-// Snapshot returns a deep-ish copy of current state. Values are copied; the
-// pointer fields (Wezterm/Hyprland/Claude) are shared — fine for read-only
-// consumers.
+// Snapshot returns the last state a writer published. It takes NO LOCK and never
+// blocks, whatever a writer is doing: a slow Apply can delay the next WRITE and
+// nothing else. That is the entire point of the change that introduced it — the
+// callers here are every waybar subscriber, every hook RPC and every
+// `switchboard-ctl focus`, so before it, a 1.81 s Apply froze the chip click the
+// user was waiting on for 1.81 s.
+//
+// ⚠ Treat the result as IMMUTABLE. Every reader holds this same []Session backing
+// array and the same *AgentInfo pointers — extending to all readers the contract
+// Broadcast.JSON already states for all subscribers ("every subscriber holds this
+// same backing array"). One reader that writes through its copy corrupts every
+// other reader, including ones in other goroutines mid-encode. Copy anything you
+// intend to change. Note that a *Session obtained from this slice (rpc.pickSession
+// hands one out) points INTO that shared array.
+//
+// How far the damage can reach, stated exactly, because the two halves differ:
+//
+//   - The Claude/Codex blocks are enrichForWire COPIES, so scribbling on one stops
+//     at the wire projection and cannot reach the session the next Apply reconciles.
+//   - Wezterm/Hyprland are NOT copies. They are the daemon's live pointers, exactly
+//     as they were before this change (the doc this replaced said so: "the pointer
+//     fields are shared"), and mapping.Reconcile writes their fields in place under
+//     the lock. Reading them off a snapshot is what every caller does today and is
+//     the only thing they may do.
+//
+// Staleness is bounded by the inter-write interval, not by the tick — hooks write
+// too. Every sampler in the reconcile tick was already written against a
+// one-Apply-stale view (that is what usableFor and freshFor exist for), so this
+// hands them the guarantee they were already coded against.
 func (s *Store) Snapshot() Snapshot {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.snapshotLocked()
+	return *s.published.Load()
 }
 
 func (s *Store) snapshotLocked() Snapshot {
@@ -739,6 +829,26 @@ func (s *Store) snapshotLocked() Snapshot {
 // Both are projections and nothing else: they are recomputed here on every
 // snapshot, so a stale value on the live block (Load leaves one behind until the
 // hydrate consumes it) can never reach the wire. nil in, nil out.
+//
+// ⚠ `cp := *info` is a SHALLOW copy, so every reference-typed field it does not
+// overwrite still aliases the live block. Snapshot's readers therefore share these
+// with the daemon itself, and the audit has to be redone whenever a field is added
+// here. As of now:
+//
+//   - Workflows ([]WorkflowStatus) — aliased. Safe only because
+//     fanout.applyWorkflowsLocked assigns a freshly built slice (c.Workflows =
+//     statuses) and never writes an element in place. A future in-place update
+//     would be a live-vs-reader data race with no test to catch it.
+//   - Pending (map, json:"-") — aliased. Same argument, weaker: SetPending and
+//     DropPending DO mutate it in place, so a reader that ranges it concurrently
+//     with a hook races. Only startup's hydratePendingVerdicts reads it off a
+//     snapshot, and that runs before the reconcile loop exists. This predates the
+//     publish-and-swap change, which neither introduced nor widened it.
+//   - PendingWriters, StatusSinceWire — NOT aliased; both are overwritten above
+//     with values built here, which is what makes them safe to hand out.
+//
+// Session's own Wezterm/Hyprland pointers are outside this function and are
+// aliased too; see Snapshot.
 func enrichForWire(info *AgentInfo) *AgentInfo {
 	if info == nil {
 		return nil
@@ -805,9 +915,14 @@ func (s *Store) Subscribe() (<-chan Broadcast, func()) {
 func (s *Store) broadcast(snap Snapshot) {
 	// Peek the subscriber count before paying for the encode. A daemon with no bar
 	// attached — headless box, bar mid-restart — should not serialize into the void.
-	s.mu.RLock()
+	// Lock, not RLock: mu is a plain Mutex now that readers do not share it. Both
+	// holds here are a map length and a loop of non-blocking sends over a handful
+	// of subscribers, so nothing is lost by excluding the other broadcaster — and
+	// the thing that used to make an exclusive hold here expensive, a reader
+	// queueing behind it, no longer exists.
+	s.mu.Lock()
 	subscribers := len(s.subscribers)
-	s.mu.RUnlock()
+	s.mu.Unlock()
 	if subscribers == 0 {
 		return
 	}
@@ -826,8 +941,8 @@ func (s *Store) broadcast(snap Snapshot) {
 		fmt.Fprintf(os.Stderr, "state: broadcast encode failed: %v\n", err)
 	}
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for ch := range s.subscribers {
 		select {
 		case ch <- b:
@@ -910,6 +1025,13 @@ func (s *Store) Load() error {
 		hydratePendingWriters(sess.Codex)
 		s.sessions[sess.PID] = &sess
 	}
+	// The other writer that bypasses Apply, and the one whose reader is closest.
+	// dropStaleSessions runs on the very next statement of the daemon's startup,
+	// and its pre-lock hydratePendingVerdicts call reads store.Snapshot() to decide
+	// which persisted permission prompts survived the downtime. Without this, that
+	// read sees the empty snapshot New published: every hydrated prompt goes
+	// unfalsified and every hydrated red stays red on evidence nobody looked for.
+	s.publishLocked(s.snapshotLocked())
 	s.mu.Unlock()
 	return nil
 }
