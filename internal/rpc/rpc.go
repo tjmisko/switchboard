@@ -749,9 +749,10 @@ func pendingEntryFor(info *state.AgentInfo, writer string) (state.PendingPrompt,
 // writer that raised it (plan §3.3, docs/claude-code-hook-schema.md §2).
 //
 //	writer mismatch (agent_id owns no prompt)  → HOLD, no transcript read
+//	unidentified writer, teammates in flight   → never at hook speed; the transcript decides
 //	writer + tool_name + input hash all match  → CLEAR at hook speed
 //	writer + tool_name, hashes differ          → fall through to the transcript
-//	writer + tool_name, no hash on either side → CLEAR, unless the T2 floor applies
+//	writer + tool_name, no hash on either side → CLEAR
 //	anything else                              → the writer's OWN transcript decides
 //
 // ⚠ Why a hash MISMATCH does not hold red on its own. PostToolUse reports
@@ -771,10 +772,28 @@ func pendingEntryFor(info *state.AgentInfo, writer string) (state.PendingPrompt,
 // one writer — rather than to the transcript, which would strand every no-arg tool
 // call and every pre-T6 ctl on the slow path.
 //
-// ⚠ T2's guard survives as the FLOOR for the unidentifiable writer: an empty
-// agent_id is "main thread" AND "a hook that carried no id", so with subagents in
-// flight it may never clear on tool NAME alone — that is the 12:38:21 lost RED
-// verbatim. A hash match is not name alone and still clears; fail closed, never open.
+// ⚠ T2's guard survives as the FLOOR for the unidentifiable writer, and it OUTRANKS
+// the correlator (T21). An empty agent_id is "main thread" AND "a hook that carried
+// no id", so with subagents in flight NO hook-speed match may clear it — not tool
+// name, and not an input hash either.
+//
+// T7 exempted a hash match here, reasoning that a name AND a hash collision needs
+// "two independent failures to coincide". They are not independent. The hash is taken
+// over tool_input ALONE (cmd/switchboard-ctl.hashToolInput — no cwd, no session, no
+// writer), so it says WHICH CALL, never WHO RAN IT: it is a second reading of the
+// same axis agent_id already covers, and it becomes load-bearing precisely when
+// agent_id has told us nothing. That degraded case — agent_id absent on tool events —
+// is exactly what plan T1 has not yet ruled out (hook-schema §4, confidence medium).
+// And a byte-identical same-tool call from a teammate is ordinary under fanout, not
+// exotic: five agents in five worktrees run one `go build ./...`, and a command
+// pre-approved under one worktree's permission root while it prompts under another
+// collides with no human having answered anything. That is the 12:38:21 lost RED with
+// one extra step.
+//
+// The price is one reconcile tick — ≤5s, §4's own P2 budget, and only when the writer
+// is unidentifiable AND teammates are live; an identified writer's fast path is
+// untouched. A missed RED is the worst error there is (§4.1) and a slow-but-correct
+// clear the cheapest. Fail closed, never open.
 //
 // ⚠ Do NOT relax matching to agent_id alone (plan §9.6 trap 2). A hydrated entry has
 // Tool == "", so the `req.ToolName != ""` guard makes it unmatchable and it resolves
@@ -805,17 +824,19 @@ func (s *Server) clearsPermission(info *state.AgentInfo, req Request) (clear boo
 	hashKnown := entry.InputHash != "" && req.ToolInputHash != ""
 	hashMatch := hashKnown && entry.InputHash == req.ToolInputHash
 	hashMismatch := hashKnown && entry.InputHash != req.ToolInputHash
-	// The T2 floor: nothing identifies this writer, so a tool-KIND match is a
-	// teammate collision waiting to happen while any teammate can produce one.
+	// The T2 floor: nothing identifies this writer, so ANY correlator match — tool
+	// KIND or input hash, neither of which names a writer — is a teammate collision
+	// waiting to happen while any teammate can produce one.
 	unidentified := writer == "" && info.InFlightSubagents > 0
 
 	switch {
+	case nameMatch && unidentified, nameMatch && hashMismatch:
+		// Unattributable with teammates live (the floor OUTRANKS the correlator —
+		// T21), or ambiguous (input rewritten on approval vs. a sibling call). Either
+		// way the transcript below decides.
 	case nameMatch && hashMatch:
 		return true, writer, statustune.RuleApproveToolMatch,
 			fmt.Sprintf("%s completed %s, input %s — the approved call", writerLabel(writer), req.ToolName, req.ToolInputHash)
-	case nameMatch && hashMismatch, nameMatch && unidentified:
-		// Ambiguous (input rewritten on approval vs. a sibling call), or unattributable
-		// with teammates live. Either way the transcript below decides.
 	case nameMatch:
 		return true, writer, statustune.RuleApproveToolMatch,
 			fmt.Sprintf("%s completed %s (no input signal on either event)", writerLabel(writer), req.ToolName)
