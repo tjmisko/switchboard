@@ -128,6 +128,12 @@ func reconcileFixture(t *testing.T, sessionCount int, opts ...fixtureOption) (*s
 // reports the longest a reader was blocked. Those readers stand in for what
 // actually queues behind this lock in production: every waybar subscriber, every
 // hook RPC from a live session, and `switchboard-ctl focus` — the chip click.
+//
+// ⚠ It answers ONE question now, and it is not "how long was the lock held".
+// After publish-and-swap Snapshot() is an atomic pointer load, so this reports ~0
+// for every workload BY CONSTRUCTION and any budget written against it passes
+// vacuously. Its one live use is TestShouldNotBlockAReaderWhileAWriterHoldsTheLock,
+// where ~0 IS the assertion. To budget a lock hold, use measureWorstWriterWait.
 func measureWorstReaderWait(store *state.Store, work func()) time.Duration {
 	stop := make(chan struct{})
 	var mu sync.Mutex
@@ -422,18 +428,32 @@ func TestShouldEnumerateTheTerminalOncePerTickWhateverTheSessionCount(t *testing
 	}
 }
 
+// The two enumeration budgets below budget the WRITER side, for the same reason
+// TestShouldNotHoldTheStoreLockAcrossTheFanoutSeed does: publish-and-swap took
+// readers off the lock entirely, so the number measureWorstReaderWait reports is
+// ~0 whatever the tick holds the lock across. Both of these were reader-side
+// until that landed, and both went vacuous the moment it did — proven by moving
+// enumerateForResolve back inside the tick's store.Apply, the exact pre-#57
+// defect the first one is named for, and watching it still PASS. On the writer
+// probe the same mutation fails at ~299ms against a 100ms limit.
+//
+// This is the second instrument in this file to be hollowed out by that change
+// (see locateOnlyLocator.Locate for the first). The rule the two share: after
+// publish-and-swap, ONLY a writer can observe the store lock, so any assertion
+// about what a lock hold costs has to be phrased as a competing write.
+
 func TestShouldNotHoldTheStoreLockAcrossTerminalEnumeration(t *testing.T) {
 	store, _, _, tick := reconcileFixture(t, 8)
 
-	got := measureWorstReaderWait(store, tick)
+	got := measureWorstWriterWait(store, tick)
 
-	// Generous: the assertion that matters is that a reader is not blocked for
+	// Generous: the assertion that matters is that the lock is not held for
 	// anything like the enumeration's duration. Before the hoist this test would
 	// have measured roughly 8*enumDelay, since every session's enumeration
 	// happened inside store.Apply.
 	limit := enumDelay / 3
 	if got > limit {
-		t.Errorf("a store reader blocked for %v during a tick whose enumeration takes %v; "+
+		t.Errorf("a competing write waited %v during a tick whose enumeration takes %v; "+
 			"want under %v — the enumeration is being held under the lock again", got, enumDelay, limit)
 	}
 }
@@ -441,7 +461,7 @@ func TestShouldNotHoldTheStoreLockAcrossTerminalEnumeration(t *testing.T) {
 func TestShouldNotHoldTheStoreLockAcrossEnumerationOnTheWMLayoutPath(t *testing.T) {
 	store, loc, resolver, _ := reconcileFixture(t, 8)
 
-	got := measureWorstReaderWait(store, func() {
+	got := measureWorstWriterWait(store, func() {
 		reresolveAll(context.Background(), store, resolver, nil)
 	})
 
@@ -452,7 +472,7 @@ func TestShouldNotHoldTheStoreLockAcrossEnumerationOnTheWMLayoutPath(t *testing.
 	// same rule, so both are pinned.
 	limit := enumDelay / 3
 	if got > limit {
-		t.Errorf("a store reader blocked for %v during a layout re-resolve whose enumeration "+
+		t.Errorf("a competing write waited %v during a layout re-resolve whose enumeration "+
 			"takes %v; want under %v", got, enumDelay, limit)
 	}
 	if snapshots, locates := loc.counts(); snapshots != 1 || locates != 0 {
