@@ -369,6 +369,21 @@ func withSlowFanoutSeed(seed *slowSeed) fixtureOption {
 // reader side went vacuous the moment readers stopped taking the lock. Post
 // publish-and-swap the assertion reads "the tick's Apply is short", which is still
 // exactly the invariant: the seed belongs in Prime, before the lock.
+//
+// WHAT THIS BUDGET DOES AND DOES NOT CATCH. It is agnostic about which function
+// spent the time, but only ABOVE THE BUDGET — a fraction of the injected delay,
+// so ~8 ms here. The injected delay is the HISTORY ARCHIVE alone. The other read
+// applyWorkflowsLocked could regrow, the workflow run-dir scan
+// (transcript.WorkflowRunsForTranscript), costs ~0 in this fixture: no session
+// here has a subagents/workflows dir, so the scan is one ReadDir that returns
+// ErrNotExist. Adding that call back into applyWorkflowsLocked and discarding the
+// result leaves this test passing 3/3 — checked, not assumed. What catches THAT
+// is internal/fanout's
+// TestReconcileFrom_shouldApplyWorkflowsFromTheSampleWhenTheRunDirIsGone, which
+// takes the dir away and requires the answer to come out anyway, so it sees a
+// re-read whatever the read costs. The two are complements: this one is blind to
+// cheap reads, that one is blind to reads whose result is thrown away. Issue #64
+// tracks that scan growing without bound, which is when it would stop being cheap.
 func TestShouldNotHoldTheStoreLockAcrossTheFanoutSeed(t *testing.T) {
 	var seed slowSeed
 	store, _, _, tick := reconcileFixture(t, seedArchiveSessions, withSlowFanoutSeed(&seed))

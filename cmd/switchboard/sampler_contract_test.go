@@ -17,16 +17,36 @@ import (
 	"github.com/tjmisko/switchboard/internal/testsupport"
 )
 
-// This file registers every pre-lock reader of the reconcile tick in
-// conformance.RunSamplerContract. One registration per sampler in reconcileOnce,
-// in the order the tick runs them:
+// This file registers every sample* reader of the reconcile tick in
+// conformance.RunSamplerContract. One registration each, in the order
+// reconcileOnce runs them:
 //
 //	sampleMemory   sampleFanout   sampleProc   sampleLabels   sampleUsage   sampleSignals
 //
 // Adding a sampler to the tick means adding it here. Nothing enforces that — see
-// the honest limit on the suite — which is why the tick budget test in
-// reconcile_lock_test.go exists alongside it, measuring the whole Apply against an
-// injected delay without caring which function spent it.
+// the honest limit on the suite — which is why the tick budget tests in
+// reconcile_lock_test.go exist alongside it, measuring the whole Apply against an
+// injected delay without caring which function spent it. Read that claim with the
+// bound stated on TestShouldNotHoldTheStoreLockAcrossTheFanoutSeed: a budget is a
+// fraction of an injected delay, so it catches an unregistered reader only once
+// that reader is EXPENSIVE. Cheap ones are this suite's job, and only a
+// registered one is covered.
+//
+// The tick has two more pre-lock reads that are NOT sample* and are deliberately
+// not registered here, stated so the boundary is not mistaken for an oversight:
+//
+//   - enumerateForResolve, consumed by resolver.ReconcileFrom under the lock. Its
+//     no-I/O property is pinned at the source, in internal/mapping, by
+//     explodingLocator/explodingManager — fakes that fail the test if ReconcileFrom
+//     touches the terminal or the WM at all. That is a stronger statement than
+//     proof-by-removal, and it belongs in the package that owns the function.
+//   - manager.ActiveWindow, consumed by applyFocus. applyFocus takes the active
+//     address as a plain string and holds nothing it could re-read from, so there
+//     is no under-lock read for a contract to detect.
+//
+// A new pre-lock reader that stages a result for the Apply belongs here. One that,
+// like these two, hands the Apply an inert value can be pinned where it lives —
+// but it has to be pinned somewhere.
 
 // eventDigest renders one history event without its clocks.
 //
