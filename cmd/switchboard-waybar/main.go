@@ -192,9 +192,14 @@ func renderSlot(snap state.Snapshot, slot int, availPx float64, metrics barlayou
 		return waybarOutput{Text: "", Class: []string{"empty"}}
 	}
 	cfg := names.config()
+	// Scoped to this render and dropped with it: every session is named to compute
+	// the shared Fit budget and the tooltip resolves its own twice more, but they
+	// span only a handful of distinct project dirs. Deliberately a local — see
+	// projectname.DirCache on why it must not outlive the render.
+	dirs := &projectname.DirCache{}
 	labels := make([]string, len(snap.Sessions))
 	for i := range snap.Sessions {
-		labels[i] = cache.Chip(cfg, snap.Sessions[i])
+		labels[i] = cache.Chip(cfg, dirs, snap.Sessions[i])
 	}
 	labels = barlayout.Fit(labels, availPx, metrics)
 	s := snap.Sessions[slot]
@@ -221,7 +226,7 @@ func renderSlot(snap state.Snapshot, slot int, availPx float64, metrics barlayou
 	}
 	return waybarOutput{
 		Text:    labels[slot],
-		Tooltip: sessionTooltip(cfg, cache, s, time.Now()),
+		Tooltip: sessionTooltip(cfg, dirs, cache, s, time.Now()),
 		Class:   classes,
 		Alt:     chipClass(status),
 	}
@@ -243,13 +248,14 @@ func renderAggregate(snap state.Snapshot, names *nameConfig, cache *sblabel.Name
 		return waybarOutput{Text: "", Tooltip: "no claude sessions", Class: []string{"empty"}}
 	}
 	cfg := names.config()
+	dirs := &projectname.DirCache{} // this render only, as in renderSlot
 	var parts []string
 	for _, s := range snap.Sessions {
 		mark := ""
 		if s.Focused {
 			mark = "*"
 		}
-		parts = append(parts, mark+cache.Chip(cfg, s))
+		parts = append(parts, mark+cache.Chip(cfg, dirs, s))
 	}
 	return waybarOutput{
 		Text:  strings.Join(parts, "  "),
@@ -275,9 +281,9 @@ func sessionStatus(s state.Session) string {
 // Line 1 is the project abbreviation + a status-colored dot; line 2 is the bare
 // task name (the project prefix stripped, since the abbrev already shows it);
 // line 3 is dimmed metadata.
-func sessionTooltip(cfg projectname.Config, cache *sblabel.NameCache, s state.Session, now time.Time) string {
-	abbrev := projectname.CanonicalForDir(cfg, s.CWD)
-	task := projectname.TaskForDir(cfg, s.CWD, cache.RawName(s))
+func sessionTooltip(cfg projectname.Config, dirs *projectname.DirCache, cache *sblabel.NameCache, s state.Session, now time.Time) string {
+	abbrev := dirs.CanonicalForDir(cfg, s.CWD)
+	task := dirs.TaskForDir(cfg, s.CWD, cache.RawName(s))
 	status := sessionStatus(s)
 
 	statusText := status

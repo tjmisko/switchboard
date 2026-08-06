@@ -29,7 +29,7 @@ func TestSessionTooltipShowsStatusDuration(t *testing.T) {
 		PID: 4821, CWD: "/home/u/proj",
 		Claude: &state.ClaudeInfo{Status: "permission", StatusSinceWire: &since},
 	}
-	tip := sessionTooltip(projectname.Config{}, nil, s, now)
+	tip := sessionTooltip(projectname.Config{}, nil, nil, s, now)
 	if !strings.Contains(tip, "permission · 45s") {
 		t.Errorf("tooltip should show the permission-wait duration:\n%s", tip)
 	}
@@ -42,7 +42,7 @@ func TestSessionTooltipSuspendedShowsNoDuration(t *testing.T) {
 		PID: 4821, CWD: "/home/u/proj", Suspended: true,
 		Claude: &state.ClaudeInfo{Status: "working", StatusSinceWire: &since},
 	}
-	tip := sessionTooltip(projectname.Config{}, nil, s, now)
+	tip := sessionTooltip(projectname.Config{}, nil, nil, s, now)
 	// Suspended status (and its clock) is stale; show "suspended", not a counter.
 	if strings.Contains(tip, "5m") {
 		t.Errorf("suspended session should not show a stale duration:\n%s", tip)
@@ -193,7 +193,7 @@ func blockedSession(t *testing.T, writers []string, inflight int, names map[stri
 func TestSessionTooltipShouldNameTheBlockedTeammate(t *testing.T) {
 	s := blockedSession(t, []string{"af5bd126402ac16c7"}, 4,
 		map[string]string{"af5bd126402ac16c7": "escalate-cleanup"})
-	tip := sessionTooltip(projectname.Config{}, &sblabel.NameCache{}, s, blockedNow)
+	tip := sessionTooltip(projectname.Config{}, &projectname.DirCache{}, &sblabel.NameCache{}, s, blockedNow)
 	if !strings.Contains(tip, "permission · escalate-cleanup · 45s") {
 		t.Errorf("tooltip should name the blocked teammate:\n%s", tip)
 	}
@@ -202,7 +202,7 @@ func TestSessionTooltipShouldNameTheBlockedTeammate(t *testing.T) {
 func TestSessionTooltipShouldNameEveryWriterWhenTwoAreBlockedAtOnce(t *testing.T) {
 	s := blockedSession(t, []string{"af5bd126402ac16c7", "main"}, 2,
 		map[string]string{"af5bd126402ac16c7": "escalate-cleanup"})
-	tip := sessionTooltip(projectname.Config{}, &sblabel.NameCache{}, s, blockedNow)
+	tip := sessionTooltip(projectname.Config{}, &projectname.DirCache{}, &sblabel.NameCache{}, s, blockedNow)
 	if !strings.Contains(tip, "permission · escalate-cleanup, main · 45s") {
 		t.Errorf("tooltip should name both blocked writers:\n%s", tip)
 	}
@@ -212,7 +212,7 @@ func TestSessionTooltipShouldNameEveryWriterWhenTwoAreBlockedAtOnce(t *testing.T
 // what the red already means, so the hover stays exactly as it was.
 func TestSessionTooltipShouldLeaveASoloPermissionUnannotated(t *testing.T) {
 	s := blockedSession(t, []string{"main"}, 0, nil)
-	tip := sessionTooltip(projectname.Config{}, &sblabel.NameCache{}, s, blockedNow)
+	tip := sessionTooltip(projectname.Config{}, &projectname.DirCache{}, &sblabel.NameCache{}, s, blockedNow)
 	if !strings.Contains(tip, "permission · 45s") {
 		t.Errorf("solo permission tooltip should be status + duration only:\n%s", tip)
 	}
@@ -458,6 +458,56 @@ func BenchmarkRenderSlotCachedNames(b *testing.B) {
 	for b.Loop() {
 		_ = renderSlot(snap, 0, testAvail, testMetrics, names, labels)
 	}
+}
+
+// BenchmarkRenderSlotRealisticCwds is the emission cost with cwds that EXIST and
+// carry a .git, which is what every live session on this machine looks like.
+//
+// It exists because benchSnapshot's cwd (/home/u/Projects/Arachne) does not
+// exist, so ProjectRoot climbs to "/" — five stats — before giving up. A real
+// session sits AT its repo root and resolves in one. Sizing the projectname cost
+// off the missing-path benchmark overstates it by roughly 3x, and that number is
+// the whole argument for caching the resolution.
+func BenchmarkRenderSlotRealisticCwds(b *testing.B) {
+	snap := benchSnapshotRealistic(b)
+	names := &nameConfig{}
+	names.config()
+	labels := &sblabel.NameCache{}
+	renderSlot(snap, 0, testAvail, testMetrics, names, labels) // prime
+	b.ResetTimer()
+	for b.Loop() {
+		_ = renderSlot(snap, 0, testAvail, testMetrics, names, labels)
+	}
+}
+
+// benchSnapshotRealistic mirrors benchSnapshot but gives each session a real
+// repo root as its cwd, spread over several projects the way the live bar is.
+func benchSnapshotRealistic(b *testing.B) state.Snapshot {
+	b.Helper()
+	home := b.TempDir()
+	b.Setenv("HOME", home)
+	b.Setenv("XDG_CONFIG_HOME", b.TempDir())
+	dir := filepath.Join(home, ".claude", "sessions")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		b.Fatal(err)
+	}
+	projects := b.TempDir()
+	sessions := make([]state.Session, 13)
+	for i := range sessions {
+		pid := 7000 + i
+		// Six distinct projects over thirteen sessions, the live shape: several
+		// sessions share a repo, so a per-dir cache would see repeats.
+		cwd := filepath.Join(projects, fmt.Sprintf("proj%d", i%6))
+		if err := os.MkdirAll(filepath.Join(cwd, ".git"), 0o755); err != nil {
+			b.Fatal(err)
+		}
+		body := fmt.Sprintf(`{"pid":%d,"sessionId":"b5c7fd65-5733-4ce2-a0fa-932b91d2c02%d","cwd":%q,"startedAt":1785950796170,"kind":"interactive","name":"assess-npm-vulnerabilities","nameSource":"derived","status":"busy","updatedAt":1785957054072}`, pid, i%10, cwd)
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%d.json", pid)), []byte(body), 0o644); err != nil {
+			b.Fatal(err)
+		}
+		sessions[i] = state.Session{PID: pid, CWD: cwd, Claude: &state.ClaudeInfo{Status: "working"}}
+	}
+	return state.Snapshot{Sessions: sessions}
 }
 
 // benchSnapshot is a snapshot at this machine's usual live session count, each

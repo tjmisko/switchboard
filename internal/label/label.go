@@ -303,9 +303,14 @@ func (c *NameCache) RawName(s state.Session) string {
 	return rawName(s, c.claudeSessionName)
 }
 
-// Chip is Chip with the disk lookup memoized.
-func (c *NameCache) Chip(cfg projectname.Config, s state.Session) string {
-	return projectname.ResolveForDir(cfg, s.CWD, c.RawName(s))
+// Chip is Chip with the disk lookup memoized. dirs memoizes the other half — the
+// cwd -> project resolution — and may be nil, which resolves it uncached.
+//
+// The two caches are separate values because their lifetimes are: this one is
+// process-wide and stamp-validated, while a *projectname.DirCache is scoped to a
+// single render on purpose. See its doc comment.
+func (c *NameCache) Chip(cfg projectname.Config, dirs *projectname.DirCache, s state.Session) string {
+	return dirs.ResolveForDir(cfg, s.CWD, c.RawName(s))
 }
 
 // BlockedWriters is BlockedWriters with the per-writer meta.json lookup memoized.

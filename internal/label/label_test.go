@@ -285,11 +285,23 @@ func TestNameCache_Chip_matchesTheUncachedChip(t *testing.T) {
 	cfg := projectname.Load()
 
 	want := Chip(cfg, s)
-	c := &NameCache{}
-	for i := range 2 {
-		if got := c.Chip(cfg, s); got != want {
-			t.Errorf("call %d: cached Chip = %q, want %q", i+1, got, want)
-		}
+	// Both halves of the memoization have to be invisible in the answer: the name
+	// cache across repeat calls, and the dir cache whether it is present or nil.
+	for _, tc := range []struct {
+		name string
+		dirs *projectname.DirCache
+	}{
+		{"nil dir cache", nil},
+		{"shared dir cache", &projectname.DirCache{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &NameCache{}
+			for i := range 2 {
+				if got := c.Chip(cfg, tc.dirs, s); got != want {
+					t.Errorf("call %d: cached Chip = %q, want %q", i+1, got, want)
+				}
+			}
+		})
 	}
 }
 
