@@ -9,19 +9,25 @@ import (
 	"github.com/tjmisko/switchboard/internal/transcript"
 )
 
-// signalSample is one session's transcript reads for the two status self-heals,
-// taken before the store lock, plus the state they were taken against.
+// signalSample is one session's transcript read for selfHealStuckStatus, taken
+// before the store lock, plus the state it was taken against.
 //
-// The self-heals are the last readers left inside the Apply, and they are the
-// hottest of the lot: selfHealStuckStatus tail-reads the transcript of EVERY
-// idle-or-working session whose file has moved since the chip transitioned, which
-// during an active turn is every session, every tick.
+// That self-heal is the hottest reader the tick had: it tail-reads the transcript
+// of EVERY idle-or-working session whose file has moved since the chip
+// transitioned, which during an active turn is every session, every tick.
 //
-// They are also the most delicate code in the daemon — the H1/H7/H8/H9 timing
-// hazards and the §5 permission case table all live here — so the reads move out
-// while every decision stays exactly where it was. A sample is applied only if
-// the session still looks the way it did when the read was taken; otherwise the
-// self-heal reads inline, precisely as it always did.
+// It is also among the most delicate code in the daemon — the H1/H7/H8/H9 timing
+// hazards live here — so the read moves out while every decision stays exactly
+// where it was. A sample is applied only if the session still looks the way it did
+// when the read was taken; otherwise the self-heal reads inline, precisely as it
+// always did.
+//
+// selfHealStaleAttention is deliberately NOT sampled. T9 routes each pending
+// prompt to the transcript of the WRITER that raised it, so what needs reading is
+// not knowable until the locked map says which writers are blocked — sampling it
+// would mean a sample per (session, writer) guarded against a pending set that can
+// move between the read and the decision. Its reads stay under the lock, bounded
+// by the blocked-writer count, and are the last ones there.
 type signalSample struct {
 	// The state the reads were taken against. If any of it has moved by the time
 	// the lock is held, the sample describes a session that no longer exists in
@@ -32,35 +38,28 @@ type signalSample struct {
 	transcript  string
 	stamp       fileStamp
 
-	// selfHealStuckStatus inputs. quiescent records the cheap stat gate: nothing
-	// written since the chip transitioned, so no signal can be newer than it.
+	// quiescent records the cheap stat gate: nothing written since the chip
+	// transitioned, so no signal can be newer than it.
 	quiescent bool
 	kind      transcript.Signal
 	kindTs    time.Time
 	kindErr   bool
 
-	// selfHealStaleAttention input, taken only for a chip currently latched red.
-	resolution    transcript.ResolutionKind
-	resolutionErr bool
-	resolved      bool
-
 	valid bool
 }
 
 // freshFor reports whether this sample still describes the session in hand. The
-// guard is exact rather than approximate: both self-heals key their decisions on
+// guard is exact rather than approximate: the self-heal keys its decisions on
 // StatusSince, and a status edge landing between the sample and the lock (a hook
 // firing mid-tick) changes what the read means, not merely how fresh it is.
 //
 // The session fields alone are NOT enough, which is subtle and was got wrong the
-// first time. The thing both self-heals actually read is the transcript, and the
-// user can move it without moving any of them: answering or declining a permission
-// prompt appends to the file while Status stays "permission", StatusSince stays
-// put (nothing has released the chip — that is what the self-heal is FOR), and the
-// path is unchanged. The pre-lock window spans every sampler in the tick, so this
-// is not a narrow race. Without the stamp the sample computed before the answer
-// landed is applied after it, and the red chip stays red for another full tick;
-// the same window makes an interrupt notice miss the working→idle recovery.
+// first time. The thing the self-heal actually reads is the transcript, and it can
+// move without any of them moving — the file grows while Status and StatusSince
+// sit still, which is the normal shape of a turn in progress. The pre-lock window
+// spans every sampler in the tick, so this is not a narrow race: without the stamp,
+// an interrupt notice that lands inside it misses the working→idle recovery for a
+// full extra tick.
 //
 // So re-stamp the file here and require it unchanged. That is one os.Stat per
 // sampled session under the lock — deliberate, and cheap next to what this code
@@ -95,17 +94,27 @@ func (s fileStamp) equal(o fileStamp) bool {
 	return s.ok == o.ok && s.size == o.size && s.modTime.Equal(o.modTime)
 }
 
-// sampleSignals performs both self-heals' transcript reads for every session in
-// the tick's pre-lock snapshot, holding no store lock.
+// sampleSignals performs selfHealStuckStatus's transcript read for every session
+// in the tick's pre-lock snapshot that the self-heal could act on, holding no
+// store lock.
 //
 // The snapshot is taken by the caller and shared with every other sampler — one
 // read lock and one set of session copies per tick, and one view of the world for
 // all of them to agree on.
+//
+// Only idle and working chips are sampled, because those are the only ones
+// selfHealStuckStatus reads for; a session in any other status would pay a stat for
+// a sample nobody consumes. A chip that changes status between here and the lock
+// simply has no usable sample and is read inline, which is the same fallback a
+// status edge already triggers.
 func sampleSignals(snap state.Snapshot, tun statustune.Tuning) map[int]signalSample {
 	out := map[int]signalSample{}
 	for _, sess := range snap.Sessions {
 		c := sess.Claude
 		if c == nil || c.Transcript == "" {
+			continue
+		}
+		if c.Status != state.StatusIdle && c.Status != state.StatusWorking {
 			continue
 		}
 		out[sess.PID] = readSignals(c, tun)
@@ -124,12 +133,6 @@ func readSignals(c *state.AgentInfo, tun statustune.Tuning) signalSample {
 	// discarded. Stamping afterwards would hide exactly that write — the stamp
 	// would still match at apply time while the content predates it.
 	s.stamp = stampOf(c.Transcript)
-
-	if c.Status == state.StatusPermission {
-		kind, err := transcript.ResolveKind(c.Transcript, c.StatusSince, tun.TailBytes)
-		s.resolution, s.resolutionErr, s.resolved = kind, err != nil, true
-		return s // a red chip is never also a stuck idle/working chip
-	}
 
 	if c.Status != state.StatusIdle && c.Status != state.StatusWorking {
 		return s

@@ -207,7 +207,9 @@ func TestTimingHazards(t *testing.T) {
 			if h.hookAt != "" {
 				hookNow = mustParseTime(t, h.hookAt)
 			}
-			since := transcript.AnchorSince(atHookPath, hookNow, h.status == "working", transcript.DefaultTailBytes)
+			// Zero prev: each hazard stamps a chip that carries no earlier
+			// StatusSince, so the max(anchor, prev) floor is inert here.
+			since := transcript.AnchorSince(atHookPath, hookNow, time.Time{}, h.status == "working", transcript.DefaultTailBytes)
 			reconcileNow := hookNow.Add(h.afterHook)
 
 			// Phase 2: the transcript grows to its reconcile-time tail.

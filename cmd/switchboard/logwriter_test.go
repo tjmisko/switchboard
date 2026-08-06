@@ -15,9 +15,14 @@ import (
 // reader, hook and waybar subscriber for as long as it lasts.
 type stalledWriter struct {
 	release chan struct{}
+	entered chan struct{} // closed once the writer is actually stuck, not merely expected to be
 	mu      sync.Mutex
 	buf     bytes.Buffer
 	stalled bool
+}
+
+func newStalledWriter() *stalledWriter {
+	return &stalledWriter{release: make(chan struct{}), entered: make(chan struct{})}
 }
 
 func (w *stalledWriter) Write(p []byte) (int, error) {
@@ -26,11 +31,26 @@ func (w *stalledWriter) Write(p []byte) (int, error) {
 	w.stalled = true
 	w.mu.Unlock()
 	if first {
+		close(w.entered)
 		<-w.release
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.buf.Write(p)
+}
+
+// stall blocks until the drain goroutine is genuinely wedged inside Write. Without
+// it a test only knows it *asked* for a stalled writer — the drain may not have
+// been scheduled yet — and any assertion about drops becomes a race with the Go
+// scheduler rather than a statement about the code.
+func (w *stalledWriter) stall(t *testing.T, log *nonBlockingLog) {
+	t.Helper()
+	log.Write([]byte("the line that wedges the drain\n"))
+	select {
+	case <-w.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the drain never reached the writer")
+	}
 }
 
 func (w *stalledWriter) String() string {
@@ -40,8 +60,9 @@ func (w *stalledWriter) String() string {
 }
 
 func TestNonBlockingLogNeverBlocksItsCaller(t *testing.T) {
-	out := &stalledWriter{release: make(chan struct{})}
+	out := newStalledWriter()
 	w := newNonBlockingLog(out)
+	out.stall(t, w)
 
 	done := make(chan struct{})
 	go func() {
@@ -68,14 +89,15 @@ func TestNonBlockingLogNeverBlocksItsCaller(t *testing.T) {
 // A gap in the log must not be silent — the lines that were lost are exactly the
 // ones someone would go looking for.
 func TestNonBlockingLogReportsWhatItDropped(t *testing.T) {
-	out := &stalledWriter{release: make(chan struct{})}
+	out := newStalledWriter()
 	w := newNonBlockingLog(out)
+	out.stall(t, w)
 
 	for range logBufferLines * 2 {
 		w.Write([]byte("a log line\n"))
 	}
 	if w.dropped.Load() == 0 {
-		t.Skip("nothing dropped; the drain kept up with the burst")
+		t.Fatal("nothing dropped after overrunning the buffer against a wedged drain")
 	}
 	close(out.release)
 

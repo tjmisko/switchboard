@@ -30,7 +30,11 @@
         "transcript": "/home/tjmisko/.claude/projects/switchboard/e0b4b21f.jsonl",
         "status": "working",
         "status_since": "2026-05-28T09:01:00Z",
-        "in_flight_subagents": 2
+        "in_flight_subagents": 2,
+        "pending_writers": [
+          "af5bd126402ac16c7",
+          "main"
+        ]
       }
     },
     {

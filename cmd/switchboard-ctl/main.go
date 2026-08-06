@@ -4,6 +4,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -382,6 +384,7 @@ func cmdHook(c *rpc.Client, event, agent string) {
 	sessionID := ""
 	transcript := ""
 	toolName := ""
+	toolInputHash := ""
 	agentID := ""
 	agentType := ""
 	if body, err := io.ReadAll(os.Stdin); err == nil && len(body) > 0 {
@@ -393,6 +396,12 @@ func cmdHook(c *rpc.Client, event, agent string) {
 			// itself completes (see rpc.clearsPermission); absent on other events,
 			// which just disables that fast path.
 			ToolName string `json:"tool_name"`
+			// tool_input is present on PermissionRequest AND PostToolUse
+			// (claude-code-hook-schema.md §2), which makes it the "which call"
+			// correlator sitting between agent_id ("which writer") and tool_name
+			// ("which kind" — collides constantly). It is captured raw here only so
+			// hashToolInput can reduce it; the raw bytes never leave this function.
+			ToolInput json.RawMessage `json:"tool_input"`
 			// SubagentStart/Stop carry the subagent's identity. The wire form is
 			// snake_case (verified against the 2.1.195 binary); the camelCase
 			// fallbacks tolerate a build that reuses the dir-style key. Best-effort —
@@ -406,23 +415,83 @@ func cmdHook(c *rpc.Client, event, agent string) {
 			sessionID = payload.SessionID
 			transcript = payload.TranscriptPath
 			toolName = payload.ToolName
+			toolInputHash = hashToolInput(payload.ToolInput)
 			agentID = firstNonEmpty(payload.AgentID, payload.AgentIDAlt)
 			agentType = firstNonEmpty(payload.AgentType, payload.AgentTypeAlt)
 		}
 	}
 	_ = c.Send(rpc.Request{
-		Cmd:        "hook",
-		Event:      event,
-		PID:        pid,
-		SessionID:  sessionID,
-		Transcript: transcript,
-		ToolName:   toolName,
-		AgentID:    agentID,
-		AgentType:  agentType,
-		Agent:      agent,
+		Cmd:           "hook",
+		Event:         event,
+		PID:           pid,
+		SessionID:     sessionID,
+		Transcript:    transcript,
+		ToolName:      toolName,
+		ToolInputHash: toolInputHash,
+		AgentID:       agentID,
+		AgentType:     agentType,
+		Agent:         agent,
 	})
 	var resp rpc.Response
 	_ = c.Recv(&resp)
+}
+
+// toolInputHashLen is how much of the sha256 hex digest is forwarded. 16 hex
+// chars is 64 bits — far more than enough to tell apart the handful of tool
+// calls one writer has in flight at once, and short enough to stay readable in a
+// journal line.
+const toolInputHashLen = 16
+
+// hashToolInput reduces a hook payload's tool_input to a short, stable
+// fingerprint of *which call* it is. The daemon uses it (with agent_id and
+// tool_name) to decide whether a PostToolUse is the completion of the very call
+// a pending PermissionRequest was raised for.
+//
+// Two properties matter, and both are why this lives at the ctl edge rather than
+// in the daemon:
+//
+//   - Hash, never forward. tool_input can be large (a whole file body on Write)
+//     and can carry sensitive content. Only the digest crosses the socket, and
+//     nothing here retains the raw bytes.
+//   - Canonicalize before hashing. The same logical call must hash identically
+//     when seen via PermissionRequest and again via PostToolUse, and the raw
+//     bytes are not guaranteed to be byte-identical across the two emitters —
+//     JSON object key order is not significant, and re-serialization may reorder
+//     it. So we unmarshal into interface{} and re-marshal: encoding/json sorts
+//     map keys on marshal, which normalizes ordering (and whitespace, and string
+//     escaping) into one canonical form.
+//
+// A no-signal input yields "" rather than a hash. Absent, unparseable, null, and
+// empty container inputs all return "" — hashing them would mint a digest that
+// every other signal-less event also produces, and that false match is exactly
+// what this correlator exists to prevent. Consumers must read "" as "no signal",
+// never as "a hash that failed to match".
+func hashToolInput(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var decoded interface{}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return ""
+	}
+	switch v := decoded.(type) {
+	case nil: // literal JSON null
+		return ""
+	case map[string]interface{}:
+		if len(v) == 0 {
+			return ""
+		}
+	case []interface{}:
+		if len(v) == 0 {
+			return ""
+		}
+	}
+	canonical, err := json.Marshal(decoded)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(canonical)
+	return hex.EncodeToString(sum[:])[:toolInputHashLen]
 }
 
 // firstNonEmpty returns the first non-empty string, for tolerating snake_case vs

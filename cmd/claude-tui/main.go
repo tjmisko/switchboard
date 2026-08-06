@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/durfmt"
+	sblabel "github.com/tjmisko/switchboard/internal/label"
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
 )
@@ -41,7 +42,8 @@ func main() {
 			fmt.Fprintln(os.Stderr, "claude-tui:", err)
 			os.Exit(1)
 		}
-		fmt.Print(renderSnapshot(snap, home, false, time.Now()))
+		// One-shot: no loop to amortize a cache over, so nil (read the disk).
+		fmt.Print(renderSnapshot(snap, home, false, time.Now(), nil))
 		return
 	}
 
@@ -79,8 +81,12 @@ func runLive(ctx context.Context, socketPath, home string) {
 		fmt.Print(showCursor + altScreenLeave)
 	}()
 
+	// One cache for the process lifetime: every redraw names any blocked writer,
+	// and the meta.json behind a name is written once at spawn and never moves.
+	writers := &sblabel.NameCache{}
+
 	for ctx.Err() == nil {
-		err := streamInto(ctx, socketPath, home)
+		err := streamInto(ctx, socketPath, home, writers)
 		if ctx.Err() != nil {
 			return
 		}
@@ -95,7 +101,7 @@ func runLive(ctx context.Context, socketPath, home string) {
 }
 
 // streamInto subscribes and redraws each snapshot until the connection ends.
-func streamInto(ctx context.Context, socketPath, home string) error {
+func streamInto(ctx context.Context, socketPath, home string, writers *sblabel.NameCache) error {
 	c, err := rpc.Dial(socketPath)
 	if err != nil {
 		return err
@@ -114,7 +120,7 @@ func streamInto(ctx context.Context, socketPath, home string) error {
 			return err
 		}
 		if resp.Snapshot != nil {
-			drawFrame(renderSnapshot(*resp.Snapshot, home, true, time.Now()))
+			drawFrame(renderSnapshot(*resp.Snapshot, home, true, time.Now(), writers))
 		}
 	}
 }
@@ -162,7 +168,13 @@ func statusStyle(status string) (glyph, color string) {
 // renderSnapshot turns a snapshot into a printable frame. color toggles ANSI so
 // the -once/plain path and tests stay readable. Lines end in CRLF so the frame
 // renders correctly in a terminal's raw alt-screen.
-func renderSnapshot(snap state.Snapshot, home string, color bool, now time.Time) string {
+//
+// writers memoizes the blocked-writer name lookup behind a red row's "blocked:"
+// annotation, which would otherwise read a meta.json per blocked writer on every
+// redraw — and the live loop redraws on every snapshot. A nil *NameCache is legal
+// and simply reads the disk each time, which is what the -once path and the tests
+// want.
+func renderSnapshot(snap state.Snapshot, home string, color bool, now time.Time, writers *sblabel.NameCache) string {
 	c := func(code, s string) string {
 		if !color {
 			return s
@@ -212,9 +224,19 @@ func renderSnapshot(snap state.Snapshot, home string, color bool, now time.Time)
 				dur = "  " + d
 			}
 		}
-		fmt.Fprintf(&b, "%s %s %s %s %s%s%s\r\n",
+		// A red row says a decision is needed; with teammates running it does not
+		// say whose. Name the blocked writer(s) so the row is actionable without a
+		// trip to the pane. Last on the line, after the fixed-width columns, so it
+		// can be any length without disturbing the alignment above it — and painted
+		// in the status color rather than the trailing grey, because it is the one
+		// thing on the row the user is meant to act on.
+		blocked := ""
+		if w := writers.BlockedWriters(s); w != "" {
+			blocked = "  blocked: " + w
+		}
+		fmt.Fprintf(&b, "%s %s %s %s %s%s%s%s\r\n",
 			focus, c(gcol, glyph), label, cwd,
-			c(colGrey, fmt.Sprintf("pid %d", s.PID)), c(colGrey, ws), c(colGrey, dur))
+			c(colGrey, fmt.Sprintf("pid %d", s.PID)), c(colGrey, ws), c(colGrey, dur), c(gcol, blocked))
 	}
 	return b.String()
 }

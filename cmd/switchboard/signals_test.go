@@ -62,32 +62,36 @@ func TestSelfHealStuckStatusUsesThePreLockSample(t *testing.T) {
 	}
 }
 
-// The transcript is what both self-heals actually read, and the user can move it
-// without moving any of the session fields the guard compares. Answering a
-// permission prompt is exactly that: the file grows while Status stays
-// "permission" and StatusSince stays put — nothing has released the chip, which is
-// what the self-heal is for. A sample computed before the answer landed must not
-// be applied after it, or the red chip stays red for another whole tick.
-func TestSelfHealStaleAttentionRejectsASampleTakenBeforeTheAnswerLanded(t *testing.T) {
+// An answer that lands while the tick is doing its pre-lock sampling must be seen
+// on THAT tick, not the next one.
+//
+// This is the one property the permission self-heal gets for free by reading at
+// decision time, and it is worth pinning because an earlier revision of this branch
+// lost it: it sampled the resolution before the lock, and a decline landing in the
+// sampling window — during which Status stays "permission" and StatusSince stays
+// put, since nothing has released the chip yet — was missed for a full extra tick.
+// T9's per-writer routing put the read back at decision time for its own reasons;
+// this asserts the freshness that comes with it.
+func TestSelfHealStaleAttentionSeesAnAnswerThatLandsDuringTheTick(t *testing.T) {
 	prompt := mustParse(t, "2026-06-01T21:39:00Z")
-	// Sampled while the prompt is genuinely unanswered: no resolution in the file.
+	// The prompt is genuinely unanswered when the tick starts.
 	tpath := writeTranscript(t, tResult("2026-06-01T21:39:10Z"))
 	m := permMap(tpath, prompt)
 	sess := m[100]
 
 	store := state.New(filepath.Join(t.TempDir(), "state.json"))
 	store.Apply(func(sm map[int]*state.Session) { sm[sess.PID] = sess })
-	signals := sampleSignals(store.Snapshot(), testTune)
+	sampleSignals(store.Snapshot(), testTune) // the tick's pre-lock phase runs
 
-	// The user declines DURING the pre-lock window. Status, StatusSince and the
-	// path are all untouched — only the file moved.
+	// The user declines DURING it. Status, StatusSince and the path are all
+	// untouched — only the file moved.
 	appendTranscript(t, tpath, tInterrupt("2026-06-01T21:39:30Z"))
 
-	selfHealStaleAttention(m, prompt.Add(time.Minute), testTune, nil, signals)
+	healStale(t, m, prompt.Add(time.Minute), testTune, nil)
 
 	if got := sess.Claude.Status; got == "permission" {
 		t.Fatal("the chip is still red a full tick after the prompt was declined: " +
-			"the sample was applied even though the transcript moved under it")
+			"the decision was made against a read older than the answer")
 	}
 }
 
@@ -132,40 +136,30 @@ func TestSelfHealStuckStatusFallsBackToAnInlineReadWithoutASample(t *testing.T) 
 	}
 }
 
-// This is where the staleness guard actually earns its place, and it took a
-// failed mutation to find it.
+// A resolution belonging to a PREVIOUS prompt must never clear the red a NEW
+// prompt just raised.
 //
-// On the stuck-status path the guard looks load-bearing but is not: a sampled
-// signal that predates a new StatusSince is rejected downstream anyway by
-// `ts.After(c.StatusSince)`. The permission path has no such second line of
-// defence. ResolveKind bakes `since` INTO its answer — it returns a resolution
-// only if one landed after the reference time — and permissionExit then consumes
-// that answer without re-checking any timestamp.
-//
-// So if the chip re-latches red on a NEW prompt between the sample and the lock,
-// a stale sample carries a resolution belonging to the PREVIOUS prompt, and the
-// new red chip is cleared by evidence that has nothing to do with it. The guard
-// rejects it and the inline re-read, measured against the new StatusSince, finds
-// nothing and correctly keeps the chip red.
+// The hazard is that ResolveKind bakes `since` into its answer — it reports a
+// resolution only if one landed after the reference time — and permissionExit then
+// consumes that answer without re-checking any timestamp. So the answer is only as
+// correct as the instant it was dated against. Under T9 that instant is the
+// prompt's OWN onset (c.Pending[writer].Since, falling back to StatusSince), which
+// is what makes a chip that re-latches mid-tick immune to the earlier decline.
 func TestSelfHealStaleAttentionRejectsAResolutionBelongingToAPriorPrompt(t *testing.T) {
 	firstPrompt := mustParse(t, "2026-06-01T21:39:00Z")
-	// The user declined the FIRST prompt; that interrupt is what the sample sees.
+	// The user declined the FIRST prompt.
 	m := permMap(writeTranscript(t, tInterrupt("2026-06-01T21:39:30Z")), firstPrompt)
 	sess := m[100]
 
-	store := state.New(filepath.Join(t.TempDir(), "state.json"))
-	store.Apply(func(sm map[int]*state.Session) { sm[sess.PID] = sess })
-	signals := sampleSignals(store.Snapshot(), testTune)
-
-	// Mid-tick, a SECOND permission prompt latches the chip red again. The decline
-	// above predates it and must not clear it.
+	// A SECOND permission prompt latches the chip red again. The decline above
+	// predates it and must not clear it.
 	secondPrompt := mustParse(t, "2026-06-01T21:40:00Z")
 	sess.Claude.StatusSince = secondPrompt
 
-	selfHealStaleAttention(m, secondPrompt.Add(time.Minute), testTune, nil, signals)
+	healStale(t, m, secondPrompt.Add(time.Minute), testTune, nil)
 
 	if got := sess.Claude.Status; got != "permission" {
-		t.Fatalf("status = %q, want permission: the sampled resolution belongs to the previous prompt", got)
+		t.Fatalf("status = %q, want permission: that resolution belongs to the previous prompt", got)
 	}
 }
 

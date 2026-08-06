@@ -225,6 +225,11 @@ assumptions above. Authoritative facts now:
   `tool_use_id` in the payload** — correlate by `agent_id`. The hook must be a
   pure **trigger** for a re-scan, never a second writer of the counter (single
   writer = the Observer). See `[[cc-subagent-hook-schema]]` memory.
+  > **Scope note (2026-08-05):** the "no `tool_use_id`" fact is about these two
+  > lifecycle events only. Tool events (`PreToolUse`/`PostToolUse`) **do** carry
+  > `tool_use_id`, and `agent_id` is a **common** field present on every hook
+  > fired from within a subagent — not just these two. Full binary-verified
+  > payload schema: [claude-code-hook-schema.md](claude-code-hook-schema.md).
 - **Done marker.** Last jsonl line `.message.stop_reason == "end_turn"` ⇒ a
   subagent's final turn ended. Guard with mtime quiescence (a between-turns
   `end_turn` is possible) and a hard age cap that force-closes as

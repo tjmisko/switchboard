@@ -322,8 +322,10 @@ func TestAnchorSince(t *testing.T) {
 	// now sits after the newest entry, as a real hook (processed after Claude wrote
 	// the entry) would.
 	now := mustTime(t, "2026-06-01T21:40:00Z")
+	// noPrev is a chip making its first-ever transition: nothing to floor against.
+	var noPrev time.Time
 
-	t.Run("into idle or permission should return now, not the transcript anchor", func(t *testing.T) {
+	t.Run("should return now when the edge is not into working", func(t *testing.T) {
 		// The flush-ordering races (H7/H8): the turn's own entries — the final
 		// assistant message of a completing turn, the pre-prompt thinking/text of a
 		// blocked one — flush late, so a non-working edge must NOT date StatusSince
@@ -331,32 +333,115 @@ func TestAnchorSince(t *testing.T) {
 		// post-transition signals ("activity after idle" / "turn resumed past the
 		// prompt"). now (the hook's causal boundary) is the race-free anchor.
 		path := writeTranscript(t, assistantText("2026-06-01T21:39:30Z"))
-		if got := AnchorSince(path, now, false, DefaultTailBytes); !got.Equal(now) {
+		if got := AnchorSince(path, now, noPrev, false, DefaultTailBytes); !got.Equal(now) {
 			t.Errorf("got %v, want now %v (non-working edge ignores the transcript anchor)", got, now)
 		}
 	})
 
-	t.Run("into working should pull back to the newest turn entry", func(t *testing.T) {
+	t.Run("should return now when the edge is not into working even with a stale anchor and a prev", func(t *testing.T) {
+		// The clamp is a working-edge concern only; it must not leak into the
+		// non-working directions, whose anchor is deliberately wall-clock now.
+		path := writeTranscript(t, assistantText("2026-06-01T21:20:00Z"))
+		prev := mustTime(t, "2026-06-01T21:39:00Z")
+		if got := AnchorSince(path, now, prev, false, DefaultTailBytes); !got.Equal(now) {
+			t.Errorf("got %v, want now %v (non-working edge ignores both anchor and prev)", got, now)
+		}
+	})
+
+	t.Run("should pull back to the newest turn entry when the edge is into working", func(t *testing.T) {
 		path := writeTranscript(t, assistantText("2026-06-01T21:39:30Z"))
 		want := mustTime(t, "2026-06-01T21:39:30Z")
-		if got := AnchorSince(path, now, true, DefaultTailBytes); !got.Equal(want) {
+		if got := AnchorSince(path, now, noPrev, true, DefaultTailBytes); !got.Equal(want) {
 			t.Errorf("got %v, want anchor %v (working edge anchors to the entry)", got, want)
 		}
 	})
 
-	t.Run("into working should never run now backward", func(t *testing.T) {
+	t.Run("should not run now backward when the newest entry postdates the hook", func(t *testing.T) {
 		// A turn entry timestamped after the hook-processing instant must not pull
 		// StatusSince ahead of now (the anchor.Before(now) guard).
 		path := writeTranscript(t, assistantText("2026-06-01T21:41:00Z"))
-		if got := AnchorSince(path, now, true, DefaultTailBytes); !got.Equal(now) {
+		if got := AnchorSince(path, now, noPrev, true, DefaultTailBytes); !got.Equal(now) {
 			t.Errorf("got %v, want now %v (anchor after now is ignored)", got, now)
 		}
 	})
 
-	t.Run("into working with no anchor should fall back to now", func(t *testing.T) {
+	t.Run("should fall back to now when the tail holds no anchor", func(t *testing.T) {
 		path := writeTranscript(t, noise) // no timestamped turn entry
-		if got := AnchorSince(path, now, true, DefaultTailBytes); !got.Equal(now) {
+		if got := AnchorSince(path, now, noPrev, true, DefaultTailBytes); !got.Equal(now) {
 			t.Errorf("got %v, want now %v (empty tail falls back to now)", got, now)
+		}
+	})
+
+	// The max(anchor, prev) floor. A subagent's hooks carry the PARENT's
+	// transcript_path, so a teammate-driven working edge can anchor to a main
+	// transcript that has been quiescent for minutes — back-dating StatusSince far
+	// enough to defeat the reconciler's idle-title grace and start an orange/green
+	// limit cycle (docs/subagent-permission-oscillation.md §3.3, §3.4).
+	t.Run("should clamp to prev when the anchor predates the previous StatusSince", func(t *testing.T) {
+		// The incident's shape in miniature: the main transcript's newest entry is
+		// 20 minutes stale, but the chip was last stamped one second ago.
+		path := writeTranscript(t, assistantText("2026-06-01T21:20:00Z"))
+		prev := mustTime(t, "2026-06-01T21:39:59Z")
+		if got := AnchorSince(path, now, prev, true, DefaultTailBytes); !got.Equal(prev) {
+			t.Errorf("got %v, want prev %v (a stale anchor may not back-date the chip)", got, prev)
+		}
+	})
+
+	t.Run("should preserve an anchor that falls between prev and now", func(t *testing.T) {
+		// H1 must still work: the entry that triggered THIS hook is newer than the
+		// chip's last stamp, so the pull-back is a genuine same-turn correction and
+		// the clamp must leave it alone.
+		path := writeTranscript(t, assistantText("2026-06-01T21:39:30Z"))
+		prev := mustTime(t, "2026-06-01T21:39:00Z")
+		want := mustTime(t, "2026-06-01T21:39:30Z")
+		if got := AnchorSince(path, now, prev, true, DefaultTailBytes); !got.Equal(want) {
+			t.Errorf("got %v, want anchor %v (H1's pull-back survives the clamp)", got, want)
+		}
+	})
+
+	t.Run("should leave the anchor unchanged when prev is zero", func(t *testing.T) {
+		// First-ever transition of an AgentInfo: no floor exists, so even a very old
+		// anchor is used as-is — the pre-clamp behavior.
+		path := writeTranscript(t, assistantText("2026-06-01T21:20:00Z"))
+		want := mustTime(t, "2026-06-01T21:20:00Z")
+		if got := AnchorSince(path, now, noPrev, true, DefaultTailBytes); !got.Equal(want) {
+			t.Errorf("got %v, want anchor %v (a zero prev is a no-op)", got, want)
+		}
+	})
+
+	t.Run("should return now when a stale anchor is clamped against a prev at or after now", func(t *testing.T) {
+		// Clock skew or a chip restored with a forward-dated StatusSince: the floor
+		// must not push StatusSince into the future, so it caps at now.
+		path := writeTranscript(t, assistantText("2026-06-01T21:20:00Z"))
+		for _, prev := range []time.Time{now, mustTime(t, "2026-06-01T21:45:00Z")} {
+			if got := AnchorSince(path, now, prev, true, DefaultTailBytes); !got.Equal(now) {
+				t.Errorf("prev %v: got %v, want now %v (the floor never dates an edge ahead of the hook)", prev, got, now)
+			}
+		}
+	})
+
+	t.Run("should keep a re-greened chip's age bounded when the main transcript is quiescent", func(t *testing.T) {
+		// The limit cycle in miniature. The main transcript stopped 20 minutes ago
+		// (its thread is blocked); the reconciler demotes to idle at wall clock and a
+		// teammate's PostToolUse re-greens one tick later. Unclamped, every re-green
+		// stamped StatusSince at that 20-minute-old anchor, so the demotion's
+		// freshness gate and IdleTitleGrace were both trivially satisfied on the very
+		// next tick and the pair oscillated. Clamped, a re-greened chip's age never
+		// exceeds the interval it was actually idle for, so the grace can do its job.
+		path := writeTranscript(t, assistantText("2026-06-01T21:20:00Z"))
+		const tick = 5 * time.Second
+		since := now // the chip was last stamped at `now`
+		for cycle := range 4 {
+			// The reconciler's idle edge is unanchored — plain wall clock.
+			demoteAt := now.Add(time.Duration(cycle+1) * 2 * tick)
+			since = demoteAt
+			// A teammate's hook re-greens a tick later, anchored against the stale
+			// main transcript.
+			regreenAt := demoteAt.Add(tick)
+			since = AnchorSince(path, regreenAt, since, true, DefaultTailBytes)
+			if age := regreenAt.Sub(since); age > tick {
+				t.Fatalf("cycle %d: re-green age %v exceeds the idle interval %v (chip back-dated to the stale anchor)", cycle, age, tick)
+			}
 		}
 	})
 }

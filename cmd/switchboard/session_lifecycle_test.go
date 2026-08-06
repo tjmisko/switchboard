@@ -9,6 +9,7 @@ import (
 	"github.com/tjmisko/switchboard/internal/history"
 	"github.com/tjmisko/switchboard/internal/osproc"
 	"github.com/tjmisko/switchboard/internal/state"
+	"github.com/tjmisko/switchboard/internal/transcript"
 	"github.com/tjmisko/switchboard/internal/wm"
 )
 
@@ -181,7 +182,7 @@ func TestDropStaleSessionsRecordsSessionEnd(t *testing.T) {
 
 	src := fakeProcSource{st: map[int]procState{deadPID: procGone, livePID: procAlive}}
 	var forgotten []int
-	dropStaleSessions(store, src, sink, func(p int) { forgotten = append(forgotten, p) })
+	dropStaleSessions(store, src, sink, func(p int) { forgotten = append(forgotten, p) }, transcript.DefaultTailBytes)
 	sink.Close()
 
 	ends := eventsOfType(readEvents(t, histDir), history.EventSessionEnd)

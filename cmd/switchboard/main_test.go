@@ -49,27 +49,28 @@ func healStuck(t *testing.T, m map[int]*state.Session, now time.Time, tun status
 	assertSamePath(t, "selfHealStuckStatus", inline, m)
 }
 
+// healStale has only one path to run: selfHealStaleAttention reads inline, since
+// T9 routes each pending prompt to its own writer's transcript and the writer set
+// is not known until the locked map is in hand. The helper stays so the case table
+// reads uniformly with healStuck, and so there is one place to change if that read
+// is ever hoisted.
 func healStale(t *testing.T, m map[int]*state.Session, now time.Time, tun statustune.Tuning, sink *history.Sink) {
 	t.Helper()
-	inline := cloneSessions(m)
-	samples := sampledSignals(t, m, tun)
-	selfHealStaleAttention(inline, now, tun, nil, noSignals)
-	selfHealStaleAttention(m, now, tun, sink, samples)
-	assertSamePath(t, "selfHealStaleAttention", inline, m)
+	selfHealStaleAttention(m, now, tun, sink)
 }
 
-// healBoth runs both self-heals in reconcileOnce's order against ONE sample map,
-// which is the part that matters: stale-attention can flip a chip that
-// stuck-status then sees, and in production the sample stuck-status gets was taken
-// before that flip. Sampling separately per call would hide any bug in how the
-// second self-heal handles a sample its predecessor invalidated.
+// healBoth runs both self-heals in reconcileOnce's order, with the sample taken
+// where production takes it: BEFORE either runs. That ordering is the part that
+// matters — stale-attention can flip a chip that stuck-status then sees, so the
+// sample stuck-status gets was taken against the pre-flip status and must be
+// rejected by its own guard. Sampling after the flip would hide that.
 func healBoth(t *testing.T, m map[int]*state.Session, now time.Time, tun statustune.Tuning, sink *history.Sink) {
 	t.Helper()
 	inline := cloneSessions(m)
 	samples := sampledSignals(t, m, tun)
-	selfHealStaleAttention(inline, now, tun, nil, noSignals)
+	selfHealStaleAttention(inline, now, tun, nil)
 	selfHealStuckStatus(inline, now, tun, nil, noSignals)
-	selfHealStaleAttention(m, now, tun, sink, samples)
+	selfHealStaleAttention(m, now, tun, sink)
 	selfHealStuckStatus(m, now, tun, sink, samples)
 	assertSamePath(t, "the two self-heals in tick order", inline, m)
 }
