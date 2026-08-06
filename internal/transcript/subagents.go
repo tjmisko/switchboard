@@ -41,6 +41,7 @@ import (
 type Subagent struct {
 	AgentID     string    // <id> from the agent-<id>.{meta.json,jsonl} FILENAME — the universal key/join (matches the SubagentStart/Stop hook agent_id)
 	AgentType   string    // agentType from the meta; "" for an orphan jsonl that has no sibling meta
+	Name        string    // name — the human-readable teammate name (e.g. "escalate-cleanup"); best-effort (only the fuller in-process-teammate metas carry it)
 	Description string    // description — best-effort (absent in minimal metas)
 	ToolUseID   string    // toolUseId — best-effort (absent ~36% of metas); for parent-transcript cross-check only
 	SpawnDepth  int       // spawnDepth — best-effort (absent → 0; 0 = launched by the main thread)
@@ -59,6 +60,7 @@ type Subagent struct {
 // key).
 type subagentMeta struct {
 	AgentType   string `json:"agentType"`
+	Name        string `json:"name"`
 	Description string `json:"description"`
 	ToolUseID   string `json:"toolUseId"`
 	SpawnDepth  int    `json:"spawnDepth"`
@@ -143,17 +145,84 @@ func SubagentPath(mainTranscript, agentID string) string {
 	if agentID == "" {
 		return mainTranscript // main thread: its writes are the parent transcript
 	}
+	return subagentFilePath(mainTranscript, agentID, subagentJSONLSuffix)
+}
+
+// SubagentMetaPath is SubagentPath's twin for the OTHER file a spawn writes:
+//
+//	<dir>/<session-id>/subagents/agent-<agentID>.meta.json
+//
+// It is the file that carries a teammate's human-readable `name`, so a renderer
+// that wants to name a blocked writer reads exactly this one path rather than
+// listing (and tail-reading) the whole subagents dir the way
+// SubagentsForTranscript does.
+//
+// Unlike SubagentPath there is NO main-thread case: the main thread is not a
+// spawn and has no meta, so an empty agentID returns "" — which is the natural
+// discriminator for a caller resolving a pending-writer key ("" = main thread).
+//
+// Every other rule is SubagentPath's, shared through the same derivation: the
+// agentID must be BARE (no second "agent-" strip — see SubagentPath for the
+// missed-RED hazard that would create), a trailing ".jsonl" is tolerated so an id
+// and its transcript filename are interchangeable at call sites, and a path
+// separator or an empty derived id yields "".
+func SubagentMetaPath(mainTranscript, agentID string) string {
+	if agentID == "" {
+		return "" // the main thread is not a spawn: no meta file exists for it
+	}
+	return subagentFilePath(mainTranscript, agentID, subagentMetaSuffix)
+}
+
+// subagentFilePath is the shared derivation behind SubagentPath and
+// SubagentMetaPath: the sibling subagents dir plus agent-<bare id><suffix>, or ""
+// when there is nothing sane to derive. Keeping it in one place is what stops the
+// two exported spellings from drifting on the id-safety rules.
+func subagentFilePath(mainTranscript, agentID, suffix string) string {
 	dir := subagentsDirForTranscript(mainTranscript)
 	if dir == "" {
 		return ""
 	}
 	// No TrimPrefix: agentID is already bare (see the contract above). Stripping a
-	// second "agent-" here would silently retarget another agent's transcript.
+	// second "agent-" here would silently retarget another agent's files.
 	id := strings.TrimSuffix(agentID, subagentJSONLSuffix)
 	if id == "" || strings.ContainsRune(id, filepath.Separator) || strings.ContainsRune(id, '/') {
 		return ""
 	}
-	return filepath.Join(dir, subagentFilePrefix+id+subagentJSONLSuffix)
+	return filepath.Join(dir, subagentFilePrefix+id+suffix)
+}
+
+// SubagentDisplayName reads the most human-readable identifier an
+// agent-<id>.meta.json carries, given that meta's path:
+//
+//  1. `name` — the teammate name the user themselves typed or saw (e.g.
+//     "escalate-cleanup"). Present on the fuller in-process-teammate metas.
+//  2. `agentType` — the only field present in EVERY meta (e.g. "Explore",
+//     "general-purpose"). It names a kind rather than an instance, so two
+//     concurrent Explores are indistinguishable by it — but it is still a word
+//     the user recognizes, which a hex id is not.
+//  3. "" — a missing, unreadable, non-JSON, or nameless meta. The caller decides
+//     what to show instead; this function never invents a name.
+//
+// The fallback order lives HERE, beside subagentMeta, because it is a fact about
+// the heterogeneous on-disk shape (only agentType is universal) rather than a
+// rendering policy. Callers add presentation on top: how to spell the main
+// thread, and what to fall back to when this returns "".
+func SubagentDisplayName(metaPath string) string {
+	if metaPath == "" {
+		return ""
+	}
+	raw, err := os.ReadFile(metaPath)
+	if err != nil {
+		return ""
+	}
+	var m subagentMeta
+	if json.Unmarshal(raw, &m) != nil {
+		return "" // tolerate a non-JSON meta exactly as SubagentsForTranscript does
+	}
+	if n := strings.TrimSpace(m.Name); n != "" {
+		return n
+	}
+	return strings.TrimSpace(m.AgentType)
 }
 
 // subagentTerminalReason is the assistant stop_reason that marks a subagent's own
@@ -240,6 +309,7 @@ func SubagentsForTranscript(transcriptPath string) ([]Subagent, error) {
 			var m subagentMeta
 			if json.Unmarshal(raw, &m) == nil { // tolerate a non-JSON meta: id stays reported, fields zero
 				s.AgentType = m.AgentType
+				s.Name = m.Name
 				s.Description = m.Description
 				s.ToolUseID = m.ToolUseID
 				s.SpawnDepth = m.SpawnDepth

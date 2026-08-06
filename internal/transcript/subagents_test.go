@@ -573,3 +573,147 @@ func TestSubagentPathAgreesWithSubagentsForTranscript(t *testing.T) {
 		}
 	}
 }
+
+// --- naming a blocked writer ---------------------------------------------
+//
+// A red chip that names the blocked teammate has to get that name from
+// somewhere, and the only place it exists is the spawn's meta.json. These pin
+// the single-file path derivation and the fallback chain a renderer resolves
+// through, without paying SubagentsForTranscript's whole-directory scan.
+
+func TestSubagentMetaPath(t *testing.T) {
+	const parent = "/home/u/.claude/projects/-home-u-proj/sess.jsonl"
+	const dir = "/home/u/.claude/projects/-home-u-proj/sess/subagents"
+
+	t.Run("should resolve the sibling meta file when the agent id names a teammate", func(t *testing.T) {
+		want := dir + "/agent-af5bd126402ac16c7.meta.json"
+		if got := SubagentMetaPath(parent, "af5bd126402ac16c7"); got != want {
+			t.Errorf("SubagentMetaPath = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("should return nothing when the writer is the main thread", func(t *testing.T) {
+		// Unlike SubagentPath, which hands the main thread its parent transcript,
+		// there is no meta for a thread that was never spawned. "" is the caller's
+		// discriminator, not an error.
+		if got := SubagentMetaPath(parent, ""); got != "" {
+			t.Errorf("SubagentMetaPath(main) = %q, want \"\"", got)
+		}
+	})
+
+	t.Run("should tolerate a trailing .jsonl so an id and its filename are interchangeable", func(t *testing.T) {
+		want := dir + "/agent-a1b2.meta.json"
+		if got := SubagentMetaPath(parent, "a1b2.jsonl"); got != want {
+			t.Errorf("SubagentMetaPath = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("should not strip a second agent- prefix when the id legitimately carries one", func(t *testing.T) {
+		// The missed-RED hazard SubagentPath documents, in the meta namespace: an
+		// agent named "gent-foo" has id "agent-foo-<hex>" and lives in
+		// agent-agent-foo-<hex>.meta.json. Stripping would name a DIFFERENT agent.
+		want := dir + "/agent-agent-foo-9f.meta.json"
+		if got := SubagentMetaPath(parent, "agent-foo-9f"); got != want {
+			t.Errorf("SubagentMetaPath = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("should return nothing when the id could escape the subagents dir", func(t *testing.T) {
+		for _, id := range []string{"../../etc/passwd", "a/b", ".jsonl"} {
+			if got := SubagentMetaPath(parent, id); got != "" {
+				t.Errorf("SubagentMetaPath(%q) = %q, want \"\" (must not escape the dir)", id, got)
+			}
+		}
+	})
+
+	t.Run("should return nothing when there is no transcript to derive from", func(t *testing.T) {
+		if got := SubagentMetaPath("", "a1b2"); got != "" {
+			t.Errorf("SubagentMetaPath = %q, want \"\"", got)
+		}
+	})
+
+	t.Run("should point at the same spawn as SubagentPath", func(t *testing.T) {
+		// The two exported spellings share one derivation; this is the tripwire if
+		// they ever stop agreeing on which spawn they mean.
+		jsonl := SubagentPath(parent, "a1b2")
+		meta := SubagentMetaPath(parent, "a1b2")
+		if strings.TrimSuffix(jsonl, ".jsonl") != strings.TrimSuffix(meta, ".meta.json") {
+			t.Errorf("SubagentPath %q and SubagentMetaPath %q name different spawns", jsonl, meta)
+		}
+	})
+}
+
+func TestSubagentDisplayName(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		writeFile(t, path, []string{body})
+		return path
+	}
+
+	t.Run("should prefer the teammate name when the meta carries one", func(t *testing.T) {
+		p := write("full.meta.json", `{"agentType":"general-purpose","name":"escalate-cleanup","description":"Clean up escalation duplication","taskKind":"in_process_teammate"}`)
+		if got := SubagentDisplayName(p); got != "escalate-cleanup" {
+			t.Errorf("SubagentDisplayName = %q, want escalate-cleanup", got)
+		}
+	})
+
+	t.Run("should fall back to the agent type when the meta is the minimal shape", func(t *testing.T) {
+		// Only agentType is present in EVERY meta; a Task-spawned agent has no name.
+		p := write("minimal.meta.json", `{"agentType":"Explore"}`)
+		if got := SubagentDisplayName(p); got != "Explore" {
+			t.Errorf("SubagentDisplayName = %q, want Explore", got)
+		}
+	})
+
+	t.Run("should trim surrounding whitespace from the name it reports", func(t *testing.T) {
+		p := write("padded.meta.json", `{"agentType":"Explore","name":"  spaced-out  "}`)
+		if got := SubagentDisplayName(p); got != "spaced-out" {
+			t.Errorf("SubagentDisplayName = %q, want spaced-out", got)
+		}
+	})
+
+	t.Run("should report nothing rather than invent a name when the meta is unusable", func(t *testing.T) {
+		cases := map[string]string{
+			"missing":  filepath.Join(dir, "nope.meta.json"),
+			"empty id": "",
+			"non-JSON": write("junk.meta.json", `not json at all`),
+			"nameless": write("bare.meta.json", `{"toolUseId":"toolu_x"}`),
+			"blank":    write("blank.meta.json", `{"agentType":"","name":"   "}`),
+		}
+		for what, p := range cases {
+			if got := SubagentDisplayName(p); got != "" {
+				t.Errorf("%s: SubagentDisplayName = %q, want \"\"", what, got)
+			}
+		}
+	})
+}
+
+func TestSubagentsForTranscriptShouldReportTheTeammateName(t *testing.T) {
+	dir := t.TempDir()
+	transcriptPath := filepath.Join(dir, "sess.jsonl")
+	subagentsDir := filepath.Join(dir, "sess", "subagents")
+	if err := os.MkdirAll(subagentsDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeFile(t, filepath.Join(subagentsDir, "agent-named.meta.json"),
+		[]string{`{"agentType":"general-purpose","name":"escalate-cleanup","description":"Clean up escalation duplication"}`})
+	writeFile(t, filepath.Join(subagentsDir, "agent-anon.meta.json"),
+		[]string{`{"agentType":"Explore"}`})
+
+	subs, err := SubagentsForTranscript(transcriptPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	byID := map[string]Subagent{}
+	for _, s := range subs {
+		byID[s.AgentID] = s
+	}
+	if got := byID["named"].Name; got != "escalate-cleanup" {
+		t.Errorf("named agent: Name = %q, want escalate-cleanup", got)
+	}
+	if got := byID["anon"].Name; got != "" {
+		t.Errorf("minimal meta should leave Name empty, got %q", got)
+	}
+}
