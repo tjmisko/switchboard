@@ -78,6 +78,16 @@ func canonicalSnapshot() Snapshot {
 					// function feeds the encoder directly rather than going through
 					// enrichForWire, exactly as StatusSinceWire above does.
 					PendingWriters: []string{"af5bd126402ac16c7", "main"},
+					// workflows: the active ultracode Workflow runs behind the
+					// in_flight_subagents count — set here to pin the field and its
+					// nested shape on the wire. Sorted by run_id.
+					Workflows: []WorkflowStatus{{
+						RunID:         "wf_5e3cb808-2ac",
+						Name:          "simplification-audit",
+						AgentsStarted: 17,
+						AgentsDone:    7,
+						InFlight:      2,
+					}},
 				},
 			},
 			{

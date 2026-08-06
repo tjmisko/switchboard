@@ -140,3 +140,32 @@ func PriorSubagentState(dir, sessionID string) (spawned, stopped map[string]bool
 	}
 	return spawned, stopped, nil
 }
+
+// PriorWorkflowState is PriorSubagentState's twin for workflow runs: the set of
+// WorkflowRunIDs already recorded as started and as stopped for sessionID. It
+// primes the Observer's per-run seen-set so a daemon restart mid-workflow does
+// not re-emit workflow_start for a run whose records it is seeing again for the
+// first time (the run dirs, like subagent metas, are never deleted).
+func PriorWorkflowState(dir, sessionID string) (started, stopped map[string]bool, err error) {
+	started = map[string]bool{}
+	stopped = map[string]bool{}
+	if sessionID == "" {
+		return started, stopped, nil
+	}
+	events, err := ReadRange(dir, time.Time{}, time.Time{})
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, ev := range events {
+		if ev.SessionID != sessionID || ev.WorkflowRunID == "" {
+			continue
+		}
+		switch ev.Type {
+		case EventWorkflowStart:
+			started[ev.WorkflowRunID] = true
+		case EventWorkflowStop:
+			stopped[ev.WorkflowRunID] = true
+		}
+	}
+	return started, stopped, nil
+}

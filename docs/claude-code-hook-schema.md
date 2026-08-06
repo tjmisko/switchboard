@@ -243,3 +243,62 @@ Three things this settles:
 
 Recheck all three on a Claude Code version bump — §5's table is the place to
 record the result.
+
+## 6. Hook ownership: which *process*, not just which *writer*
+
+`agent_id` answers "which writer inside a session fired this" (T7/T17). It says
+nothing about **which process** — and a hook payload carries no pid at all. The
+daemon supplies that itself: `switchboard-ctl hook` sends `os.Getppid()`
+(`cmd/switchboard-ctl/main.go`), and `findTrackedAncestor` (`internal/rpc/rpc.go`)
+resolves it to a session by walking up the ppid chain.
+
+The walk exists because a hook is often wrapped in a shell, so `getppid()` is the
+wrapper rather than the agent. It stops at the nearest **agent** process for the
+mirror reason: that process owns the hook.
+
+### A2 — the nested-headless race
+
+A nested `claude -p` (the session-digest summarizer, a flag investigation, any
+SDK run launched from inside a session) fires `SessionStart` within milliseconds
+of exec. Discovery registers it only on the next `/proc` scan tick
+(`--scan-interval`, default 1s). Inside that sub-second window the helper is not
+in the session map, so a walk that merely looked for the nearest *tracked* pid
+sailed past it onto the interactive **parent**, which then took the helper's
+identity:
+
+| write | consequence for the parent |
+|---|---|
+| `info.Transcript` | the reconciler derived the parent's status from the *helper's* transcript |
+| the `rotated` clause → `ClearPending()` | a background helper silently cleared a genuine red permission chip |
+| `info.SessionID` (last-hook-wins) | the parent's id was replaced and never restored |
+
+Measured on `2026-07-31.jsonl`: **35 of 102** session ids were carried by two
+pids, and one interactive session cycled through **41 distinct ids** in 10.5
+hours. In **32 of those 35** the parent took the id **1–700 ms before** the
+helper's own `session_start` — the entire distribution sits inside one scan tick,
+which is the signature of this race and not of anything the session-resume
+contract in `history-schema.md` permits (that is a *sequential* case; this is two
+processes alive at the same instant under one id).
+
+Reproduced live on 2026-08-05, three runs in four:
+
+```
+18:23:36.119  transition     3798011  6d25c699   ← interactive session takes the id
+18:23:36.828  transition     1922750  6d25c699   ← the helper that owns it, 709ms later
+18:23:38.481  session_label  3798011  6d25c699   ← the parent is mislabeled too
+```
+
+Downstream this is also what mints ghost lanes: the helper's `session_end` closes
+the shared lane and the parent's next transition opens one nothing ever closes.
+
+**The rule.** Reaching an agent process that is *not* tracked means the hook
+belongs to a session the daemon has not registered yet. The hook is dropped.
+That is self-correcting — the scan picks the helper up within the tick and its
+later hooks self-match, so only hooks fired inside the window are lost. A
+`claude -p` shorter than one tick gets no session id at all, which is the unnamed
+single-interval lane switchboard already produces for a process that dies before
+transitioning.
+
+This is the process-level counterpart to T17, and T17 does not cover it: T17
+discriminates by `agent_id` and suppresses only `status`, whereas this is a
+separate process corrupting *identity*.
