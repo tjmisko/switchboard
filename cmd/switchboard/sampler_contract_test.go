@@ -293,14 +293,10 @@ func TestSamplerContract_sampleMemory(t *testing.T) {
 					tree.RemoveProcess(t, pid)
 				},
 				Apply: func() any {
-					// Exactly the two lines reconcileOnce runs under the lock.
-					if reading, ok := mem.Sessions[sess.PID]; ok {
-						sess.MemAgentBytes = reading.Agent.Pss
-						sess.MemTreeBytes = reading.Tree.Pss
-					}
-					if ev, ok := mem.event(sess, now); ok {
-						sink.Record(ev)
-					}
+					// The real function reconcileOnce calls under the lock, not a copy
+					// of its body: a copy would keep passing over its own stale lines the
+					// day a read is added to the production one.
+					mem.applyLocked(sess, sink, now)
 					return struct {
 						AgentBytes int64
 						TreeBytes  int64

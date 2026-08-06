@@ -887,18 +887,10 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 				sess.Suspended = p.suspended
 			}
 			// The session's resident cost, read outside this lock at the top of the
-			// tick. The live fields take whatever the tick has, including a repeated
-			// last-known figure after a failed read (better a stale tooltip than one
-			// that flaps to zero); the log takes only a fresh reading, so a process
-			// that is gone yields NO sample rather than a zero one — a zero would
-			// read as "freed all its memory" and corrupt the peak and average.
-			if reading, ok := mem.Sessions[sess.PID]; ok {
-				sess.MemAgentBytes = reading.Agent.Pss
-				sess.MemTreeBytes = reading.Tree.Pss
-			}
-			if ev, ok := mem.event(sess, now); ok {
-				sink.Record(ev)
-			}
+			// tick. Everything under-lock about it lives in applyLocked, which is also
+			// what the sampler contract drives — keep it that way, so a read added here
+			// is a read the contract can see.
+			mem.applyLocked(sess, sink, now)
 			// Recompute the S dimension — in-flight subagent Tasks — from the main
 			// transcript so the self-heals (and the wire/tooltip) see current
 			// delegation, and emit fanout (subagent spawn/stop) + usage (token)
