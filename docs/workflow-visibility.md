@@ -127,10 +127,19 @@ every other sampler. So the split is:
   orphans force-close — the same conservative bound as a stalled flat fanout.
   A tighter kill signal would need the parent's task-notification or the /tmp
   task output file.
-- Both workflow reads are now correctly PLACED but not yet cheap.
-  `history.PriorWorkflowState` still answers a one-session question by decoding
-  the whole archive — the shape the byte pre-filter in `scanSubagentLines`
-  already undid for `PriorSubagentState` — and the run-dir scan runs per
-  session per tick over a directory that accumulates every run the session has
-  ever made (#64). Neither blocks a store reader any more; both still scale
-  with accumulated history rather than with what is live.
+- The run-dir scan is correctly PLACED but not cheap: it runs per session per
+  tick over a directory that accumulates every run the session has ever made
+  (#64), so it scales with accumulated history rather than with what is live.
+- `history.PriorWorkflowState` now carries the same byte pre-filter as
+  `PriorSubagentState` (`scanCandidateLines`), which it did not when these reads
+  were first hoisted. On a 40-day synthetic archive that took the seed's
+  workflow half from 227 ms to 20 ms and the whole seed — `seedFor` calls both
+  halves, so its cost is their sum — from 277 ms to 37 ms.
+- **"Hoisted out of the lock" is true of the FAST path only**, so read the two
+  points above as latency AND as a lock-hold budget. `Observer.reconcile` keeps
+  a lazy seeding backstop, and it runs under the store lock: a hook trigger has
+  no pre-lock phase to hang a `Prime` on, and a session discovered between the
+  tick's `Snapshot` and its `Apply` reaches the lock unprimed. Both are ordinary
+  events, not corner cases, which is why making the seed cheap was worth doing
+  rather than deferring — placement alone does not bound what those two paths
+  hold the lock for.
