@@ -114,7 +114,7 @@ func (o *Observer) Prime(sessionID, transcript string) {
 		return
 	}
 
-	sp, st, off := seedFor(o.dir, sessionID, transcript)
+	sd := seedFor(o.dir, sessionID, transcript)
 
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -130,7 +130,19 @@ func (o *Observer) Prime(sessionID, transcript string) {
 		// rather than overwrite.
 		return
 	}
-	ss.applySeed(sp, st, off)
+	ss.applySeed(sd) // a failed read installs nothing; the backstop retries
+}
+
+// seed is one first-sight read's result.
+//
+// ok distinguishes the two outcomes that used to be conflated: the history read
+// SUCCEEDED (possibly finding nothing, which is the normal case for a brand-new
+// session and is a perfectly good seed), versus it FAILED and this says nothing
+// about what was already emitted. Only the first may be installed.
+type seed struct {
+	spawned, stopped map[string]bool
+	offset           int64
+	ok               bool
 }
 
 // seedFor is the first-sight read, factored out so the pre-lock Prime and the
@@ -141,26 +153,42 @@ func (o *Observer) Prime(sessionID, transcript string) {
 // does not re-emit historical spawns (metas are never deleted). The cursor is
 // primed to EOF — the dir scan is the authoritative spawn source, so there is no
 // need to re-read the whole transcript on every restart.
-func seedFor(dir, sessionID, transcript string) (spawned, stopped map[string]bool, offset int64) {
-	if sp, st, err := history.PriorSubagentState(dir, sessionID); err == nil {
-		spawned, stopped = sp, st
+func seedFor(dir, sessionID, transcript string) seed {
+	sp, st, err := history.PriorSubagentState(dir, sessionID)
+	if err != nil {
+		return seed{} // not seeded: see applySeed
 	}
-	return spawned, stopped, fileSize(transcript)
+	return seed{spawned: sp, stopped: st, offset: fileSize(transcript), ok: true}
 }
 
-// applySeed installs a seedFor result. The caller holds o.mu. A failed history
-// read (nil maps) leaves the empty sets newSessionState built rather than
-// nilling them out, so a later spawn can still be recorded.
-func (ss *sessionState) applySeed(spawned, stopped map[string]bool, offset int64) {
-	if spawned != nil {
-		ss.spawned = spawned
+// applySeed installs a seedFor result and reports whether the session is now
+// seeded. The caller holds o.mu.
+//
+// A FAILED read installs nothing and leaves ss.seeded false, so the backstop in
+// reconcile retries on the next tick. Marking it seeded anyway — which is what
+// this did — hands the dir scan an EMPTY already-emitted set, and the scan then
+// re-announces a spawn AND a stop for every historical subagent of the session:
+// precisely the G1 double-count the seed exists to prevent. The read fails for
+// ordinary reasons (EMFILE under load, a permission blip during a backup, a
+// >1 MiB event line tripping the scanner's line limit), so this is not a
+// theoretical path.
+//
+// A successful read that found nothing still counts as seeded, or a fresh session
+// would retry forever.
+func (ss *sessionState) applySeed(s seed) bool {
+	if !s.ok {
+		return false
 	}
-	if stopped != nil {
-		ss.stopped = stopped
+	if s.spawned != nil {
+		ss.spawned = s.spawned
 	}
-	ss.offset = offset
+	if s.stopped != nil {
+		ss.stopped = s.stopped
+	}
+	ss.offset = s.offset
 	ss.seeded = true
 	ss.gen++
+	return true
 }
 
 // Sample is the I/O half of one session's Reconcile, taken with no store lock
@@ -178,6 +206,7 @@ type Sample struct {
 	resultIDs  []string
 	newOffset  int64
 	tasksOK    bool
+	shrank     bool // the transcript was shorter than base at read time (G5)
 	subs       []transcript.Subagent
 	subsOK     bool
 	valid      bool
@@ -254,7 +283,7 @@ func readSample(sessionID, transcriptPath string, base int64) Sample {
 	s := Sample{sessionID: sessionID, transcript: transcriptPath, base: base}
 	from := base
 	if size := fileSize(transcriptPath); from > size {
-		from = 0
+		from, s.shrank = 0, true
 	}
 	if spawns, resultIDs, newOff, err := transcript.TasksSince(transcriptPath, from); err == nil {
 		s.spawns, s.resultIDs, s.newOffset, s.tasksOK = spawns, resultIDs, newOff, true
@@ -304,14 +333,19 @@ func (o *Observer) reconcile(sess *state.Session, c *state.AgentInfo, now time.T
 		ss = newSessionState()
 		o.sessions[c.SessionID] = ss
 	}
-	if !ss.seeded {
+	if !ss.seeded && !ss.applySeed(seedFor(o.dir, c.SessionID, c.Transcript)) {
 		// The lazy backstop. Prime (called before the store lock is taken) normally
 		// gets here first, so this fires only for a session that appeared between
 		// the caller's snapshot and the lock, or on the hook trigger, which has no
 		// pre-lock phase to hang a Prime on. Correctness does not depend on which
 		// path seeds — only cost does, and this one pays it under the lock.
-		sp, st, off := seedFor(o.dir, c.SessionID, c.Transcript)
-		ss.applySeed(sp, st, off)
+		//
+		// Reaching here means the read FAILED, and this tick must emit nothing: the
+		// dir scan below is authoritative about what EXISTS but knows nothing about
+		// what was already recorded, so running it against an empty seen-set would
+		// re-announce every historical subagent of this session. Retrying next tick
+		// costs one tick of delegation lag; guessing costs a corrupted timeline.
+		return nil
 	}
 
 	if !s.usableFor(c.SessionID, c.Transcript, ss) {
@@ -324,6 +358,17 @@ func (o *Observer) reconcile(sess *state.Session, c *state.AgentInfo, now time.T
 	// including the one another producer may be holding right now, mid-tick. o.mu is
 	// held for the whole body, so where the bump sits inside it does not matter.
 	ss.gen++
+
+	// G5, and it must be durable: on /clear or compaction the transcript shrinks
+	// below the cursor, and the reset is written to ss BEFORE the read outcome is
+	// considered — exactly as it was when this ran inline. Folding the reset into
+	// the read (using it only when the read succeeded) loses it precisely when the
+	// file is being replaced, which is when a truncation and a failed read are most
+	// likely to coincide: the cursor would keep a value past EOF, and if the file
+	// then regrew past it, every entry in between would be skipped forever.
+	if s.shrank {
+		ss.offset = 0
+	}
 
 	// 1) Advance the forward cursor. It supplies the run_in_background flag (only
 	// the parent tool_use carries it) and a secondary tool_result completion

@@ -457,6 +457,83 @@ func TestPrime_servesConcurrentCallersWithoutRacingTheSeed(t *testing.T) {
 	}
 }
 
+// The seed is what stops a restart or `--resume` re-announcing every subagent the
+// session ever had. A FAILED history read says nothing about what was already
+// emitted, so it must not be mistaken for "nothing was emitted": marking the
+// session seeded on that would hand the authoritative dir scan an empty
+// already-emitted set, and it would re-announce the lot (G1).
+//
+// The read fails for ordinary reasons — EMFILE under load, a permission blip
+// during a backup, an over-long event line — so this is a path, not a theory.
+func TestReconcile_doesNotEmitOrMarkSeededWhenTheHistoryReadFails(t *testing.T) {
+	e := newEnv(t)
+	day := seedHistory(t, e)
+	writeSub(t, e.subdir, "r1", metaClassic(1, "toolu_r1"), "end_turn")
+	obs := NewObserver(e.historyDir)
+
+	if err := os.Chmod(day, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := os.Open(day); err == nil {
+		f.Close()
+		t.Skip("the history file is still readable at mode 0000 — running as root?")
+	}
+
+	if ev := obs.Reconcile(e.sess, e.c, time.Now()); len(ev) != 0 {
+		t.Fatalf("a tick that could not read history must emit nothing; got %+v", ev)
+	}
+
+	// The history comes back. r1's spawn was already recorded before the restart, so
+	// the recovered tick must emit its missed STOP and not a second spawn.
+	if err := os.Chmod(day, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ev := obs.Reconcile(e.sess, e.c, time.Now())
+	if hasEvent(ev, history.EventSubagentSpawn, "r1") {
+		t.Fatalf("r1's spawn was re-emitted: the session was marked seeded from a failed read; got %+v", ev)
+	}
+	if !hasEvent(ev, history.EventSubagentStop, "r1") {
+		t.Fatalf("the retry should seed and then emit r1's missed stop; got %+v", ev)
+	}
+}
+
+// G5 durability. On /clear or compaction the transcript shrinks below the cursor.
+// The reset must be written to the durable cursor whether or not the read that
+// followed it succeeded — a truncation and an unreadable file coincide exactly
+// when the file is being replaced, and a cursor left past EOF skips everything
+// written between it and the file's regrowth.
+func TestReconcile_resetsTheCursorOnShrinkEvenWhenTheReadFails(t *testing.T) {
+	e := newEnv(t)
+	obs := NewObserver(e.historyDir)
+	now := time.Now()
+
+	// Push the cursor out to a real offset.
+	appendLine(t, e.transcript, `{"type":"system","note":"a reasonably long first line to advance the cursor"}`)
+	obs.Reconcile(e.sess, e.c, now)
+	if obs.cursorFor(e.c.SessionID) == 0 {
+		t.Fatal("setup: the cursor should have advanced past the first line")
+	}
+
+	// A /clear truncates the transcript AND the file is momentarily unreadable —
+	// os.Stat still answers (so the shrink is visible) while the read cannot open it.
+	if err := os.WriteFile(e.transcript, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(e.transcript, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := os.Open(e.transcript); err == nil {
+		f.Close()
+		t.Skip("the transcript is still readable at mode 0000 — running as root?")
+	}
+
+	obs.Reconcile(e.sess, e.c, now)
+	if got := obs.cursorFor(e.c.SessionID); got != 0 {
+		t.Fatalf("cursor = %d after a truncation whose read failed, want 0: it is now past EOF, "+
+			"and everything written before the file passes it again is lost", got)
+	}
+}
+
 func TestReconcile_staleCapForceClosesLeak(t *testing.T) {
 	e := newEnv(t)
 	jsonl := writeSub(t, e.subdir, "s1", metaClassic(1, "toolu_s1"), "") // running, never terminal
