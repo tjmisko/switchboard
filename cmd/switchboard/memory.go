@@ -190,18 +190,18 @@ func (t memoryTick) event(sess *state.Session, now time.Time) (history.Event, bo
 }
 
 // sampleMemory takes the tick's readings before the reconciler locks the store.
-// A no-op when memory sampling is off, down to not taking the snapshot.
-func (rs *reconcileState) sampleMemory(store *state.Store) memoryTick {
+// A no-op when memory sampling is off.
+func (rs *reconcileState) sampleMemory(snap state.Snapshot) memoryTick {
 	if rs.memory == nil {
 		return memoryTick{}
 	}
-	return rs.memory.sample(livePIDs(store.Snapshot()))
+	return rs.memory.sample(livePIDs(snap))
 }
 
-// livePIDs is the pid set a tick samples: every session in the last published
-// snapshot. Read through Snapshot — a read lock, shared with every other reader
-// — rather than through Apply, which is the exclusive lock the sampler exists to
-// stay out of.
+// livePIDs is the pid set a tick samples: every session in the snapshot the tick
+// took before locking. Read through Snapshot — a read lock, shared with every
+// other reader — rather than through Apply, which is the exclusive lock the
+// sampler exists to stay out of.
 func livePIDs(snap state.Snapshot) []int {
 	pids := make([]int, 0, len(snap.Sessions))
 	for _, sess := range snap.Sessions {

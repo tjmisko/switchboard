@@ -45,6 +45,10 @@ func main() {
 	historyDir := flag.String("history-dir", "", "activity-log directory (default $XDG_STATE_HOME/switchboard/history)")
 	flag.Parse()
 
+	// Before anything else logs: the daemon logs from inside store.Apply, and a
+	// blocking write there stalls every reader on the log pipe. See nonBlockingLog.
+	installNonBlockingLog()
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -212,6 +216,46 @@ func sessionDead(src osproc.Source, pid int) bool {
 	return discovery.Classify(info) == discovery.AgentNone
 }
 
+// procSample is what one tick learns about one session's PROCESS, as opposed to
+// its transcript: whether it is definitively gone, and whether it is job-control
+// suspended (Ctrl-Z).
+//
+// Both used to be read inside store.Apply, one osproc.Read and one
+// /proc/<pid>/status per session per tick. Measured on this box at ~22-40µs and
+// ~7.5-11µs respectively, so a 12-session tick held the exclusive lock across
+// roughly half a millisecond of procfs — small next to the reads this change set
+// removed, but no longer small relative to what is left, and unbounded rather than
+// merely slow when a process is in uninterruptible-D state or procfs is contended.
+type procSample struct {
+	dead      bool // definitively gone (or the pid recycled to a non-agent)
+	suspended bool
+	stateOK   bool // the run-state read succeeded; false leaves the last-known value
+}
+
+// sampleProc reads both, once per session, BEFORE the lock.
+//
+// It also removes a duplicate: the liveness verdict is needed twice in a tick —
+// by sampleUsage out here (a dead session earns none of the tick's work, and usage
+// is the one sampler that emits rather than staging) and by sweepDeadSessions
+// inside the Apply. Reading it once and passing the result to both is what makes
+// the consolidation cheaper rather than just relocated.
+//
+// A pid absent from the result is alive and unchanged as far as this tick knows —
+// including a session that appeared after the snapshot. That is the safe default
+// in both directions: liveness is judged only on positive evidence of death (L4),
+// and a missing run-state leaves the last-known suspension rather than flapping it.
+func sampleProc(snap state.Snapshot, src osproc.Source) map[int]procSample {
+	out := make(map[int]procSample, len(snap.Sessions))
+	for _, sess := range snap.Sessions {
+		p := procSample{dead: sessionDead(src, sess.PID)}
+		if st, err := proc.State(sess.PID); err == nil {
+			p.suspended, p.stateOK = proc.Suspended(st), true
+		}
+		out[sess.PID] = p
+	}
+	return out
+}
+
 // sweepDeadSessions closes the lane of every tracked session whose process is
 // definitively gone. It is the DURABLE backstop for session_end, and the reason
 // the daemon no longer depends on a death-watch surviving anything.
@@ -221,14 +265,20 @@ func sessionDead(src osproc.Source, pid int) bool {
 // observed. A watch that failed to register never observes one either. In both
 // cases nothing else would ever drop the session, and the reader stretches its
 // final interval to `now` — the ghost lane this sweep exists to prevent
-// (L1/L3, session-lifecycle-hazards.md). Polling here costs one process read per
+// (L1/L3, session-lifecycle-hazards.md). Polling costs one process read per
 // session per tick and depends on no prior state at all, so it self-heals across
 // a restart within a single reconcile interval.
 //
-// Deleting from a map while ranging it is safe in Go. Runs inside store.Apply.
-func sweepDeadSessions(m map[int]*state.Session, src osproc.Source, sink *history.Sink, forget func(int), now time.Time) {
+// The verdict comes from sampleProc, taken before the lock: this runs inside
+// store.Apply, and a procfs read in here is a read every RPC reader, hook and chip
+// click waits on. A session with no verdict — one that appeared after the
+// snapshot — is left alone and swept on the next tick, which is the same "one tick
+// late beats a false end" trade the predicate itself makes.
+//
+// Deleting from a map while ranging it is safe in Go.
+func sweepDeadSessions(m map[int]*state.Session, procs map[int]procSample, sink *history.Sink, forget func(int), now time.Time) {
 	for pid := range m {
-		if !sessionDead(src, pid) {
+		if !procs[pid].dead {
 			continue
 		}
 		if endSession(m, pid, sink, forget, now) {
@@ -582,11 +632,11 @@ func reresolveAll(ctx context.Context, store *state.Store, resolver *mapping.Res
 	// layout events this path serves. The debounce above rations how often this
 	// runs; this is what makes each run cheap.
 	turn.Do(func() {
-		panes, clients := resolver.Enumerate(ctx)
+		panes, clients := enumerateForResolve(ctx, resolver, store.Snapshot(), turn.degradeLog())
 		now := time.Now()
 		store.Apply(func(m map[int]*state.Session) {
 			for _, sess := range m {
-				resolveSession(ctx, resolver, sess, panes, clients, now)
+				resolver.ReconcileFrom(sess, panes, clients, now)
 			}
 		})
 	})
@@ -613,7 +663,23 @@ func reresolveAll(ctx context.Context, store *state.Store, resolver *mapping.Res
 // reader, hook, or subscriber touches it, so a waiter here blocks nothing a user
 // can feel — unlike the store lock, where a waiter is a chip click. Always take
 // this BEFORE store.Apply, never the reverse.
-type resolveTurn struct{ mu sync.Mutex }
+//
+// Being the two producers' shared seat, it also carries the one piece of state
+// they must not each keep privately: whether the terminal enumeration is
+// currently degraded (see enumerate/resolveDegradeLog).
+type resolveTurn struct {
+	mu      sync.Mutex
+	degrade resolveDegradeLog
+}
+
+// degradeLog is the turn's shared enumeration-degradation tracker, nil-safe like
+// Do so a call site without a turn still type-checks and simply keeps no state.
+func (t *resolveTurn) degradeLog() *resolveDegradeLog {
+	if t == nil {
+		return nil
+	}
+	return &t.degrade
+}
 
 // Do runs fn as the sole resolver. A nil turn runs fn unserialized, which keeps
 // single-goroutine call sites (and tests) from having to construct one.
@@ -627,19 +693,72 @@ func (t *resolveTurn) Do(fn func()) {
 	fn()
 }
 
-// resolveSession applies a tick's already-fetched enumeration to one session,
-// falling back to the per-session resolve — which does its own I/O — when the
-// terminal backend offers no batch path.
+// enumerateForResolve is the ONE place either resolve producer fetches the
+// terminal + WM enumeration a tick needs. Both call it immediately before their
+// store.Apply, and neither may resolve any other way.
 //
 // It exists so the reconciler and the WM layout path cannot drift apart on the
-// rule that matters: the enumeration happens BEFORE store.Apply, never inside
-// it. They drifted once already.
-func resolveSession(ctx context.Context, resolver *mapping.Resolver, sess *state.Session, panes map[string]terminal.PaneRef, clients []wm.Window, now time.Time) {
-	if panes != nil {
-		resolver.ReconcileFrom(sess, panes, clients, now)
+// rule that matters: every resolve read happens BEFORE store.Apply, never inside
+// it. They drifted once already, and then a second time — through a per-session
+// fallback that sat inside resolveSession, downstream of both, and fired on ANY
+// empty enumeration. A transient mux failure was enough to put a fork of
+// `wezterm cli list` per session back under the exclusive lock, silently, on a box
+// whose operator believed the fix was deployed. mapping.Enumerate now separates
+// that case from a backend with no batch path, and the only thing either call site
+// does under the lock is apply the result.
+//
+// deg makes a degraded tick audible and is shared by both producers, so an
+// alternating tick and layout event cannot each report the same degradation as
+// new. It is nil-safe, matching resolveTurn.Do.
+func enumerateForResolve(ctx context.Context, resolver *mapping.Resolver, snap state.Snapshot, deg *resolveDegradeLog) (map[string]terminal.PaneRef, []wm.Window) {
+	panes, clients, err := resolver.Enumerate(ctx, ttysOf(snap))
+	deg.observe(err)
+	return panes, clients
+}
+
+// ttysOf is the tty set of a pre-lock snapshot, which is all mapping.Enumerate
+// needs from it (and only in its degraded mode).
+func ttysOf(snap state.Snapshot) []string {
+	ttys := make([]string, 0, len(snap.Sessions))
+	for _, sess := range snap.Sessions {
+		if sess.TTY != "" {
+			ttys = append(ttys, sess.TTY)
+		}
+	}
+	return ttys
+}
+
+// resolveDegradeLog reports the terminal enumeration failing, and recovering, on
+// the EDGES rather than every tick — a 5s ticker would otherwise turn a wedged mux
+// into a log flood, and a flood is its own kind of silence.
+//
+// It exists because the failure it reports used to have no symptom at all: the
+// daemon quietly stopped resolving (or, before this, quietly started forking per
+// session under the lock) and looked healthy from the outside. Both resolve
+// producers share one of these, so an alternating tick and layout event cannot
+// each report the same degradation as new.
+//
+// Logging happens outside the store lock, at both call sites, and must stay that
+// way: a blocking write with the exclusive lock held is an unbounded stall.
+type resolveDegradeLog struct {
+	mu       sync.Mutex
+	degraded bool
+}
+
+func (d *resolveDegradeLog) observe(err error) {
+	if d == nil {
 		return
 	}
-	resolver.Reconcile(ctx, sess)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	switch {
+	case err != nil && !d.degraded:
+		d.degraded = true
+		log.Printf("switchboard: terminal enumeration failed, session→window mapping is frozen until it recovers: %v", err)
+	case err == nil && d.degraded:
+		d.degraded = false
+		log.Printf("switchboard: terminal enumeration recovered; session→window mapping resumed")
+	}
 }
 
 // runReconciler periodically re-resolves every session's wezterm + hyprland
@@ -656,7 +775,7 @@ func runReconciler(ctx context.Context, store *state.Store, resolver *mapping.Re
 	// the WM path landing an older observation between them. See resolveTurn.
 	tick := func() {
 		turn.Do(func() {
-			reconcileOnce(ctx, store, resolver, manager, stack, tun, sink, rstate, forget)
+			reconcileOnce(ctx, store, resolver, manager, stack, tun, sink, rstate, forget, turn.degradeLog())
 		})
 	}
 	tick()
@@ -670,12 +789,18 @@ func runReconciler(ctx context.Context, store *state.Store, resolver *mapping.Re
 	}
 }
 
-func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, tun statustune.Tuning, sink *history.Sink, rstate *reconcileState, forget func(int)) {
+func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, tun statustune.Tuning, sink *history.Sink, rstate *reconcileState, forget func(int), deg *resolveDegradeLog) {
 	// Re-publish capabilities every tick: the terminal locator is self-redetecting
 	// (detect.NewAuto), so a terminal that came up after the daemon flips
 	// terminal/navigate from their boot-race "none" values without a restart.
 	store.SetCapabilities(stack.Capabilities())
 	active, _ := manager.ActiveWindow(ctx)
+	// ONE snapshot for the enumeration and every sampler below. Each used to take
+	// its own, which is four acquisitions of the read lock and four deep copies of
+	// every session per tick — and, worse than the cost, four different views of
+	// which sessions exist, taken at four different instants and then applied
+	// together. Taken here, before any of them, so they all describe one instant.
+	snap := store.Snapshot()
 	// The two enumerations the per-session resolve needs, fetched ONCE for the
 	// whole tick and OUTSIDE the lock. This is the same rule the memory sample
 	// below already follows, and it is why this function has this shape:
@@ -685,40 +810,81 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 	// them on an 8-session, 2-mux box — and every RPC reader, every hook, and
 	// every chip click queued behind it. Measured before this change: p99 166ms,
 	// worst 1382ms, with the spike train landing exactly on the tick interval.
-	panes, clients := resolver.Enumerate(ctx)
+	panes, clients := enumerateForResolve(ctx, resolver, snap, deg)
 	// Stamped AFTER the enumeration so TitleAt still means "when the title was
 	// sampled", which is what it meant when each session stamped its own clock on
 	// the way out of Locate. Stamping before would backdate every title by the
 	// fetch duration, and TitleAt is the freshness gate for the H9 idle-title
 	// recovery (docs/timing-hazards.md).
 	now := time.Now()
-	// Memory is sampled BEFORE the lock is taken, against the pid set of the last
-	// published snapshot: the reads are milliseconds and Store.Apply blocks every
-	// RPC reader and every hook for as long as it holds. Only the assignment and
-	// the sink.Record below run under the lock. See memorySampler.
-	mem := rstate.sampleMemory(store)
+	// Memory is sampled BEFORE the lock is taken, against the pid set of that
+	// snapshot: the reads are milliseconds and Store.Apply blocks every RPC reader
+	// and every hook for as long as it holds. Only the assignment and the
+	// sink.Record below run under the lock. See memorySampler.
+	mem := rstate.sampleMemory(snap)
+	// Same rule, same reason: every read the fanout Observer needs — the first-sight
+	// history seed, the transcript cursor, and the per-session subagents/ dir scan —
+	// used to happen inside the Apply below. See sampleFanout.
+	rstate.sampleFanout(snap)
+	// Liveness and job-control suspension, one process read each per session, both
+	// of which used to happen under the lock. See procSample.
+	procs := sampleProc(snap, stack.OSProc)
+	// The session names, which used to be looked up per session under the lock —
+	// a stat every tick, and a read plus unmarshal whenever one changes. See
+	// sampleLabels.
+	names := rstate.sampleLabels(snap)
+	// Usage moves out entirely rather than being sampled-then-applied: it mutates
+	// no session state, so nothing about it needs the lock. It is also the only
+	// sampler that EMITS out here rather than staging a result for the Apply, so it
+	// is the one that has to carry sweepDeadSessions' liveness rule out with it.
+	// See sampleUsage.
+	rstate.sampleUsage(snap, procs, sink, now)
+	// The two status self-heals' transcript reads. Their DECISIONS stay under the
+	// lock — only the reads move. See signalSample.
+	signals := sampleSignals(snap, tun)
+	// WHAT IS STILL I/O INSIDE THIS Apply, stated plainly so the next reader does
+	// not assume the answer is "nothing" and add one more:
+	//
+	//  1. One os.Stat per sampled session, in signalSample.freshFor. Deliberate:
+	//     it is what makes the guard mean what it says, since the transcript can
+	//     move without any session field moving. ~µs, and it replaced a stat AND a
+	//     bounded tail read per session per tick.
+	//  2. The inline fallbacks, when a sample no longer describes its session — a
+	//     hook reconciling mid-tick, a session that appeared after the snapshot.
+	//     Then readSignals (stat + bounded tail) or the fanout readSample
+	//     (transcript delta + subagents dir scan) runs here, exactly as all of it
+	//     used to. Bounded to the affected sessions and rare by construction, but
+	//     it is a real read under a real lock.
+	//  3. state.Apply's own lock-hold warning writes an Fprintf while holding the
+	//     lock, by design, and only when SWITCHBOARD_DEBUG_LOCK is set.
+	//
+	// Everything else is gone: the resolve enumerations, the fanout seed and dir
+	// scan, the usage delta, the session-name lookup, the self-heals' reads, and
+	// both per-session /proc reads all happen above. sink.Record drops rather than
+	// blocks, log writes go through a non-blocking writer (see nonBlockingLog), and
+	// the persist and broadcast happen after Apply releases the lock.
 	store.Apply(func(m map[int]*state.Session) {
 		// Close the lanes of any session whose process is gone, BEFORE the per-tick
 		// work below — a dead session earns none of it.
-		sweepDeadSessions(m, stack.OSProc, sink, forget, now)
+		sweepDeadSessions(m, procs, sink, forget, now)
 		for _, sess := range m {
-			resolveSession(ctx, resolver, sess, panes, clients, now)
-			// Refresh job-control suspension (Ctrl-Z). On ErrGone the sweep above has
-			// already dropped the session, so this only ever sees a live pid; leave
-			// the last-known value on any other read error rather than flapping. A
-			// change is logged to history as a suspend/resume edge (it greys/un-greys
-			// the chip in a timeline).
-			if st, err := proc.State(sess.PID); err == nil {
-				susp := proc.Suspended(st)
-				if susp != sess.Suspended {
-					evType := history.EventResume
-					if susp {
-						evType = history.EventSuspend
-					}
-					sink.Record(history.Event{Ts: now, Type: evType,
-						SessionID: enrichmentID(sess), PID: sess.PID, Agent: sess.Agent, CWD: sess.CWD})
+			// Applies the pre-lock enumeration and does no I/O — ReconcileFrom takes no
+			// context precisely so it cannot. A degraded tick arrives here with nil
+			// panes, which every session reads as a miss and leaves alone.
+			resolver.ReconcileFrom(sess, panes, clients, now)
+			// Refresh job-control suspension (Ctrl-Z) from the pre-lock read. A session
+			// whose run-state could not be read keeps its last-known value rather than
+			// flapping, and so does one that appeared after the snapshot. A change is
+			// logged to history as a suspend/resume edge (it greys/un-greys the chip in
+			// a timeline).
+			if p := procs[sess.PID]; p.stateOK && p.suspended != sess.Suspended {
+				evType := history.EventResume
+				if p.suspended {
+					evType = history.EventSuspend
 				}
-				sess.Suspended = susp
+				sink.Record(history.Event{Ts: now, Type: evType,
+					SessionID: enrichmentID(sess), PID: sess.PID, Agent: sess.Agent, CWD: sess.CWD})
+				sess.Suspended = p.suspended
 			}
 			// The session's resident cost, read outside this lock at the top of the
 			// tick. The live fields take whatever the tick has, including a repeated
@@ -738,7 +904,7 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 			// delegation, and emit fanout (subagent spawn/stop) + usage (token)
 			// history events derived from the same read. Claude-only.
 			if c := sess.Claude; c != nil {
-				rstate.observe(sink, sess, c, now)
+				rstate.observe(sink, names, sess, c, now)
 			}
 		}
 		// Re-sync focus against the active window (the backstop for any focus event
@@ -746,7 +912,7 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 		// Runs after the resolve loop so every session's Hyprland address is current.
 		applyFocus(m, active, sink, now)
 		selfHealStaleAttention(m, now, tun, sink)
-		selfHealStuckStatus(m, now, tun, sink)
+		selfHealStuckStatus(m, now, tun, sink, signals)
 		rstate.prune(m)
 	})
 }
@@ -861,10 +1027,20 @@ func enrichmentID(s *state.Session) string {
 // — plan risk R3, which T3 widened. See writerQuiescentPastCap.
 //
 // It runs inside the reconcile Apply, so it operates on the locked session map
-// directly (no shared-pointer race) and folds into the tick's single persist.
-// The bounded transcript reads under the lock are consistent with the per-session
-// /proc and WM I/O the same loop already performs; the read count is bounded by
+// directly (no shared-pointer race) and folds into the tick's single persist. Its
+// transcript reads run there too, and are the LAST per-session reads left under
+// the store lock — see the inventory above the Apply in reconcileOnce. Bounded by
 // the number of BLOCKED writers, which is one in every case but case 18.
+//
+// The earlier version of this comment justified those reads as "consistent with
+// the per-session /proc and WM I/O the same loop already performs". That precedent
+// no longer exists: the /proc reads, the WM and terminal enumerations, the fanout
+// dir scan and the session-name lookup have all moved before the lock, and this
+// one is now the exception rather than one of a crowd. It stays here because T9
+// routes each prompt to its own writer's file, so what has to be read is not known
+// until the locked map says which writers are blocked — hoisting it means sampling
+// per (session, writer) against a pending set that can move, which is a redesign,
+// not a relocation. Tracked as its own task rather than done by reflex.
 func selfHealStaleAttention(m map[int]*state.Session, now time.Time, tun statustune.Tuning, sink *history.Sink) {
 	for _, sess := range m {
 		c := sess.Claude
@@ -1062,16 +1238,17 @@ func writerQuiescentPastCap(path string, since, now time.Time, staleCap time.Dur
 //
 // A cheap stat short-circuits the common quiescent case: if nothing has been
 // written since the chip's last transition, no signal can be newer than it, so
-// the tail read is skipped. The read itself is bounded and runs inside the
-// reconcile Apply, exactly like selfHealStaleAttention. Every flip re-stamps
-// StatusSince, so the entry that triggered it is older than the new StatusSince
-// on the next tick and cannot cause a reverse flip — no flapping.
+// the tail read is skipped. That stat and the bounded tail read both happen in
+// sampleSignals, BEFORE the lock — only the decision below runs under it, and
+// only a sample the session has moved past is re-read inline. Every flip
+// re-stamps StatusSince, so the entry that triggered it is older than the new
+// StatusSince on the next tick and cannot cause a reverse flip — no flapping.
 //
 // Deliberately keyed on the interrupt marker, not a no-activity TTL: a
 // multi-minute tool run writes nothing to the transcript for the duration, so a
 // TTL would wrongly decay a genuinely busy session; the marker has no such
 // false-positive (a completed tool records "interrupted":false, not a text block).
-func selfHealStuckStatus(m map[int]*state.Session, now time.Time, tun statustune.Tuning, sink *history.Sink) {
+func selfHealStuckStatus(m map[int]*state.Session, now time.Time, tun statustune.Tuning, sink *history.Sink, samples map[int]signalSample) {
 	for _, sess := range m {
 		c := sess.Claude
 		if c == nil {
@@ -1128,15 +1305,18 @@ func selfHealStuckStatus(m map[int]*state.Session, now time.Time, tun statustune
 		if c.Status != state.StatusIdle && c.Status != state.StatusWorking {
 			continue
 		}
-		// A cheap stat short-circuits the quiescent case: if nothing was written
-		// since the chip transitioned, no signal can be newer than it. (Delegating
-		// is handled above precisely because this gate would skip it.)
-		fi, err := os.Stat(c.Transcript)
-		if err != nil || !fi.ModTime().After(c.StatusSince) {
+		// The stat short-circuit and the tail read both happen in readSignals now,
+		// before the lock. (Delegating is handled above precisely because the stat
+		// gate would skip it.)
+		s := samples[sess.PID]
+		if !s.freshFor(c) {
+			s = readSignals(c, tun) // no usable sample: read inline, as this always did
+		}
+		if s.quiescent {
 			continue
 		}
-		kind, ts, err := transcript.NewestSignal(c.Transcript, tun.TailBytes)
-		if err != nil || kind == transcript.SignalNone || !ts.After(c.StatusSince) {
+		kind, ts := s.kind, s.kindTs
+		if s.kindErr || kind == transcript.SignalNone || !ts.After(c.StatusSince) {
 			continue
 		}
 		switch {

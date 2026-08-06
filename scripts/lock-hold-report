@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# lock-hold-report — summarize store.Apply lock holds from the daemon's journal.
+#
+# Reads the SWITCHBOARD_DEBUG_LOCK warnings ("state: Apply held the write lock
+# 12.3ms (> 5ms) sessions=8 caller=main.reconcileOnce") over a window and reports
+# count, percentiles and worst case PER CALLER. Per-caller is the point: the
+# reconcile tick, the hook handler and the WM layout path hold the lock for
+# different reasons, and a total that mixes them cannot say which regressed.
+#
+# Usage:
+#   scripts/lock-hold-report [--since "2026-08-05 18:00:00"] [--until "..."]
+#
+# Default window is the current daemon's start instant, which is deliberate: the
+# startup tick is the single most expensive Apply of a run (the first tick samples
+# against a nearly-empty snapshot and falls back to inline reads), and a window
+# that begins after it reports a cleaner number than the truth. That mistake has
+# been made twice on this work — see task 5's measurement lessons.
+#
+# Do NOT run builds, `go test`, or a multi-agent review while measuring. They hit
+# the same disk and the same CPU, and a window that overlaps them is not
+# comparable to one that does not.
+set -euo pipefail
+
+since=""
+until_arg=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --since) since="$2"; shift 2 ;;
+        --until) until_arg=(--until "$2"); shift 2 ;;
+        -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+        *) echo "unknown argument: $1" >&2; exit 2 ;;
+    esac
+done
+
+if [[ -z "$since" ]]; then
+    # ExecMainStartTimestamp is "Wed 2026-08-05 17:22:39 PDT"; journalctl wants
+    # the date and time without the weekday or zone.
+    stamp=$(systemctl --user show switchboard -p ExecMainStartTimestamp --value)
+    since=$(awk '{print $2" "$3}' <<<"$stamp")
+fi
+
+echo "window: since $since ${until_arg[*]:-(now)}"
+echo "daemon: $(systemctl --user show switchboard -p ExecMainStartTimestamp --value)"
+echo "binary: $(stat -c '%y  %s bytes' "$HOME/go/bin/switchboard")"
+echo
+
+# The caller= field only exists on a daemon carrying the attribution commit
+# (28ced0d, this branch). A build without it still reports the hold, so the
+# unattributed case is folded into a single "(unattributed)" row rather than
+# dropped — a baseline arm you cannot see is worse than one you cannot break down.
+journalctl --user -u switchboard --since "$since" "${until_arg[@]}" --no-pager -o cat 2>/dev/null |
+    grep -F 'held the write lock' |
+    sed -E 's/.*held the write lock ([0-9.]+)(µs|ms|s) .*sessions=([0-9]+)( caller=(.*))?$/\1 \2 \3 \5/' |
+    awk '
+    {
+        ms = $1
+        if ($2 == "µs") ms = $1 / 1000
+        else if ($2 == "s") ms = $1 * 1000
+        caller = ($4 == "" ? "(unattributed)" : $4)
+        n[caller]++
+        vals[caller, n[caller]] = ms
+        if (ms > worst[caller]) worst[caller] = ms
+        sessions[caller] = $3
+        total++
+    }
+    END {
+        if (total == 0) { print "no lock-hold warnings in the window"; exit }
+        printf "%-34s %6s %9s %9s %9s %9s\n", "caller", "count", "p50", "p90", "p99", "max"
+        for (c in n) {
+            # insertion sort; the counts here are small by construction
+            for (i = 1; i <= n[c]; i++) {
+                v = vals[c, i]; j = i - 1
+                while (j >= 1 && vals[c, j] > v) { vals[c, j+1] = vals[c, j]; j-- }
+                vals[c, j+1] = v
+            }
+            p50 = vals[c, int(n[c] * 0.50) + (n[c] > 1 ? 1 : 0)]
+            p90 = vals[c, int(n[c] * 0.90) + (n[c] > 1 ? 1 : 0)]
+            p99 = vals[c, int(n[c] * 0.99) + (n[c] > 1 ? 1 : 0)]
+            printf "%-34s %6d %8.1fms %8.1fms %8.1fms %8.1fms\n", c, n[c], p50, p90, p99, worst[c]
+        }
+        printf "\ntotal warnings: %d\n", total
+    }'
+
+echo
+# Session count is the multiplier on everything above — the tick's per-session
+# work is what this whole effort is about, so a window's numbers mean nothing
+# without knowing how many sessions produced them.
+sessions=$("$HOME/go/bin/switchboard-ctl" list 2>/dev/null | grep -cE '^ *\[[0-9]+\] pid=') || sessions="?"
+echo "sessions tracked right now: $sessions"

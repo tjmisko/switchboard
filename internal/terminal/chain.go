@@ -88,9 +88,11 @@ func (c chain) Snapshot(ctx context.Context) (map[string]PaneRef, error) {
 			// answer partially: a merged map missing this child's panes is
 			// indistinguishable from "those ttys own no pane", so every session
 			// on that backend would silently resolve to nothing. Refuse the
-			// whole batch instead — SnapshotOrNil turns this into the per-session
-			// Locate fallback, which still routes through every child.
-			return nil, fmt.Errorf("terminal: chain member %q provides no batch snapshot path", l.Name())
+			// whole batch instead, as ErrNoBatchPath — the caller turns that into
+			// the per-session Locate fallback, which still routes through every
+			// child. A plain error here would instead be read as a transient
+			// failure and skip the fallback entirely.
+			return nil, fmt.Errorf("%w: chain member %q", ErrNoBatchPath, l.Name())
 		}
 		panes, err := s.Snapshot(ctx)
 		if err != nil {

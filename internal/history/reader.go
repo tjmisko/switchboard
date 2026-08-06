@@ -2,6 +2,7 @@ package history
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -119,24 +120,82 @@ func PriorSubagentState(dir, sessionID string) (spawned, stopped map[string]bool
 	if sessionID == "" {
 		return spawned, stopped, nil
 	}
-	events, err := ReadRange(dir, time.Time{}, time.Time{})
+	days, err := Days(dir)
 	if err != nil {
 		return nil, nil, err
 	}
-	for _, ev := range events {
-		if ev.SessionID != sessionID {
-			continue
-		}
-		key := eventAgentKey(ev)
-		if key == "" {
-			continue
-		}
-		switch ev.Type {
-		case EventSubagentSpawn:
-			spawned[key] = true
-		case EventSubagentStop:
-			stopped[key] = true
+	// The needle is the JSON-ENCODED session id, quotes included, not the bare
+	// string: quoting is what stops session "s1" from matching `"session_id":"s10"`,
+	// and it keeps the needle correct for an id that would need escaping.
+	needle, err := json.Marshal(sessionID)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, day := range days {
+		if err := scanSubagentLines(DayPath(dir, day), needle, func(ev Event) {
+			if ev.SessionID != sessionID {
+				return
+			}
+			key := eventAgentKey(ev)
+			if key == "" {
+				return
+			}
+			switch ev.Type {
+			case EventSubagentSpawn:
+				spawned[key] = true
+			case EventSubagentStop:
+				stopped[key] = true
+			}
+		}); err != nil {
+			return nil, nil, err
 		}
 	}
 	return spawned, stopped, nil
+}
+
+// subagentNeedle is the substring every subagent_spawn/subagent_stop line carries
+// in its `type`, and no other event type does.
+var subagentNeedle = []byte("subagent_")
+
+// scanSubagentLines streams one day-file and decodes ONLY the lines that could
+// possibly be a subagent event for the session `idNeedle` names, handing each to
+// fn.
+//
+// The two byte-scans before the unmarshal are the whole point. The caller's
+// question is about one session's subagents, but a day-file is dominated by other
+// sessions' transitions and usage samples, so decoding every line to discard
+// nearly all of them made the cost of the answer scale with total retained
+// history rather than with the session. Both needles are necessary conditions for
+// a line to matter — a matching event must carry the quoted id and must carry a
+// `subagent_` type — so skipping a line that lacks either drops nothing. The
+// converse is not assumed: a line that contains both is still decoded and still
+// checked against SessionID and Type, because the needles can appear in other
+// fields (a cwd, a subject) and a substring match is not a parse.
+//
+// A torn final line is tolerated exactly as ReadDay tolerates it, and a file that
+// vanished between the Days listing and the open is not an error.
+func scanSubagentLines(path string, idNeedle []byte, fn func(Event)) error {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if !bytes.Contains(line, idNeedle) || !bytes.Contains(line, subagentNeedle) {
+			continue
+		}
+		var ev Event
+		if json.Unmarshal(line, &ev) != nil {
+			continue // tolerate a torn line (crash mid-append)
+		}
+		fn(ev)
+	}
+	return sc.Err()
 }

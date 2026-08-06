@@ -132,7 +132,7 @@ func TestIdleTitleDemotionHonorsGraceAfterSubagentRegreen(t *testing.T) {
 			// chip green here.
 			m[100].Wezterm = &state.WeztermInfo{Title: "✳ switchboard", TitleAt: now}
 
-			selfHealStuckStatus(m, now, tun, nil)
+			healStuck(t, m, now, tun, nil)
 
 			got := m[100].Claude
 			if got.Status != tc.want {
@@ -208,7 +208,7 @@ func TestAnchorClampFreshnessDependsOnWallClockWriters(t *testing.T) {
 					m[100].Wezterm = &state.WeztermInfo{Title: w.title, TitleAt: now}
 				}
 
-				selfHealStuckStatus(m, now, tun, nil)
+				healStuck(t, m, now, tun, nil)
 
 				got := m[100].Claude
 				if got.Status != w.to {
@@ -284,7 +284,7 @@ func TestAnchorClampFreshnessDependsOnWallClockWriters(t *testing.T) {
 		m := stuckMap(state.StatusWorking, path, since)
 		m[100].Agent = state.AgentKindClaude
 		m[100].Wezterm = &state.WeztermInfo{Title: "✳ switchboard", TitleAt: tick}
-		selfHealStuckStatus(m, tick, tun, nil)
+		healStuck(t, m, tick, tun, nil)
 
 		if got := m[100].Claude.Status; got != state.StatusIdle {
 			t.Fatalf("status = %q one tick after the re-green, want idle", got)
@@ -344,7 +344,7 @@ func TestRegreenCycleAgeTracksTheCycleNotTheQuiescentTranscript(t *testing.T) {
 		before := m[100].Claude.StatusSince
 		wasWorking := m[100].Claude.Status == state.StatusWorking
 
-		selfHealStuckStatus(m, now, tun, nil)
+		healStuck(t, m, now, tun, nil)
 
 		if wasWorking && m[100].Claude.Status == state.StatusIdle {
 			demotions = append(demotions, now)

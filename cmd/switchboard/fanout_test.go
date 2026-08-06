@@ -68,6 +68,125 @@ func assistantUsageModelLine(model string, in, out int64) string {
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }
 
+// tickObserve mirrors one tick for a single session: resolve the label BEFORE the
+// lock (what sampleLabels does over the whole snapshot), then apply under it. The
+// two steps are separate in production precisely so the name lookup's filesystem
+// round trip does not happen with the lock held.
+func tickObserve(rs *reconcileState, sink *history.Sink, sess *state.Session, now time.Time) {
+	names := map[int]string{sess.PID: rs.names.RawName(*sess)}
+	rs.observe(sink, names, sess, sess.Claude, now)
+}
+
+// The wiring test for the pre-lock reads. The Observer's own tests cover Sample
+// and Prime; this one covers sampleFanout actually reaching the sessions in the
+// store, since a Sample that is never taken is exactly as slow as no Sample.
+//
+// Same trick as the Observer test: the history is deleted after sampleFanout, so
+// a Reconcile that still seeded from disk would find nothing and re-emit r1's
+// already-recorded spawn.
+func TestSampleFanoutSeedsEverySessionInTheSnapshot(t *testing.T) {
+	base := t.TempDir()
+	sid := "s-primed"
+	tpath := filepath.Join(base, sid+".jsonl")
+	writeLines(t, tpath, `{"type":"system"}`)
+	subdir := filepath.Join(base, sid, "subagents")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// r1 ran and finished; its spawn was already emitted on a previous daemon run.
+	if err := os.WriteFile(filepath.Join(subdir, "agent-r1.meta.json"),
+		[]byte(`{"agentType":"Explore","description":"probe","spawnDepth":1,"toolUseId":"toolu_r1"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subdir, "agent-r1.jsonl"),
+		[]byte(`{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn"}}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	obsDir := t.TempDir()
+	day := filepath.Join(obsDir, "2026-06-27.jsonl")
+	if err := os.WriteFile(day,
+		[]byte(`{"ts":"2026-06-27T12:00:00Z","type":"subagent_spawn","session_id":"`+sid+`","agent_id":"r1"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	histDir := t.TempDir()
+	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
+	rs := newReconcileState(fanout.NewObserver(obsDir), nil)
+	sess := &state.Session{PID: 11, Agent: "claude", CWD: "/home/u/proj",
+		Claude: &state.AgentInfo{SessionID: sid, Transcript: tpath}}
+
+	store := state.New(filepath.Join(t.TempDir(), "state.json"))
+	store.Apply(func(m map[int]*state.Session) { m[sess.PID] = sess })
+
+	rs.sampleFanout(store.Snapshot())
+	if err := os.Remove(day); err != nil {
+		t.Fatal(err)
+	}
+
+	tickObserve(rs, sink, sess, time.Now())
+	sink.Close()
+
+	for _, ev := range eventsOfType(readEvents(t, histDir), history.EventSubagentSpawn) {
+		if ev.AgentID == "r1" {
+			t.Fatalf("r1's spawn was re-emitted, so primeFanout did not seed this session before observe ran: %+v", ev)
+		}
+	}
+}
+
+// The seed test above passes even if observeFanout throws the sample away, since
+// sampleFanout seeds as a side effect. This one covers the plumbing itself: the
+// subagents dir is removed after sampling, so the spawn can ONLY come from the
+// sample. It fails if observeFanout reads inline instead.
+func TestObserveFanoutAppliesTheSampledDirScan(t *testing.T) {
+	base := t.TempDir()
+	sid := "s-sampled"
+	tpath := filepath.Join(base, sid+".jsonl")
+	writeLines(t, tpath, `{"type":"system"}`)
+	subdir := filepath.Join(base, sid, "subagents")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subdir, "agent-n1.meta.json"),
+		[]byte(`{"agentType":"Explore","description":"probe","spawnDepth":1,"toolUseId":"toolu_n1"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subdir, "agent-n1.jsonl"),
+		[]byte(`{"type":"assistant","message":{"role":"assistant","stop_reason":null}}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	histDir := t.TempDir()
+	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+	sess := &state.Session{PID: 12, Agent: "claude", CWD: "/home/u/proj",
+		Claude: &state.AgentInfo{SessionID: sid, Transcript: tpath}}
+
+	store := state.New(filepath.Join(t.TempDir(), "state.json"))
+	store.Apply(func(m map[int]*state.Session) { m[sess.PID] = sess })
+
+	rs.sampleFanout(store.Snapshot())
+	if err := os.RemoveAll(filepath.Join(base, sid)); err != nil {
+		t.Fatal(err)
+	}
+
+	tickObserve(rs, sink, sess, time.Now())
+	sink.Close()
+
+	var spawned bool
+	for _, ev := range eventsOfType(readEvents(t, histDir), history.EventSubagentSpawn) {
+		if ev.AgentID == "n1" {
+			spawned = true
+		}
+	}
+	if !spawned {
+		t.Fatal("n1's spawn must come from the pre-lock sample; observeFanout appears to have read inline instead")
+	}
+	if sess.Claude.InFlightSubagents != 1 {
+		t.Fatalf("inflight = %d, want 1 from the sampled dir scan", sess.Claude.InFlightSubagents)
+	}
+}
+
 func TestObserveUsageEmitsOneSamplePerModel(t *testing.T) {
 	dir := t.TempDir()
 	tpath := filepath.Join(dir, "t.jsonl")
@@ -79,8 +198,13 @@ func TestObserveUsageEmitsOneSamplePerModel(t *testing.T) {
 	sess := &state.Session{PID: 7, Agent: "claude", CWD: "/home/u/proj",
 		Claude: &state.AgentInfo{SessionID: "s7", Transcript: tpath}}
 
-	// First observe primes the usage cursor to EOF — no sample for the baseline.
-	rs.observe(sink, sess, sess.Claude, time.Now())
+	// Usage is sampled before the store lock now, so drive it the way the tick
+	// does — through the store — rather than through observe.
+	store := state.New(filepath.Join(t.TempDir(), "state.json"))
+	store.Apply(func(m map[int]*state.Session) { m[sess.PID] = sess })
+
+	// First pass primes the usage cursor to EOF — no sample for the baseline.
+	rs.sampleUsage(store.Snapshot(), nil, sink, time.Now())
 
 	// Two models accrue tokens while we watch.
 	f, _ := os.OpenFile(tpath, os.O_APPEND|os.O_WRONLY, 0o644)
@@ -89,7 +213,7 @@ func TestObserveUsageEmitsOneSamplePerModel(t *testing.T) {
 	f.WriteString(assistantUsageModelLine("claude-opus-4-8", 20, 8) + "\n")
 	f.Close()
 
-	rs.observe(sink, sess, sess.Claude, time.Now())
+	rs.sampleUsage(store.Snapshot(), nil, sink, time.Now())
 	sink.Close()
 
 	samples := eventsOfType(readEvents(t, histDir), history.EventUsageSample)
@@ -122,12 +246,12 @@ func TestObserveLabelEmitsOnChangeOnly(t *testing.T) {
 		Wezterm: &state.WeztermInfo{WindowTitle: "first-name"},
 		Claude:  &state.AgentInfo{SessionID: "s1", Transcript: tpath}}
 
-	rs.observe(sink, sess, sess.Claude, time.Now()) // emit "first-name"
-	rs.observe(sink, sess, sess.Claude, time.Now()) // unchanged → no emit
+	tickObserve(rs, sink, sess, time.Now()) // emit "first-name"
+	tickObserve(rs, sink, sess, time.Now()) // unchanged → no emit
 
-	sess.Wezterm.WindowTitle = "second-name"        // user renamed the session
-	rs.observe(sink, sess, sess.Claude, time.Now()) // emit "second-name"
-	rs.observe(sink, sess, sess.Claude, time.Now()) // unchanged → no emit
+	sess.Wezterm.WindowTitle = "second-name" // user renamed the session
+	tickObserve(rs, sink, sess, time.Now())  // emit "second-name"
+	tickObserve(rs, sink, sess, time.Now())  // unchanged → no emit
 	sink.Close()
 
 	labels := eventsOfType(readEvents(t, histDir), history.EventSessionLabel)
@@ -174,8 +298,8 @@ func TestObserveLabelEmitsAgainWhenTheSessionFileIsRenamed(t *testing.T) {
 		Wezterm: &state.WeztermInfo{WindowTitle: "ignored-window-title"},
 		Claude:  &state.AgentInfo{SessionID: "s1", Transcript: tpath}}
 
-	rs.observe(sink, sess, sess.Claude, time.Now()) // emit "aaa-name"
-	rs.observe(sink, sess, sess.Claude, time.Now()) // unchanged → no emit
+	tickObserve(rs, sink, sess, time.Now()) // emit "aaa-name"
+	tickObserve(rs, sink, sess, time.Now()) // unchanged → no emit
 
 	// `/name bbb-name`. Same length as the old name, so the file's size does not
 	// move and mtime alone has to carry the invalidation; forced forward so the
@@ -186,8 +310,8 @@ func TestObserveLabelEmitsAgainWhenTheSessionFileIsRenamed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rs.observe(sink, sess, sess.Claude, time.Now()) // emit "bbb-name"
-	rs.observe(sink, sess, sess.Claude, time.Now()) // unchanged → no emit
+	tickObserve(rs, sink, sess, time.Now()) // emit "bbb-name"
+	tickObserve(rs, sink, sess, time.Now()) // unchanged → no emit
 	sink.Close()
 
 	labels := eventsOfType(readEvents(t, histDir), history.EventSessionLabel)
@@ -215,12 +339,12 @@ func TestObserveLabelReAnnouncesTheNameToANewSessionInTheSameProcess(t *testing.
 		Wezterm: &state.WeztermInfo{WindowTitle: "digest-status"},
 		Claude:  &state.AgentInfo{SessionID: "s1", Transcript: tpath}}
 
-	rs.observe(sink, sess, sess.Claude, time.Now()) // emit for s1
-	rs.observe(sink, sess, sess.Claude, time.Now()) // unchanged → no emit
+	tickObserve(rs, sink, sess, time.Now()) // emit for s1
+	tickObserve(rs, sink, sess, time.Now()) // unchanged → no emit
 
-	sess.Claude.SessionID = "s2"                    // /clear: same pane, same name, new session
-	rs.observe(sink, sess, sess.Claude, time.Now()) // emit for s2
-	rs.observe(sink, sess, sess.Claude, time.Now()) // unchanged → no emit
+	sess.Claude.SessionID = "s2"            // /clear: same pane, same name, new session
+	tickObserve(rs, sink, sess, time.Now()) // emit for s2
+	tickObserve(rs, sink, sess, time.Now()) // unchanged → no emit
 	sink.Close()
 
 	labels := eventsOfType(readEvents(t, histDir), history.EventSessionLabel)
@@ -276,7 +400,7 @@ func TestObserveLabelDoesNotReAnnounceAfterATickWithoutClaudeInfo(t *testing.T) 
 		Claude:  &state.AgentInfo{SessionID: "s1", Transcript: tpath}}
 	live := map[int]*state.Session{424242: sess}
 
-	rs.observe(sink, sess, sess.Claude, time.Now())
+	tickObserve(rs, sink, sess, time.Now())
 	rs.prune(live)
 
 	claude := sess.Claude
@@ -284,7 +408,7 @@ func TestObserveLabelDoesNotReAnnounceAfterATickWithoutClaudeInfo(t *testing.T) 
 	rs.prune(live)
 	sess.Claude = claude
 
-	rs.observe(sink, sess, sess.Claude, time.Now())
+	tickObserve(rs, sink, sess, time.Now())
 	sink.Close()
 
 	labels := eventsOfType(readEvents(t, histDir), history.EventSessionLabel)
@@ -342,15 +466,20 @@ func TestObserveUsagePrimesThenSamples(t *testing.T) {
 	sess := &state.Session{PID: 1, Agent: "claude", CWD: "/home/u/proj",
 		Claude: &state.AgentInfo{SessionID: "s1", Transcript: tpath}}
 
-	// First observe primes the usage cursor to EOF — no sample for the backlog.
-	rs.observe(sink, sess, sess.Claude, time.Now())
+	// Usage is sampled before the store lock now, so drive it the way the tick
+	// does — through the store — rather than through observe.
+	store := state.New(filepath.Join(t.TempDir(), "state.json"))
+	store.Apply(func(m map[int]*state.Session) { m[sess.PID] = sess })
+
+	// First pass primes the usage cursor to EOF — no sample for the backlog.
+	rs.sampleUsage(store.Snapshot(), nil, sink, time.Now())
 
 	// New usage accrues while we watch.
 	f, _ := os.OpenFile(tpath, os.O_APPEND|os.O_WRONLY, 0o644)
 	f.WriteString(`{"type":"assistant","message":{"role":"assistant","content":[],"usage":{"input_tokens":120,"output_tokens":34}}}` + "\n")
 	f.Close()
 
-	rs.observe(sink, sess, sess.Claude, time.Now())
+	rs.sampleUsage(store.Snapshot(), nil, sink, time.Now())
 	sink.Close()
 
 	samples := eventsOfType(readEvents(t, histDir), history.EventUsageSample)
@@ -359,5 +488,41 @@ func TestObserveUsagePrimesThenSamples(t *testing.T) {
 	}
 	if samples[0].TokIn != 120 || samples[0].TokOut != 34 {
 		t.Errorf("usage sample = %+v, want only the post-priming delta (120/34)", samples[0])
+	}
+}
+
+// Usage sampling used to run inside the Apply, AFTER sweepDeadSessions, whose
+// contract is that a dead session earns none of the tick's work. Moving it before
+// the lock moved it out from behind that sweep, so it has to carry the rule with
+// it: on the tick that discovers a claude has exited, the sweep closes its lane
+// with a session_end, and a usage_sample emitted in the same tick would attribute
+// tokens to a lane that is closing.
+func TestSampleUsageSkipsASessionWhoseProcessIsGone(t *testing.T) {
+	dir := t.TempDir()
+	tpath := filepath.Join(dir, "t.jsonl")
+	writeLines(t, tpath, `{"type":"system"}`)
+
+	histDir := t.TempDir()
+	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+	sess := &state.Session{PID: 9, Agent: "claude", CWD: "/home/u/proj",
+		Claude: &state.AgentInfo{SessionID: "s9", Transcript: tpath}}
+
+	store := state.New(filepath.Join(t.TempDir(), "state.json"))
+	store.Apply(func(m map[int]*state.Session) { m[sess.PID] = sess })
+
+	// Prime the cursor while the session is still alive.
+	rs.sampleUsage(store.Snapshot(), nil, sink, time.Now())
+
+	// The turn's last tokens land, and then the process exits before the next tick.
+	f, _ := os.OpenFile(tpath, os.O_APPEND|os.O_WRONLY, 0o644)
+	f.WriteString(assistantUsageModelLine("claude-opus-4-8", 77, 11) + "\n")
+	f.Close()
+
+	rs.sampleUsage(store.Snapshot(), map[int]procSample{9: {dead: true}}, sink, time.Now())
+	sink.Close()
+
+	if samples := eventsOfType(readEvents(t, histDir), history.EventUsageSample); len(samples) != 0 {
+		t.Fatalf("got %d usage samples for a session whose process is gone, want 0: %+v", len(samples), samples)
 	}
 }

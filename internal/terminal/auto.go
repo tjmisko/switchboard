@@ -64,16 +64,16 @@ func (a auto) Activate(ctx context.Context, ref *PaneRef) error {
 // daemon starts joins the fast path on the next reconcile tick, not on restart.
 //
 // current() hands back a plain Locator that may or may not carry the fast path,
-// so this applies SnapshotOrNil's upgrade/degrade rule itself. When the live
-// backend has no batch path it must ERROR rather than return an empty map:
-// SnapshotOrNil then reports "no usable batch answer" and the caller falls back
-// to Locate, whereas an empty map would be read as "no tty owns a pane" and
-// blank every chip.
+// so this applies Snapshot's upgrade/degrade rule itself. When the live backend
+// has no batch path it must ERROR rather than return an empty map, and it must
+// error with ErrNoBatchPath specifically: an empty map would be read as "no tty
+// owns a pane" and blank every chip, while an undistinguished error would be read
+// as a transient failure and suppress the per-session fallback this case needs.
 func (a auto) Snapshot(ctx context.Context) (map[string]PaneRef, error) {
 	cur := a.current()
 	s, ok := cur.(Snapshotter)
 	if !ok {
-		return nil, fmt.Errorf("terminal: backend %q provides no batch snapshot path", cur.Name())
+		return nil, fmt.Errorf("%w: %q", ErrNoBatchPath, cur.Name())
 	}
 	return s.Snapshot(ctx)
 }

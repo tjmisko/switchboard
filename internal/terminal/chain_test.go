@@ -210,8 +210,10 @@ func TestChainSnapshotShouldSurfaceTheErrorWhenEveryLocatorFailsAndNothingIsFoun
 
 // A locator without the batch path cannot contribute to a merge, and a merged
 // map missing its panes is indistinguishable from "those ttys own no pane" — so
-// the chain refuses the batch wholesale and SnapshotOrNil degrades the caller to
-// per-session Locate, which still routes through every child.
+// the chain refuses the batch wholesale, as ErrNoBatchPath, and the caller
+// degrades to per-session Locate, which still routes through every child. The
+// sentinel matters: an undistinguished error here would be read as a transient
+// failure and resolve nothing at all.
 func TestChainSnapshotShouldRefuseTheBatchPathWhenAMemberHasNoSnapshotter(t *testing.T) {
 	singlePath := &fakeLocator{name: "kitty", available: true, wantTTY: "/dev/pts/3", pane: &PaneRef{Backend: "kitty", TTY: "/dev/pts/3"}}
 	batch := newBatchFake("wezterm", map[string]PaneRef{
@@ -219,11 +221,15 @@ func TestChainSnapshotShouldRefuseTheBatchPathWhenAMemberHasNoSnapshotter(t *tes
 	})
 	c := NewChain(singlePath, batch)
 
-	if _, err := chainSnapshot(t, c); err == nil {
+	_, err := chainSnapshot(t, c)
+	if err == nil {
 		t.Fatal("Snapshot = nil err, want a refusal when a member has no batch path")
 	}
-	if got := SnapshotOrNil(context.Background(), c); got != nil {
-		t.Errorf("SnapshotOrNil = %+v, want nil so the caller falls back to Locate", got)
+	if !errors.Is(err, ErrNoBatchPath) {
+		t.Errorf("Snapshot err = %v, want ErrNoBatchPath so the caller falls back to Locate", err)
+	}
+	if got, err := Snapshot(context.Background(), c); got != nil || !errors.Is(err, ErrNoBatchPath) {
+		t.Errorf("Snapshot = (%+v, %v), want (nil, ErrNoBatchPath)", got, err)
 	}
 	// The fallback still resolves the single-path locator's tty.
 	pane, err := c.Locate(context.Background(), "/dev/pts/3")

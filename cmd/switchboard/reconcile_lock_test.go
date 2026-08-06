@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -87,7 +88,7 @@ func reconcileFixture(t *testing.T, sessionCount int) (*state.Store, *slowBatchL
 
 	tick := func() {
 		reconcileOnce(context.Background(), store, resolver, manager, stack,
-			statustune.Default(), nil, rstate, func(int) {})
+			statustune.Default(), nil, rstate, func(int) {}, nil)
 	}
 	return store, loc, resolver, tick
 }
@@ -190,26 +191,141 @@ func TestShouldNotHoldTheStoreLockAcrossEnumerationOnTheWMLayoutPath(t *testing.
 }
 
 func TestShouldFallBackToPerSessionResolveWhenTheBackendCannotBatch(t *testing.T) {
-	// terminal.NewNone provides no Snapshotter, so SnapshotOrNil yields nil and the
-	// tick must still resolve — degraded in speed, never in correctness.
+	// The none backend DOES implement Snapshotter (owning nothing is a complete
+	// answer), so this needs a locator that genuinely has none. The tick must still
+	// resolve it — degraded in speed, never in correctness — and must do that
+	// resolving before the lock, not inside it.
 	store := state.New("")
 	store.Apply(func(m map[int]*state.Session) {
 		m[6000] = &state.Session{PID: 6000, TTY: "/dev/pts/1", CWD: "/home/test", StartedAt: time.Now()}
 	})
-	loc := terminal.NewNone()
+	loc := &locateOnlyLocator{store: store, panes: map[string]terminal.PaneRef{
+		"/dev/pts/1": {Backend: "locateonly", TTY: "/dev/pts/1", PaneID: 42, Title: "resolved"},
+	}}
 	manager := stubManager{}
 	stack := detect.Stack{OSProc: fakeProcSource{st: map[int]procState{6000: procAlive}}, Terminal: loc, WM: manager}
 	resolver := mapping.NewResolver(loc, manager)
 	rstate := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
 
 	reconcileOnce(context.Background(), store, resolver, manager, stack,
-		statustune.Default(), nil, rstate, func(int) {})
+		statustune.Default(), nil, rstate, func(int) {}, nil)
 
-	// The session survives the tick with its identity intact; the none backend
-	// simply never resolves it past the Observe tier.
 	snap := store.Snapshot()
 	if len(snap.Sessions) != 1 || snap.Sessions[0].PID != 6000 {
 		t.Fatalf("session did not survive a no-batch tick: %+v", snap.Sessions)
+	}
+	if loc.locatesDuringApply() != 0 {
+		t.Errorf("the no-batch fallback ran %d Locates INSIDE store.Apply, want 0 — "+
+			"that is the O(sessions)-subprocess-under-the-lock pathology this seam exists to remove",
+			loc.locatesDuringApply())
+	}
+	if loc.locateCount() == 0 {
+		t.Error("the no-batch fallback never called Locate, so a backend without a batch path resolves nothing at all")
+	}
+}
+
+// A transient enumeration failure — a wedged mux, EMFILE, a slow WM socket — must
+// NOT be treated as "this backend has no batch path". Doing so put a fork of the
+// terminal enumeration per session back under the exclusive store lock, silently,
+// on any blip: precisely the behavior measured at p99 166ms / worst 1382ms that
+// this whole change set exists to remove. Resolving nothing for one tick is
+// strictly better, and the next tick recovers.
+func TestShouldNotResolvePerSessionWhenTheBatchEnumerationFails(t *testing.T) {
+	store := state.New("")
+	store.Apply(func(m map[int]*state.Session) {
+		for i := range 8 {
+			pid := 6100 + i
+			m[pid] = &state.Session{PID: pid, TTY: ttyName(i), CWD: "/home/test", StartedAt: time.Now()}
+		}
+	})
+	procs := map[int]procState{}
+	for i := range 8 {
+		procs[6100+i] = procAlive
+	}
+	loc := &locateOnlyLocator{snapErr: errors.New("mux socket went away")}
+	manager := stubManager{}
+	stack := detect.Stack{OSProc: fakeProcSource{st: procs}, Terminal: loc, WM: manager}
+	resolver := mapping.NewResolver(loc, manager)
+	rstate := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+
+	reconcileOnce(context.Background(), store, resolver, manager, stack,
+		statustune.Default(), nil, rstate, func(int) {}, nil)
+
+	if got := loc.locateCount(); got != 0 {
+		t.Errorf("a failed batch enumeration fell back to %d per-session Locates, want 0 "+
+			"(a transient failure must skip the tick, not fork per session)", got)
+	}
+	if got := len(store.Snapshot().Sessions); got != 8 {
+		t.Errorf("sessions after a degraded tick = %d, want 8 — a failed enumeration must not drop anyone", got)
+	}
+}
+
+// locateOnlyLocator is a backend whose Snapshot behavior is configurable and
+// whose Locate records whether it was called while the store lock was held. It
+// implements Snapshotter so it can model a FAILING batch path; leave snapErr nil
+// and it reports ErrNoBatchPath instead, modelling a backend that has none.
+type locateOnlyLocator struct {
+	mu      sync.Mutex
+	locates int
+	inApply int
+	store   *state.Store
+	panes   map[string]terminal.PaneRef
+	snapErr error
+}
+
+func (l *locateOnlyLocator) Name() string    { return "locateonly" }
+func (l *locateOnlyLocator) Available() bool { return true }
+
+func (l *locateOnlyLocator) Snapshot(context.Context) (map[string]terminal.PaneRef, error) {
+	if l.snapErr != nil {
+		return nil, l.snapErr
+	}
+	return nil, terminal.ErrNoBatchPath
+}
+
+// Locate detects the store lock by trying to take a read lock without blocking:
+// a Snapshot that cannot complete promptly means a writer holds it, which — since
+// the only writer in this test is the tick's own Apply — means this call is inside
+// it. Cheap and exact enough for the property under test.
+func (l *locateOnlyLocator) Locate(_ context.Context, tty string) (*terminal.PaneRef, error) {
+	l.mu.Lock()
+	l.locates++
+	if l.store != nil && !readableNow(l.store) {
+		l.inApply++
+	}
+	l.mu.Unlock()
+	if ref, ok := l.panes[tty]; ok {
+		return &ref, nil
+	}
+	return nil, nil
+}
+
+func (l *locateOnlyLocator) Activate(context.Context, *terminal.PaneRef) error { return nil }
+
+func (l *locateOnlyLocator) locateCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.locates
+}
+
+func (l *locateOnlyLocator) locatesDuringApply() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.inApply
+}
+
+// readableNow reports whether a store read completes without waiting on a writer.
+func readableNow(store *state.Store) bool {
+	done := make(chan struct{})
+	go func() {
+		store.Snapshot()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(50 * time.Millisecond):
+		return false
 	}
 }
 
@@ -276,7 +392,7 @@ func runConcurrentResolves(t *testing.T, turn *resolveTurn) bool {
 		defer wg.Done()
 		turn.Do(func() {
 			reconcileOnce(context.Background(), store, resolver, manager, stack,
-				statustune.Default(), nil, rstate, func(int) {})
+				statustune.Default(), nil, rstate, func(int) {}, nil)
 		})
 	}()
 	go func() {

@@ -62,6 +62,18 @@ func (f fakeProcSource) Enumerate() ([]osproc.Info, error)        { return nil, 
 func (f fakeProcSource) Watch(context.Context, int, func()) error { return nil }
 func (f fakeProcSource) Stop(int)                                 {}
 
+// procsFor is the tick's pre-lock process sample for the sessions in m, built
+// through the same predicate reconcileOnce uses. sweepDeadSessions consumes the
+// verdict rather than reading /proc itself, because it runs with the store lock
+// held; the reading happens out here.
+func procsFor(m map[int]*state.Session, src osproc.Source) map[int]procSample {
+	out := make(map[int]procSample, len(m))
+	for pid := range m {
+		out[pid] = procSample{dead: sessionDead(src, pid)}
+	}
+	return out
+}
+
 // trackedSession is one session in the store map, as the daemon holds it.
 func trackedSession(pid int, sid string) *state.Session {
 	return &state.Session{PID: pid, Agent: "claude", CWD: "/home/u/proj",
@@ -125,7 +137,7 @@ func TestSessionLifecycleHazards(t *testing.T) {
 
 			m := map[int]*state.Session{pid: trackedSession(pid, "sid-1")}
 			var forgotten []int
-			sweepDeadSessions(m, src, sink, func(p int) { forgotten = append(forgotten, p) }, time.Now())
+			sweepDeadSessions(m, procsFor(m, src), sink, func(p int) { forgotten = append(forgotten, p) }, time.Now())
 			sink.Close()
 
 			ends := eventsOfType(readEvents(t, histDir), history.EventSessionEnd)
@@ -208,13 +220,13 @@ func TestEndSessionEmitsExactlyOncePerDeath(t *testing.T) {
 	now := time.Now()
 
 	// The sweep notices first...
-	sweepDeadSessions(m, src, sink, func(int) {}, now)
+	sweepDeadSessions(m, procsFor(m, src), sink, func(int) {}, now)
 	// ...then the orphaned-but-late pidfd callback fires for the same death.
 	if endSession(m, pid, sink, func(int) {}, now) {
 		t.Error("second endSession reported closing the lane again; it must be a no-op")
 	}
 	// ...and a later tick sweeps again for good measure.
-	sweepDeadSessions(m, src, sink, func(int) {}, now)
+	sweepDeadSessions(m, procsFor(m, src), sink, func(int) {}, now)
 	sink.Close()
 
 	if ends := eventsOfType(readEvents(t, histDir), history.EventSessionEnd); len(ends) != 1 {

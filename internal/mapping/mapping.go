@@ -11,6 +11,7 @@ package mapping
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/osproc"
@@ -114,25 +115,73 @@ func (r *Resolver) Reconcile(ctx context.Context, sess *state.Session) {
 // path could never produce, and the two would disagree exactly when the batch
 // path degraded — the worst possible time.
 //
-// panes is nil when the terminal backend offers no batch path OR its enumeration
-// failed; both mean "no usable batch answer" and the caller falls back to
-// per-session Reconcile (see terminal.SnapshotOrNil). Note that nil is NOT the
-// same as an empty map, which is a real answer meaning no tty owns a pane.
-// clients is nil on a WM error, matching findWindow, which swallows that error
-// and returns no window.
+// ttys is the tick's session tty set, needed only for the fallback below; pass
+// nil when there is nothing to resolve.
+//
+// The two ways a batch answer can be missing are NOT the same thing, and this is
+// the function that has to tell them apart:
+//
+//   - The backend has no batch path at all (terminal.ErrNoBatchPath). That is
+//     static, so per-session Locate is the only way to resolve anything, and it
+//     is done HERE — outside the store lock, where the caller still is — rather
+//     than handed back to be discovered later inside an Apply. The synthesized
+//     map is indistinguishable from a real batch answer downstream.
+//   - The enumeration was attempted and FAILED (a wedged mux, EMFILE, a slow WM
+//     socket). That is transient, and the answer is to resolve nothing this tick
+//     and let the next one recover: panes is nil and the error is returned so the
+//     caller can say so out loud. Falling back to per-session Locate here would
+//     fork one enumeration per session — the exact O(sessions)-subprocess
+//     pathology this whole seam exists to remove, reintroduced by a blip.
+//
+// A nil panes with a nil error cannot happen; a non-nil panes is complete and its
+// missing keys are real misses (nil is NOT an empty map, which means no tty owns
+// a pane). clients is nil on a WM error, matching findWindow, which swallows that
+// error and returns no window.
 //
 // Carries Reconcile's 3s timeout so a wedged mux or compositor bounds the tick
 // rather than stalling it.
-func (r *Resolver) Enumerate(ctx context.Context) (map[string]terminal.PaneRef, []wm.Window) {
+func (r *Resolver) Enumerate(ctx context.Context, ttys []string) (map[string]terminal.PaneRef, []wm.Window, error) {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
-	panes := terminal.SnapshotOrNil(ctx, r.term)
 	clients, err := r.wm.Clients(ctx)
 	if err != nil {
 		clients = nil
 	}
-	return panes, clients
+	panes, err := terminal.Snapshot(ctx, r.term)
+	switch {
+	case err == nil:
+		return panes, clients, nil
+	case errors.Is(err, terminal.ErrNoBatchPath):
+		return r.locateEach(ctx, ttys), clients, nil
+	default:
+		return nil, clients, err
+	}
+}
+
+// locateEach builds a pane set one Locate at a time, for a backend that has no
+// batch path. It is Enumerate's degraded mode and runs in Enumerate's context —
+// before the store lock, never under it.
+//
+// A tty whose Locate errors or finds nothing is simply absent from the map, which
+// ReconcileFrom reads as a miss and leaves the session's existing mapping alone —
+// the same outcome the per-session Reconcile produced from the same failure.
+func (r *Resolver) locateEach(ctx context.Context, ttys []string) map[string]terminal.PaneRef {
+	panes := make(map[string]terminal.PaneRef, len(ttys))
+	for _, tty := range ttys {
+		if tty == "" {
+			continue
+		}
+		if _, done := panes[tty]; done {
+			continue // several sessions can share one tty; enumerate it once
+		}
+		pane, err := r.term.Locate(ctx, tty)
+		if err != nil || pane == nil {
+			continue
+		}
+		panes[tty] = *pane
+	}
+	return panes
 }
 
 // ReconcileFrom is Reconcile with the two I/O calls hoisted out: it applies an
