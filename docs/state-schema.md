@@ -50,7 +50,23 @@ delta.
 | Field | JSON type | Always present | Meaning |
 |-------|-----------|----------------|---------|
 | `sessions` | array of `Session` | yes | All currently-tracked coding-agent sessions (Claude Code and Codex). May be empty (`[]`) when no sessions exist. |
-| `updated_at` | RFC 3339 timestamp string | yes | When this snapshot was produced (`time.Now()` at encode). Monotonic-ish wall clock; advisory only. |
+| `updated_at` | RFC 3339 timestamp string | yes | When the daemon last **published** this state — stamped by the writer that produced the snapshot, not by the reader that fetched it. Monotonic-ish wall clock; advisory only. |
+
+⚠ `updated_at` means slightly different things on the two transports, and the
+difference is one tick wide:
+
+- **In this file** it is the time of the last observable **change**, because the
+  file is only rewritten when something changed (see "How it is written" above).
+- **Over the RPC socket** (`list`, `subscribe`) it is the time of the last
+  **write**, changed or not. The daemon republishes on every mutation so that a
+  reader's `updated_at` cannot freeze, so an idle box advances it once per
+  reconcile tick while `state.json` holds still.
+
+Neither is a liveness signal, which is why both are advisory. What changed when
+the daemon stopped stamping this at read time: two `list` calls a second apart
+used to return two different `updated_at` values on an idle daemon, and now
+return the same one. That is the point — the field says when the state a reader
+is holding was current, which a read-time clock could never report.
 
 **Ordering guarantee:** `sessions` is sorted ascending by `started_at`. ⚠ The
 sort is currently by `started_at` **only** and is not stabilized by a
