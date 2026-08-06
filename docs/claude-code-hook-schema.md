@@ -211,9 +211,35 @@ outside the `SubagentStart`/`Stop` branch.
 | `PermissionRequest` lacks `tool_use_id` | emitter construction site | **high** |
 | `PostToolUse` has `tool_use_id`, `tool_input` | emitter construction site | **high** |
 | `transcript_path` is the parent's | `HM(session_id)` + observed stale-anchor behavior in the 2026-08-05 incident | **high** |
-| `agent_id` non-empty in practice for a subagent-raised prompt | **not yet observed live** | **medium — see plan T1** |
+| `agent_id` non-empty in practice for a subagent's hook | **observed live 2026-08-05 17:21** | **high** |
+| `agent_id` arrives **bare** (no `agent-` prefix) | same observation | **high** |
+| `transcript_path` is the parent's even from a subagent hook | same observation | **high** |
 
-The last row is the one gap: the emitter passes `r?.agentId` from the
-`toolUseContext`, and the field doc says it is populated for AgentTool workers,
-but switchboard has not yet logged a real subagent `PermissionRequest` to
-confirm it is non-empty end-to-end. Do that before building on it.
+### 5.1 The live observation (plan T1 / T20, closed)
+
+Instrumented daemon, three teammates in flight on one session:
+
+```
+hook-identity: pid=1090904 session=191d2044 event=PostToolUse
+  agent_id="ac24f297af282c150" agent_type="general-purpose" tool="Bash"
+  chip=permission pending="AskUserQuestion" S=3
+```
+
+Three distinct ids appeared across the sample — `a1a4f5cc80cc6d9c2`,
+`ac24f297af282c150`, `acd4e3a19f8487bdd` — matching `S=3`, so teammates are
+individually identified, not merged. `agent_type` rides alongside as documented.
+
+Three things this settles:
+
+1. **`agent_id` is present on `PostToolUse` from a subagent.** The whole
+   writer-attribution design (T7, T17) is live rather than inert.
+2. **The bare form is what arrives** — no `agent-` prefix. `normalizeAgentID`
+   is therefore a no-op in practice; it stays as insurance, and it costs nothing.
+3. **`transcript_path` stayed the parent's.** That session took many teammate
+   hooks and its stored `transcript` remained
+   `…/DigestDownloads/191d2044-….jsonl`. The unconditional
+   `info.Transcript = req.Transcript` is safe, and §3's claim is confirmed from
+   the wire and not only from the emitter.
+
+Recheck all three on a Claude Code version bump — §5's table is the place to
+record the result.
