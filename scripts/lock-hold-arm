@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# lock-hold-arm — start a measurement arm and record what it started.
+#
+# Usage:
+#   scripts/lock-hold-arm <arm-name> [tree]
+#
+# Builds ./cmd/switchboard from `tree` (default: the current worktree), restarts
+# the daemon, and writes a marker recording the arm name, the binary's SHA and
+# the daemon's start instant. scripts/lock-hold-report reads that marker and
+# refuses to report if either changed.
+#
+# The marker exists because this box is not quiet. Other Claude sessions work in
+# this same repo, and one of them ran `go install` and `systemctl --user restart
+# switchboard` fourteen minutes into a thirty-minute window on 2026-08-05. The
+# report's default window follows the daemon's start instant, so the clobber did
+# not look like an error — it looked like a clean 206-warning result for a binary
+# nobody meant to measure. An unnoticed wrong number is worse than no number.
+set -euo pipefail
+
+arm="${1:-}"
+tree="${2:-$(git rev-parse --show-toplevel)}"
+if [[ -z "$arm" ]]; then
+    echo "usage: scripts/lock-hold-arm <arm-name> [tree]" >&2
+    exit 2
+fi
+
+marker="${XDG_RUNTIME_DIR:-/tmp}/switchboard/lock-hold-arm"
+mkdir -p "$(dirname "$marker")"
+
+echo "building $arm from $tree"
+(cd "$tree" && go install ./cmd/switchboard)
+
+# Record the commit the arm was built from, so a marker outlives the shell that
+# made it and a later reader can tell the two arms apart by more than a name.
+commit=$(git -C "$tree" rev-parse --short HEAD)
+dirty=$(git -C "$tree" status --porcelain | head -1)
+[[ -n "$dirty" ]] && commit="$commit+dirty"
+
+systemctl --user restart switchboard
+# The restart is asynchronous; the start instant is only stable once the unit is
+# running, and a marker holding the PREVIOUS start would fail every later check.
+for _ in $(seq 1 50); do
+    [[ "$(systemctl --user is-active switchboard)" == "active" ]] && break
+    sleep 0.1
+done
+
+sha=$(sha256sum "$HOME/go/bin/switchboard" | cut -c1-16)
+start=$(systemctl --user show switchboard -p ExecMainStartTimestamp --value)
+
+cat > "$marker" <<EOF
+arm=$arm
+commit=$commit
+sha=$sha
+start=$start
+EOF
+
+echo "arm:    $arm ($commit)"
+echo "binary: $sha"
+echo "daemon: $start"
+echo
+echo "window is now OPEN. Leave the box alone for >= 30 minutes, then:"
+echo "  scripts/lock-hold-report"

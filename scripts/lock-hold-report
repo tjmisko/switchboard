@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# lock-hold-report — summarize store.Apply lock holds from the daemon's journal.
+#
+# Reads the SWITCHBOARD_DEBUG_LOCK warnings ("state: Apply held the write lock
+# 12.3ms (> 5ms) sessions=8 caller=main.reconcileOnce") over a window and reports
+# count, percentiles and worst case PER CALLER. Per-caller is the point: the
+# reconcile tick, the hook handler and the WM layout path hold the lock for
+# different reasons, and a total that mixes them cannot say which regressed.
+#
+# Usage:
+#   scripts/lock-hold-arm <arm-name>     # build + restart + record the marker
+#   ... leave the box alone >= 30 min ...
+#   scripts/lock-hold-report [--since "2026-08-05 18:00:00"] [--until "..."]
+#
+# If scripts/lock-hold-arm started the arm, this refuses to report when the
+# daemon was restarted or the binary replaced mid-window. That is not
+# hypothetical: other Claude sessions work in this repo and run `go install`.
+#
+# Default window is the current daemon's start instant, which is deliberate: the
+# startup tick is the single most expensive Apply of a run (the first tick samples
+# against a nearly-empty snapshot and falls back to inline reads), and a window
+# that begins after it reports a cleaner number than the truth. That mistake has
+# been made twice on this work — see task 5's measurement lessons.
+#
+# Do NOT run builds, `go test`, or a multi-agent review while measuring. They hit
+# the same disk and the same CPU, and a window that overlaps them is not
+# comparable to one that does not.
+set -euo pipefail
+
+since=""
+until_arg=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --since) since="$2"; shift 2 ;;
+        --until) until_arg=(--until "$2"); shift 2 ;;
+        -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
+        *) echo "unknown argument: $1" >&2; exit 2 ;;
+    esac
+done
+
+now_start=$(systemctl --user show switchboard -p ExecMainStartTimestamp --value)
+
+# Verify the arm still is what lock-hold-arm started. Without this the default
+# window silently TRACKS a clobber: since it is derived from the daemon's start
+# instant, a restart mid-window just moves the window, and the shortened run on
+# the replacement binary reports as a clean result. Checked before anything is
+# printed, because the failure mode being guarded against is a plausible number.
+marker="${XDG_RUNTIME_DIR:-/tmp}/switchboard/lock-hold-arm"
+if [[ -r "$marker" ]]; then
+    # Parsed, not sourced: `start` is a systemd timestamp with spaces in it, and
+    # sourcing that runs "2026-08-05" as a command.
+    arm=$(sed -n 's/^arm=//p' "$marker")
+    commit=$(sed -n 's/^commit=//p' "$marker")
+    sha=$(sed -n 's/^sha=//p' "$marker")
+    start=$(sed -n 's/^start=//p' "$marker")
+    now_sha=$(sha256sum "$HOME/go/bin/switchboard" | cut -c1-16)
+    if [[ "$now_start" != "$start" || "$now_sha" != "$sha" ]]; then
+        echo "REFUSING TO REPORT — the arm changed underneath this window." >&2
+        echo >&2
+        echo "  arm:            $arm ($commit)" >&2
+        echo "  daemon started: $start   (marker)" >&2
+        echo "                  $now_start   (now)" >&2
+        echo "  binary sha:     $sha   (marker)" >&2
+        echo "                  $now_sha   (now)" >&2
+        echo >&2
+        echo "Something restarted the daemon or ran 'go install' during the window." >&2
+        echo "Other Claude sessions work in this repo and do both. The numbers for" >&2
+        echo "this window are not attributable to the arm; re-run scripts/lock-hold-arm." >&2
+        exit 1
+    fi
+    echo "arm:    $arm ($commit) sha=$sha  [marker verified]"
+else
+    echo "arm:    (no marker — started by hand; nothing verifies the binary held still)"
+fi
+
+if [[ -z "$since" ]]; then
+    # ExecMainStartTimestamp is "Wed 2026-08-05 17:22:39 PDT"; journalctl wants
+    # the date and time without the weekday or zone.
+    since=$(awk '{print $2" "$3}' <<<"$now_start")
+fi
+
+echo "window: since $since ${until_arg[*]:-(now)}"
+echo "daemon: $now_start"
+echo "binary: $(stat -c '%y  %s bytes' "$HOME/go/bin/switchboard")"
+echo
+
+# The caller= field only exists on a daemon carrying the attribution commit
+# (28ced0d, this branch). A build without it still reports the hold, so the
+# unattributed case is folded into a single "(unattributed)" row rather than
+# dropped — a baseline arm you cannot see is worse than one you cannot break down.
+journalctl --user -u switchboard --since "$since" "${until_arg[@]}" --no-pager -o cat 2>/dev/null |
+    grep -F 'held the write lock' |
+    sed -E 's/.*held the write lock ([0-9.]+)(µs|ms|s) .*sessions=([0-9]+)( caller=(.*))?$/\1 \2 \3 \5/' |
+    awk '
+    {
+        ms = $1
+        if ($2 == "µs") ms = $1 / 1000
+        else if ($2 == "s") ms = $1 * 1000
+        caller = ($4 == "" ? "(unattributed)" : $4)
+        n[caller]++
+        vals[caller, n[caller]] = ms
+        if (ms > worst[caller]) worst[caller] = ms
+        sessions[caller] = $3
+        total++
+    }
+    END {
+        if (total == 0) { print "no lock-hold warnings in the window"; exit }
+        printf "%-34s %6s %9s %9s %9s %9s\n", "caller", "count", "p50", "p90", "p99", "max"
+        for (c in n) {
+            # insertion sort; the counts here are small by construction
+            for (i = 1; i <= n[c]; i++) {
+                v = vals[c, i]; j = i - 1
+                while (j >= 1 && vals[c, j] > v) { vals[c, j+1] = vals[c, j]; j-- }
+                vals[c, j+1] = v
+            }
+            # A percentile needs enough samples to sit below the max. At n=30 the
+            # p99 index rounds to n itself, so the column repeats "max" while
+            # LOOKING like a tail statistic — a 2026-08-06 arm reported p99 and
+            # max both 17.3ms and it read as a suspiciously tight tail rather
+            # than as two names for one sample. Flagged rather than dropped: p99
+            # is the number you want once a window has the samples to earn it.
+            thin[c] = (int(n[c] * 0.99) + (n[c] > 1 ? 1 : 0) >= n[c])
+            p50 = vals[c, int(n[c] * 0.50) + (n[c] > 1 ? 1 : 0)]
+            p90 = vals[c, int(n[c] * 0.90) + (n[c] > 1 ? 1 : 0)]
+            p99 = vals[c, int(n[c] * 0.99) + (n[c] > 1 ? 1 : 0)]
+            mark = thin[c] ? "*" : " "
+            printf "%-34s %6d %8.1fms %8.1fms %8.1fms%s %8.1fms\n", c, n[c], p50, p90, p99, mark, worst[c]
+            anythin = anythin || thin[c]
+        }
+        printf "\ntotal warnings: %d\n", total
+        if (anythin) {
+            printf "\n* too few samples for a real p99 — the index rounds to the max,\n"
+            printf "  so that column is repeating it. Read max, not p99, for those rows.\n"
+        }
+    }'
+
+echo
+# Session count is the multiplier on everything above — the tick's per-session
+# work is what this whole effort is about, so a window's numbers mean nothing
+# without knowing how many sessions produced them.
+sessions=$("$HOME/go/bin/switchboard-ctl" list 2>/dev/null | grep -cE '^ *\[[0-9]+\] pid=') || sessions="?"
+echo "sessions tracked right now: $sessions"
