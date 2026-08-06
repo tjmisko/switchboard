@@ -231,6 +231,32 @@ covers *awaiting approval* and *executing right now* with no field separating th
 A `state.json` written before this field existed hydrates its red as a main-thread
 prompt, reproducing the pre-field behavior exactly.
 
+###### naming a blocked writer
+
+`pending_writers` carries ids, not names, and that is deliberate — **no
+`pending_writer_names` field exists or is planned.** A renderer that wants to say
+*which teammate* is stuck derives the name itself, entirely from fields already on
+this contract:
+
+```
+claude.transcript          = <dir>/<session-id>.jsonl
+one non-"main" writer id w → <dir>/<session-id>/subagents/agent-<w>.meta.json
+```
+
+and reads that meta's `name` (the teammate name, e.g. `escalate-cleanup`), falling
+back to `agentType` — the only field present in *every* meta — and then to the id
+itself. Do **not** strip a second `agent-` prefix from `w`: an agent whose own id
+begins with `agent-` lives in `agent-agent-<…>.meta.json`, and stripping would name
+a different agent.
+
+The daemon leaves this to the renderer on purpose. The name lives on disk, never
+changes once written, and is wanted only when a chip is actually being drawn — so
+resolving it at render time (memoized) keeps the reconcile tick free of the
+per-writer I/O that a wire field would add to every snapshot, and keeps this
+contract from carrying data it does not already imply. Switchboard's own renderers
+go through `internal/label.NameCache.BlockedWriters`, which is the reference
+implementation of the derivation above.
+
 ##### `delegating` self-heal & decision log
 
 Independently, each tick recomputes `in_flight_subagents`; an **idle** main thread

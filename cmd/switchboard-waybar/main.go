@@ -288,6 +288,21 @@ func sessionTooltip(cfg projectname.Config, cache *sblabel.NameCache, s state.Se
 			statusText = fmt.Sprintf("delegating · %d agent%s", n, plural(n))
 		}
 	}
+	// A red chip says a decision is needed; with teammates running it does not say
+	// WHOSE, and the user has to switch to the pane to find out — which defeats the
+	// point of holding the red. Name the blocked writer(s) instead:
+	//
+	//	permission · escalate-cleanup · 45s
+	//
+	// Same shape as the delegating annotation above (detail after the status, clock
+	// last). Deliberately NOT on the chip TEXT: chip labels are fitted against the
+	// bar's width budget as a set (barlayout.Fit), so a label that grew when a
+	// prompt appeared and shrank when it cleared would re-abbreviate every OTHER
+	// chip on the row twice per prompt — and would break the stable chip identity
+	// the user navigates by.
+	if w := cache.BlockedWriters(s); w != "" {
+		statusText += " · " + w
+	}
 	// How long the session has held this status: "idle · 3m", "permission · 45s".
 	// Skipped while suspended — the status (and its clock) is stale until resume.
 	if !s.Suspended {
