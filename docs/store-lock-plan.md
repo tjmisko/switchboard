@@ -20,7 +20,17 @@ Measured, so the effort goes to the right place:
 | `Apply` with an empty closure, 5 sessions | **5.6 µs** | `BenchmarkApplyFloor` |
 | `Snapshot`, 5 sessions | **0.8 µs** | `BenchmarkSnapshot` |
 | Observer seed on `main`, per newly-seen session | **1.81 s** | live archive, 62.6 MB / 37 days |
-| Observer seed after #57's merge resolution | **54.8 ms** | same archive |
+| — as #57's merge first resolved | **0.93 s** | live archive, 68 MB / 36 days |
+| — after the workflow half got the same pre-filter | **0.21 s** | same |
+
+Read the seed rows as `seedFor`, which is the only thing a newly-seen session
+actually pays: `PriorSubagentState` **plus** `PriorWorkflowState`. An earlier
+draft of this table quoted 54.8 ms here, which is `BenchmarkPriorSubagentState`
+— one half. The merge gave only that half the byte pre-filter, leaving one full
+unfiltered archive decode in the seed (817 ms of the 929 ms), so the half-figure
+understated the real cost by ~17x. `ccd82e9` on `perf/fanout-seed-hoist` gives
+the workflow half the same filter; the 0.21 s row is that tree. Quoting either
+half alone is the mistake to not repeat.
 
 The lock's own machinery is five orders of magnitude below the thing that hurt.
 **There is no contention problem.** A is therefore justified as a change of
@@ -112,6 +122,16 @@ must be stated on `Snapshot()` and the callers audited once:
 All six read-only on inspection. The audit is a plan step, not a formality:
 it must be re-run against the post-merge tree, and the result recorded in the
 commit message.
+
+The re-run has one known addition already. `enrichForWire` does `cp := *info`,
+so every slice field on `AgentInfo` shares its backing array with the live
+block — the table above was written when `PendingWriters` was the only one, and
+#61 added `Workflows`. It is safe today for the same reason `PendingWriters` is:
+`applyWorkflowsLocked` assigns a freshly built slice (`c.Workflows = statuses`)
+and never mutates an element in place. Safe, but load-bearing and unstated,
+which is precisely the shape of defect this plan exists to stop recurring —
+state it on `enrichForWire` when A lands, and list every slice field the re-run
+finds rather than just the two known now.
 
 **A4 — `UpdatedAt` moves from read time to publish time.** Today
 `snapshotLocked` stamps `time.Now()` on every call, so two readers a second
@@ -396,10 +416,41 @@ number. Attribution is what makes that claim sayable at all, which is the
 justification for cherry-picking `28ced0d` onto the baseline arm.
 
 The distribution is bimodal — a ~10 ms body that is the terminal enumeration,
-and a multi-second tail that is the seed. #57 hoists both. A prediction worth
-writing down before the `merged` arm runs: if the merge is correct, the
-nine-hold tail goes to **zero** and p50 drops toward the sub-millisecond floor.
-A tail that survives the merge means a read was missed.
+and a multi-second tail that is the seed. #57 hoists both.
+
+## Predicting the `merged` arm, per caller
+
+The obvious prediction — "the tail goes to zero; a surviving tail means a read
+was missed" — is **wrong**, and it is worth saying why, because it is the kind
+of wrong that would have been read as a result. The seed is hoisted off the
+*tick*, not out of the lock. `Observer.reconcile` keeps a lazy seeding backstop
+for any session that reaches the lock unseeded, and two ordinary things reach
+it:
+
+- **the hook trigger.** `handleHook` has no pre-lock phase to hang a `Prime` on,
+  so a `SubagentStart` for a session no tick has primed yet — a fresh session, or
+  an id rotated by `/clear` — seeds inside the `store.Apply` the handler opened.
+- **a session discovered mid-tick**, appearing between `reconcileOnce`'s
+  `snap := store.Snapshot()` and its `store.Apply`. The pre-lock `Prime`s widen
+  that window slightly, most of all at startup.
+
+So the decision rule is per `caller=`, which is exactly the discrimination the
+cherry-picked `28ced0d` was added to make:
+
+| caller | expected under `merged` | what a violation means |
+|---|---|---|
+| `main.reconcileOnce` | tail gone, p50 toward the floor | a read was missed — this path Primes |
+| `rpc.(*Server).handleHook` | a few holds, each **bounded by the seed cost** | above the seed cost, something else is under the lock |
+
+"Bounded by the seed cost" is why the number in the table above has to be right:
+against the merge as first resolved that bound is 0.93 s, and against `ccd82e9`
+it is 0.21 s. Which tree the arm is built from therefore changes the pass
+criterion, and the marker file records the binary SHA for exactly this reason.
+Build the `merged` arm from `ccd82e9` or later.
+
+The baseline arm puts `handleHook` at 1 warning / 30 min, so this is a thin
+signal on an idle box; a `merged` window that shows zero `handleHook` warnings
+has not disproved the backstop, it has merely not hit it.
 
 ## Rules, from the script headers
 
