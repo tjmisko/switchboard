@@ -634,3 +634,149 @@ func TestFindTrackedAncestorTerminators(t *testing.T) {
 		t.Errorf("ppid==0 = %d, want 0", got)
 	}
 }
+
+// procChainReader is chainReader's richer sibling: it serves whole proc.Info
+// records, so a link in the chain can be made to CLASSIFY as an agent process.
+// chainReader is left alone deliberately — the records it returns carry no
+// Comm/Exe, so they classify as AgentNone and every pre-existing walk test above
+// exercises the unchanged path.
+func procChainReader(infos map[int]proc.Info, calls *int) func(int) (proc.Info, error) {
+	return func(pid int) (proc.Info, error) {
+		*calls++
+		info, ok := infos[pid]
+		if !ok {
+			return proc.Info{}, errors.New("gone")
+		}
+		return info, nil
+	}
+}
+
+// claudeProc is a process snapshot discovery.Classify accepts as a Claude
+// session. The /claude/ path segment is what claudeExeValid requires on Linux.
+func claudeProc(pid, ppid int, args ...string) proc.Info {
+	if len(args) == 0 {
+		args = []string{"/home/u/.local/share/claude/claude"}
+	}
+	return proc.Info{PID: pid, PPID: ppid, Comm: "claude",
+		Exe: "/home/u/.local/share/claude/claude", Args: args}
+}
+
+// A2 — a hook from a nested `claude -p` must never be attributed to the
+// interactive session that spawned it. The helper is the nearest AGENT ancestor
+// and therefore owns the hook; during the sub-second window before discovery's
+// scan tick registers it, it is absent from the map, and the walk must report
+// "unattributable" rather than continuing on to the tracked parent.
+func TestFindTrackedAncestorStopsAtUntrackedAgent(t *testing.T) {
+	// 300 (switchboard-ctl's parent shell) → 200 (claude -p, NOT tracked) →
+	// 100 (the interactive session, tracked).
+	infos := map[int]proc.Info{
+		300: {PID: 300, PPID: 200, Comm: "sh", Exe: "/usr/bin/sh"},
+		200: claudeProc(200, 100, "/home/u/.local/share/claude/claude", "-p", "summarize"),
+		100: claudeProc(100, 1),
+	}
+	calls := 0
+	if got := findTrackedAncestor(tracked(100), 300, procChainReader(infos, &calls)); got != 0 {
+		t.Errorf("nested headless hook attributed to pid %d, want 0 (unattributable)", got)
+	}
+	// The shell and the helper are read; the walk must stop before ever reading
+	// the parent, which is what proves it did not merely fail to match.
+	if calls != 2 {
+		t.Errorf("readProc called %d times, want 2 (shell, then the helper it stops at)", calls)
+	}
+}
+
+// The guard must not fire once discovery HAS registered the helper: the m[pid]
+// check runs first, so the helper's own later hooks self-match and it gets its
+// own identity. This is the other half of the race and the reason the fix is
+// self-correcting rather than a permanent drop.
+func TestFindTrackedAncestorTrackedAgentWinsFirst(t *testing.T) {
+	infos := map[int]proc.Info{
+		300: {PID: 300, PPID: 200, Comm: "sh", Exe: "/usr/bin/sh"},
+		200: claudeProc(200, 100, "/home/u/.local/share/claude/claude", "-p", "summarize"),
+		100: claudeProc(100, 1),
+	}
+	calls := 0
+	if got := findTrackedAncestor(tracked(100, 200), 300, procChainReader(infos, &calls)); got != 200 {
+		t.Errorf("tracked helper = %d, want 200 (self-match beats the guard)", got)
+	}
+}
+
+// The shell-wrapper case the walk exists for. Non-agent links — sh, bash, env,
+// whatever a hook command is wrapped in — must still be walked through, or the
+// guard would break every hook that does not exec switchboard-ctl directly.
+func TestFindTrackedAncestorNonAgentWrappersStillWalk(t *testing.T) {
+	infos := map[int]proc.Info{
+		400: {PID: 400, PPID: 300, Comm: "env", Exe: "/usr/bin/env"},
+		300: {PID: 300, PPID: 200, Comm: "bash", Exe: "/usr/bin/bash"},
+		200: {PID: 200, PPID: 100, Comm: "sh", Exe: "/usr/bin/sh"},
+		100: claudeProc(100, 1),
+	}
+	calls := 0
+	if got := findTrackedAncestor(tracked(100), 400, procChainReader(infos, &calls)); got != 100 {
+		t.Errorf("wrapped hook = %d, want 100 (walk through non-agent wrappers)", got)
+	}
+}
+
+// A non-claude binary that merely SHARES the name must not stop the walk —
+// claudeExeValid rejects it, so it is an ordinary wrapper. Guards the guard
+// against being widened into a comm-only check.
+func TestFindTrackedAncestorImpostorDoesNotStopWalk(t *testing.T) {
+	infos := map[int]proc.Info{
+		200: {PID: 200, PPID: 100, Comm: "claude", Exe: "/usr/bin/claude-impostor"},
+		100: claudeProc(100, 1),
+	}
+	calls := 0
+	if got := findTrackedAncestor(tracked(100), 200, procChainReader(infos, &calls)); got != 100 {
+		t.Errorf("impostor stopped the walk: got %d, want 100", got)
+	}
+}
+
+// A2, end to end — the test that would have caught the defect. A hook fired by a
+// nested `claude -p` must leave the interactive parent's identity ENTIRELY
+// alone: not its session id, not its transcript path, and not its pending
+// prompts (the false-rotation clause would otherwise drop a live red chip).
+// The walk tests above check the choke point; this one checks the three writes
+// that made the misattribution damaging.
+func TestHandleHookIgnoresNestedHeadlessSession(t *testing.T) {
+	const (
+		parentPID  = 100
+		helperPID  = 200
+		hookPID    = 300
+		parentID   = "95997af7-0000-4000-8000-000000000000"
+		helperID   = "6d25c699-1111-4000-8000-000000000000"
+		parentPath = "/home/u/.claude/projects/proj/95997af7.jsonl"
+	)
+	store := state.New("")
+	store.Apply(func(m map[int]*state.Session) {
+		sess := &state.Session{PID: parentPID, CWD: "/home/u/proj", Agent: state.AgentKindClaude}
+		info := sess.AgentBlock(state.AgentKindClaude)
+		info.SessionID = parentID
+		info.Transcript = parentPath
+		info.Status = state.StatusPermission
+		info.SetPending(state.PendingWriterMain, state.PendingPrompt{Tool: "Bash", Since: time.Now()})
+		m[parentPID] = sess
+	})
+	s := New(store, "", terminal.NewNone(), wm.NewNone())
+	s.readProc = procChainReader(map[int]proc.Info{
+		hookPID:   {PID: hookPID, PPID: helperPID, Comm: "sh", Exe: "/usr/bin/sh"},
+		helperPID: claudeProc(helperPID, parentPID, "/home/u/.local/share/claude/claude", "-p", "summarize"),
+		parentPID: claudeProc(parentPID, 1),
+	}, new(int))
+
+	s.handleHook(Request{Cmd: "hook", Event: "SessionStart", PID: hookPID,
+		SessionID: helperID, Transcript: "/home/u/.claude/projects/summaries/6d25c699.jsonl"})
+
+	got := store.Snapshot().Sessions[0].Claude
+	if got.SessionID != parentID {
+		t.Errorf("parent session_id = %q, want %q (helper's id must not land here)", got.SessionID, parentID)
+	}
+	if got.Transcript != parentPath {
+		t.Errorf("parent transcript = %q, want %q", got.Transcript, parentPath)
+	}
+	if len(got.Pending) != 1 {
+		t.Errorf("parent pending = %v, want the prompt held (a helper hook must not clear red)", got.Pending)
+	}
+	if got.Status != state.StatusPermission {
+		t.Errorf("parent status = %q, want permission", got.Status)
+	}
+}

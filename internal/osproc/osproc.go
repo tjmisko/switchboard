@@ -13,6 +13,8 @@ package osproc
 import (
 	"context"
 	"errors"
+
+	"github.com/tjmisko/switchboard/internal/proc"
 )
 
 // Info is the neutral process record. TTY is an opaque join key whose literal
@@ -29,6 +31,15 @@ type Info struct {
 	CWD  string
 	TTY  string
 	Args []string
+}
+
+// FromProc projects a proc.Info onto the neutral record. It lives here rather
+// than in the Linux backend (its only caller until now) because callers ABOVE
+// the seam hold a proc.Info too — the RPC hook path walks the ppid chain with
+// proc.Read and must ask discovery what it is looking at — and internal/proc
+// carries no build tags, so this compiles on every platform.
+func FromProc(p proc.Info) Info {
+	return Info{PID: p.PID, PPID: p.PPID, Comm: p.Comm, Exe: p.Exe, CWD: p.CWD, TTY: p.TTY, Args: p.Args}
 }
 
 // ErrGone means the process disappeared between enumeration and read (the most
