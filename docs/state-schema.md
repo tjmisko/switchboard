@@ -52,15 +52,26 @@ delta.
 | `sessions` | array of `Session` | yes | All currently-tracked coding-agent sessions (Claude Code and Codex). May be empty (`[]`) when no sessions exist. |
 | `updated_at` | RFC 3339 timestamp string | yes | When the daemon last **published** this state — stamped by the writer that produced the snapshot, not by the reader that fetched it. Monotonic-ish wall clock; advisory only. |
 
-⚠ `updated_at` means slightly different things on the two transports, and the
-difference is one tick wide:
+⚠ `updated_at` means slightly different things depending on how you fetched it,
+and the difference is one tick wide. It splits three ways, not two — the split is
+by **what makes the value reach you**, not by transport:
 
 - **In this file** it is the time of the last observable **change**, because the
   file is only rewritten when something changed (see "How it is written" above).
-- **Over the RPC socket** (`list`, `subscribe`) it is the time of the last
-  **write**, changed or not. The daemon republishes on every mutation so that a
-  reader's `updated_at` cannot freeze, so an idle box advances it once per
-  reconcile tick while `state.json` holds still.
+- **`list`, and `subscribe`'s first frame**, are served straight off the
+  published snapshot, so they carry the time of the last **write**, changed or
+  not. The daemon republishes on every mutation precisely so a reader's
+  `updated_at` cannot freeze; an idle box advances it once per reconcile tick
+  while `state.json` holds still.
+- **`subscribe`'s subsequent frames** are change-gated exactly like the file: a
+  frame is only pushed when something observable changed, so a long-lived
+  subscriber's `updated_at` tracks the last change, not the last write. The
+  unconditional publish still matters to it — the value it eventually receives is
+  a publish instant — but it does not receive one per tick.
+
+So a subscriber that sits idle and a poller hitting `list` on the same daemon
+will legitimately disagree about `updated_at`, and neither is stale. Reconnecting
+a subscriber re-serves the first frame and resynchronizes it with `list`.
 
 Neither is a liveness signal, which is why both are advisory. What changed when
 the daemon stopped stamping this at read time: two `list` calls a second apart

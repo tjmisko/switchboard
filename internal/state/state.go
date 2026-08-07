@@ -8,9 +8,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -780,8 +782,13 @@ func snapshotChangeKey(snap Snapshot) []byte {
 //
 // How far the damage can reach, stated exactly, because the two halves differ:
 //
-//   - The Claude/Codex blocks are enrichForWire COPIES, so scribbling on one stops
-//     at the wire projection and cannot reach the session the next Apply reconciles.
+//   - The Claude/Codex blocks are enrichForWire copies, and enrichForWire clones
+//     every reference-typed field it carries (Pending, Workflows), so scribbling on
+//     one stops at the wire projection and cannot reach the session the next Apply
+//     reconciles. That holds ONLY because those clones are there: while the copy was
+//     shallow this same sentence was false, and writing to a snapshot's Pending map
+//     latched a red chip on the live session. Add a reference-typed field to
+//     AgentInfo without cloning it and this bullet silently becomes a lie again.
 //   - Wezterm/Hyprland are NOT copies. They are the daemon's live pointers, exactly
 //     as they were before this change (the doc this replaced said so: "the pointer
 //     fields are shared"), and mapping.Reconcile writes their fields in place under
@@ -831,29 +838,36 @@ func (s *Store) snapshotLocked() Snapshot {
 // hydrate consumes it) can never reach the wire. nil in, nil out.
 //
 // ⚠ `cp := *info` is a SHALLOW copy, so every reference-typed field it does not
-// overwrite still aliases the live block. Snapshot's readers therefore share these
-// with the daemon itself, and the audit has to be redone whenever a field is added
-// here. As of now:
+// overwrite would still alias the live block. Each one is therefore cloned below,
+// and THE AUDIT HAS TO BE REDONE WHENEVER A FIELD IS ADDED HERE — a new map or
+// slice that nobody clones re-opens the hole silently. As of now:
 //
-//   - Workflows ([]WorkflowStatus) — aliased. Safe only because
-//     fanout.applyWorkflowsLocked assigns a freshly built slice (c.Workflows =
-//     statuses) and never writes an element in place. A future in-place update
-//     would be a live-vs-reader data race with no test to catch it.
-//   - Pending (map, json:"-") — aliased. Same argument, weaker: SetPending and
-//     DropPending DO mutate it in place, so a reader that ranges it concurrently
-//     with a hook races. Only startup's hydratePendingVerdicts reads it off a
-//     snapshot, and that runs before the reconcile loop exists. This predates the
-//     publish-and-swap change, which neither introduced nor widened it.
+//   - Workflows ([]WorkflowStatus) — cloned. WorkflowStatus is all scalars, so a
+//     slices.Clone is a complete copy, not a one-level-deep one.
+//   - Pending (map, json:"-") — cloned. PendingPrompt is likewise all scalars.
+//     This one is load-bearing beyond the snapshot contract: SetPending and
+//     DropPending mutate the live map in place, so before the clone a reader
+//     ranging it concurrently with a hook was a genuine data race.
 //   - PendingWriters, StatusSinceWire — NOT aliased; both are overwritten above
 //     with values built here, which is what makes them safe to hand out.
 //
-// Session's own Wezterm/Hyprland pointers are outside this function and are
-// aliased too; see Snapshot.
+// The clones are what let Snapshot promise that scribbling on a Claude/Codex block
+// cannot reach the live session. That promise was FALSE when this copy was shallow:
+// snap.Sessions[i].Claude.Pending[k] = … wrote straight into the daemon's map, and
+// `len(Pending) > 0 → RED` is the top-priority chip rule, so one careless reader
+// could latch a red chip on a live session. Two allocations per enriched block per
+// publish is the price of the contract being true; the publish path already does a
+// JSON encode, so it is not the expensive thing here.
+//
+// Session's own Wezterm/Hyprland pointers are outside this function and remain
+// aliased; see Snapshot.
 func enrichForWire(info *AgentInfo) *AgentInfo {
 	if info == nil {
 		return nil
 	}
 	cp := *info
+	cp.Pending = maps.Clone(cp.Pending)
+	cp.Workflows = slices.Clone(cp.Workflows)
 	cp.StatusSinceWire = nil
 	if !cp.StatusSince.IsZero() {
 		since := cp.StatusSince

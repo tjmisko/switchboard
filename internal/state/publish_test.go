@@ -137,17 +137,25 @@ func TestShouldServeSessionsHydratedOutsideApply(t *testing.T) {
 //
 // The second half is the boundary of the damage, and it is the reason a mutating
 // reader is a bug and not a catastrophe: the published snapshot's enrichment
-// blocks are still enrichForWire copies, so a reader that scribbles on one
-// corrupts its fellow readers and NOT the live session the daemon keeps
-// reconciling.
+// blocks are enrichForWire copies whose reference-typed fields are CLONED, so a
+// reader that scribbles on one corrupts its fellow readers and NOT the live
+// session the daemon keeps reconciling.
+//
+// That second half must be asserted through a map or a slice, never through a
+// scalar. A shallow copy insulates a scalar for free, so a Status-only assertion
+// stays green whether the clones exist or not — which is exactly what it did while
+// Pending and Workflows still aliased the daemon's own block.
 //
 // Verified failing against the pre-change tree, where every Snapshot() allocated
 // a fresh slice: "two readers got different backing arrays".
 func TestShouldShareOneBackingArrayAcrossEveryReader(t *testing.T) {
 	store := state.New("")
 	store.Apply(func(m map[int]*state.Session) {
+		info := &state.AgentInfo{SessionID: "abc", Status: state.StatusWorking}
+		info.SetPending("w1", state.PendingPrompt{Tool: "Bash", InputHash: "h1"})
+		info.Workflows = []state.WorkflowStatus{{RunID: "wf_1", AgentsStarted: 3, InFlight: 2}}
 		m[1] = &state.Session{PID: 1, StartedAt: time.Unix(1000, 0), Agent: state.AgentKindClaude,
-			Claude: &state.AgentInfo{SessionID: "abc", Status: state.StatusWorking}}
+			Claude: info}
 	})
 
 	first := store.Snapshot()
@@ -169,12 +177,73 @@ func TestShouldShareOneBackingArrayAcrossEveryReader(t *testing.T) {
 	}
 
 	// But the live store is insulated. The published snapshot holds enrichForWire
-	// COPIES, so the corruption stops at the wire projection and never reaches the
-	// session the next Apply reconciles.
+	// copies whose Pending map and Workflows slice are cloned, so the corruption
+	// stops at the wire projection and never reaches the session the next Apply
+	// reconciles.
+	//
+	// Scribble through the two reference-typed fields specifically. Pending is the
+	// dangerous one: `len(Pending) > 0 → RED` is the highest-priority rule in the
+	// chip fold, so a write that reached the live map would latch a red chip on a
+	// session that has no prompt outstanding.
+	first.Sessions[0].Claude.Pending["intruder"] = state.PendingPrompt{Tool: "Bash", InputHash: "h2"}
+	first.Sessions[0].Claude.Workflows[0].InFlight = 99
+
 	store.Apply(func(m map[int]*state.Session) {
-		if got := m[1].Claude.Status; got != state.StatusWorking {
+		live := m[1].Claude
+		if got := live.Status; got != state.StatusWorking {
 			t.Errorf("a reader's mutation reached the LIVE block: status = %q, want %q — "+
 				"the snapshot is sharing the daemon's own *AgentInfo, not a wire copy", got, state.StatusWorking)
 		}
+		if _, intruded := live.Pending["intruder"]; intruded {
+			t.Errorf("a reader's write reached the LIVE Pending map, which is the daemon's own: "+
+				"enrichForWire's copy is shallow again, so `len(Pending) > 0 → RED` now latches a red "+
+				"chip on a session with no prompt outstanding. Clone the map.")
+		}
+		if got := live.Workflows[0].InFlight; got != 2 {
+			t.Errorf("a reader's write reached the LIVE Workflows slice: in_flight = %d, want 2 — "+
+				"enrichForWire is aliasing the backing array again", got)
+		}
 	})
+}
+
+// TestShouldRepublishEvenWhenNothingObservableChanged pins the plan's "publish
+// unconditionally" decision, which until now was carried by a comment and by
+// nothing else: gating publishLocked on `changed` — the exact regression the
+// decision exists to forbid — left the entire suite green.
+//
+// Apply gates its broadcast and its persist on `changed`, and that is right:
+// re-encoding an unchanged snapshot for every subscriber and rewriting an
+// identical state.json every tick are both pure waste. The publish is different,
+// and the difference is UpdatedAt. It is the one field a reader cannot recompute
+// and the one field whose entire job is to say when the state in hand was
+// current. Gate the publish and a reader's updated_at freezes at the last
+// OBSERVABLE change, so an idle box looks like a daemon that died — which is the
+// precise misreading docs/state-schema.md warns against.
+//
+// An idle reconcile tick is the common case, not a corner: it re-derives the same
+// state and suppresses the write, so on a quiet machine nearly every Apply lands
+// here.
+func TestShouldRepublishEvenWhenNothingObservableChanged(t *testing.T) {
+	store := state.New("")
+	store.Apply(func(m map[int]*state.Session) {
+		m[1] = &state.Session{PID: 1, StartedAt: time.Unix(1000, 0), Agent: state.AgentKindClaude,
+			Claude: &state.AgentInfo{SessionID: "abc", Status: state.StatusWorking}}
+	})
+	before := store.Snapshot()
+
+	// Long enough that the two stamps cannot collide on a coarse clock, short
+	// enough to be free. The assertion is on ordering, not on the interval.
+	time.Sleep(2 * time.Millisecond)
+
+	// A no-op Apply: the tick that finds nothing to do. `changed` is false here,
+	// so this is exactly the path a `changed` gate would skip.
+	store.Apply(func(m map[int]*state.Session) {})
+	after := store.Snapshot()
+
+	if !after.UpdatedAt.After(before.UpdatedAt) {
+		t.Errorf("updated_at did not advance across an idle Apply: before=%s after=%s — the publish "+
+			"is gated on `changed` again, so a reader's updated_at now freezes at the last observable "+
+			"change and an idle daemon is indistinguishable from a dead one",
+			before.UpdatedAt.Format(time.RFC3339Nano), after.UpdatedAt.Format(time.RFC3339Nano))
+	}
 }
