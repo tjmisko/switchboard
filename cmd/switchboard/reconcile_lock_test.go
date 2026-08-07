@@ -17,6 +17,7 @@ import (
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/statustune"
 	"github.com/tjmisko/switchboard/internal/terminal"
+	"github.com/tjmisko/switchboard/internal/transcript"
 )
 
 // enumDelay stands in for the real cost of enumerating a terminal: on the live
@@ -69,7 +70,8 @@ func (l *slowBatchLocator) counts() (snapshots, locates int) {
 // original fixture: Claude enrichment left nil, so the tick does no transcript
 // I/O and the fixture is about the resolve alone.
 type fixtureConfig struct {
-	seed *slowSeed // non-nil once withSlowFanoutSeed is applied
+	seed         *slowSeed         // non-nil once withSlowFanoutSeed is applied
+	workflowScan *slowWorkflowScan // non-nil once withSlowWorkflowScan is applied
 }
 
 type fixtureOption func(*testing.T, *fixtureConfig)
@@ -100,6 +102,16 @@ func reconcileFixture(t *testing.T, sessionCount int, opts ...fixtureOption) (*s
 				sess.Claude = &state.AgentInfo{
 					SessionID:  cfg.seed.sessionID(i),
 					Transcript: cfg.seed.transcript(t, i),
+				}
+			}
+			if cfg.workflowScan != nil {
+				// Session 0's transcript and run dirs already exist — the option built
+				// them to time one scan — and transcript() is idempotent, so this both
+				// reuses that work and lays down the rest.
+				sess.Agent = state.AgentKindClaude
+				sess.Claude = &state.AgentInfo{
+					SessionID:  cfg.workflowScan.sessionID(i),
+					Transcript: cfg.workflowScan.transcript(t, i),
 				}
 			}
 			m[pid] = sess
@@ -771,5 +783,205 @@ func TestShouldOverlapWithoutATurn_negativeControl(t *testing.T) {
 	if !runConcurrentResolves(t, nil) {
 		t.Error("the harness did not produce concurrent enumerations even without a turn, " +
 			"so the serialization test above is not proving anything")
+	}
+}
+
+// ---------------------------------------------------------------------------
+
+// These size the fixture's workflow run dirs. The shape models issue #64: run
+// dirs are never deleted, so the scan's cost is proportional to every run a
+// session has EVER made rather than to what is live. The two counts are a session
+// that has barely used workflows and one that has used them for months.
+const (
+	workflowScanRunsLean = 16
+	workflowScanRunsFat  = 3200
+	workflowScanSessions = 2
+)
+
+// minWorkflowScanDelta is the vacuity floor: how much more expensive the fat
+// scan must be than the lean one for the comparison below to mean anything. A
+// differential budget proves nothing if there is no differential.
+const minWorkflowScanDelta = 10 * time.Millisecond
+
+// slowWorkflowScan lays out accumulated workflow run dirs and times what scanning
+// them costs.
+type slowWorkflowScan struct {
+	base string
+	runs int
+	cost time.Duration
+}
+
+func (s *slowWorkflowScan) sessionID(i int) string { return fmt.Sprintf("s-wf-%d", i) }
+
+// transcript writes session i's transcript plus the run dirs behind it, and
+// returns the transcript path. The layout is the one
+// transcript.WorkflowRunsForTranscript walks:
+//
+//	<base>/<sid>.jsonl                                      the transcript
+//	<base>/<sid>/subagents/workflows/wf_NNNN/journal.jsonl  one per run
+//	<base>/<sid>/workflows/scripts/<name>-wf_NNNN.js        what names the runs
+func (s *slowWorkflowScan) transcript(t *testing.T, i int) string {
+	t.Helper()
+	sid := s.sessionID(i)
+	path := filepath.Join(s.base, sid+".jsonl")
+	if err := os.WriteFile(path, []byte(`{"type":"system"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	runsDir := filepath.Join(s.base, sid, "subagents", "workflows")
+	scriptsDir := filepath.Join(s.base, sid, "workflows", "scripts")
+	if err := os.MkdirAll(scriptsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for run := range s.runs {
+		runID := fmt.Sprintf("wf_%04d", run)
+		dir := filepath.Join(runsDir, runID)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// Both journal shapes, so the delta parse does real work rather than
+		// bailing on the first unparseable line.
+		journal := fmt.Sprintf(`{"type":"started","agentId":"a%d"}`+"\n"+
+			`{"type":"result","agentId":"a%d"}`+"\n", run, run)
+		if err := os.WriteFile(filepath.Join(dir, "journal.jsonl"), []byte(journal), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		script := filepath.Join(scriptsDir, fmt.Sprintf("fixture-%s.js", runID))
+		if err := os.WriteFile(script, []byte("export const meta = {}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return path
+}
+
+// withSlowWorkflowScan backs every fixture session with `runs` accumulated run
+// dirs and records what one scan of them costs.
+//
+// The history archive is left EMPTY on purpose. The seed and the scan are
+// separate reads that regrow independently, and a fixture where both were slow
+// could not say which one a blown budget came from.
+func withSlowWorkflowScan(scan *slowWorkflowScan, runs int) fixtureOption {
+	return func(t *testing.T, cfg *fixtureConfig) {
+		t.Helper()
+		scan.base, scan.runs = t.TempDir(), runs
+
+		// Time one scan the way the tick pays it: the run listing plus the journal
+		// delta for every run it returns. First call discarded so the figure and
+		// the tick that follows meet the same warm page cache.
+		probe := scan.transcript(t, 0)
+		measure := func() time.Duration {
+			start := time.Now()
+			found, err := transcript.WorkflowRunsForTranscript(probe)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, run := range found {
+				if _, _, _, err := transcript.WorkflowJournalSince(run.Journal, 0); err != nil {
+					t.Fatal(err)
+				}
+			}
+			return time.Since(start)
+		}
+		measure()
+		scan.cost = measure()
+
+		cfg.workflowScan = scan
+	}
+}
+
+// workflowScanTickHold builds a fixture with `runs` accumulated run dirs per
+// session and returns the worst a competing write waited during a STEADY-STATE
+// tick, plus what one scan of those dirs cost.
+//
+// The first tick is deliberately excluded. On first sight the Observer has no
+// cursor for these sessions, so the pre-lock sample is rejected and the apply
+// phase re-reads inline, under the lock — the fallback that exists so a tick
+// racing a hook is never dropped, and which the plan is explicit must survive.
+// Measuring it would budget the one under-lock read that is supposed to be there.
+// The steady state is also the case that matters: unlike the seed, this scan is
+// paid for EVERY session on EVERY tick.
+func workflowScanTickHold(t *testing.T, runs int) (hold, scanCost time.Duration) {
+	t.Helper()
+	var scan slowWorkflowScan
+	store, _, _, tick := reconcileFixture(t, workflowScanSessions, withSlowWorkflowScan(&scan, runs))
+	tick()
+	return measureWorstWriterWait(store, tick), scan.cost
+}
+
+// TestShouldNotChargeTheStoreLockForAccumulatedWorkflowRuns budgets the OTHER
+// read #61 put under the lock.
+//
+// #61 added two: a full-archive decode in the seed, and this per-session run-dir
+// scan every tick. The seed budget covers the first. This covers the second, and
+// they are not interchangeable — the seed is paid once per newly-seen session
+// while this is paid for EVERY session on EVERY tick, so on a steady box with no
+// churn (which is exactly what the 30-minute merged measurement window turned out
+// to be) this is the only one of the pair still running.
+//
+// ⚠ IT IS A DIFFERENTIAL, and the first attempt at it was not, which is worth
+// recording because the failure was silent in the useful direction. Budgeting the
+// hold as a fraction of the scan's cost — the shape the seed test uses — does not
+// work here. A steady-state tick over this fixture carries ~10 ms of legitimate
+// under-lock work that has nothing to do with workflows, and that constant does
+// not shrink when the scan does: measured at 1600 runs and at 3200, the hold
+// stayed ~9-11 ms while the scan's cost doubled from ~11 ms to ~29 ms. A budget of
+// scan/3 therefore sat right on top of the constant and flaked 1-in-3, and the
+// only way to lift it clear would have been to grow the fixture until the scan
+// dwarfed everything else.
+//
+// Comparing two fixtures cancels the constant instead. A lean session and a fat
+// one do the same tick work except for the run dirs, so the DIFFERENCE in hold is
+// attributable to accumulated run history and nothing else. If the scan is where
+// it belongs — in readSample, before the lock — that difference is ~0 no matter
+// how many runs have piled up. If it moves back under the lock, the difference is
+// the scan's whole cost.
+//
+// This is also the assertion #64 will need. When that lands, the fat fixture's
+// scan gets cheaper and this test keeps asserting the same invariant.
+func TestShouldNotChargeTheStoreLockForAccumulatedWorkflowRuns(t *testing.T) {
+	leanHold, leanCost := workflowScanTickHold(t, workflowScanRunsLean)
+	fatHold, fatCost := workflowScanTickHold(t, workflowScanRunsFat)
+
+	costDelta := fatCost - leanCost
+	if costDelta < minWorkflowScanDelta {
+		t.Fatalf("scanning %d run dirs costs %v and scanning %d costs %v, a difference of only %v — "+
+			"under the %v this test needs to mean anything. With no differential to detect, the "+
+			"comparison below would pass whether or not the scan is under the lock. Grow "+
+			"workflowScanRunsFat.",
+			workflowScanRunsFat, fatCost, workflowScanRunsLean, leanCost, costDelta, minWorkflowScanDelta)
+	}
+
+	// The budget is the WHOLE cost difference, not half of it, and the gap between
+	// those two numbers is where a real and separate cost lives.
+	//
+	// Accumulated runs are not free under the lock even when the scan is hoisted:
+	// applyWorkflowsLocked folds one WorkflowStatus per run from the sample, which
+	// is O(runs) CPU with the lock held. Measured on the correct tree, the fat
+	// fixture ran 2-19 ms longer than the lean one on that account alone. A budget
+	// of costDelta/2 sat inside that range and flaked ~1 in 6.
+	//
+	// That fold is legitimate — it is not I/O, and the invariant B enforces is that
+	// the FAST PATH DOES NO I/O, not that the lock hold is independent of history.
+	// Budgeting at the full costDelta keeps the two separable: the fold alone stays
+	// under it, while a scan moved back under the lock adds the scan's whole cost
+	// ON TOP of the fold and lands at 50-80 ms — measured, by reintroducing #61's
+	// placement, which failed this 3/3 with 5-8x of headroom.
+	//
+	// scanCost is measured reading each journal from offset 0, while a steady-state
+	// tick reads only the delta from its stored offset. So costDelta OVERSTATES
+	// what the scan costs per tick, which errs toward a generous budget rather than
+	// a flaky one. If this test ever needs tightening, that is the thing to fix
+	// first.
+	//
+	// The fold growing without bound is #64's problem, in the same shape and for
+	// the same reason: cost proportional to accumulated history rather than to what
+	// is live. When #64 lands, this budget should tighten.
+	limit := costDelta
+	if got := fatHold - leanHold; got > limit {
+		t.Errorf("a session carrying %d accumulated workflow run dirs held the store lock %v longer "+
+			"than one carrying %d (%v vs %v), against a scan-cost difference of %v; want the extra "+
+			"hold under %v — the run-dir scan is being read with the store lock held again, so the "+
+			"lock now costs what the session's whole history costs. It belongs in readSample.",
+			workflowScanRunsFat, got, workflowScanRunsLean, fatHold, leanHold, costDelta, limit)
 	}
 }
