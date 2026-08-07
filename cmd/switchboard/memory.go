@@ -189,6 +189,33 @@ func (t memoryTick) event(sess *state.Session, now time.Time) (history.Event, bo
 	return ev, true
 }
 
+// applyLocked is the ENTIRE under-lock half of the memory sampler: write the
+// pre-lock reading onto the session, then log a fresh one. It does no I/O, and
+// that is the property the sampler contract in cmd/switchboard pins.
+//
+// It is a named function rather than four lines inline in reconcileOnce so the
+// contract can drive the real thing. Registered as a copy of those lines, the
+// contract would keep passing over its own stale duplicate on the day someone
+// adds a read here — which is the one day it exists for. Every other registration
+// already drives a real production function (observeFanout, selfHealStuckStatus,
+// observeLabel, sweepDeadSessions); this is what gives the memory one the same
+// lever.
+//
+// The live fields take whatever the tick has, INCLUDING a repeated last-known
+// figure after a failed read: better a stale tooltip than one that flaps to zero.
+// The log takes only a fresh reading (event's own Fresh gate), so a process that
+// is gone yields NO sample rather than a zero one — a zero would read as "freed
+// all its memory" and corrupt the peak and average.
+func (t memoryTick) applyLocked(sess *state.Session, sink *history.Sink, now time.Time) {
+	if reading, ok := t.Sessions[sess.PID]; ok {
+		sess.MemAgentBytes = reading.Agent.Pss
+		sess.MemTreeBytes = reading.Tree.Pss
+	}
+	if ev, ok := t.event(sess, now); ok {
+		sink.Record(ev)
+	}
+}
+
 // sampleMemory takes the tick's readings before the reconciler locks the store.
 // A no-op when memory sampling is off.
 func (rs *reconcileState) sampleMemory(snap state.Snapshot) memoryTick {
