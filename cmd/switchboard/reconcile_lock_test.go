@@ -283,14 +283,21 @@ func (l *locateOnlyLocator) Snapshot(context.Context) (map[string]terminal.PaneR
 	return nil, terminal.ErrNoBatchPath
 }
 
-// Locate detects the store lock by trying to take a read lock without blocking:
-// a Snapshot that cannot complete promptly means a writer holds it, which — since
-// the only writer in this test is the tick's own Apply — means this call is inside
-// it. Cheap and exact enough for the property under test.
+// Locate detects the store lock by trying to take it as a WRITER without
+// blocking: an Apply that cannot complete promptly means someone else holds the
+// lock, which — since the only other writer in this test is the tick's own Apply —
+// means this call is inside it.
+//
+// This used to probe with Snapshot, and that stopped working the moment Snapshot
+// became a lock-free load of a published pointer: the probe then always succeeded
+// instantly, inApply was always 0, and the assertion below passed no matter what
+// the code did. A test that cannot fail is worse than no test, so the probe now
+// asks the question in the only terms that still mean anything — is the WRITE lock
+// held?
 func (l *locateOnlyLocator) Locate(_ context.Context, tty string) (*terminal.PaneRef, error) {
 	l.mu.Lock()
 	l.locates++
-	if l.store != nil && !readableNow(l.store) {
+	if l.store != nil && !writableNow(l.store) {
 		l.inApply++
 	}
 	l.mu.Unlock()
@@ -314,11 +321,13 @@ func (l *locateOnlyLocator) locatesDuringApply() int {
 	return l.inApply
 }
 
-// readableNow reports whether a store read completes without waiting on a writer.
-func readableNow(store *state.Store) bool {
+// writableNow reports whether the store lock is free, by trying to take it with
+// an empty Apply. An empty Apply mutates nothing, so its change check finds no
+// change and it neither broadcasts nor persists.
+func writableNow(store *state.Store) bool {
 	done := make(chan struct{})
 	go func() {
-		store.Snapshot()
+		store.Apply(func(map[int]*state.Session) {})
 		close(done)
 	}()
 	select {
@@ -326,6 +335,38 @@ func readableNow(store *state.Store) bool {
 		return true
 	case <-time.After(50 * time.Millisecond):
 		return false
+	}
+}
+
+// TestShouldDetectAHeldStoreLock_negativeControl guards the probe above from
+// going quietly vacuous, the way its Snapshot-based predecessor did when Snapshot
+// stopped taking the lock. If this stops reporting a held lock, then
+// locatesDuringApply is measuring nothing and the fallback test that reads it
+// proves nothing.
+func TestShouldDetectAHeldStoreLock_negativeControl(t *testing.T) {
+	store := state.New("")
+
+	if !writableNow(store) {
+		t.Fatal("an idle store reported its lock as held; the probe is stuck on false and would " +
+			"accuse every caller of running inside an Apply")
+	}
+
+	held := make(chan struct{})
+	released := make(chan struct{})
+	go func() {
+		store.Apply(func(map[int]*state.Session) {
+			close(held)
+			<-released
+		})
+	}()
+
+	<-held
+	got := writableNow(store)
+	close(released)
+
+	if got {
+		t.Error("the probe reported the lock free while an Apply was demonstrably holding it, " +
+			"so locatesDuringApply can never observe a read taken under the lock")
 	}
 }
 
