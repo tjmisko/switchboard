@@ -261,6 +261,21 @@
 - ⚠ should remain unpopulated — `Monitor` is declared but never written by any
   code path (always `""`); reserved (characterization).
 
+### 6.4 `FocusWindow` command construction  — Lua-parser dialect
+Hyprland 0.56 accepts either a legacy `hyprland.conf` (hyprlang) or a
+`hyprland.lua` config, and drops hyprlang entirely in 0.57. Under the Lua parser
+the request socket changes dialect: `keyword` is refused outright ("keyword can't
+work with non-legacy parsers. Use eval.") and `dispatch`'s argument is evaluated
+as Lua rather than read as a dispatcher string. We speak only the Lua dialect.
+- `focusDispatch` should render `hl.dsp.focus({window="address:<addr>"})`, the Lua
+  spelling of the legacy `focuswindow address:<addr>`.
+- `focusBatch` should bracket that dispatch between two
+  `eval hl.config({cursor={no_warps=…}})` chunks — `true` before, the caller's
+  `prev` after — `hl.config` being the setter `keyword` used to be.
+- ⚠ neither Lua chunk may contain a `;`: that is the `[[BATCH]]` sub-command
+  separator, and an embedded one would split the request into unparseable
+  fragments.
+
 ---
 
 ## 7. Daemon event translation — `cmd/switchboard/handleHyprlandEvent`

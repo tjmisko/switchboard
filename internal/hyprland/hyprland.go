@@ -70,8 +70,13 @@ func ActiveWindowAddress(ctx context.Context) (string, error) {
 	return aw.Address, nil
 }
 
-// Dispatch sends a `dispatch` command (e.g. "focuswindow address:0x...") and
-// returns the raw response bytes. Hyprland responds with "ok" on success.
+// Dispatch sends a `dispatch` command and returns the raw response bytes.
+// Hyprland responds with "ok" on success.
+//
+// cmd is a Lua dispatcher expression (e.g. `hl.dsp.focus({window="address:0x…"})`),
+// not the legacy "focuswindow address:0x…" string. Under Hyprland's Lua config
+// parser the argument to `dispatch` is evaluated as Lua — it is wrapped as
+// `return hl.dispatch(<cmd>)` — so the legacy form is a syntax error there.
 func Dispatch(ctx context.Context, cmd string) error {
 	resp, err := request(ctx, "/dispatch "+cmd)
 	if err != nil {
@@ -102,13 +107,9 @@ func FocusWindow(ctx context.Context, addr string) error {
 	if err != nil {
 		// If we can't read the option, fall back to a plain focus. The cursor
 		// may warp, but focus still works — better than failing the jump.
-		return Dispatch(ctx, "focuswindow address:"+addr)
+		return Dispatch(ctx, focusDispatch(addr))
 	}
-	cmd := fmt.Sprintf(
-		"[[BATCH]]keyword cursor:no_warps true ; dispatch focuswindow address:%s ; keyword cursor:no_warps %t",
-		addr, prev,
-	)
-	resp, err := request(ctx, cmd)
+	resp, err := request(ctx, focusBatch(addr, prev))
 	if err != nil {
 		return err
 	}
@@ -119,6 +120,29 @@ func FocusWindow(ctx context.Context, addr string) error {
 		}
 	}
 	return nil
+}
+
+// focusDispatch renders the Lua dispatcher expression that focuses the window at
+// addr — the Lua-parser spelling of the legacy `focuswindow address:0x…`.
+func focusDispatch(addr string) string {
+	return fmt.Sprintf("hl.dsp.focus({window=%q})", "address:"+addr)
+}
+
+// focusBatch renders the one-round-trip no-warp focus request: set the option,
+// focus, restore the option to prev.
+//
+// Both halves are written in the Lua-parser dialect. Hyprland refuses the legacy
+// `keyword` command outright once the config is Lua ("keyword can't work with
+// non-legacy parsers. Use eval."), and evaluates `dispatch`'s argument as Lua, so
+// the pre-Lua spelling of this batch fails on every sub-command. `eval` runs a
+// raw Lua chunk, in which `hl.config` is the setter that `keyword` used to be.
+//
+// The [[BATCH]] separator is " ; ", so neither Lua chunk may contain a semicolon.
+func focusBatch(addr string, prev bool) string {
+	return fmt.Sprintf(
+		"[[BATCH]]eval hl.config({cursor={no_warps=true}}) ; dispatch %s ; eval hl.config({cursor={no_warps=%t}})",
+		focusDispatch(addr), prev,
+	)
 }
 
 // noWarps reports the current effective value of the cursor:no_warps option.

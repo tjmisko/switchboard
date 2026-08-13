@@ -251,3 +251,56 @@ func TestParseEventsStopsOnContextCancel(t *testing.T) {
 		t.Fatal("parseEvents did not stop on ctx cancel")
 	}
 }
+
+// §6.4 focusDispatch — should render the Lua dispatcher expression, because the
+// legacy "focuswindow address:0x…" string is a syntax error once the compositor
+// config is Lua (dispatch's argument is evaluated as Lua).
+func TestFocusDispatchRendersLuaExpression(t *testing.T) {
+	const want = `hl.dsp.focus({window="address:0xdeadbeef"})`
+	if got := focusDispatch("0xdeadbeef"); got != want {
+		t.Errorf("focusDispatch = %q, want %q", got, want)
+	}
+}
+
+// §6.4 focusBatch — should bracket the focus with `eval hl.config` chunks that
+// set no_warps true, then restore the caller's prior value. `keyword` is refused
+// outright by the Lua parser, so the whole batch must speak the Lua dialect.
+func TestFocusBatchRestoresPriorNoWarps(t *testing.T) {
+	tests := []struct {
+		name string
+		prev bool
+		want string
+	}{
+		{
+			name: "restores false when warps were enabled",
+			prev: false,
+			want: `[[BATCH]]eval hl.config({cursor={no_warps=true}}) ; ` +
+				`dispatch hl.dsp.focus({window="address:0xabc"}) ; ` +
+				`eval hl.config({cursor={no_warps=false}})`,
+		},
+		{
+			name: "restores true when the user globally disabled warps",
+			prev: true,
+			want: `[[BATCH]]eval hl.config({cursor={no_warps=true}}) ; ` +
+				`dispatch hl.dsp.focus({window="address:0xabc"}) ; ` +
+				`eval hl.config({cursor={no_warps=true}})`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := focusBatch("0xabc", tt.prev); got != tt.want {
+				t.Errorf("focusBatch(prev=%t) =\n %q\nwant\n %q", tt.prev, got, tt.want)
+			}
+		})
+	}
+}
+
+// §6.4 focusBatch — should emit exactly three sub-commands. The [[BATCH]]
+// separator is " ; ", so a semicolon inside either Lua chunk would silently split
+// the request into fragments that each fail to parse.
+func TestFocusBatchSplitsIntoThreeSubCommands(t *testing.T) {
+	batch := strings.TrimPrefix(focusBatch("0xabc", false), "[[BATCH]]")
+	if n := len(strings.Split(batch, ";")); n != 3 {
+		t.Errorf("focusBatch splits into %d sub-commands, want 3: %q", n, batch)
+	}
+}
