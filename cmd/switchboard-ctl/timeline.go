@@ -56,6 +56,18 @@ func cmdTimeline(args []string) {
 	if err != nil {
 		fail("read %s: %v", *dir, err)
 	}
+	// The activity stream carries across midnight exactly like names do: an edge
+	// is written only on change, so an operator idle since last night has no edge
+	// in this window until morning. Seed the window with the carried state as a
+	// synthetic edge at `from`, so ActivityTimeline and the delegation metrics
+	// tile the pre-first-edge stretch with the truth instead of leaving it
+	// unknown (they no longer presume "active" there — that fabricated presence).
+	// A failed lookback logs and degrades to unknown rather than failing the run.
+	if seed, err := history.CarriedActivityState(*dir, from); err != nil {
+		log.Printf("carried activity: %v — the stretch before the window's first activity edge reads as unknown", err)
+	} else if seed != "" {
+		events = append(events, history.Event{Ts: from, Type: history.EventActivity, To: seed})
+	}
 	lanes := history.BuildSwimlanes(events, end)
 	// A `/name` is recorded once, when it is set, so a session named before this
 	// window opened (yesterday evening, for one still running this morning) has no

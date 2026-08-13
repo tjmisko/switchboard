@@ -36,6 +36,9 @@ func TestTimelineEndToEnd(t *testing.T) {
 		{Ts: at(0, 0), Type: history.EventSessionStart, PID: 1, SessionID: "s1", Agent: "claude", Project: "demo"},
 		{Ts: at(0, 0), Type: history.EventSessionLabel, PID: 1, SessionID: "s1", Label: "delegation-demo"},
 		{Ts: at(0, 0), Type: history.EventFocus, PID: 1, SessionID: "s1"}, // user focuses s1
+		// The leading state is data, not a presumption: the watcher's edge says the
+		// user is at the keyboard from t0 (the pre-first-edge stretch is unknown).
+		{Ts: at(0, 0), Type: history.EventActivity, To: "active"},
 		{Ts: at(0, 0), Type: history.EventTransition, PID: 1, SessionID: "s1", To: "working"},
 		{Ts: at(1, 0), Type: history.EventUsageSample, PID: 1, SessionID: "s1", Model: "claude-opus-4-8", TokIn: 1_000_000, TokOut: 100_000}, // $7.50
 		{Ts: at(1, 0), Type: history.EventUsageSample, PID: 1, SessionID: "s1", Model: "claude-sonnet-4-6", TokIn: 1_000_000},                // $3.00

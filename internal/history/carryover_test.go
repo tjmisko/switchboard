@@ -248,3 +248,82 @@ func TestBackfillCarriedNamesShouldNoOpOnAnUnboundedWindow(t *testing.T) {
 		t.Errorf("lane name = %q, want none: an unbounded window carries nothing", got)
 	}
 }
+
+// activityLine renders an activity edge exactly as the sink writes one, so the
+// carried-activity scan is exercised against the real on-disk shape.
+func activityLine(t *testing.T, at time.Time, to string) string {
+	t.Helper()
+	b, err := json.Marshal(Event{Ts: at, Type: EventActivity, To: to})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// The overnight case this exists for: the operator went idle yesterday evening
+// and today's file has no edge until morning. The carried state must say idle,
+// so the pre-first-edge stretch tiles as absence rather than as the fabricated
+// active span the old presumed-active seed produced.
+func TestCarriedActivityStateShouldFindYesterdaysIdleEdgeWhenTodayHasNoneYet(t *testing.T) {
+	dir := t.TempDir()
+	evening := localAt(25, 23)
+	writeDay(t, dir, dayOf(evening), activityLine(t, evening.Add(-time.Hour), "active"), activityLine(t, evening, "idle"))
+
+	state, err := CarriedActivityState(dir, localAt(26, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != "idle" {
+		t.Errorf("carried state = %q, want idle (the last edge before the window)", state)
+	}
+}
+
+func TestCarriedActivityStateShouldTakeTheLatestEdgeBeforeTheBound(t *testing.T) {
+	dir := t.TempDir()
+	morning := localAt(26, 8)
+	writeDay(t, dir, dayOf(morning),
+		activityLine(t, morning, "active"),
+		activityLine(t, morning.Add(time.Hour), "idle"),
+		activityLine(t, morning.Add(5*time.Hour), "active")) // after the bound: ignored
+
+	state, err := CarriedActivityState(dir, localAt(26, 12))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != "idle" {
+		t.Errorf("carried state = %q, want idle (the 09:00 edge; the 13:00 one is after the bound)", state)
+	}
+}
+
+func TestCarriedActivityStateShouldReportUnknownWhenNoEdgeExists(t *testing.T) {
+	dir := t.TempDir()
+	day := localAt(26, 0)
+	writeDay(t, dir, dayOf(day), labelLine(t, day, "s1", "unrelated"))
+
+	state, err := CarriedActivityState(dir, localAt(26, 12))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != "" {
+		t.Errorf("carried state = %q, want \"\" (no activity edge on disk)", state)
+	}
+}
+
+func TestCarriedActivityStateShouldStopAtTheLookbackBound(t *testing.T) {
+	dir := t.TempDir()
+	old := localAt(10, 12)
+	writeDay(t, dir, dayOf(old), activityLine(t, old, "idle"))
+	// Enough newer edge-free day-files that the scan exhausts its budget first.
+	for d := 0; d < carriedNameLookbackDays; d++ {
+		at := localAt(20+d, 12)
+		writeDay(t, dir, dayOf(at), labelLine(t, at, "other", "unrelated"))
+	}
+
+	state, err := CarriedActivityState(dir, localAt(27, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != "" {
+		t.Errorf("carried state = %q, want \"\" (the only edge is beyond the lookback)", state)
+	}
+}
