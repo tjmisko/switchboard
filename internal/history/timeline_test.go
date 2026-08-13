@@ -849,15 +849,16 @@ func TestBuildSwimlanesFocusOpenSpanCapsAtLaneEnd(t *testing.T) {
 
 func TestSummarizeDelegationMetrics(t *testing.T) {
 	// One session working 0-60 (then idle to 80). Focus on s1 over [10,30] and
-	// [50,70]. User active over [0,20] and [40,75] (presumed active at start,
-	// idle@20, active@40, idle@75).
+	// [50,70]. User active over [0,20] and [40,75] (an explicit active edge at 0
+	// — the leading state is no longer presumed — then idle@20, active@40,
+	// idle@75).
 	evs := []Event{
 		{Ts: ts(0), Type: EventSessionStart, PID: 1, SessionID: "s1"},
 		tr(1, "s1", 0, "", "working", 0),
 		tr(1, "s1", 60, "working", "idle", 0),
 		{Ts: ts(80), Type: EventSessionEnd, PID: 1, SessionID: "s1"},
 		focusEv(10, "s1"), focusEv(30, ""), focusEv(50, "s1"), focusEv(70, ""),
-		activityEv(20, "idle"), activityEv(40, "active"), activityEv(75, "idle"),
+		activityEv(0, "active"), activityEv(20, "idle"), activityEv(40, "active"), activityEv(75, "idle"),
 	}
 	lanes := BuildSwimlanes(evs, ts(99))
 	s := Summarize(lanes, evs)
@@ -954,12 +955,13 @@ func TestSubtractSpans(t *testing.T) {
 	}
 }
 
-func TestUserActiveSpansPresumesActiveAtStart(t *testing.T) {
-	// First event is idle@20 → presumed active [0,20]; resume active@40 → idle
-	// [20,40]; trailing active [40,60].
+func TestUserActiveSpansUnknownBeforeFirstEdge(t *testing.T) {
+	// First edge is idle@20: the state before it is UNKNOWN, not presumed active
+	// — presuming active fabricated an overnight presence span on any day whose
+	// first edge came in the morning. Only the trailing active [40,60] survives.
 	evs := []Event{activityEv(20, "idle"), activityEv(40, "active")}
 	got := userActiveSpans(evs, ts(0), ts(60))
-	want := []span{{ts(0), ts(20)}, {ts(40), ts(60)}}
+	want := []span{{ts(40), ts(60)}}
 	if len(got) != len(want) {
 		t.Fatalf("active spans = %+v, want %+v", got, want)
 	}
@@ -973,13 +975,29 @@ func TestUserActiveSpansPresumesActiveAtStart(t *testing.T) {
 	}
 }
 
+func TestUserActiveSpansCarriedSeedRestoresLeadingState(t *testing.T) {
+	// A caller that knows the carried state prepends a synthetic edge at the
+	// window start (see cmdTimeline): active@0 restores the old full tiling.
+	evs := []Event{activityEv(0, "active"), activityEv(20, "idle"), activityEv(40, "active")}
+	got := userActiveSpans(evs, ts(0), ts(60))
+	want := []span{{ts(0), ts(20)}, {ts(40), ts(60)}}
+	if len(got) != len(want) {
+		t.Fatalf("active spans = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if !got[i].start.Equal(want[i].start) || !got[i].end.Equal(want[i].end) {
+			t.Errorf("active[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
 func TestActivityTimelineAlternatesBothStates(t *testing.T) {
-	// Same stream as the active-only test, but the top-level timeline keeps BOTH
-	// states: presumed active [0,20], idle [20,40], active [40,60].
+	// The top-level timeline keeps BOTH states and starts at the FIRST EDGE: the
+	// stretch before idle@20 is unknown and stays untiled; idle [20,40], active
+	// [40,60].
 	evs := []Event{activityEv(20, "idle"), activityEv(40, "active")}
 	got := ActivityTimeline(evs, ts(0), ts(60))
 	want := []ActivitySpan{
-		{State: "active", Start: ts(0), End: ts(20)},
 		{State: "idle", Start: ts(20), End: ts(40)},
 		{State: "active", Start: ts(40), End: ts(60)},
 	}
@@ -993,6 +1011,26 @@ func TestActivityTimelineAlternatesBothStates(t *testing.T) {
 	}
 	if ActivityTimeline(nil, ts(0), ts(60)) != nil {
 		t.Errorf("no activity events should yield a nil timeline (omitted from JSON)")
+	}
+}
+
+func TestActivityTimelineCarriedSeedTilesFromWindowStart(t *testing.T) {
+	// With a carried idle edge at the window start (the operator went idle the
+	// previous night), the overnight stretch tiles as idle rather than as the
+	// fabricated active span the old presumed-active seed produced.
+	evs := []Event{activityEv(0, "idle"), activityEv(40, "active")}
+	got := ActivityTimeline(evs, ts(0), ts(60))
+	want := []ActivitySpan{
+		{State: "idle", Start: ts(0), End: ts(40)},
+		{State: "active", Start: ts(40), End: ts(60)},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("activity spans = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i].State != want[i].State || !got[i].Start.Equal(want[i].Start) || !got[i].End.Equal(want[i].End) {
+			t.Errorf("activity[%d] = %+v, want %+v", i, got[i], want[i])
+		}
 	}
 }
 

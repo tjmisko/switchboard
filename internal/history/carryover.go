@@ -181,3 +181,88 @@ func scanDayLabels(path string, before time.Time, want map[string]bool) (map[str
 	}
 	return out, sc.Err()
 }
+
+// activityMarker prefilters the lines a carried-activity scan decodes, matching
+// the event type's value exactly as sessionLabelMarker does for names.
+var activityMarker = []byte(EventActivity)
+
+// CarriedActivityState returns the operator's activity state ("idle" or
+// "active") as of `at` — the last activity edge recorded strictly before it —
+// or "" when no edge exists within the lookback (the state is then unknown).
+//
+// This is the activity stream's carry-forward, and it exists for the same
+// reason names carry (see the package note): the daemon writes an edge only
+// when the state CHANGES, so an operator who went idle at 23:49 and slept in
+// has no edge in the next day-file until morning. Replaying that day from its
+// own events alone leaves the overnight stretch stateless, and the old
+// presumed-active seed turned it into fabricated presence. Callers express a
+// found state by prepending a synthetic edge at their window start, which both
+// ActivityTimeline and userActiveSpans then tile from.
+func CarriedActivityState(dir string, at time.Time) (string, error) {
+	if at.IsZero() {
+		return "", nil
+	}
+	days, err := Days(dir)
+	if err != nil {
+		return "", err
+	}
+	opened := 0
+	for i := len(days) - 1; i >= 0 && opened < carriedNameLookbackDays; i-- {
+		d, err := time.ParseInLocation("2006-01-02", days[i], time.Local)
+		if err != nil {
+			continue
+		}
+		// A file whose day begins after `at` cannot hold an earlier edge. The file
+		// for `at`'s own day IS opened: an edge can land just before the bound, and
+		// a legacy UTC-named file's contents are offset from its name.
+		if d.After(at) {
+			continue
+		}
+		opened++
+		state, err := scanDayActivityState(DayPath(dir, days[i]), at)
+		if err != nil {
+			return "", err
+		}
+		if state != "" {
+			return state, nil // newest-first walk: the first hit is the latest edge
+		}
+	}
+	return "", nil
+}
+
+// scanDayActivityState returns the last activity edge before `at` in one
+// day-file, or "" when the file holds none. Malformed lines are skipped exactly
+// as the other carry-forward scans skip them, and a missing file is empty
+// rather than an error.
+func scanDayActivityState(path string, at time.Time) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	defer f.Close()
+
+	state := ""
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if !bytes.Contains(line, activityMarker) {
+			continue
+		}
+		var ev Event
+		if json.Unmarshal(line, &ev) != nil {
+			continue
+		}
+		if ev.Type != EventActivity || (ev.To != activityIdle && ev.To != activityActive) {
+			continue
+		}
+		if !ev.Ts.Before(at) {
+			continue
+		}
+		state = ev.To // a later line in the same file is the newer edge
+	}
+	return state, sc.Err()
+}

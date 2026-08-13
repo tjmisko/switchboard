@@ -1325,11 +1325,14 @@ func focusToSpans(focus []FocusSpan) []span {
 
 // userActiveSpans derives the global stretches the user was at the keyboard
 // (active) from the activity stream (EventActivity, To ∈ {"idle","active"}),
-// bounded to [from, to]. The user is presumed active at the window start (an idle
-// daemon emits "idle" on timeout and "active" on resume, so the first event is
-// normally a move away from active). With no activity events there is no idle
-// signal and this returns nil — callers then treat all agent work as unattended
-// (graceful degradation).
+// bounded to [from, to]. The state before the first edge in the window is
+// UNKNOWN and contributes nothing: the old "presumed active at the window
+// start" seed fabricated an active stretch from midnight to the first edge of
+// the day — hours of phantom presence on any morning the operator slept in.
+// Callers that know the carried state (see CarriedActivityState) express it by
+// prepending a synthetic edge at the window start. With no activity events at
+// all there is no idle signal and this returns nil — callers then treat all
+// agent work as unattended (graceful degradation).
 func userActiveSpans(events []Event, from, to time.Time) []span {
 	var acts []Event
 	for _, ev := range events {
@@ -1342,7 +1345,7 @@ func userActiveSpans(events []Event, from, to time.Time) []span {
 	}
 	sort.SliceStable(acts, func(i, j int) bool { return acts[i].Ts.Before(acts[j].Ts) })
 	var out []span
-	state := activityActive
+	state := ""
 	start := from
 	closeActive := func(t time.Time) {
 		if state == activityActive && !start.IsZero() && t.After(start) {
@@ -1377,11 +1380,15 @@ type ActivitySpan struct {
 
 // ActivityTimeline derives the alternating global activity spans — BOTH "active"
 // and "idle", unlike userActiveSpans which keeps only the active ones — from the
-// activity stream (EventActivity, To ∈ {"idle","active"}), tiling [from, to]. The
-// user is presumed active at the window start (an idle daemon emits "idle" on
-// timeout and "active" on resume, so the first event is normally a move away from
-// active). With no activity events it returns nil — there is no idle signal to
-// surface, and the dashboard overlay degrades to focus-only.
+// activity stream (EventActivity, To ∈ {"idle","active"}), tiling [from, to]
+// from the FIRST EDGE onward. The state before that edge is unknown and is not
+// tiled: presuming "active" there (the old rule) painted an active span from
+// midnight to the operator's first keystroke of the day — on 2026-08-06 that
+// was a fabricated 8-hour overnight presence the dashboard then refused to dim.
+// A caller that knows the carried state (see CarriedActivityState) prepends a
+// synthetic edge at the window start and gets the full tiling. With no activity
+// events it returns nil — there is no idle signal to surface, and the dashboard
+// overlay degrades to focus-only.
 func ActivityTimeline(events []Event, from, to time.Time) []ActivitySpan {
 	var acts []Event
 	for _, ev := range events {
@@ -1398,8 +1405,10 @@ func ActivityTimeline(events []Event, from, to time.Time) []ActivitySpan {
 	}
 	sort.SliceStable(acts, func(i, j int) bool { return acts[i].Ts.Before(acts[j].Ts) })
 	var out []ActivitySpan
-	state := activityActive
-	start := from
+	// Unknown until the first edge: a zero start keeps emit() silent, so the
+	// first span begins at the first edge rather than at a presumed state.
+	state := ""
+	start := time.Time{}
 	emit := func(t time.Time) {
 		if !start.IsZero() && t.After(start) {
 			out = append(out, ActivitySpan{State: state, Start: start, End: t})
