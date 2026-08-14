@@ -118,17 +118,51 @@ later, so a reconcile tick landing inside that window emits the spawn untagged.
 This is cosmetic: the completion logic is unaffected, because an ack never
 enters `resultDone` no matter when it arrives.
 
-## Blast radius
+## Blast radius, and repairing the log
 
-Every `subagent_spawn`/`stop` pair switchboard has ever recorded for an `Agent`
-fanout is wrong — the stop is the ack's arrival, not the agent's finish. The
-history log needs repair, not just the detector; see
-`scripts/repair-launch-ack-spans`.
+Every `subagent_spawn`/`stop` pair switchboard has recorded for an `Agent`
+fanout is suspect — the stop is the ack's arrival, not the agent's finish. The
+detector fix does nothing for spans already on disk, so the history needs
+repair too: [`scripts/repair-launch-ack-spans`](../scripts/repair-launch-ack-spans).
 
-The same pairing bug exists wherever else a Task/Agent tool_use is matched
-against its tool_result:
+It re-dates each truncated stop against the subagent's own transcript, which
+the bug never touched, and classifies by what that transcript shows —
+`end_turn` ⇒ finished (re-date to it), quiet past the stale cap ⇒ abandoned
+(re-date to last activity), still warm ⇒ **drop the stop entirely** so the
+fixed daemon can close it for real. Dropping matters: a stop in the log makes
+`history.PriorSubagentState` seed the agent as already closed, and no real stop
+would ever follow.
+
+Dry run by default; `--apply` backs up first; re-running is a no-op. Measured
+on 2026-08-12 alone: sub-30s spans fell from 13 to 3 and recovered delegated
+time rose from 11.97h to 16.01h — four hours of agent work that had been
+erased from a single day.
+
+Two things it deliberately does **not** do:
+
+- **Rewrite `transition` events.** Those record what switchboard actually
+  believed and displayed, and they are chained by `dur_prev_ms`; synthesizing
+  `delegating` states would fabricate a record of what the operator saw.
+  `--report-transitions` quantifies the gap instead (the session in the
+  complaint above: 92.8 minutes logged idle with an agent working).
+- **Touch today's file without `--include-today`.** The live daemon appends
+  there and the rewrite is read-all/replace. Note the guard covers the
+  *destination* as well as the source: an agent that spawned before midnight
+  and finished after it re-dates into today's file even when you are repairing
+  last week.
+
+## Not just this repo
+
+The same pairing bug lives wherever a Task/Agent tool_use is matched against
+its tool_result:
 
 - `transcript.Tasks` / `InFlightTasks` (legacy, no non-test callers) — fixed
   here by the same rule so a future caller does not inherit it.
 - `agent-watcher`'s `in_flight_delegations` — fixed in that repo, which had no
-  background handling at all.
+  background handling at all. Note the trap documented there: its `collected`
+  set also gates prompt resolution, where an ack genuinely *does* end the main
+  thread's wait, so the two questions needed separate sets.
+- `switchboard-dashboard` has no independent copy — its arachne provider
+  consumes these history events and never parses transcripts — but its
+  provider contract now states the obligation (§5.1).
+
