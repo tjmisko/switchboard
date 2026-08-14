@@ -151,6 +151,30 @@ Two things it deliberately does **not** do:
   and finished after it re-dates into today's file even when you are repairing
   last week.
 
+## What repairing the spans does not fix
+
+Re-dating a span makes it cover the agent's real lifetime — which is in-flight
+time, not work time. An agent parked on a permission prompt is still in flight,
+so a repaired span can credit hours in which the agent did nothing but wait.
+
+That surfaced immediately here. Two of the overnight TaskPump agents were
+blocked on a Bash approval for 7.86 h and 7.57 h of 8.50 h and 7.78 h spans —
+92% and 97% dead time. Corpus-wide it is 17.6 h of 127.5 h (13.8%) of all
+subagent span time, so the distortion is usually small but unbounded, and a
+single unattended night dominates it.
+
+Two separate consequences, only one of which is fixed:
+
+- **The chip should have been RED for that whole wait, and was not.** That was
+  its own defect — the stale-writer backstop dropping a red after 30 minutes of
+  quiescence, when a blocked writer is quiet *because* it is blocked. Fixed;
+  see `resolveWriterPrompt` in `cmd/switchboard/main.go`.
+- **The span still credits the wait as delegated work.** Not fixed. It needs
+  per-span blocked intervals that no producer emits today — the history records
+  permission transitions at session level, not per writer, so the overlap
+  cannot be recovered after the fact once a session has more than one agent.
+  Documented as a limitation in the dashboard's provider contract (§5.2).
+
 ## Not just this repo
 
 The same pairing bug lives wherever a Task/Agent tool_use is matched against
