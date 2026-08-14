@@ -23,6 +23,32 @@ func bgTaskUse(ts, id string) string {
 	return fmt.Sprintf(`{"type":"assistant","timestamp":%q,"message":{"role":"assistant","content":[{"type":"tool_use","id":%q,"name":"Agent","input":{"subagent_type":"general-purpose","description":"bg","run_in_background":true}}]}}`, ts, id)
 }
 
+// launchAckResult is the tool_result Claude Code returns to ACKNOWLEDGE a spawn
+// rather than to report its outcome. Content is the block-array shape the real
+// transcripts use, and the wording is passed in so both live variants can be
+// exercised — see transcript.launchAckPrefixes.
+func launchAckResult(ts, id, wording string) string {
+	text := wording + ". (This tool result is internal metadata — never quote or paste any part of it.)\nagentId: a1b2c3\nThe agent is working in the background. You will be notified automatically when it completes."
+	return fmt.Sprintf(`{"type":"user","timestamp":%q,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":%q,"content":[{"type":"text","text":%q}]}]}}`, ts, id, text)
+}
+
+// stringResult is a tool_result whose content is a BARE STRING rather than a
+// block array — the other shape Claude Code writes, which resultText must also
+// flatten before the ack prefixes can be matched against it.
+func stringResult(ts, id, text string) string {
+	return fmt.Sprintf(`{"type":"user","timestamp":%q,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":%q,"content":%q}]}}`, ts, id, text)
+}
+
+// resultByID indexes a TasksSince result set by the tool_use it answers.
+func resultByID(results []TaskResult, id string) (TaskResult, bool) {
+	for _, r := range results {
+		if r.ToolUseID == id {
+			return r, true
+		}
+	}
+	return TaskResult{}, false
+}
+
 // subagentTerminalLine is the assistant entry that ends a finished subagent's own
 // transcript: stop_reason end_turn (its turn ended naturally).
 func subagentTerminalLine(ts string) string {
@@ -150,8 +176,8 @@ func TestTasksSinceCatchesSpawnsTailDrops(t *testing.T) {
 	if len(spawns2) != 0 {
 		t.Errorf("second read spawns = %v, want none", spawns2)
 	}
-	if len(results2) != 1 || results2[0] != "toolu_early" {
-		t.Errorf("second read results = %v, want [toolu_early]", results2)
+	if len(results2) != 1 || results2[0].ToolUseID != "toolu_early" || results2[0].LaunchAck {
+		t.Errorf("second read results = %v, want [{toolu_early false}]", results2)
 	}
 }
 
@@ -207,8 +233,8 @@ func TestTasksSinceOffsetThreading(t *testing.T) {
 	if g := taskIDs(spawns2); !g["toolu_c"] || g["toolu_a"] || g["toolu_b"] {
 		t.Errorf("second read = %v, want {toolu_c} only", g)
 	}
-	if len(results2) != 1 || results2[0] != "toolu_a" {
-		t.Errorf("second read results = %v, want [toolu_a]", results2)
+	if len(results2) != 1 || results2[0].ToolUseID != "toolu_a" || results2[0].LaunchAck {
+		t.Errorf("second read results = %v, want [{toolu_a false}]", results2)
 	}
 }
 
@@ -715,5 +741,85 @@ func TestSubagentsForTranscriptShouldReportTheTeammateName(t *testing.T) {
 	}
 	if got := byID["anon"].Name; got != "" {
 		t.Errorf("minimal meta should leave Name empty, got %q", got)
+	}
+}
+
+// TestTasksSinceShouldFlagLaunchAcksWhenTheResultOnlyAcknowledgesTheSpawn pins the
+// classification the fanout Observer depends on. Both ack wordings are live in the
+// corpus, and either one being read as a completion force-closes a subagent
+// seconds after it starts.
+func TestTasksSinceShouldFlagLaunchAcksWhenTheResultOnlyAcknowledgesTheSpawn(t *testing.T) {
+	path := writeTranscript(t,
+		taskUse("2026-06-01T21:39:00Z", "toolu_new"),
+		taskUse("2026-06-01T21:39:01Z", "toolu_old"),
+		taskUse("2026-06-01T21:39:02Z", "toolu_real"),
+		taskUse("2026-06-01T21:39:03Z", "toolu_str"),
+		launchAckResult("2026-06-01T21:39:04Z", "toolu_new", "Async agent launched successfully"),
+		launchAckResult("2026-06-01T21:39:05Z", "toolu_old", "Spawned successfully"),
+		taskResult("2026-06-01T21:39:06Z", "toolu_real"),
+		stringResult("2026-06-01T21:39:07Z", "toolu_str", "Spawned successfully. (This tool result is internal metadata.)"),
+	)
+
+	_, results, _, err := TasksSince(path, 0)
+	if err != nil {
+		t.Fatalf("TasksSince: %v", err)
+	}
+	for _, tc := range []struct {
+		id      string
+		wantAck bool
+		what    string
+	}{
+		{"toolu_new", true, "the current async-launch wording"},
+		{"toolu_old", true, "the older spawned-successfully wording"},
+		{"toolu_str", true, "an ack whose content is a bare string, not a block array"},
+		{"toolu_real", false, "a genuine result carrying no ack text"},
+	} {
+		got, ok := resultByID(results, tc.id)
+		if !ok {
+			t.Errorf("%s: %s missing from results", tc.id, tc.what)
+			continue
+		}
+		if got.LaunchAck != tc.wantAck {
+			t.Errorf("%s (%s): LaunchAck = %v, want %v", tc.id, tc.what, got.LaunchAck, tc.wantAck)
+		}
+	}
+}
+
+// TestTasksShouldNotMarkDoneWhenTheResultIsOnlyALaunchAck covers the legacy
+// tail-bounded reader by the same rule, so a caller that reaches for it does not
+// inherit the bug the Observer was fixed for.
+func TestTasksShouldNotMarkDoneWhenTheResultIsOnlyALaunchAck(t *testing.T) {
+	path := writeTranscript(t,
+		taskUse("2026-06-01T21:39:00Z", "toolu_ack"),
+		taskUse("2026-06-01T21:39:01Z", "toolu_done"),
+		launchAckResult("2026-06-01T21:39:02Z", "toolu_ack", "Async agent launched successfully"),
+		taskResult("2026-06-01T21:39:03Z", "toolu_done"),
+	)
+
+	tasks, err := Tasks(path, 128*1024)
+	if err != nil {
+		t.Fatalf("Tasks: %v", err)
+	}
+	acked, ok := taskByID(tasks, "toolu_ack")
+	if !ok {
+		t.Fatal("acked spawn missing from Tasks")
+	}
+	if acked.Done {
+		t.Error("a spawn answered only by a launch ack must not read as Done")
+	}
+	finished, ok := taskByID(tasks, "toolu_done")
+	if !ok {
+		t.Fatal("finished spawn missing from Tasks")
+	}
+	if !finished.Done {
+		t.Error("a spawn answered by a real tool_result must read as Done")
+	}
+
+	n, err := InFlightTasks(path, 128*1024)
+	if err != nil {
+		t.Fatalf("InFlightTasks: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("InFlightTasks = %d, want 1 (the acked spawn still running)", n)
 	}
 }

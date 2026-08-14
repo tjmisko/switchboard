@@ -171,18 +171,101 @@ type block struct {
 	Name      string `json:"name"`
 	ID        string `json:"id"`
 	ToolUseID string `json:"tool_use_id"`
+	// Content is a tool_result's payload, kept raw because Claude Code writes it
+	// either as a bare string or as an array of typed blocks. resultText()
+	// reconciles both; it is what isLaunchAck reads to tell a subagent's spawn
+	// acknowledgement from a real completion.
+	Content json.RawMessage `json:"content"`
 	// Input is the tool_use's arguments. For a Task/Agent tool_use it carries the
 	// subagent's type and human description, which Tasks surfaces for the rich
 	// subagent_spawn history events.
 	Input struct {
 		Description  string `json:"description"`
 		SubagentType string `json:"subagent_type"`
-		// RunInBackground is set when the main thread launched the subagent in the
-		// background (Agent/Task input run_in_background:true) — a fanout whose
-		// parent tool_result may land long after the spawn, so the subagents/ dir
-		// (SubagentsForTranscript) is the more reliable completion signal for it.
+		// RunInBackground is the Agent/Task input run_in_background flag.
+		//
+		// DO NOT make completion logic depend on this. Measured over 120
+		// transcripts on this machine (2026-08-14): 69 Agent spawns, of which 68
+		// carried no run_in_background at all and one carried an explicit false —
+		// yet ALL 69 were answered with a spawn acknowledgement rather than a
+		// result (see launchAckPrefixes). The flag has never been true for an
+		// Agent spawn here, so any guard keyed on it silently never fires. It is
+		// retained only as a best-effort tag; isLaunchAck is the load-bearing
+		// signal.
 		RunInBackground bool `json:"run_in_background"`
 	} `json:"input"`
+}
+
+// launchAckPrefixes are the tool_result texts Claude Code returns to ACKNOWLEDGE
+// a subagent spawn rather than to report its outcome. Both wordings are live in
+// the corpus (49 "Spawned successfully" and 19 "Async agent launched
+// successfully" over the 120 transcripts surveyed on 2026-08-14), so both must be
+// recognized; the older one is not historical.
+//
+// An ack lands ~2s after the tool_use and says, in its own words, "The agent is
+// working in the background. You will be notified automatically when it
+// completes." The completion itself never arrives as a tool_result — it arrives
+// as a <task-notification> user entry — so treating an ack as completion
+// force-closes a subagent seconds after it starts. That is exactly the bug that
+// made a session with four live background agents render idle.
+//
+// Matching is on the text prefix rather than on any structural field because no
+// structural field distinguishes the two: the ack and a hypothetical real result
+// are both plain tool_result blocks answering the same tool_use id.
+var launchAckPrefixes = []string{
+	"Async agent launched successfully",
+	"Spawned successfully",
+}
+
+// resultText flattens a tool_result's content to the text it carries: a bare
+// string as-is, an array of typed blocks as their text blocks joined by newline.
+// Anything else (null, object, unparseable) yields "" — which reads as "not an
+// ack", the fail-safe direction: a result we cannot classify is treated as a
+// real result, and a real result that is wrongly excluded would only mean
+// falling back to the subagent's own jsonl for completion.
+func (b block) resultText() string {
+	raw := bytes.TrimSpace(b.Content)
+	if len(raw) == 0 {
+		return ""
+	}
+	switch raw[0] {
+	case '"':
+		var s string
+		if json.Unmarshal(raw, &s) != nil {
+			return ""
+		}
+		return s
+	case '[':
+		var bs []block
+		if json.Unmarshal(raw, &bs) != nil {
+			return ""
+		}
+		var parts []string
+		for _, inner := range bs {
+			if inner.Type == "text" && inner.Text != "" {
+				parts = append(parts, inner.Text)
+			}
+		}
+		return strings.Join(parts, "\n")
+	default:
+		return ""
+	}
+}
+
+// isLaunchAck reports whether this tool_result merely acknowledges a subagent
+// spawn (see launchAckPrefixes) instead of reporting its outcome. Callers must
+// never count an ack as the subagent's completion.
+func (b block) isLaunchAck() bool {
+	text := strings.TrimSpace(b.resultText())
+	if text == "" {
+		return false
+	}
+	for _, prefix := range launchAckPrefixes {
+		if strings.HasPrefix(text, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // blocks parses message.content tolerantly: an array of typed blocks yields its
@@ -570,7 +653,9 @@ func Tasks(path string, maxBytes int64) ([]Task, error) {
 					launched[b.ID] = meta{b.Input.SubagentType, b.Input.Description, b.Input.RunInBackground}
 				}
 			case "tool_result":
-				if b.ToolUseID != "" {
+				// A spawn ack is not a completion — see launchAckPrefixes. Without
+				// this, every Agent fanout reads Done ~2s after it launches.
+				if b.ToolUseID != "" && !b.isLaunchAck() {
 					done[b.ToolUseID] = true
 				}
 			}
