@@ -25,6 +25,22 @@ const (
 	activityActive = "active"
 )
 
+// activeHoldCap bounds how long a single "active" edge keeps evidencing
+// presence when no further edge follows it. An "active" state is a
+// self-expiring claim: the watcher declares idle within minutes of stillness,
+// so a healthy stream closes every real active stretch with an idle edge soon
+// after the operator stops — the only way an active hold runs for many hours
+// edge-free is a dead watcher, and holding the state anyway fabricates
+// presence (2026-07-30: one broken edge at 10:59 held "active" for 10.6h
+// across an afternoon the operator was demonstrably away for). Across the
+// full recorded history the real distribution is p50 2.5min / p95 40min over
+// ~1000 holds; 2h clears the genuine tail about three times over while every
+// observed hold beyond it was a watcher outage. Time past the cap is UNKNOWN
+// — neither presence nor absence — exactly like the pre-first-edge stretch.
+// Idle holds never expire: idle is the absorbing state, since a machine
+// nobody touches stays idle without needing another edge to say so.
+const activeHoldCap = 2 * time.Hour
+
 // isActive reports whether a status counts as the parent thread's own agent work
 // for the attention stats: the main thread working, or delegating (a teammate
 // working by proxy). Idle (your turn), permission (waiting on you), suspended
@@ -1363,12 +1379,23 @@ func userActiveSpans(events []Event, from, to time.Time) []span {
 	if !to.IsZero() {
 		closeActive(to)
 	}
-	return mergeSpans(out)
+	// Every span here is an active hold; expire the implausible ones (see
+	// activeHoldCap) so a dead watcher's last edge cannot evidence hours of
+	// presence into the delegation metrics.
+	spans := mergeSpans(out)
+	for i := range spans {
+		if spans[i].end.Sub(spans[i].start) > activeHoldCap {
+			spans[i].end = spans[i].start.Add(activeHoldCap)
+		}
+	}
+	return spans
 }
 
 // ActivitySpan is one stretch of the global user-activity timeline: the user was
 // State ("active" or "idle") for [Start, End]. Successive spans alternate state
-// and tile [from, to] whenever the activity stream has any event. It is the
+// and, when the stream is healthy, tile [from, to]; the stretch before the
+// first edge and the expired remainder of an implausibly long active hold
+// (activeHoldCap) are left untiled — unknown rather than presumed. It is the
 // public, top-level view of the same idle/active signal the delegation metrics
 // consume internally (userActiveSpans) — the dashboard dims the idle stretches
 // and outlines focus∧active from it. (C2.)
@@ -1424,6 +1451,15 @@ func ActivityTimeline(events []Event, from, to time.Time) []ActivitySpan {
 	}
 	if !to.IsZero() {
 		emit(to)
+	}
+	// Expire implausible active holds (see activeHoldCap): the span keeps its
+	// first credible stretch and the remainder goes untiled — unknown, like the
+	// pre-first-edge lead-in — rather than reading as hours of presence off a
+	// watcher that died mid-day. Idle spans pass untouched.
+	for i := range out {
+		if out[i].State == activityActive && out[i].End.Sub(out[i].Start) > activeHoldCap {
+			out[i].End = out[i].Start.Add(activeHoldCap)
+		}
 	}
 	return out
 }

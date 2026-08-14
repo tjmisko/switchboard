@@ -327,3 +327,49 @@ func TestCarriedActivityStateShouldStopAtTheLookbackBound(t *testing.T) {
 		t.Errorf("carried state = %q, want \"\" (the only edge is beyond the lookback)", state)
 	}
 }
+
+// A carried "active" is a claim that expires: an active edge hours before the
+// window with no idle edge after it is a watcher that died mid-claim, and
+// carrying it re-fabricates exactly the phantom presence the carry-in exists
+// to kill (2026-07-30 opened on an 11h "active" span carried this way).
+func TestCarriedActivityStateShouldExpireAStaleActiveEdge(t *testing.T) {
+	dir := t.TempDir()
+	evening := localAt(25, 18) // 6h before the midnight bound: beyond activeHoldCap
+	writeDay(t, dir, dayOf(evening), activityLine(t, evening, "active"))
+
+	state, err := CarriedActivityState(dir, localAt(26, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != "" {
+		t.Errorf("carried state = %q, want \"\" (a 6h-old active claim has expired)", state)
+	}
+}
+
+func TestCarriedActivityStateShouldCarryAFreshActiveEdge(t *testing.T) {
+	dir := t.TempDir()
+	lateNight := localAt(25, 23) // 1h before the bound: inside activeHoldCap
+	writeDay(t, dir, dayOf(lateNight), activityLine(t, lateNight, "active"))
+
+	state, err := CarriedActivityState(dir, localAt(26, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != "active" {
+		t.Errorf("carried state = %q, want active (the edge is fresh)", state)
+	}
+}
+
+func TestCarriedActivityStateShouldCarryIdleAtAnyAge(t *testing.T) {
+	dir := t.TempDir()
+	daysAgo := localAt(23, 9) // idle is absorbing: age does not expire it
+	writeDay(t, dir, dayOf(daysAgo), activityLine(t, daysAgo, "idle"))
+
+	state, err := CarriedActivityState(dir, localAt(26, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != "idle" {
+		t.Errorf("carried state = %q, want idle (idle never expires)", state)
+	}
+}

@@ -1210,3 +1210,57 @@ func TestBuildMemorySessionsKeepsSamplesFromBeforeTheFirstHook(t *testing.T) {
 		t.Errorf("peaks = %d / %d, want 700 / 1100", got[0].PeakAgentBytes, got[0].PeakTreeBytes)
 	}
 }
+
+func TestActivityTimelineExpiresAnImplausiblyLongActiveHold(t *testing.T) {
+	// One active edge, then nothing for 10 hours, then an idle edge — the
+	// 2026-07-30 shape, where the watcher died mid-day. The hold keeps its
+	// first credible stretch (activeHoldCap) and the remainder goes untiled;
+	// the idle span that follows is untouched, and an idle HOLD never expires.
+	tsAt := func(d time.Duration) time.Time { return ts(0).Add(d) }
+	evs := []Event{
+		{Ts: tsAt(0), Type: EventActivity, To: "active"},
+		{Ts: tsAt(10 * time.Hour), Type: EventActivity, To: "idle"},
+	}
+	got := ActivityTimeline(evs, ts(0), tsAt(20*time.Hour))
+	want := []ActivitySpan{
+		{State: "active", Start: tsAt(0), End: tsAt(activeHoldCap)},
+		{State: "idle", Start: tsAt(10 * time.Hour), End: tsAt(20 * time.Hour)},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("activity spans = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i].State != want[i].State || !got[i].Start.Equal(want[i].Start) || !got[i].End.Equal(want[i].End) {
+			t.Errorf("activity[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestUserActiveSpansExpiresAnImplausiblyLongActiveHold(t *testing.T) {
+	tsAt := func(d time.Duration) time.Time { return ts(0).Add(d) }
+	evs := []Event{
+		{Ts: tsAt(0), Type: EventActivity, To: "active"},
+		{Ts: tsAt(10 * time.Hour), Type: EventActivity, To: "idle"},
+	}
+	got := userActiveSpans(evs, ts(0), tsAt(20*time.Hour))
+	want := []span{{tsAt(0), tsAt(activeHoldCap)}}
+	if len(got) != len(want) {
+		t.Fatalf("active spans = %+v, want %+v", got, want)
+	}
+	if !got[0].start.Equal(want[0].start) || !got[0].end.Equal(want[0].end) {
+		t.Errorf("active[0] = %+v, want %+v", got[0], want[0])
+	}
+}
+
+func TestActivityTimelineKeepsAPlausibleActiveHoldWhole(t *testing.T) {
+	// A hold inside the cap is real work and must not be truncated.
+	tsAt := func(d time.Duration) time.Time { return ts(0).Add(d) }
+	evs := []Event{
+		{Ts: tsAt(0), Type: EventActivity, To: "active"},
+		{Ts: tsAt(90 * time.Minute), Type: EventActivity, To: "idle"},
+	}
+	got := ActivityTimeline(evs, ts(0), tsAt(2*time.Hour))
+	if len(got) != 2 || !got[0].End.Equal(tsAt(90*time.Minute)) {
+		t.Fatalf("a 90m active hold must survive whole, got %+v", got)
+	}
+}
