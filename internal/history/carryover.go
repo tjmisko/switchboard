@@ -198,6 +198,13 @@ var activityMarker = []byte(EventActivity)
 // presumed-active seed turned it into fabricated presence. Callers express a
 // found state by prepending a synthetic edge at their window start, which both
 // ActivityTimeline and userActiveSpans then tile from.
+//
+// A carried "idle" is trusted at any age — idle is the absorbing state, a
+// machine nobody touches stays idle. A carried "active" expires exactly like
+// an in-window hold (activeHoldCap): an active edge hours before the window
+// with no idle edge after it means the watcher died mid-claim, and carrying it
+// would re-fabricate the phantom overnight presence this function exists to
+// kill. An expired active reads as unknown ("").
 func CarriedActivityState(dir string, at time.Time) (string, error) {
 	if at.IsZero() {
 		return "", nil
@@ -219,32 +226,38 @@ func CarriedActivityState(dir string, at time.Time) (string, error) {
 			continue
 		}
 		opened++
-		state, err := scanDayActivityState(DayPath(dir, days[i]), at)
+		state, ts, err := scanDayActivityState(DayPath(dir, days[i]), at)
 		if err != nil {
 			return "", err
 		}
-		if state != "" {
-			return state, nil // newest-first walk: the first hit is the latest edge
+		if state == "" {
+			continue
 		}
+		// newest-first walk: the first hit is the latest edge
+		if state == activityActive && at.Sub(ts) > activeHoldCap {
+			return "", nil // the claim expired before the window opened
+		}
+		return state, nil
 	}
 	return "", nil
 }
 
 // scanDayActivityState returns the last activity edge before `at` in one
-// day-file, or "" when the file holds none. Malformed lines are skipped exactly
-// as the other carry-forward scans skip them, and a missing file is empty
-// rather than an error.
-func scanDayActivityState(path string, at time.Time) (string, error) {
+// day-file (its state and timestamp), or "" when the file holds none.
+// Malformed lines are skipped exactly as the other carry-forward scans skip
+// them, and a missing file is empty rather than an error.
+func scanDayActivityState(path string, at time.Time) (string, time.Time, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", nil
+			return "", time.Time{}, nil
 		}
-		return "", err
+		return "", time.Time{}, err
 	}
 	defer f.Close()
 
 	state := ""
+	var stateTs time.Time
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
@@ -262,7 +275,7 @@ func scanDayActivityState(path string, at time.Time) (string, error) {
 		if !ev.Ts.Before(at) {
 			continue
 		}
-		state = ev.To // a later line in the same file is the newer edge
+		state, stateTs = ev.To, ev.Ts // a later line in the same file is the newer edge
 	}
-	return state, sc.Err()
+	return state, stateTs, sc.Err()
 }
