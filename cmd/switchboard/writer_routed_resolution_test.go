@@ -53,6 +53,18 @@ func routedBlocked(since time.Time) string {
 	return tToolUse(at(since, -400*time.Millisecond)) + "\n"
 }
 
+// routedAbandoned is a writer that went quiet with its last exchange COMPLETE:
+// it dispatched a tool, the result came back, and then nothing more. This is the
+// shape a crashed or abandoned teammate actually leaves — 50 of the 362 subagent
+// transcripts measured on the development machine — as against the dangling
+// tool_use of a writer still waiting on a human, which occurred exactly once and
+// in a session long dead.
+func routedAbandoned(since time.Time) string {
+	return tToolUse(at(since, -400*time.Millisecond)) + "\n" +
+		`{"type":"user","timestamp":"` + at(since, -300*time.Millisecond) +
+		`","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_gated"}]}}` + "\n"
+}
+
 // routedWorking is a writer advancing its own thread: assistant messages dated
 // well after the prompt's onset. Against its OWN prompt this is resolution;
 // against anyone else's it is noise.
@@ -352,13 +364,16 @@ func TestPendingWriterStaleCapBackstop(t *testing.T) {
 		}
 	})
 
-	t.Run("should drop a prompt when its writer's file is readable but has not moved past the cap", func(t *testing.T) {
+	t.Run("should drop a prompt when its writer's file is readable, quiescent past the cap, and its last exchange is complete", func(t *testing.T) {
 		// The case case 15 cannot reach: the jsonl is on disk and reads fine, it just
 		// never advances again. ResolveKind says ResolutionNone forever, so before
 		// T10 this red had nothing that could ever release it.
+		//
+		// The writer must be quiescent AND carry no unanswered tool — a completed
+		// last exchange. Quiescence alone is not enough; see the sibling case below.
 		main := routedFixture(t, map[string]string{
-			"":             routedBlocked(since),
-			routedTeammate: routedBlocked(since),
+			"":             routedAbandoned(since),
+			routedTeammate: routedAbandoned(since),
 		}, since)
 		m := routedSession(main, since, routedTeammate)
 
@@ -369,6 +384,28 @@ func TestPendingWriterStaleCapBackstop(t *testing.T) {
 		}
 		if got := m[100].Claude.Status; got != testTune.InterruptExitStatus {
 			t.Errorf("status = %q, want %q", got, testTune.InterruptExitStatus)
+		}
+	})
+
+	t.Run("should hold red past the cap when the writer's tail still shows an unanswered tool", func(t *testing.T) {
+		// The missed RED of 2026-08-14: a teammate blocked overnight on a Bash
+		// approval lost its red 47 minutes in, because a blocked writer goes quiet
+		// BY BEING blocked and the backstop judged it on mtime alone. An unanswered
+		// tool_use still sitting at the tail is proof the prompt is live, and proof
+		// outranks the clock — however long past the cap it has been.
+		main := routedFixture(t, map[string]string{
+			"":             routedBlocked(since),
+			routedTeammate: routedBlocked(since),
+		}, since)
+		m := routedSession(main, since, routedTeammate)
+
+		selfHealStaleAttention(m, since.Add(12*time.Hour), testTune, nil)
+
+		if len(m[100].Claude.Pending) == 0 {
+			t.Error("a demonstrably blocked writer must keep its prompt past the cap")
+		}
+		if got := m[100].Claude.Status; got != "permission" {
+			t.Errorf("status = %q, want permission — the human never answered", got)
 		}
 	})
 

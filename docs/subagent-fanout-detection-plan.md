@@ -73,6 +73,13 @@ the window** rather than tracked durably.
 4. **Background agents (`run_in_background: true`).** Completion arrives async
    (a later task-notification), so the in-window `tool_result` correlation is
    unreliable → they tend to show as perpetually in-flight or never stop.
+
+   > **CORRECTION (2026-08-14):** the failure runs the *other* way, and it is
+   > universal rather than occasional. Every `Agent` spawn is async — the flag
+   > named here is never set — and the parent answers each one with a launch
+   > ack ~2s later. Correlating on `tool_result` therefore stopped every fanout
+   > seconds after it started; nothing showed as perpetually in-flight. See
+   > [async-agent-launch-ack.md](async-agent-launch-ack.md).
 5. **No daemon-start backfill.** Unlike usage (which primes an offset),
    `observeFanout` has no authoritative seed; fanouts already scrolled out of
    the tail when the daemon starts are invisible.
@@ -237,6 +244,16 @@ assumptions above. Authoritative facts now:
 - **Background** = parent tool_use `input.run_in_background == true` (only count
   it for `name` ∈ {Agent,Task}; it also appears on Bash etc.). `SubagentStop`
   may NOT fire for background agents ⇒ dir/jsonl-quiescence stays authoritative.
+
+  > **CORRECTION (2026-08-14):** this is wrong for `Agent`, and building on it
+  > cost four hours of a session rendering idle while four agents worked. The
+  > `Agent` tool takes no `run_in_background` parameter — it is asynchronous by
+  > construction. Measured over 120 transcripts: 69 Agent spawns, 68 with the
+  > field absent and 1 with it explicitly `false`, **zero** with it true. Any
+  > guard keyed on this flag never fires. The real discriminator is the parent
+  > `tool_result` being a launch ack (`Spawned successfully` / `Async agent
+  > launched successfully`) rather than a result — see
+  > [async-agent-launch-ack.md](async-agent-launch-ack.md).
 - **spawnDepth semantics (verified on the corpus):** `1` = direct child of main
   (toolUseId in main transcript 79/81); `2` = grandchild (toolUseId in main
   transcript **0/8**); absent = mostly direct. ⇒ **Exclude `spawnDepth>=2` from
@@ -269,5 +286,6 @@ assumptions above. Authoritative facts now:
 
 ### Resolved open questions
 - Hook stdin schema: resolved (binary). Done marker: resolved (stop_reason +
-  quiescence + cap). Background: parent tool_use input; Stop may not fire → keep
-  jsonl path. spawnDepth≥2: exclude from count, render nested.
+  quiescence + cap). Background: ~~parent tool_use input~~ **the parent
+  tool_result being a launch ack** (2026-08-14 correction above); Stop may not
+  fire → keep jsonl path. spawnDepth≥2: exclude from count, render nested.

@@ -1,0 +1,432 @@
+#!/usr/bin/env python3
+"""repair-launch-ack-spans — re-date subagent spans the launch-ack bug truncated.
+
+Until 2026-08-14 the fanout Observer read a subagent's spawn acknowledgement
+("Spawned successfully" / "Async agent launched successfully", which lands ~2s
+after the dispatch) as its tool_result completion. Every Agent fanout therefore
+got a `subagent_stop` within seconds of its `subagent_spawn`, no matter how long
+it actually ran. See docs/async-agent-launch-ack.md.
+
+The detector is fixed, but the history log still carries the truncated spans, so
+every figure derived from them — agents-aloft, fanout weighting, per-agent
+duration — remains wrong for the affected window. This repairs them IN PLACE
+against ground truth.
+
+GROUND TRUTH is the subagent's own transcript, which the bug never touched:
+
+    ~/.claude/projects/<slug>/<session-id>/subagents/agent-<agent-id>.jsonl
+
+Its last timestamped entry is when the agent last did anything, and whether that
+entry is terminal (`stop_reason: "end_turn"`) says whether it finished. Neither
+fact is recoverable from the history log alone, which is why this cannot be a
+pure log-rewrite.
+
+Three outcomes per truncated span, mirroring the daemon's own completion rules:
+
+  finished   jsonl ended with end_turn        -> stop re-dated to that entry
+  abandoned  non-terminal, quiet > --stale-cap -> stop re-dated to last activity
+                                                 (what the stale cap would give)
+  running    non-terminal, still warm          -> stop event DROPPED entirely
+
+Dropping matters. A stop in the log makes the daemon's restart seeding
+(history.PriorSubagentState) believe the agent is already closed, so it would
+never emit the real one. Removing it hands the span back to the fixed detector.
+
+Spans are only ever extended, never shortened: a stop that already sits at or
+after the evidence is left alone, which makes re-runs idempotent. Workflow-agent
+spans (`workflow_run_id`) are skipped — they are paired from a run journal and
+never saw an ack.
+
+DRY RUN BY DEFAULT. Nothing is written without --apply, and --apply always
+backs up first.
+
+Usage:
+    repair-launch-ack-spans                      # report what it would change
+    repair-launch-ack-spans --apply              # repair, skipping today
+    repair-launch-ack-spans --apply --include-today
+    repair-launch-ack-spans --since 2026-08-10   # bound the window
+    repair-launch-ack-spans --report-transitions # idle time the spans contradict
+"""
+
+import argparse
+import datetime as dt
+import glob
+import json
+import os
+import shutil
+import sys
+
+DEFAULT_HISTORY = os.path.expanduser("~/.local/state/switchboard/history")
+DEFAULT_PROJECTS = os.path.expanduser("~/.claude/projects")
+
+# Matches fanout.DefaultStaleCap: how long a non-terminal agent transcript may be
+# quiet before the daemon would have force-closed it as abandoned. An agent
+# quieter than this is treated as still running.
+DEFAULT_STALE_CAP_S = 30 * 60
+
+# A stop within this much of the evidence is already right; leaving it alone is
+# what makes re-running a no-op. Comfortably above the reconcile interval, so a
+# stop that merely landed on the tick after the true end is not churned.
+DEFAULT_TOLERANCE_S = 60
+
+TERMINAL_STOP_REASON = "end_turn"
+
+
+def parse_ts(raw):
+    """Parse a history/transcript timestamp to an aware datetime, or None."""
+    if not raw:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    return parsed
+
+
+def agent_transcript(projects_dir, session_id, agent_id):
+    """The subagent's own jsonl, found by session-id and agent-id.
+
+    Globbed across project slugs rather than derived from the event's cwd: a
+    session that moved into a git worktree keeps its records under the ORIGINAL
+    slug, so re-deriving from cwd would miss exactly the long-running delegated
+    work this repairs.
+    """
+    if not session_id or not agent_id:
+        return None
+    pattern = os.path.join(
+        projects_dir, "*", session_id, "subagents", f"agent-{agent_id}.jsonl"
+    )
+    hits = sorted(glob.glob(pattern))
+    return hits[0] if hits else None
+
+
+def transcript_evidence(path):
+    """(last_activity, terminal) for a subagent transcript.
+
+    last_activity is the newest timestamp on any entry, falling back to the
+    file's mtime when no entry carries one. terminal says the final complete
+    line ended the agent's turn. Returns (None, False) if nothing is readable —
+    the caller then leaves the span alone rather than guessing.
+    """
+    try:
+        with open(path, "r", errors="replace") as handle:
+            lines = [line.strip() for line in handle if line.strip()]
+    except OSError:
+        return None, False
+    if not lines:
+        return None, False
+
+    newest = None
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # tolerate a half-written tail line
+        stamp = parse_ts(entry.get("timestamp"))
+        if stamp and (newest is None or stamp > newest):
+            newest = stamp
+
+    terminal = False
+    try:
+        last = json.loads(lines[-1])
+        terminal = (last.get("message") or {}).get("stop_reason") == TERMINAL_STOP_REASON
+    except json.JSONDecodeError:
+        terminal = False  # a partial final line is not evidence of finishing
+
+    if newest is None:
+        try:
+            newest = dt.datetime.fromtimestamp(os.path.getmtime(path)).astimezone()
+        except OSError:
+            return None, False
+    return newest, terminal
+
+
+def load_day(path):
+    """Parse one day file into [(raw_line, event_or_None)], preserving order."""
+    rows = []
+    with open(path, "r", errors="replace") as handle:
+        for line in handle:
+            stripped = line.rstrip("\n")
+            if not stripped.strip():
+                continue
+            try:
+                rows.append((stripped, json.loads(stripped)))
+            except json.JSONDecodeError:
+                rows.append((stripped, None))  # kept verbatim, never rewritten
+    return rows
+
+
+def classify(evidence_at, terminal, now, stale_cap_s):
+    """finished | abandoned | running, from the transcript evidence."""
+    if terminal:
+        return "finished"
+    if (now - evidence_at).total_seconds() > stale_cap_s:
+        return "abandoned"
+    return "running"
+
+
+def plan_repairs(args, now):
+    """Walk the history and decide every change, touching nothing.
+
+    Returns (repairs, skipped, day_rows) where a repair is a dict describing one
+    stop event to re-date or drop.
+    """
+    day_files = sorted(glob.glob(os.path.join(args.history, "*.jsonl")))
+    if args.since:
+        day_files = [
+            p for p in day_files
+            if os.path.basename(p)[: len("0000-00-00")] >= args.since
+        ]
+
+    today = dt.date.today().isoformat()
+    day_rows = {}
+    spawns = {}          # (session, agent) -> spawn event
+    repairs = []
+    skipped = []
+
+    for path in day_files:
+        rows = load_day(path)
+        day_rows[path] = rows
+        is_today = os.path.basename(path).startswith(today)
+
+        for index, (_, event) in enumerate(rows):
+            if event is None:
+                continue
+            kind = event.get("type")
+            if kind not in ("subagent_spawn", "subagent_stop"):
+                continue
+            key = (event.get("session_id"), event.get("agent_id"))
+
+            if kind == "subagent_spawn":
+                spawns[key] = event
+                continue
+
+            spawn = spawns.pop(key, None)
+            if event.get("workflow_run_id") or (spawn or {}).get("workflow_run_id"):
+                continue  # journal-paired; never saw an ack
+            if spawn is None:
+                skipped.append((path, key, "stop with no spawn in window"))
+                continue
+
+            stop_at = parse_ts(event.get("ts"))
+            if stop_at is None:
+                skipped.append((path, key, "unparsable stop timestamp"))
+                continue
+
+            transcript = agent_transcript(args.projects, key[0], key[1])
+            if not transcript:
+                skipped.append((path, key, "no subagent transcript on disk"))
+                continue
+
+            evidence_at, terminal = transcript_evidence(transcript)
+            if evidence_at is None:
+                skipped.append((path, key, "subagent transcript unreadable"))
+                continue
+
+            gap_s = (evidence_at - stop_at).total_seconds()
+            if gap_s <= args.tolerance:
+                continue  # already at or past the evidence: nothing to fix
+
+            # Today's file is the one the live daemon appends to, and a rewrite
+            # is read-all/replace — anything it appends in between would be
+            # lost. Guarding the SOURCE file is not enough: an agent that
+            # spawned before midnight and finished after it has its stop
+            # re-dated INTO today's file, so the destination needs the same
+            # guard or a repair of last week's log could clobber this morning's.
+            if not args.include_today and (
+                is_today or evidence_at.date().isoformat() == today
+            ):
+                skipped.append((path, key, "would write today's file (pass --include-today)"))
+                continue
+
+            verdict = classify(evidence_at, terminal, now, args.stale_cap)
+            repairs.append({
+                "path": path,
+                "index": index,
+                "key": key,
+                "verdict": verdict,
+                "spawn_at": parse_ts(spawn.get("ts")),
+                "stop_at": stop_at,
+                "evidence_at": evidence_at,
+                "event": event,
+                "description": spawn.get("description") or spawn.get("agent_type") or "",
+            })
+
+    return repairs, skipped, day_rows
+
+
+def apply_repairs(repairs, day_rows, history_dir, now):
+    """Rewrite the day files. Backs up every file it touches, first."""
+    stamp = now.strftime("%Y%m%dT%H%M%S")
+    backup_dir = os.path.join(history_dir, f".repair-backup-{stamp}")
+    if os.path.exists(backup_dir):
+        sys.exit(f"backup dir already exists, refusing to overwrite: {backup_dir}")
+    os.makedirs(backup_dir)
+
+    # A re-dated stop can land on a later CALENDAR day than the file it lives
+    # in, and the readers partition by day — so it must move files, not just
+    # timestamps, or it would be invisible to every reader of the later day.
+    drops = {}                      # path -> {index, …}
+    additions = {}                  # path -> [event, …]
+    for repair in repairs:
+        drops.setdefault(repair["path"], set()).add(repair["index"])
+        if repair["verdict"] == "running":
+            continue                # dropped outright; the daemon will re-close it
+        moved = dict(repair["event"])
+        moved["ts"] = repair["evidence_at"].isoformat()
+        target = os.path.join(
+            history_dir, repair["evidence_at"].date().isoformat() + ".jsonl"
+        )
+        additions.setdefault(target, []).append(moved)
+
+    touched = set(drops) | set(additions)
+    for path in sorted(touched):
+        if os.path.exists(path):
+            shutil.copy2(path, os.path.join(backup_dir, os.path.basename(path)))
+
+        rows = day_rows.get(path)
+        if rows is None:
+            rows = load_day(path) if os.path.exists(path) else []
+        dropped = drops.get(path, set())
+        kept = [raw for i, (raw, _) in enumerate(rows) if i not in dropped]
+
+        for event in additions.get(path, []):
+            kept.append(json.dumps(event))
+
+        # Re-sort by timestamp so an appended stop lands in order. A line that
+        # does not parse, or carries no ts, inherits the key of the line before
+        # it and is then held in place by the stable sort — sorting such lines
+        # to datetime.min instead would rip a half-written tail line, or any
+        # foreign line, out to the top of the file.
+        floor = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+        keyed = []
+        previous = floor
+        for raw in kept:
+            try:
+                stamp = parse_ts(json.loads(raw).get("ts"))
+            except (json.JSONDecodeError, AttributeError):
+                stamp = None
+            previous = stamp or previous
+            keyed.append((previous, raw))
+        ordered = [raw for _, raw in sorted(keyed, key=lambda pair: pair[0])]
+
+        tmp = path + ".repair-tmp"
+        with open(tmp, "w") as handle:
+            handle.write("\n".join(ordered) + "\n")
+        os.replace(tmp, path)
+
+    return backup_dir
+
+
+def report_transitions(repairs, day_rows):
+    """Idle time the repaired spans contradict, per session.
+
+    NOT rewritten. A `transition` event records what switchboard actually
+    believed and displayed at the time, and the events are chained by
+    dur_prev_ms — synthesizing delegating states here would fabricate a record
+    of what the operator saw. This only quantifies the gap so the call can be
+    made deliberately.
+    """
+    by_session = {}
+    for repair in repairs:
+        if repair["spawn_at"] is None:
+            continue
+        by_session.setdefault(repair["key"][0], []).append(
+            (repair["spawn_at"], repair["evidence_at"])
+        )
+
+    print("\nIDLE TIME CONTRADICTED BY THE REPAIRED SPANS (reported, not rewritten)")
+    for session, spans in sorted(by_session.items()):
+        covered = 0.0
+        for path, rows in day_rows.items():
+            open_idle_at = None
+            for _, event in rows:
+                if event is None or event.get("type") != "transition":
+                    continue
+                if event.get("session_id") != session:
+                    continue
+                at = parse_ts(event.get("ts"))
+                if at is None:
+                    continue
+                if event.get("to") == "idle":
+                    open_idle_at = at
+                elif open_idle_at is not None:
+                    for span_start, span_end in spans:
+                        lo = max(open_idle_at, span_start)
+                        hi = min(at, span_end)
+                        if hi > lo:
+                            covered += (hi - lo).total_seconds()
+                    open_idle_at = None
+        print(f"  {session[:8]}  {covered / 60:8.1f} min of idle had an agent working")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Re-date subagent spans truncated by the launch-ack bug."
+    )
+    parser.add_argument("--history", default=DEFAULT_HISTORY)
+    parser.add_argument("--projects", default=DEFAULT_PROJECTS)
+    parser.add_argument("--since", help="only day files on/after this YYYY-MM-DD")
+    parser.add_argument("--apply", action="store_true", help="write (default: dry run)")
+    parser.add_argument(
+        "--include-today", action="store_true",
+        help="allow reads AND writes of today's file (a span crossing midnight "
+             "lands there even when repairing an older day); STOP THE DAEMON "
+             "FIRST, it appends there and a rewrite would drop what it adds",
+    )
+    parser.add_argument("--tolerance", type=float, default=DEFAULT_TOLERANCE_S)
+    parser.add_argument("--stale-cap", type=float, default=DEFAULT_STALE_CAP_S)
+    parser.add_argument("--report-transitions", action="store_true")
+    args = parser.parse_args()
+
+    now = dt.datetime.now().astimezone()
+    repairs, skipped, day_rows = plan_repairs(args, now)
+
+    if not repairs:
+        print("no truncated spans found — nothing to repair")
+    else:
+        verdicts = {}
+        print(f"{'day':11} {'agent':18} {'was':>9} {'becomes':>10}  verdict / what")
+        for repair in sorted(repairs, key=lambda r: (r["path"], r["stop_at"])):
+            verdicts[repair["verdict"]] = verdicts.get(repair["verdict"], 0) + 1
+            was = (repair["stop_at"] - repair["spawn_at"]).total_seconds() \
+                if repair["spawn_at"] else float("nan")
+            becomes = (repair["evidence_at"] - repair["spawn_at"]).total_seconds() \
+                if repair["spawn_at"] else float("nan")
+            print(
+                f"{os.path.basename(repair['path'])[:10]:11} "
+                f"{repair['key'][1][:18]:18} "
+                f"{was:8.0f}s {becomes:9.0f}s  "
+                f"{repair['verdict']:9} {repair['description'][:40]}"
+            )
+        print(
+            "\n" + ", ".join(f"{n} {v}" for v, n in sorted(verdicts.items()))
+            + f"  ({len(repairs)} spans total)"
+        )
+        print("  running spans have their stop DROPPED so the fixed daemon can close them")
+
+    if skipped:
+        print(f"\nskipped {len(skipped)}:")
+        reasons = {}
+        for _, _, reason in skipped:
+            reasons[reason] = reasons.get(reason, 0) + 1
+        for reason, count in sorted(reasons.items(), key=lambda kv: -kv[1]):
+            print(f"  {count:4}  {reason}")
+
+    if args.report_transitions:
+        report_transitions(repairs, day_rows)
+
+    if not args.apply:
+        print("\nDRY RUN — nothing written. Re-run with --apply to repair.")
+        return
+
+    if not repairs:
+        return
+    backup_dir = apply_repairs(repairs, day_rows, args.history, now)
+    print(f"\nrepaired {len(repairs)} spans; originals backed up to {backup_dir}")
+
+
+if __name__ == "__main__":
+    main()

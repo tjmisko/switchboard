@@ -163,15 +163,26 @@ func (o *Observer) Reconcile(sess *state.Session, c *state.AgentInfo, now time.T
 	if size := fileSize(c.Transcript); ss.offset > size {
 		ss.offset = 0
 	}
-	if spawns, resultIDs, newOff, err := transcript.TasksSince(c.Transcript, ss.offset); err == nil {
+	if spawns, results, newOff, err := transcript.TasksSince(c.Transcript, ss.offset); err == nil {
 		ss.offset = newOff
 		for _, t := range spawns {
 			if t.Background && t.ID != "" {
 				ss.background[t.ID] = true
 			}
 		}
-		for _, id := range resultIDs {
-			ss.resultDone[id] = true
+		for _, r := range results {
+			// A launch ack is the ONLY thing the parent transcript ever says about an
+			// async fanout: it lands ~2s after the spawn and the real completion
+			// arrives later as a <task-notification> entry, never as a tool_result.
+			// So an ack marks the spawn background (which is what it proves) and must
+			// never reach resultDone — recording it there force-closes a subagent
+			// seconds after it starts, which is what made a session with four live
+			// background agents render idle.
+			if r.LaunchAck {
+				ss.background[r.ToolUseID] = true
+				continue
+			}
+			ss.resultDone[r.ToolUseID] = true
 		}
 	}
 
@@ -199,11 +210,15 @@ func (o *Observer) Reconcile(sess *state.Session, c *state.AgentInfo, now time.T
 		// stalled/aborted subagent so in-flight can never leak.
 		done := s.Done
 		// The parent tool_result is the real completion only for a FOREGROUND fanout.
-		// A run_in_background fanout gets an immediate "Spawned successfully"
-		// tool_result ~1s after launch that is NOT completion, so its resultDone must
-		// be ignored — a background fanout completes via its jsonl terminal (s.Done)
-		// or the stale cap, never the spawn-ack. (Without this guard every background
-		// fanout stops ~1s after it starts.)
+		// An async fanout's parent result is a spawn ack that lands ~2s after launch
+		// and is NOT completion; TasksSince now classifies those (TaskResult.LaunchAck)
+		// so they never enter resultDone at all, and an async fanout completes via its
+		// jsonl terminal (s.Done) or the stale cap.
+		//
+		// The background check below is a second line of defence, not the primary one.
+		// It cannot be relied on alone: it is fed by the run_in_background input flag,
+		// which no Agent spawn in the measured corpus has ever set (see
+		// transcript.launchAckPrefixes). The ack classification is what actually holds.
 		if !done && s.ToolUseID != "" && !ss.background[s.ToolUseID] && ss.resultDone[s.ToolUseID] {
 			done = true
 		}

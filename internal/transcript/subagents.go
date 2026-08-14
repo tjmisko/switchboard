@@ -389,20 +389,34 @@ func subagentJSONLState(path string) (done bool, mod time.Time) {
 	return e.Message.StopReason == subagentTerminalReason, mod
 }
 
+// TaskResult is one tool_result seen in a transcript delta, tagged with whether
+// it is merely a subagent's spawn acknowledgement (launchAckPrefixes) rather than
+// a real completion. The distinction is reported as a RAW fact here; what to do
+// with it — the Observer treats an ack as proof the spawn is asynchronous and
+// never as a completion — is policy that belongs to the caller.
+type TaskResult struct {
+	ToolUseID string // the tool_use this result answers
+	LaunchAck bool   // true when the payload only acknowledges the spawn
+}
+
 // TasksSince reads new transcript bytes from offset to EOF (NOT tail-bounded) and
-// returns the Task/Agent tool_use spawns and the tool_use_ids whose tool_result
-// landed in this delta, plus the new offset (at a line boundary, like
-// UsageSinceByModel — a line caught mid-write is excluded and re-read next call,
-// never double-counted). Threading the offset across calls means no spawn or
-// result is ever missed to window scroll-out, unlike the tail-bounded Tasks().
+// returns the Task/Agent tool_use spawns and the tool_results that landed in this
+// delta, plus the new offset (at a line boundary, like UsageSinceByModel — a line
+// caught mid-write is excluded and re-read next call, never double-counted).
+// Threading the offset across calls means no spawn or result is ever missed to
+// window scroll-out, unlike the tail-bounded Tasks().
 //
-// spawns and resultIDs are reported separately rather than paired: a spawn's
+// spawns and results are reported separately rather than paired: a spawn's
 // tool_result commonly lands in a LATER delta than its spawn, so spawns always
-// carry Done=false and the caller correlates resultIDs against the spawn ids it
-// has seen across calls. A file shorter than offset (a /clear or session
-// replacement truncated it) restarts from 0. Returns a non-nil error only on I/O
-// failure.
-func TasksSince(path string, offset int64) (spawns []Task, resultIDs []string, newOffset int64, err error) {
+// carry Done=false and the caller correlates results against the spawn ids it has
+// seen across calls. A file shorter than offset (a /clear or session replacement
+// truncated it) restarts from 0. Returns a non-nil error only on I/O failure.
+//
+// Results carry LaunchAck rather than being filtered out here so the caller can
+// tell "no result yet" from "acknowledged, still running" — the latter is what
+// identifies an async fanout, and a caller that dropped acks entirely could not
+// distinguish the two.
+func TasksSince(path string, offset int64) (spawns []Task, results []TaskResult, newOffset int64, err error) {
 	complete, newOffset, err := readNewLines(path, offset)
 	if err != nil || len(complete) == 0 {
 		return nil, nil, newOffset, err
@@ -428,10 +442,10 @@ func TasksSince(path string, offset int64) (spawns []Task, resultIDs []string, n
 				}
 			case "tool_result":
 				if b.ToolUseID != "" {
-					resultIDs = append(resultIDs, b.ToolUseID)
+					results = append(results, TaskResult{ToolUseID: b.ToolUseID, LaunchAck: b.isLaunchAck()})
 				}
 			}
 		}
 	}
-	return spawns, resultIDs, newOffset, nil
+	return spawns, results, newOffset, nil
 }

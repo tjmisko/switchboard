@@ -289,6 +289,68 @@ func TestReconcile_backgroundIgnoresSpawnAckResult(t *testing.T) {
 	}
 }
 
+// TestReconcile_shouldStayInFlightWhenTheAgentSpawnCarriesNoBackgroundFlag is the
+// regression for the bug that made a session with four live background agents
+// render idle.
+//
+// TestReconcile_backgroundIgnoresSpawnAckResult above covers the same hazard but
+// spawns with run_in_background:true — and that is why it did not catch this. In
+// 120 measured transcripts NO Agent spawn ever set that flag (68 omitted it, one
+// set it false), so the guard keyed on it never fired in production and the
+// spawn-ack closed every fanout seconds after launch. Here the tool_use carries no
+// flag at all, exactly as the real ones do: the ack alone must hold the agent in
+// flight.
+func TestReconcile_shouldStayInFlightWhenTheAgentSpawnCarriesNoBackgroundFlag(t *testing.T) {
+	for _, wording := range []string{
+		"Async agent launched successfully. (This tool result is internal metadata.)\nagentId: bg1",
+		"Spawned successfully. (This tool result is internal metadata.)\nagentId: bg1",
+	} {
+		e := newEnv(t)
+		obs := NewObserver(e.historyDir)
+		now := time.Now()
+
+		obs.Reconcile(e.sess, e.c, now) // prime cursor to EOF (empty)
+
+		// No run_in_background anywhere in the input — the shape every real Agent
+		// spawn has — followed by the launch ack ~2s later.
+		appendLine(t, e.transcript, `{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_bg","name":"Agent","input":{"subagent_type":"general-purpose","description":"work"}}]}}`)
+		appendLine(t, e.transcript, `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bg","content":[{"type":"text","text":`+strconv.Quote(wording)+`}]}]}}`)
+		writeSub(t, e.subdir, "bg1", metaClassic(1, "toolu_bg"), "") // running, NOT terminal
+
+		ev := obs.Reconcile(e.sess, e.c, now)
+		if hasEvent(ev, history.EventSubagentStop, "bg1") {
+			t.Fatalf("%q: a launch ack must not stop the agent; got %+v", wording, ev)
+		}
+		if e.c.InFlightSubagents != 1 {
+			t.Fatalf("%q: inflight = %d, want 1", wording, e.c.InFlightSubagents)
+		}
+
+		// The ack is also what identifies the spawn as asynchronous, so the spawn
+		// event carries Background even though no input flag ever said so.
+		var spawn *history.Event
+		for i := range ev {
+			if ev[i].Type == history.EventSubagentSpawn && ev[i].AgentID == "bg1" {
+				spawn = &ev[i]
+			}
+		}
+		if spawn == nil {
+			t.Fatalf("%q: expected a spawn for bg1; got %+v", wording, ev)
+		}
+		if !spawn.Background {
+			t.Errorf("%q: an ack-answered spawn should be tagged Background; got %+v", wording, *spawn)
+		}
+
+		// It finishes for real only when its own jsonl reaches end_turn.
+		writeSub(t, e.subdir, "bg1", metaClassic(1, "toolu_bg"), "end_turn")
+		if ev := obs.Reconcile(e.sess, e.c, now); !hasEvent(ev, history.EventSubagentStop, "bg1") {
+			t.Fatalf("%q: a finished agent (jsonl end_turn) should stop; got %+v", wording, ev)
+		}
+		if e.c.InFlightSubagents != 0 {
+			t.Fatalf("%q: inflight = %d, want 0", wording, e.c.InFlightSubagents)
+		}
+	}
+}
+
 func TestReconcile_noopsWithoutSessionOrTranscript(t *testing.T) {
 	obs := NewObserver(t.TempDir())
 	now := time.Now()

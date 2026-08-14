@@ -68,6 +68,13 @@ type Tuning struct {
 	// a crashed teammate's red nag longer; lowering it starts truncating real
 	// human decision windows, which is a missed RED — the worse error — so it
 	// should stay far above any plausible time-to-answer.
+	//
+	// Scope (2026-08-14): this cap now judges only writers with NO unanswered tool
+	// at the tail. A writer still holding one is demonstrably blocked and is held
+	// red however long it has been quiet — quiescence was never evidence of death
+	// for a blocked writer, since being blocked is what makes it quiet. Tying a
+	// human's decision window to the machine's crash-detection window cost a
+	// missed RED overnight; see resolveWriterPrompt in cmd/switchboard.
 	PendingWriterStaleCap time.Duration
 
 	// TailBytes bounds how much transcript tail every reader consumes. The signals

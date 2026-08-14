@@ -992,6 +992,14 @@ func resolveWriterPrompt(c *state.AgentInfo, writer string, now time.Time, tun s
 	if ok {
 		return writerVerdict{writer, exit, rule, reason}, true
 	}
+	// Before the liveness backstop can fire, ask whether this writer is still
+	// DEMONSTRABLY blocked. A blocked writer stops writing because it is blocked,
+	// so quiescence alone cannot tell a live prompt from a dead one — but the tail
+	// can, and hydratePendingVerdicts already asks it this exact question. Proof
+	// that the tool is still unanswered outranks any clock.
+	if evidence, err := transcript.BlockedByPendingTool(path, tun.TailBytes); err == nil && evidence == transcript.BlockedYes {
+		return writerVerdict{}, false
+	}
 	if !writerQuiescentPastCap(path, since, now, tun.PendingWriterStaleCap) {
 		return writerVerdict{}, false
 	}
@@ -1030,10 +1038,28 @@ func resolveWriterPrompt(c *state.AgentInfo, writer string, now time.Time, tun s
 // teammate from latching red forever.
 //
 // Stated plainly, because it is a real cost: a genuinely pending prompt is
-// indistinguishable from a dead one by this measurement — both are a quiescent
+// indistinguishable from a dead one BY THIS MEASUREMENT — both are a quiescent
 // file — so a user who walks away for longer than the cap comes back to a chip
 // that stopped nagging. That is why the cap sits at 30 minutes rather than
 // anywhere near a plausible time-to-answer, and why it is a Tuning field.
+//
+// By this measurement, but not by every measurement — and relying on this one
+// alone was a missed RED. A writer blocked overnight on a Bash approval had its
+// red dropped 47 minutes in (2026-08-14, session 6016b3e9), because a blocked
+// writer goes quiet precisely BY BEING blocked. The tail distinguishes the two
+// cases even though the mtime cannot: a live prompt leaves an unanswered
+// tool_use sitting at the end of the file, while an abandoned writer's last
+// exchange is complete. Measured over every subagent transcript on the
+// development machine (362): 311 ended at end_turn, 50 were abandoned on a
+// COMPLETED exchange, and exactly 1 held a dangling tool_use — 550 hours old,
+// in a session long dead. So resolveWriterPrompt consults
+// transcript.BlockedByPendingTool first and this backstop now only judges
+// writers with no such proof.
+//
+// That leaves the crashed-mid-tool-use case (R3) held red indefinitely, which
+// is deliberate and is bounded elsewhere: a subagent owns no pid to probe, but
+// its parent does, and a session whose process is gone leaves the store
+// entirely and takes its chip with it.
 //
 // A zero onset (a chip with no Since at all) and a non-positive cap both disable
 // the backstop — the same shape as the Observer's zero-ModTime guard, and the
