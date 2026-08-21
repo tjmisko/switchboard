@@ -132,4 +132,3 @@ E0 gives the Codex observer agent the fixture commit and evidence report. C3
 must implement against these fixtures, not the live service. Any disagreement
 between live evidence and the frozen neutral contract is escalated to the merge
 coordinator; neither E0 nor C3 edits `internal/agentgraph` directly.
-

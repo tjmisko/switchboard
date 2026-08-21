@@ -266,4 +266,3 @@ compatibility wire projections.
 3. Branch C6 from the merged W1 baseline.
 4. Merge C6 first in Wave 2 so renderer/CLI branches see the actual emitted
    snapshot during conflict-free rebases or final merge.
-

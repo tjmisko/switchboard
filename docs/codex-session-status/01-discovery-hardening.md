@@ -123,4 +123,3 @@ Tests must not execute Codex or inspect the live process table. They use
 Return the classifier rules and test matrix with the commit. The daemon
 integration agent consumes discovery unchanged; it must not duplicate Codex
 argv filtering elsewhere.
-

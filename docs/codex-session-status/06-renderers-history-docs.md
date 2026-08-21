@@ -226,4 +226,3 @@ behavior. Merge C6 first, then C7 and C8 in either order. Run their tests before
 starting C9. The coordinator resolves any requested main-command registration
 instead of allowing C8 and C6 to edit `cmd/switchboard-ctl/main.go`
 concurrently.
-

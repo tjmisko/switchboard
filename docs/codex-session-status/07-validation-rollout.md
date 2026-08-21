@@ -222,4 +222,3 @@ edit.
 The feature is complete only when every required matrix row passes, no critical
 defect remains, docs match emitted state/history JSON, and disabling the Codex
 observer leaves existing discovery/navigation and Claude behavior intact.
-
