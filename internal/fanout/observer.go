@@ -17,9 +17,11 @@
 // tool_result completion cross-check), never as the spawn source, so a cursor
 // reset on /clear or compaction can never lose a spawn.
 //
-// The Observer is called from BOTH the reconcile tick and the SubagentStart/Stop
-// hook handler — single source of truth, two triggers. Every call must hold the
-// store lock, but a mutex guards the maps in case a future caller does not.
+// The legacy Reconcile projection is called from BOTH the reconcile tick and the
+// SubagentStart/Stop hook handler — single source of truth, two triggers. Those
+// callers currently hold the store lock. The structured Observe API is designed
+// for provider observation outside that lock; the Observer's own mutex makes both
+// entry points safe to share during migration.
 package fanout
 
 import (
@@ -51,12 +53,15 @@ const DefaultWorkflowQuietGrace = 90 * time.Second
 // ticks. Keyed by session-id (NOT pid) so a daemon restart or `claude --resume`
 // — new pid, same session-id, same subagents/ dir — reuses it after re-seeding.
 type sessionState struct {
-	seeded     bool
-	offset     int64           // forward cursor into the parent transcript
-	spawned    map[string]bool // agent_id -> spawn event already emitted
-	stopped    map[string]bool // agent_id -> stop event already emitted
-	resultDone map[string]bool // tool_use_id -> its tool_result landed (cursor cross-check)
-	background map[string]bool // tool_use_id -> run_in_background (cursor; for timeline tagging)
+	seeded      bool
+	offset      int64           // forward cursor into the parent transcript
+	spawned     map[string]bool // agent_id -> spawn event already emitted
+	stopped     map[string]bool // agent_id -> stop event already emitted
+	resultDone  map[string]bool // tool_use_id -> its tool_result landed (cursor cross-check)
+	background  map[string]bool // tool_use_id -> run_in_background (cursor; for timeline tagging)
+	spawnedAt   map[string]time.Time
+	completedAt map[string]time.Time
+	suspect     map[string]SuspectReason
 
 	// Workflow runs (subagents/workflows/wf_*/): one cursor per run, plus the
 	// start/stop already-emitted sets seeded from history so a restart mid-run
@@ -73,6 +78,9 @@ func newSessionState() *sessionState {
 		stopped:     map[string]bool{},
 		resultDone:  map[string]bool{},
 		background:  map[string]bool{},
+		spawnedAt:   map[string]time.Time{},
+		completedAt: map[string]time.Time{},
+		suspect:     map[string]SuspectReason{},
 		workflows:   map[string]*workflowCursor{},
 		wfAnnounced: map[string]bool{},
 		wfEnded:     map[string]bool{},
@@ -98,7 +106,7 @@ type Observer struct {
 	mu         sync.Mutex
 	dir        string // history dir, for first-sight seeding via PriorSubagentState
 	staleCap   time.Duration
-	quietGrace time.Duration // workflow quiet window (DefaultWorkflowQuietGrace)
+	quietGrace time.Duration            // workflow quiet window (DefaultWorkflowQuietGrace)
 	sessions   map[string]*sessionState // keyed by session-id
 }
 
@@ -204,11 +212,15 @@ func (o *Observer) Reconcile(sess *state.Session, c *state.AgentInfo, now time.T
 			bg := s.ToolUseID != "" && ss.background[s.ToolUseID]
 			events = append(events, o.spawnEvent(sess, c, s, now, bg))
 		}
+		if ss.spawnedAt[s.AgentID].IsZero() {
+			ss.spawnedAt[s.AgentID] = subagentSpawnTime(c.Transcript, s)
+		}
 		// Completion, most-authoritative first: the subagent's own jsonl reached a
 		// terminal entry (universal — every subagent has one), else its parent
 		// tool_result landed, else a hard cap on a quiescent transcript force-closes a
 		// stalled/aborted subagent so in-flight can never leak.
 		done := s.Done
+		stale := false
 		// The parent tool_result is the real completion only for a FOREGROUND fanout.
 		// An async fanout's parent result is a spawn ack that lands ~2s after launch
 		// and is NOT completion; TasksSince now classifies those (TaskResult.LaunchAck)
@@ -224,11 +236,25 @@ func (o *Observer) Reconcile(sess *state.Session, c *state.AgentInfo, now time.T
 		}
 		if !done && !s.ModTime.IsZero() && now.Sub(s.ModTime) > o.staleCap {
 			done = true
+			stale = true
 		}
 		if done {
+			if ss.completedAt[s.AgentID].IsZero() {
+				ss.completedAt[s.AgentID] = now
+				if s.Done && !s.ModTime.IsZero() {
+					ss.completedAt[s.AgentID] = s.ModTime
+				}
+			}
+			if stale {
+				ss.suspect[s.AgentID] = SuspectStaleQuiescent
+			}
 			if !ss.stopped[s.AgentID] {
 				ss.stopped[s.AgentID] = true
-				events = append(events, o.stopEvent(sess, c, s, now))
+				event := o.stopEvent(sess, c, s, now)
+				if stale {
+					event.Reason = string(SuspectStaleQuiescent)
+				}
+				events = append(events, event)
 			}
 			continue
 		}
@@ -291,9 +317,19 @@ func (o *Observer) reconcileWorkflowsLocked(sess *state.Session, c *state.AgentI
 		}
 		for _, id := range newStarted {
 			wc.started[id] = true
+			if ss.spawnedAt[id].IsZero() {
+				if mt, ok := workflowAgentMtime(run, id); ok {
+					ss.spawnedAt[id] = mt
+				} else {
+					ss.spawnedAt[id] = now
+				}
+			}
 		}
 		for _, id := range newResulted {
 			wc.resulted[id] = true
+			if ss.completedAt[id].IsZero() {
+				ss.completedAt[id] = now
+			}
 		}
 
 		// In-flight = started − resulted − stale-closed. Staleness reads the
@@ -309,6 +345,10 @@ func (o *Observer) reconcileWorkflowsLocked(sess *state.Session, c *state.AgentI
 			}
 			if mt, ok := workflowAgentMtime(run, id); ok && now.Sub(mt) > o.staleCap {
 				wc.closed[id] = true
+				if ss.completedAt[id].IsZero() {
+					ss.completedAt[id] = now
+				}
+				ss.suspect[id] = SuspectStaleQuiescent
 				continue
 			}
 			running++
@@ -371,6 +411,7 @@ func (o *Observer) reconcileWorkflowsLocked(sess *state.Session, c *state.AgentI
 			ss.stopped[id] = true
 			ev := o.stopEvent(sess, c, transcript.Subagent{AgentID: id, AgentType: transcript.WorkflowAgentType}, now)
 			ev.WorkflowRunID = run.RunID
+			ev.Reason = string(SuspectStaleQuiescent)
 			events = append(events, ev)
 		}
 
