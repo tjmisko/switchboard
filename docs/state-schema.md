@@ -338,7 +338,7 @@ counts. Renderers grey the child detail and label it stale.
 |-------|-----------|----------|---------|
 | `id` | string | always | Stable provider thread/node id; unique within this graph. |
 | `parent_id` | string | omitted on root | Immediate parent id. Every child has an explicit chain to `root_id`. |
-| `nickname` | string | omitted when empty | Provider display nickname. Optional and potentially user/content-derived. |
+| `nickname` | string | omitted when empty | Provider display nickname. Optional and potentially user/content-derived. For a Codex root, this is the explicit `Thread.name`, or a bounded stable slug derived from `Thread.preview` when unnamed; child nodes retain their agent nickname. |
 | `role` | string | omitted when empty | Provider agent role/type. |
 | `description` | string | omitted when empty | Optional task description. Renderers do not require it. |
 | `runtime` | string | always | `unknown`, `not_loaded`, `idle`, `active`, or `system_error`. |

@@ -77,6 +77,56 @@ func TestRawName_fallsBackToCwdBasename(t *testing.T) {
 	}
 }
 
+func TestRawName_CodexPrefersAppServerRootNameOverAnimatedTerminalTitle(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := state.Session{
+		PID: 4245, Agent: state.AgentKindCodex, CWD: "/home/u/Projects/switchboard",
+		Wezterm: &state.WeztermInfo{WindowTitle: "⠋ 01890f00-0000-7000-8000-000000000001"},
+		AgentGraph: &state.AgentGraph{
+			RootID: "01890f00-0000-7000-8000-000000000001",
+			Nodes: []state.AgentNode{{
+				ID: "01890f00-0000-7000-8000-000000000001", Nickname: "codex-session-naming",
+			}},
+		},
+	}
+	if got := RawName(s); got != "codex-session-naming" {
+		t.Errorf("RawName = %q, want codex-session-naming", got)
+	}
+	if got := Chip(projectname.DefaultConfig(), s); got != "sb-codex-session-naming" {
+		t.Errorf("Chip = %q, want sb-codex-session-naming", got)
+	}
+}
+
+func TestRawName_CodexNeverUsesMovingOrUUIDTerminalTitleAsFallback(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	base := state.Session{
+		PID: 4246, Agent: state.AgentKindCodex, CWD: "/home/u/Projects/switchboard",
+		AgentGraph: &state.AgentGraph{
+			RootID: "01890f00-0000-7000-8000-000000000001",
+			Nodes:  []state.AgentNode{{ID: "01890f00-0000-7000-8000-000000000001"}},
+		},
+	}
+	for _, title := range []string{
+		"⠋ 01890f00-0000-7000-8000-000000000001",
+		"⠙ 01890f00-0000-7000-8000-000000000001",
+		"Ready · 01890f00-0000-7000-8000-000000000001",
+	} {
+		s := base
+		s.Wezterm = &state.WeztermInfo{WindowTitle: title}
+		if got := RawName(s); got != "switchboard" {
+			t.Errorf("RawName with title %q = %q, want stable cwd fallback", title, got)
+		}
+	}
+}
+
+func TestRawName_CodexDoesNotReadClaudePidName(t *testing.T) {
+	writeSessionFile(t, 4247, "unrelated-claude-name")
+	s := state.Session{PID: 4247, Agent: state.AgentKindCodex, CWD: "/home/u/Projects/switchboard"}
+	if got := RawName(s); got != "switchboard" {
+		t.Errorf("RawName = %q, want switchboard", got)
+	}
+}
+
 // backdate rewrites path with body while restoring its original mtime, so the
 // file's (mtime, size) stamp is unchanged even though its contents are not. That
 // is the one edit a stamp-keyed cache is entitled to miss, and it is how a test

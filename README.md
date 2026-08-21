@@ -270,6 +270,15 @@ runtime status, approvals, and streamed events. See the
 [official OpenAI app-server documentation](https://learn.chatgpt.com/docs/app-server)
 and [Codex subagent documentation](https://learn.chatgpt.com/docs/agent-configuration/subagents).
 
+The observer also reads Codex's optional user-facing thread `name` and follows
+`thread/name/updated`. For an unnamed thread it derives a bounded, stable task
+slug from the first-message `preview` (for example,
+`codex-session-naming`) instead of showing the thread UUID. Codex terminal
+titles are deliberately excluded from label fallback: their configurable
+spinner/run-state items animate while work runs and their unnamed-thread item
+falls back to the UUID. Colors continue to come only from structured app-server
+runtime/attention state; names do not affect status.
+
 The transport used here is `codex app-server proxy`: a disposable stdio child
 that connects to the already-running app-server control socket. That proxy
 subcommand was verified locally in Codex CLI **0.149.0** and Switchboard rejects

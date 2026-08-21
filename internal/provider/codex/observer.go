@@ -488,12 +488,13 @@ func (o *Observer) handleNotification(notification rpcNotification) {
 
 func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]provider.RootKey, bool) {
 	type threadParams struct {
-		ThreadID string    `json:"threadId"`
-		TurnID   string    `json:"turnId"`
-		Thread   rpcThread `json:"thread"`
-		Status   rpcStatus `json:"status"`
-		Turn     rpcTurn   `json:"turn"`
-		Item     rpcItem   `json:"item"`
+		ThreadID   string    `json:"threadId"`
+		ThreadName *string   `json:"threadName"`
+		TurnID     string    `json:"turnId"`
+		Thread     rpcThread `json:"thread"`
+		Status     rpcStatus `json:"status"`
+		Turn       rpcTurn   `json:"turn"`
+		Item       rpcItem   `json:"item"`
 	}
 	params, ok := decodeParams[threadParams](notification.Params)
 	if !ok {
@@ -528,6 +529,15 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 				node.node.UpdatedAt = o.config.Now()
 				touches = true
 				statusMatched = true
+			}
+		case "thread/name/updated":
+			name := ""
+			if params.ThreadName != nil {
+				name = *params.ThreadName
+			}
+			if state.setThreadName(params.ThreadID, name) {
+				state.nodes[params.ThreadID].node.UpdatedAt = o.config.Now()
+				touches = true
 			}
 		case "turn/started":
 			if node := state.nodes[params.ThreadID]; node != nil {

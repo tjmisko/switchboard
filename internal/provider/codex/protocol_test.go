@@ -85,6 +85,106 @@ func TestThreadListFixtureUsesExplicitParentage(t *testing.T) {
 	}
 }
 
+func TestThreadDisplayNamePrefersExplicitNameAndDerivesStablePreviewSlug(t *testing.T) {
+	cases := []struct {
+		name     string
+		explicit string
+		preview  string
+		want     string
+	}{
+		{
+			name: "explicit Codex rename wins", explicit: "Release audit",
+			preview: "Please investigate the failing release workflow.", want: "Release audit",
+		},
+		{
+			name:    "conversational lead-in is removed",
+			preview: "I'd like you to help me with Codex session naming. Currently the title is a UUID.",
+			want:    "codex-session-naming",
+		},
+		{
+			name:    "first useful sentence wins",
+			preview: "Please help. Fix the authentication timeout in the API client.",
+			want:    "fix-authentication-timeout-api-client",
+		},
+		{
+			name:    "long content is bounded",
+			preview: "Supercalifragilisticexpialidociousplusmore should never make the switchboard chip enormous",
+			want:    "supercalifragilisticexpialidociousplusmo",
+		},
+		{name: "empty stays empty", preview: "Please help me with this.", want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := threadDisplayName(tc.explicit, tc.preview); got != tc.want {
+				t.Errorf("threadDisplayName(%q, %q) = %q, want %q", tc.explicit, tc.preview, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRootThreadNameSnapshotAndUpdateRemainDisplayOnly(t *testing.T) {
+	state := newGraphState(rpcThread{
+		ID: "root", Name: "Initial title", Preview: "Investigate the session naming behavior.",
+		Status: rpcStatus{Type: "idle"},
+	}, nil, 32)
+	observation, err := state.observation(fixtureNow, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNode(t, observation, "root", "", "Initial title", "", agentgraph.RuntimeIdle, agentgraph.AttentionNone, agentgraph.LifecycleUnknown)
+
+	if !state.setThreadName("root", "Short rename") {
+		t.Fatal("root thread name update was not applied")
+	}
+	if got := state.nodes["root"].node.Nickname; got != "Short rename" {
+		t.Fatalf("updated root nickname = %q, want Short rename", got)
+	}
+	if !state.setThreadName("root", "") {
+		t.Fatal("root thread name clear was not applied")
+	}
+	if got := state.nodes["root"].node.Nickname; got != "investigate-session-naming-behavior" {
+		t.Fatalf("cleared root nickname = %q, want preview fallback", got)
+	}
+	if state.nodes["root"].node.Runtime != agentgraph.RuntimeIdle || state.nodes["root"].node.Attention != agentgraph.AttentionNone {
+		t.Fatal("display-name update changed status axes")
+	}
+}
+
+func TestThreadNameUpdatedNotificationRefreshesRootMetadata(t *testing.T) {
+	observer, key := fixtureObserver(t)
+	root := observer.roots[key].graph.nodes[fixtureRoot]
+	root.threadPreview = "Diagnose Codex title animation."
+	root.node.Nickname = previewSlug(root.threadPreview)
+
+	changed, unknown := observer.applyNotificationLocked(rpcNotification{
+		Generation: 1,
+		Method:     "thread/name/updated",
+		Params: mustJSON(t, map[string]any{
+			"threadId": fixtureRoot, "threadName": "motionless-session-name",
+		}),
+	})
+	if unknown || len(changed) != 1 || changed[0] != key {
+		t.Fatalf("name update result = changed %#v unknown %v", changed, unknown)
+	}
+	if got := findNode(observer.roots[key].observation, fixtureRoot); got == nil || got.Nickname != "motionless-session-name" {
+		t.Fatalf("name update observation root = %#v", got)
+	}
+
+	changed, _ = observer.applyNotificationLocked(rpcNotification{
+		Generation: 1,
+		Method:     "thread/name/updated",
+		Params: mustJSON(t, map[string]any{
+			"threadId": fixtureRoot, "threadName": nil,
+		}),
+	})
+	if len(changed) != 1 {
+		t.Fatalf("name clear changed keys = %#v", changed)
+	}
+	if got := findNode(observer.roots[key].observation, fixtureRoot); got == nil || got.Nickname != "diagnose-codex-title-animation" {
+		t.Fatalf("name clear observation root = %#v", got)
+	}
+}
+
 func TestOrderingNestedParentageUnknownEnumsAndTurnPruning(t *testing.T) {
 	root := rpcThread{ID: "root", Status: rpcStatus{Type: "idle"}}
 	state := newGraphState(root, nil, 2)

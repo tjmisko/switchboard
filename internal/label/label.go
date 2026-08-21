@@ -1,7 +1,7 @@
 // Package label centralizes how a session is named for display. It sources the
-// raw human name (preferring the authoritative Claude session name on disk),
-// then applies project prefixing via internal/projectname so the bottom-bar
-// chips and `switchboard-ctl` list/pick agree on a single label.
+// provider's stable human name (Claude's session file or Codex's app-server
+// root metadata), then applies project prefixing via internal/projectname so
+// the bottom-bar chips and `switchboard-ctl` list/pick agree on a single label.
 //
 // It names the two things a renderer shows: the SESSION (RawName/Chip) and, when
 // the session is red, the WRITERS inside it that are blocked on a permission
@@ -31,12 +31,12 @@ import (
 // window title while working; we strip them so the bare name shows.
 var spinnerPrefixes = []string{"✳ ", "⠂ ", "⠐ ", "⠁ ", "⠈ ", "⠠ ", "⠄ ", "⡀ ", "⢀ "}
 
-// RawName picks the human name for a session before project prefixing:
-//  1. the Claude session name from ~/.claude/sessions/<pid>.json (what `/name`
-//     and the launcher both set — authoritative and terminal-independent);
-//  2. the wezterm window title with any spinner glyph stripped;
-//  3. the cwd basename;
-//  4. "pid N" as a last resort.
+// RawName picks the human name for a session before project prefixing. Codex
+// uses the root node name supplied by app-server and deliberately never uses
+// its terminal title: that title is configurable, may be an unnamed thread's
+// UUID, and can repaint an animated activity spinner. Claude prefers its
+// authoritative ~/.claude/sessions/<pid>.json name, then a spinner-stripped
+// terminal title. Both providers fall back to cwd and finally pid.
 func RawName(s state.Session) string {
 	return rawName(s, claudeSessionName)
 }
@@ -49,23 +49,41 @@ func Chip(cfg projectname.Config, s state.Session) string {
 // rawName is RawName's fallback chain with the disk lookup injected, so the
 // cached and uncached paths cannot drift apart.
 func rawName(s state.Session, claudeName func(pid int) string) string {
-	if n := claudeName(s.PID); n != "" {
-		return n
-	}
-	if s.Wezterm != nil && s.Wezterm.WindowTitle != "" {
-		title := s.Wezterm.WindowTitle
-		for _, p := range spinnerPrefixes {
-			if rest, ok := strings.CutPrefix(title, p); ok {
-				title = rest
-				break
-			}
+	if s.Agent == state.AgentKindCodex {
+		if n := graphRootName(s.AgentGraph); n != "" {
+			return n
 		}
-		return title
+	} else {
+		if n := claudeName(s.PID); n != "" {
+			return n
+		}
+		if s.Wezterm != nil && s.Wezterm.WindowTitle != "" {
+			title := s.Wezterm.WindowTitle
+			for _, p := range spinnerPrefixes {
+				if rest, ok := strings.CutPrefix(title, p); ok {
+					title = rest
+					break
+				}
+			}
+			return title
+		}
 	}
 	if s.CWD != "" {
 		return filepath.Base(s.CWD)
 	}
 	return fmt.Sprintf("pid %d", s.PID)
+}
+
+func graphRootName(graph *state.AgentGraph) string {
+	if graph == nil || graph.RootID == "" {
+		return ""
+	}
+	for _, node := range graph.Nodes {
+		if node.ID == graph.RootID {
+			return strings.TrimSpace(node.Nickname)
+		}
+	}
+	return ""
 }
 
 // BlockedWriters names the writers of s currently blocked on a permission prompt,

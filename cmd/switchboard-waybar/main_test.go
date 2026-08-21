@@ -23,6 +23,38 @@ var (
 	testMetrics = barlayout.DefaultMetrics()
 )
 
+func TestRenderSlotCodexNameDoesNotMoveWithTerminalSpinner(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	rootID := "01890f00-0000-7000-8000-000000000001"
+	base := state.Session{
+		PID: 1, CWD: "/irrelevant/switchboard", Agent: state.AgentKindCodex,
+		AgentGraph: &state.AgentGraph{
+			RootID: rootID, Summary: state.AgentGraphSummary{Status: state.StatusWorking},
+			Nodes: []state.AgentNode{{ID: rootID, Nickname: "codex-session-naming"}},
+		},
+	}
+	names := &nameConfig{}
+	labels := &sblabel.NameCache{}
+	var got []waybarOutput
+	for _, title := range []string{"⠋ " + rootID, "⠙ " + rootID, "Working · " + rootID} {
+		s := base
+		s.Wezterm = &state.WeztermInfo{WindowTitle: title}
+		got = append(got, renderSlot(state.Snapshot{Sessions: []state.Session{s}}, 0, testAvail, testMetrics, names, labels))
+	}
+	for i, out := range got {
+		if out.Text != "sb-codex-session-naming" {
+			t.Errorf("frame %d chip text = %q, want stable descriptive name", i, out.Text)
+		}
+		if !slices.Contains(out.Class, state.StatusWorking) {
+			t.Errorf("frame %d chip class = %v, want working color", i, out.Class)
+		}
+		if i > 0 && (out.Text != got[0].Text || out.Tooltip != got[0].Tooltip || out.Alt != got[0].Alt || !slices.Equal(out.Class, got[0].Class)) {
+			t.Errorf("frame %d changed visible output after a title-only spinner frame: %#v != %#v", i, out, got[0])
+		}
+	}
+}
+
 func TestAgentTooltipPrioritizesWaitsAndFoldsWithoutAddingSlots(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())

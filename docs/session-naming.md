@@ -1,8 +1,15 @@
 # Session naming & project prefixes
 
-switchboard prefixes each Claude session's display name with a short **project
-abbreviation** derived from the session's directory — `arachne-…`, `sspi-…`,
-`sb-…` — and de-duplicates so you never get `arachne-arachne-…`.
+switchboard gives both Claude and Codex roots a stable task name, prefixes it
+with a short **project abbreviation** derived from the session's directory —
+`arachne-…`, `sspi-…`, `sb-…` — and de-duplicates so you never get
+`arachne-arachne-…`.
+
+Codex terminal titles are never used as Codex chip labels. An unnamed Codex
+thread can put its UUID in the title, and its configurable activity item paints
+animated spinner frames there. Feeding that title into the bar made both details
+visible and made the chip's identity move. Switchboard instead uses stable
+app-server thread metadata.
 
 ## The two-layer model
 
@@ -41,6 +48,29 @@ the live border unchanged (the on-disk values persisted but were not read back
 into the running UI). So there is no supported or unsupported way to
 auto-prefix a *running* session's own name — hence the display-time approach.
 
+## Codex names
+
+The locally verified Codex 0.149 app-server `Thread` object carries two naming
+inputs:
+
+1. `name` — the optional user-facing thread title. A Codex rename emits
+   `thread/name/updated`, which Switchboard applies immediately.
+2. `preview` — usually the first user message. When `name` is empty,
+   Switchboard deterministically extracts up to five useful words / 40 runes
+   from the first useful sentence and renders a lowercase hyphenated task name.
+   For example, “I'd like you to help me with Codex session naming” becomes
+   `codex-session-naming`.
+
+The explicit Codex name always wins. Preview derivation is a display-only
+fallback: Switchboard does not call `thread/name/set`, rewrite Codex storage, or
+feed the derived value back into the live TUI. If app-server metadata is not
+available, a Codex chip falls back to the project/cwd name and then `pid N` —
+never to the moving terminal title or UUID.
+
+This separation keeps naming independent from status. App-server runtime and
+attention notifications continue to paint the chip color; a name or spinner
+change cannot turn a chip green, orange, or red.
+
 ## Components
 
 - **`internal/projectname`** — the pure resolver: prefix + dedup (longest-alias,
@@ -48,10 +78,13 @@ auto-prefix a *running* session's own name — hence the display-time approach.
   built-in defaults.
 - **`switchboard-ctl name`** — `resolve --cwd --name` (used by the wrapper),
   `abbrev --cwd` (current abbreviation), `set <dir> <abbrev>` (persist).
-- **`internal/label`** — sources the raw name from `~/.claude/sessions/<pid>.json`
-  (authoritative, terminal-independent), falling back to the wezterm window
-  title then the cwd basename, then applies the prefix. Shared by the waybar
-  chips and `switchboard-ctl pick`/`list`.
+- **`internal/label`** — sources Claude names from
+  `~/.claude/sessions/<pid>.json` (with its existing terminal-title fallback)
+  and Codex names from the app-server root node (never its terminal title), then
+  applies the project prefix. Shared by the Waybar chips and
+  `switchboard-ctl pick`/`list`.
+- **`internal/provider/codex`** — reads `Thread.name`/`Thread.preview`, derives
+  the bounded unnamed-thread fallback, and consumes `thread/name/updated`.
 - **launcher wrapper** — `~/.config/scripts/claude-name-wrapper.sh`.
 - **hover rename** — middle-click a chip → `~/.config/scripts/claude-abbrev-edit`.
 

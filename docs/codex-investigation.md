@@ -130,6 +130,43 @@ for 10 minutes, approval or user-input waits for 24 hours, and idle edges for 7
 days. Each later hook replaces and refreshes it, and a fresh app-server
 observation outranks it.
 
+## Terminal titles, spinners, and session names
+
+Codex's terminal title is an output surface, not a hidden primary state feed.
+The locally installed 0.149 TUI exposes configurable terminal-title items for:
+
+- a spinner while working / an action-required message while blocked;
+- compact run-state text such as ready, working, or thinking;
+- the current thread title, falling back to its thread identifier when unnamed;
+- project, cwd, model, branch, token, context, usage, and other metadata.
+
+The same installed app-server schema exposes the richer machine-facing sibling
+projection: `Thread.status`, `activeFlags`, `thread/status/changed`, turn/item
+events, child threads, and approval/user-input requests. It also exposes the
+stable naming fields `Thread.name` (optional user-facing title) and
+`Thread.preview` (usually the first user message), plus
+`thread/name/updated`/`thread/name/set`.
+
+Switchboard therefore does not infer Codex state from the spinner or terminal
+title. Watching the title would lose information and add failure modes:
+
+- title items and their order are user-configurable and may be disabled;
+- spinner frames repaint at animation frequency and create needless WM/bar
+  churn;
+- a compact “action required” title cannot preserve approval versus user-input
+  waits or identify a blocked child;
+- one root pane title cannot represent the descendant graph;
+- a frozen/suspended pane or terminal integration failure can leave stale text;
+- an unnamed thread's title fallback is a UUID, not a usable task name.
+
+The existing app-server observer is already the simplification: it consumes
+Codex's structured runtime projection directly. Titles remain terminal/WM
+metadata only. For display naming, the observer prefers `Thread.name`; when it
+is empty, it derives a bounded stable slug from `Thread.preview`. Codex labels
+never fall back to terminal titles, so neither spinner animation nor UUIDs can
+appear on Switchboard. This derivation is display-only and does not mutate the
+Codex thread via `thread/name/set`.
+
 ## Historical findings retained
 
 ### Process discovery
