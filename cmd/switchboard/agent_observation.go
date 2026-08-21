@@ -194,6 +194,7 @@ func (c *agentCoordinator) refreshTrackedRoots() []provider.RootRef {
 	}
 	var gone []forgotten
 	var retired []trackedProviderRoot
+	var codexBindings []provider.RootRef
 	c.mu.Lock()
 	for key, root := range c.tracked {
 		if _, ok := live[key]; !ok {
@@ -207,11 +208,15 @@ func (c *agentCoordinator) refreshTrackedRoots() []provider.RootRef {
 		root.kind = ref.Provider
 		root.provider = c.observer(ref.Provider)
 		if ref.ProviderSessionID != "" {
+			priorRootID := root.rootID
 			if root.rootID != "" && root.rootID != ref.ProviderSessionID {
 				retired = append(retired, root)
 				root.restored = false
 			}
 			root.rootID = ref.ProviderSessionID
+			if ref.Provider == agentgraph.ProviderCodex && priorRootID != ref.ProviderSessionID {
+				codexBindings = append(codexBindings, ref)
+			}
 		}
 		c.tracked[key] = root
 	}
@@ -226,6 +231,14 @@ func (c *agentCoordinator) refreshTrackedRoots() []provider.RootRef {
 	}
 	for _, root := range retired {
 		c.history.Forget(root.kind, root.rootID)
+	}
+	for _, ref := range codexBindings {
+		if c.codex == nil {
+			break
+		}
+		if err := c.codex.RegisterHookBinding(ref.Key(), ref.ProviderSessionID); err != nil {
+			c.recordDiagnostic(ref.Provider, "binding_conflict", time.Now())
+		}
 	}
 	return refs
 }
@@ -595,7 +608,11 @@ func (c *agentCoordinator) HandleHook(req rpc.Request, sess state.Session) {
 		if rootID == "" {
 			rootID = ref.ProviderSessionID
 		}
-		if c.codex != nil && req.Event == "SessionStart" && rootID != "" {
+		// SessionStart is normally the first exact identity edge, but it can fire
+		// before discovery has registered the root and be dropped by the RPC
+		// ancestry guard. Every trusted Codex lifecycle hook carries the same exact
+		// root session_id, so any later hook must self-heal that startup race.
+		if c.codex != nil && rootID != "" {
 			if err := c.codex.RegisterHookBinding(ref.Key(), rootID); err != nil {
 				c.recordDiagnostic(ref.Provider, "binding_conflict", now)
 				return

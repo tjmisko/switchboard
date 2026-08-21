@@ -180,6 +180,9 @@ using blocking fakes to prove it.
 - On process discovery, create the root as today and schedule an immediate
   provider observation.
 - On exact Codex environment/hook binding, register the binding and resnapshot.
+  Any later lifecycle hook self-heals a `SessionStart`/discovery race, and an
+  exact identity persisted for the same PID/start pair is restored after daemon
+  restart.
 - On process death, call provider `Forget` before discarding the root; close any
   graph/history lanes once.
 - PID reuse is guarded by PID plus start identity.

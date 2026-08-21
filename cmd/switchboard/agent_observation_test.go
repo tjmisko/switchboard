@@ -72,6 +72,12 @@ func (f *fakeCodexCoordinatorObserver) RegisterHookBinding(key provider.RootKey,
 	return nil
 }
 
+func (f *fakeCodexCoordinatorObserver) binding(key provider.RootKey) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.bindings[key]
+}
+
 func testCodexObservation(ref provider.RootRef, rootID string, observed time.Time, runtime agentgraph.RuntimeState, attention agentgraph.AttentionState) agentgraph.Observation {
 	return agentgraph.Observation{
 		Provider: agentgraph.ProviderCodex, RootID: rootID, Source: agentgraph.SourceCodexAppServer,
@@ -187,6 +193,46 @@ func TestCodexObserverOffKeepsHookFallbackAndClaudeGraph(t *testing.T) {
 	claudeSession, _ = sessionForKey(store.Snapshot(), claudeRef.Key())
 	if claudeSession.AgentGraph == nil || claudeSession.AgentGraph.Summary.Status != state.StatusPermission {
 		t.Fatalf("Claude graph while Codex observer is off = %#v", claudeSession.AgentGraph)
+	}
+}
+
+func TestCodexLaterLifecycleHookSelfHealsExactBindingAfterSessionStartRace(t *testing.T) {
+	store := state.New("")
+	ref := seedCoordinatorSession(store, 4053, time.Now().Add(-time.Hour), state.AgentKindCodex, "", "/codex")
+	fake := newFakeCodexCoordinatorObserver()
+	coordinator := newAgentCoordinator(store, nil, nil, fake)
+	coordinator.refreshTrackedRoots()
+	defer coordinator.Close()
+
+	sess, ok := sessionForKey(store.Snapshot(), ref.Key())
+	if !ok {
+		t.Fatal("Codex root discovery was lost before the later hook")
+	}
+	coordinator.HandleHook(rpc.Request{
+		Agent: state.AgentKindCodex, Event: "PermissionRequest",
+		SessionID: "codex-root", ToolName: "Bash",
+	}, sess)
+
+	if got := fake.binding(ref.Key()); got != "codex-root" {
+		t.Fatalf("later exact hook binding = %q, want codex-root", got)
+	}
+	sess, _ = sessionForKey(store.Snapshot(), ref.Key())
+	if sess.AgentGraph == nil || sess.AgentGraph.Source != agentgraph.SourceHook ||
+		sess.AgentGraph.Summary.Status != state.StatusPermission {
+		t.Fatalf("later Codex hook fallback graph = %#v", sess.AgentGraph)
+	}
+}
+
+func TestCodexPersistedExactIdentityRestoresObserverBindingAfterDaemonRestart(t *testing.T) {
+	store := state.New("")
+	ref := seedCoordinatorSession(store, 4054, time.Now().Add(-time.Hour), state.AgentKindCodex, "codex-root", "/codex")
+	fake := newFakeCodexCoordinatorObserver()
+	coordinator := newAgentCoordinator(store, nil, nil, fake)
+	coordinator.refreshTrackedRoots()
+	defer coordinator.Close()
+
+	if got := fake.binding(ref.Key()); got != "codex-root" {
+		t.Fatalf("restored exact hook binding = %q, want codex-root", got)
 	}
 }
 

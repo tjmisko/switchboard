@@ -371,7 +371,7 @@ func renderObserverDiagnostics(w io.Writer, diagnostics []observerDiagnostic) {
 		}
 		fmt.Fprintln(w)
 		if d.Provider == state.AgentKindCodex && !d.Bound {
-			fmt.Fprintln(w, "    exact thread identity unavailable; verify CODEX_THREAD_ID visibility or SessionStart hook delivery")
+			fmt.Fprintln(w, "    exact thread identity unavailable; verify CODEX_THREAD_ID visibility or trusted lifecycle hook delivery")
 		}
 	}
 }

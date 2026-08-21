@@ -48,8 +48,10 @@ specific:
    proxy command rather than reading the control socket directly. It snapshots
    existing descendants and then consumes live notifications.
 4. **Do not guess root identity by CWD.** Prefer `CODEX_THREAD_ID` from the root
-   process environment on Linux, then an exact `SessionStart` hook association.
-   Same-CWD/time correlation may be diagnostic evidence but never a binding.
+   process environment on Linux, then an exact lifecycle-hook association.
+   `SessionStart` normally establishes it; a later hook self-heals a discovery
+   race. Same-CWD/time correlation may be diagnostic evidence but never a
+   binding.
 5. **Status has separate axes.** Runtime activity, attention reason, and child
    lifecycle are represented independently and collapsed only by a shared
    reducer.

@@ -52,8 +52,13 @@ accepts only exact identity sources, in this order:
 
 1. `CODEX_THREAD_ID` read from the discovered root process environment on
    Linux.
-2. The root `SessionStart` hook's `session_id`, registered against the same
-   `(pid, started_at)` process lifetime.
+2. The root lifecycle hooks' common `session_id`, registered against the same
+   `(pid, started_at)` process lifetime. `SessionStart` normally establishes it;
+   a later hook self-heals when startup delivery races process discovery.
+
+Switchboard also restores a persisted exact identity for the same process
+lifetime after its own daemon restarts. It never carries that binding across a
+different PID/start pair.
 
 The observer never binds by cwd, timestamp proximity, rollout recency, title,
 or a same-directory heuristic. `CODEX_SESSION_ID` is intentionally ignored:

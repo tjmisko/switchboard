@@ -94,7 +94,9 @@ variables as ordinary unbound results. Key cached bindings by PID plus process
 start identity and forget them on session death.
 
 Expose a narrow method for C6 to register an exact hook binding. C3 defines the
-method in its own package; C6 wires existing hook input to it later.
+method in its own package; C6 wires trusted lifecycle hook input to it later.
+`SessionStart` is expected first, but a later hook must be able to self-heal a
+binding when startup delivery preceded process discovery.
 
 ## Initial snapshot
 

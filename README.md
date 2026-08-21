@@ -277,11 +277,25 @@ older or unparseable versions. The current public app-server page does not
 document the proxy subcommand, so this is a locally verified capability—not a
 general OpenAI protocol guarantee.
 
+The local app-server control daemon must already be running. Switchboard never
+starts or stops another application's service. With the locally verified 0.149
+CLI, check or start it explicitly:
+
+```bash
+codex app-server daemon version
+codex app-server daemon start
+```
+
 Root binding is exact and never uses cwd, rollout recency, or timestamp
 correlation:
 
 1. `CODEX_THREAD_ID` from the discovered root process environment on Linux.
-2. The `session_id` delivered by that root's `SessionStart` hook.
+2. The `session_id` delivered by that root's trusted lifecycle hooks.
+
+`SessionStart` is normally the first hook identity edge. If it races the
+one-second process-discovery scan, any later lifecycle hook with the same exact
+`session_id` self-heals the binding. A persisted exact identity is restored for
+the same `(pid, started_at)` process lifetime after a Switchboard restart.
 
 `CODEX_SESSION_ID` is intentionally ignored because captured 0.149 process
 evidence showed it can name an ancestor rather than the current thread. A PID is
@@ -290,7 +304,7 @@ cannot inherit a binding.
 
 Hooks are therefore optional identity and fallback enrichment, not the primary
 Codex status source. If process-environment access is unavailable, this valid
-`~/.codex/hooks.json` shape supplies the exact `SessionStart` identity and a
+`~/.codex/hooks.json` shape supplies exact hook identity and a
 short-lived partial root status while app-server reconnects:
 
 ```json
