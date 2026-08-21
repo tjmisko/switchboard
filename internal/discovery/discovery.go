@@ -8,10 +8,12 @@ package discovery
 
 import (
 	"context"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/tjmisko/switchboard/internal/osproc"
 )
@@ -131,46 +133,143 @@ func IsHeadless(p osproc.Info) bool {
 	return false
 }
 
-// codexNonInteractiveSubcommands are `codex <verb> …` invocations that are NOT
-// interactive TUI sessions. Codex is a single `codex` binary whose subcommand is
-// argv[1]; unlike claude, most of its surface is non-session — a headless
-// `exec`, the `app-server`/`mcp-server`/`mcp` servers, and `login`/`doctor`/
-// `update`/… utilities — so we blocklist those and treat everything else (the
-// bare `codex`, a leading flag, a positional prompt, `resume`, `fork`) as a
-// session. Mirrors claude's verb filter; a future non-interactive verb must be
-// added here.
+// codexNonInteractiveSubcommands is the installed Codex CLI's non-TUI command
+// surface. It is deliberately paired with a fail-closed default in
+// codexIsInteractive: this table documents known commands, but a newly-added
+// command-like token is rejected even before the table catches up.
 var codexNonInteractiveSubcommands = map[string]struct{}{
-	"exec": {}, "e": {},
-	"app-server": {}, "mcp-server": {}, "mcp": {}, "remote-control": {}, "sandbox": {},
-	"login": {}, "logout": {}, "doctor": {}, "completion": {}, "update": {},
-	"plugin": {}, "features": {}, "cloud": {}, "apply": {},
-	"archive": {}, "unarchive": {}, "delete": {}, "execpolicy": {}, "app": {},
+	"agents": {}, "exec": {}, "e": {}, "review": {},
+	"login": {}, "logout": {}, "mcp": {}, "mcp-server": {}, "plugin": {},
+	"app-server": {}, "remote-control": {}, "completion": {}, "update": {},
+	"doctor": {}, "sandbox": {}, "debug": {}, "apply": {}, "queue": {},
+	"archive": {}, "delete": {}, "migrate-rollouts": {}, "unarchive": {},
+	"cloud": {}, "exec-server": {}, "features": {}, "help": {},
+
+	// Older/private surfaces remain non-interactive if encountered.
+	"execpolicy": {}, "app": {},
 }
 
-// IsCodex returns true if the process snapshot is an interactive Codex CLI
-// session: comm == "codex" with an argv[1] that is not a non-interactive
-// subcommand (see codexNonInteractiveSubcommands). No exe-path check — codex is
-// not installed under a distinctive directory the way claude is.
+// codexGlobalValueOptions are recognized global options that consume exactly
+// one following argv element. Feature and directory options may be repeated;
+// walking them rather than inspecting Args[1] is what lets a configured TUI be
+// distinguished from `codex --model … app-server`, for example.
+var codexGlobalValueOptions = map[string]struct{}{
+	"-c": {}, "--config": {},
+	"--enable": {}, "--disable": {},
+	"-i": {}, "--image": {},
+	"-m": {}, "--model": {},
+	"--local-provider": {},
+	"-p":               {}, "--profile": {},
+	"-s": {}, "--sandbox": {},
+	"-a": {}, "--ask-for-approval": {},
+	"-C": {}, "--cd": {},
+	"--add-dir": {},
+}
+
+// codexGlobalFlags are recognized global switches that do not consume a value.
+var codexGlobalFlags = map[string]struct{}{
+	"--oss":       {},
+	"--full-auto": {},
+	"--dangerously-bypass-approvals-and-sandbox": {},
+	"--search":        {},
+	"--no-alt-screen": {},
+}
+
+var codexHelpVersionFlags = map[string]struct{}{
+	"--help": {}, "-h": {}, "--version": {}, "-V": {},
+}
+
+// IsCodex returns true only when the process snapshot proves both that it is the
+// real Codex executable and that the invocation enters an interactive TUI.
+//
+// Comm is necessary but not sufficient: codex-linux-sandbox has been observed
+// with comm=codex. Args[0], when readable, and Exe, when readable, must therefore
+// both have the exact basename "codex". A masked Exe is safe when Args[0] proves
+// identity; masked Args are not accepted because no remaining process field can
+// distinguish a bare TUI from `codex exec` or another utility invocation.
 func IsCodex(p osproc.Info) bool {
 	if p.Comm != "codex" {
+		return false
+	}
+	if len(p.Args) == 0 || filepath.Base(p.Args[0]) != "codex" {
+		return false
+	}
+	if p.Exe != "" && filepath.Base(p.Exe) != "codex" {
 		return false
 	}
 	return codexIsInteractive(p.Args)
 }
 
-// codexIsInteractive reports whether a `codex …` argv launches an interactive
-// session. args[0] is the program path; args[1] is the subcommand verb when
-// present. A bare invocation, a leading flag, or a non-blocklisted verb counts.
+// codexIsInteractive parses the global option prefix of an identity-validated
+// `codex …` argv and decides its mode. Bare, resume, fork, and an unambiguous
+// positional prompt enter the TUI. Known utilities and unknown command-like
+// tokens fail closed.
+//
+// The process table preserves shell argv boundaries. To avoid guessing that an
+// unknown one-word utility is a prompt, an unterminated positional prompt is
+// considered unambiguous only when its first argv element contains whitespace
+// (for example, `codex "fix the build"`). `--` explicitly chooses positional
+// interpretation, so any token following it is a prompt; `codex --` is the bare
+// TUI. This conservative rule cannot admit codex-linux-sandbox because identity
+// validation happens first.
 func codexIsInteractive(args []string) bool {
-	if len(args) < 2 {
-		return true // bare `codex` → TUI
+	for i := 1; i < len(args); {
+		arg := args[i]
+		if arg == "--" {
+			return true
+		}
+		if _, exits := codexHelpVersionFlags[arg]; exits {
+			return false
+		}
+		if _, flag := codexGlobalFlags[arg]; flag {
+			i++
+			continue
+		}
+		if _, takesValue := codexGlobalValueOptions[arg]; takesValue {
+			if i+1 >= len(args) || args[i+1] == "" || strings.HasPrefix(args[i+1], "-") {
+				return false
+			}
+			i += 2
+			continue
+		}
+		if strings.HasPrefix(arg, "--") {
+			name, value, hasEquals := strings.Cut(arg, "=")
+			if _, takesValue := codexGlobalValueOptions[name]; !hasEquals || !takesValue || value == "" {
+				return false
+			}
+			i++
+			continue
+		}
+		if strings.HasPrefix(arg, "-") {
+			return false
+		}
+
+		switch arg {
+		case "resume", "fork":
+			return codexInteractiveSubcommand(args[i:])
+		default:
+			if _, nonInteractive := codexNonInteractiveSubcommands[arg]; nonInteractive {
+				return false
+			}
+			return strings.IndexFunc(arg, unicode.IsSpace) >= 0
+		}
 	}
-	verb := args[1]
-	if strings.HasPrefix(verb, "-") {
-		return true // `codex --model … ` etc. → still the TUI
+	return true
+}
+
+// codexInteractiveSubcommand rejects help/version exits on the two interactive
+// command surfaces. `--` ends their option parsing and makes later tokens
+// positional (for example, a session selector literally named "--help").
+func codexInteractiveSubcommand(args []string) bool {
+	for _, arg := range args[1:] {
+		if arg == "--" {
+			break
+		}
+		if _, exits := codexHelpVersionFlags[arg]; exits {
+			return false
+		}
 	}
-	_, nonInteractive := codexNonInteractiveSubcommands[verb]
-	return !nonInteractive
+	return true
 }
 
 // procSource is the narrow seam between the scanner and the OS process layer:

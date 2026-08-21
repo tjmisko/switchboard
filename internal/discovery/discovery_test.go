@@ -128,33 +128,225 @@ func TestIsClaudeDarwinLayout(t *testing.T) {
 	}
 }
 
-// IsCodex — codex is a single binary whose subcommand is argv[1]; the bare
-// invocation, a leading flag, a positional prompt, resume, and fork are
-// interactive sessions, while exec/app-server/mcp/utility verbs are not.
+// IsCodex accepts only an argv/exe-consistent Codex binary and then parses the
+// invocation's global options to find its mode. A positional initial prompt is
+// accepted when it is unambiguously prompt-shaped (a quoted argument containing
+// whitespace); an unknown single-token verb fails closed so a newly-added Codex
+// utility cannot silently become a Switchboard session.
 func TestIsCodex(t *testing.T) {
 	tests := []struct {
 		name string
 		info osproc.Info
 		want bool
 	}{
-		{"wrong comm", osproc.Info{Comm: "claude"}, false},
-		{"bare codex is a session", osproc.Info{Comm: "codex", Args: []string{"/usr/local/bin/codex"}}, true},
-		{"no args at all", osproc.Info{Comm: "codex"}, true},
-		{"leading flag is a session", osproc.Info{Comm: "codex", Args: []string{"codex", "--model", "gpt-5-codex"}}, true},
-		{"positional prompt is a session", osproc.Info{Comm: "codex", Args: []string{"codex", "fix the build"}}, true},
-		{"resume is a session", osproc.Info{Comm: "codex", Args: []string{"codex", "resume"}}, true},
-		{"fork is a session", osproc.Info{Comm: "codex", Args: []string{"codex", "fork"}}, true},
-		{"exec is not a session", osproc.Info{Comm: "codex", Args: []string{"codex", "exec", "do it"}}, false},
-		{"exec alias e is not a session", osproc.Info{Comm: "codex", Args: []string{"codex", "e"}}, false},
-		{"app-server is not a session", osproc.Info{Comm: "codex", Args: []string{"codex", "app-server"}}, false},
-		{"mcp-server is not a session", osproc.Info{Comm: "codex", Args: []string{"codex", "mcp-server"}}, false},
-		{"mcp is not a session", osproc.Info{Comm: "codex", Args: []string{"codex", "mcp"}}, false},
-		{"login is not a session", osproc.Info{Comm: "codex", Args: []string{"codex", "login"}}, false},
+		{
+			"bare installed binary",
+			osproc.Info{Comm: "codex", Exe: "/usr/local/bin/codex", Args: []string{"/usr/local/bin/codex"}},
+			true,
+		},
+		{
+			"configured TUI with value and repeatable feature options",
+			osproc.Info{Comm: "codex", Exe: "/usr/local/bin/codex", Args: []string{
+				"/usr/local/bin/codex", "--config", `model_reasoning_effort="high"`,
+				"--enable", "shell_tool", "--enable=unified_exec", "--disable", "web_search",
+				"--model", "gpt-5-codex", "--profile", "work", "--sandbox", "workspace-write",
+				"--ask-for-approval", "on-request", "--cd", "/work/repo", "--add-dir", "/work/shared",
+				"--search", "--no-alt-screen",
+			}},
+			true,
+		},
+		{
+			"short global options before resume",
+			osproc.Info{Comm: "codex", Exe: "/opt/codex/bin/codex", Args: []string{
+				"/opt/codex/bin/codex", "-c", "model=codex", "-m", "gpt-5-codex", "-p", "default",
+				"-s", "read-only", "-a", "never", "-C", "/work/repo", "resume", "thread-id",
+			}},
+			true,
+		},
+		{
+			"global option equals forms before fork",
+			osproc.Info{Comm: "codex", Exe: "/opt/codex/bin/codex", Args: []string{
+				"codex", "--config=model=gpt-5", "--model=gpt-5-codex", "--profile=default",
+				"--sandbox=read-only", "--ask-for-approval=never", "--cd=/work/repo", "fork", "thread-id",
+			}},
+			true,
+		},
+		{
+			"image and local provider options before TUI",
+			osproc.Info{Comm: "codex", Exe: "/opt/codex/bin/codex", Args: []string{
+				"codex", "--image", "/tmp/one.png", "-i", "/tmp/two.png", "--oss", "--local-provider", "ollama",
+			}},
+			true,
+		},
+		{
+			"full auto convenience flag before TUI",
+			osproc.Info{Comm: "codex", Exe: "/opt/codex/bin/codex", Args: []string{"codex", "--full-auto"}},
+			true,
+		},
+		{
+			"explicit bypass flag before TUI",
+			osproc.Info{Comm: "codex", Exe: "/opt/codex/bin/codex", Args: []string{"codex", "--dangerously-bypass-approvals-and-sandbox"}},
+			true,
+		},
+		{
+			"positional quoted initial prompt",
+			osproc.Info{Comm: "codex", Exe: "/usr/local/bin/codex", Args: []string{"codex", "fix the build"}},
+			true,
+		},
+		{
+			"option terminator with a one-token prompt",
+			osproc.Info{Comm: "codex", Exe: "/usr/local/bin/codex", Args: []string{"codex", "--", "exec"}},
+			true,
+		},
+		{
+			"option terminator without prompt is bare TUI",
+			osproc.Info{Comm: "codex", Exe: "/usr/local/bin/codex", Args: []string{"codex", "--"}},
+			true,
+		},
+		{
+			"masked exe with exact argv zero",
+			osproc.Info{Comm: "codex", Args: []string{"/usr/local/bin/codex", "resume"}},
+			true,
+		},
+		{
+			"wrong comm",
+			osproc.Info{Comm: "claude", Exe: "/usr/local/bin/codex", Args: []string{"codex"}},
+			false,
+		},
+		{
+			"sandbox wrapper regression with codex comm",
+			osproc.Info{Comm: "codex", Exe: "/usr/local/libexec/codex-linux-sandbox", Args: []string{
+				"/usr/local/libexec/codex-linux-sandbox", "--sandbox-policy-cwd", "/work/repo",
+			}},
+			false,
+		},
+		{
+			"sandbox wrapper in argv with masked exe",
+			osproc.Info{Comm: "codex", Args: []string{"codex-linux-sandbox", "--sandbox-policy-cwd", "/work/repo"}},
+			false,
+		},
+		{
+			"codex argv with sandbox executable",
+			osproc.Info{Comm: "codex", Exe: "/usr/lib/codex/codex-linux-sandbox", Args: []string{"codex"}},
+			false,
+		},
+		{
+			"different argv zero with codex executable",
+			osproc.Info{Comm: "codex", Exe: "/usr/local/bin/codex", Args: []string{"/tmp/impostor"}},
+			false,
+		},
+		{
+			"different executable merely sets comm",
+			osproc.Info{Comm: "codex", Exe: "/tmp/codex-impostor", Args: []string{"/tmp/codex-impostor"}},
+			false,
+		},
+		{
+			"masked args with real executable fails closed",
+			osproc.Info{Comm: "codex", Exe: "/usr/local/bin/codex"},
+			false,
+		},
+		{
+			"masked args and exe fail closed",
+			osproc.Info{Comm: "codex"},
+			false,
+		},
+		{
+			"empty argv zero fails closed",
+			osproc.Info{Comm: "codex", Exe: "/usr/local/bin/codex", Args: []string{""}},
+			false,
+		},
+		{
+			"unknown command-like token fails closed",
+			osproc.Info{Comm: "codex", Exe: "/usr/local/bin/codex", Args: []string{"codex", "future-command"}},
+			false,
+		},
+		{
+			"unknown global option fails closed",
+			osproc.Info{Comm: "codex", Exe: "/usr/local/bin/codex", Args: []string{"codex", "--future-mode"}},
+			false,
+		},
+		{
+			"missing long option value fails closed",
+			osproc.Info{Comm: "codex", Exe: "/usr/local/bin/codex", Args: []string{"codex", "--model"}},
+			false,
+		},
+		{
+			"missing short option value before flag fails closed",
+			osproc.Info{Comm: "codex", Exe: "/usr/local/bin/codex", Args: []string{"codex", "-m", "--search"}},
+			false,
+		},
+		{
+			"empty equals option value fails closed",
+			osproc.Info{Comm: "codex", Exe: "/usr/local/bin/codex", Args: []string{"codex", "--profile="}},
+			false,
+		},
+		{
+			"unobserved attached short value fails closed",
+			osproc.Info{Comm: "codex", Exe: "/usr/local/bin/codex", Args: []string{"codex", "-mgpt-5-codex"}},
+			false,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := IsCodex(tt.info); got != tt.want {
 				t.Errorf("IsCodex(%+v) = %v, want %v", tt.info, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsCodexRejectsTopLevelCommands(t *testing.T) {
+	commands := []string{
+		"agents", "exec", "e", "review", "login", "logout", "mcp", "mcp-server",
+		"plugin", "app-server", "remote-control", "completion", "update", "doctor",
+		"sandbox", "debug", "apply", "queue", "archive", "delete", "migrate-rollouts",
+		"unarchive", "cloud", "exec-server", "features", "help",
+	}
+	for _, command := range commands {
+		t.Run(command, func(t *testing.T) {
+			info := osproc.Info{
+				Comm: "codex",
+				Exe:  "/usr/local/bin/codex",
+				Args: []string{"codex", "--model", "gpt-5-codex", command, "subcommand-arg"},
+			}
+			if IsCodex(info) {
+				t.Fatalf("IsCodex(%q after globals) = true, want false", command)
+			}
+		})
+	}
+}
+
+func TestIsCodexRejectsAppServerForms(t *testing.T) {
+	forms := [][]string{
+		{"app-server", "daemon"},
+		{"app-server", "proxy"},
+		{"app-server", "generate-json-schema", "--out", "/tmp/schema"},
+		{"app-server", "listen", "--socket", "/tmp/codex.sock"},
+	}
+	for _, form := range forms {
+		t.Run(form[1], func(t *testing.T) {
+			args := append([]string{"codex"}, form...)
+			if IsCodex(osproc.Info{Comm: "codex", Exe: "/usr/local/bin/codex", Args: args}) {
+				t.Fatalf("IsCodex(%v) = true, want false", args)
+			}
+		})
+	}
+}
+
+func TestIsCodexRejectsHelpAndVersion(t *testing.T) {
+	for _, flag := range []string{"--help", "-h", "--version", "-V"} {
+		t.Run(flag, func(t *testing.T) {
+			info := osproc.Info{Comm: "codex", Exe: "/usr/local/bin/codex", Args: []string{"codex", "--profile", "work", flag}}
+			if IsCodex(info) {
+				t.Fatalf("IsCodex(%q) = true, want false", flag)
+			}
+		})
+	}
+	for _, command := range []string{"resume", "fork"} {
+		t.Run(command+" subcommand help", func(t *testing.T) {
+			info := osproc.Info{Comm: "codex", Exe: "/usr/local/bin/codex", Args: []string{"codex", command, "--help"}}
+			if IsCodex(info) {
+				t.Fatalf("IsCodex(%q --help) = true, want false", command)
 			}
 		})
 	}
@@ -245,6 +437,41 @@ func TestScannerNonClaudeNotRemembered(t *testing.T) {
 	s.scanOnce(fire)
 	if count != 1 {
 		t.Fatalf("after becoming claude, fired %d, want 1", count)
+	}
+}
+
+// A rejected sandbox wrapper is not inserted into the scanner's seen set. If
+// the source later returns a real Codex TUI for that PID (the strongest form of
+// the regression; a distinct later PID follows trivially), discovery still
+// emits the real session.
+func TestScannerRejectedCodexSandboxDoesNotHideLaterTUI(t *testing.T) {
+	const pid = 103
+	src := &fakeProcSource{
+		pids: []int{pid},
+		infos: map[int]osproc.Info{pid: {
+			PID:  pid,
+			Comm: "codex",
+			Exe:  "/usr/local/libexec/codex-linux-sandbox",
+			Args: []string{"codex-linux-sandbox", "--sandbox-policy-cwd", "/work/repo"},
+		}},
+	}
+	s := newWithSource(src)
+
+	var fired []int
+	s.scanOnce(func(info osproc.Info) { fired = append(fired, info.PID) })
+	if len(fired) != 0 {
+		t.Fatalf("sandbox scan fired %v, want none", fired)
+	}
+
+	src.infos[pid] = osproc.Info{
+		PID:  pid,
+		Comm: "codex",
+		Exe:  "/usr/local/bin/codex",
+		Args: []string{"/usr/local/bin/codex"},
+	}
+	s.scanOnce(func(info osproc.Info) { fired = append(fired, info.PID) })
+	if len(fired) != 1 || fired[0] != pid {
+		t.Fatalf("later real Codex scan fired %v, want [%d]", fired, pid)
 	}
 }
 
