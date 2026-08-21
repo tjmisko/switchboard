@@ -74,8 +74,10 @@ func TestObserverReconnectFreshnessGenerationAndCoalescing(t *testing.T) {
 	proxy.Notify(rpcEnvelope{Method: "thread/status/changed", Params: mustJSON(t, map[string]any{
 		"threadId": "child", "status": map[string]any{"type": "active", "activeFlags": []string{"waitingOnApproval"}},
 	})})
-	waitUpdate(t, observer.Updates(), time.Second)
-	waiting, _ := observer.Observe(context.Background(), ref, time.Now())
+	waiting := waitUpdateObservation(t, observer, ref, time.Second, func(observation agentgraph.Observation) bool {
+		node := findNode(observation, "child")
+		return node != nil && node.Attention == agentgraph.AttentionApproval
+	})
 	assertNodeAttention(t, waiting, "child", agentgraph.AttentionApproval)
 
 	// Unrelated roots never invalidate this root.
@@ -99,6 +101,10 @@ func TestObserverReconnectFreshnessGenerationAndCoalescing(t *testing.T) {
 		})})
 	}
 	waitUpdate(t, observer.Updates(), time.Second)
+	// The direct storm has completed synchronously, so its coalesced signal must
+	// expose the final cleared state.
+	cleared, _ := observer.Observe(context.Background(), ref, time.Now())
+	assertNodeAttention(t, cleared, "child", agentgraph.AttentionNone)
 	select {
 	case extra := <-observer.Updates():
 		t.Fatalf("notification storm was not coalesced: %#v", extra)
@@ -161,6 +167,34 @@ func TestObserverReconnectFreshnessGenerationAndCoalescing(t *testing.T) {
 	}
 }
 
+func TestNotificationSignalExposesMutation(t *testing.T) {
+	observer, key := fixtureObserver(t)
+	drainUpdates(observer.Updates())
+	params := mustJSON(t, map[string]any{
+		"threadId": fixtureRoot,
+		"status":   map[string]any{"type": "active", "activeFlags": []string{"waitingOnApproval"}},
+	})
+	done := make(chan struct{})
+	go func() {
+		observer.handleNotification(rpcNotification{
+			Generation: 1,
+			Method:     "thread/status/changed",
+			Params:     params,
+		})
+		close(done)
+	}()
+	waitUpdate(t, observer.Updates(), time.Second)
+	observer.mu.Lock()
+	observation := observer.roots[key].observation.Clone()
+	observer.mu.Unlock()
+	assertNodeAttention(t, observation, fixtureRoot, agentgraph.AttentionApproval)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("notification handler did not return after signaling")
+	}
+}
+
 func TestObserverHookBindingAndRootIDVerification(t *testing.T) {
 	proxy := newFakeProxy()
 	proxy.readOverride = rpcThread{ID: "different", Status: rpcStatus{Type: "idle"}}
@@ -190,16 +224,124 @@ func TestObserverHookBindingAndRootIDVerification(t *testing.T) {
 	}
 }
 
+func TestObserverDisconnectDuringDescendantListKeepsLastCompleteSnapshot(t *testing.T) {
+	proxy := newFakeProxy()
+	key := provider.RootKey{PID: 88, StartedAt: time.Unix(88, 0)}
+	environment := &fakeEnvironment{values: map[provider.RootKey][]byte{key: []byte("CODEX_THREAD_ID=root\x00")}}
+	observer := NewObserver(Config{
+		Connector: proxy, Environment: environment,
+		Freshness: 2 * time.Second, ResnapshotInterval: time.Hour,
+		RequestTimeout: time.Second, ReconnectMinimum: 5 * time.Millisecond,
+		ReconnectMaximum: 10 * time.Millisecond, Jitter: func(time.Duration) time.Duration { return 0 },
+	})
+	defer observer.Close()
+	ref := provider.RootRef{PID: key.PID, StartedAt: key.StartedAt, Provider: agentgraph.ProviderCodex}
+
+	if _, err := observer.Observe(context.Background(), ref, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	waitCompleteObservation(t, observer, ref, time.Second)
+	drainUpdates(observer.Updates())
+
+	// The root read succeeds, but the proxy drops while the descendant list is
+	// in flight. Reconnect is disabled so only the retained snapshot can win.
+	proxy.SetAvailable(false)
+	listEntered, releaseList, disconnectedList := proxy.DisconnectOnNextList()
+	// Registered after observer.Close's defer, so a failed assertion releases
+	// the blocked fake request before Close waits for the supervisor.
+	defer releaseList()
+	observer.signalRefresh()
+	select {
+	case <-listEntered:
+	case <-time.After(time.Second):
+		t.Fatal("fake proxy never entered thread/list")
+	}
+	// Capture the authoritative boundary only after the selected list request
+	// is paused. This includes any earlier redundant refresh that won the race.
+	prior, err := observer.Observe(context.Background(), ref, time.Now())
+	if err != nil || !prior.Complete {
+		t.Fatalf("observation before descendant-list disconnect = %#v, %v", prior, err)
+	}
+	releaseList()
+	select {
+	case <-disconnectedList:
+	case <-time.After(time.Second):
+		t.Fatal("fake proxy never disconnected during thread/list")
+	}
+	waitCondition(t, time.Second, func() bool {
+		observer.mu.Lock()
+		defer observer.mu.Unlock()
+		return !observer.connected
+	})
+	waitUpdate(t, observer.Updates(), time.Second)
+
+	retained, err := observer.Observe(context.Background(), ref, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !retained.Complete || !retained.ObservedAt.Equal(prior.ObservedAt) || !retained.FreshUntil.Equal(prior.FreshUntil) {
+		t.Fatalf("partial descendant snapshot replaced last complete observation: prior=%#v retained=%#v", prior, retained)
+	}
+	if node := findNode(retained, "child"); node == nil || node.Nickname != "First" || node.Lifecycle != agentgraph.LifecycleRunning {
+		t.Fatalf("retained descendant changed after list disconnect: %#v", node)
+	}
+}
+
+func TestObserverCloseInterruptsReconnectBackoff(t *testing.T) {
+	connector := &rejectingConnector{called: make(chan struct{})}
+	backoffStarted := make(chan struct{})
+	var backoffOnce sync.Once
+	observer := NewObserver(Config{
+		Connector:        connector,
+		ReconnectMinimum: time.Hour, ReconnectMaximum: time.Hour,
+		Jitter: func(time.Duration) time.Duration {
+			backoffOnce.Do(func() { close(backoffStarted) })
+			return 0
+		},
+	})
+	select {
+	case <-connector.called:
+	case <-time.After(time.Second):
+		t.Fatal("observer never attempted connection")
+	}
+	select {
+	case <-backoffStarted:
+	case <-time.After(time.Second):
+		t.Fatal("observer never entered reconnect backoff")
+	}
+
+	started := time.Now()
+	if err := observer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("Close took %v while reconnect backoff was active", elapsed)
+	}
+	if err := observer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if connector.calls != 1 {
+		t.Fatalf("connector calls after Close = %d, want 1", connector.calls)
+	}
+}
+
 type fakeProxy struct {
-	mu           sync.Mutex
-	available    bool
-	root         rpcThread
-	descendants  []rpcThread
-	readOverride rpcThread
-	server       net.Conn
-	encoder      *json.Encoder
-	methods      []string
-	listRequests []fakeListRequest
+	mu                 sync.Mutex
+	available          bool
+	root               rpcThread
+	descendants        []rpcThread
+	readOverride       rpcThread
+	server             net.Conn
+	encoder            *json.Encoder
+	methods            []string
+	listRequests       []fakeListRequest
+	disconnectNextList bool
+	listEntered        chan struct{}
+	listRelease        chan struct{}
+	listDisconnected   chan struct{}
+	listEnterOnce      sync.Once
+	listReleaseOnce    sync.Once
+	listDisconnectOnce sync.Once
 }
 
 type fakeListRequest struct {
@@ -209,7 +351,8 @@ type fakeListRequest struct {
 
 func newFakeProxy() *fakeProxy {
 	return &fakeProxy{
-		available: true,
+		available:   true,
+		listEntered: make(chan struct{}), listRelease: make(chan struct{}), listDisconnected: make(chan struct{}),
 		root: rpcThread{ID: "root", Status: rpcStatus{Type: "idle"}, Turns: []rpcTurn{{
 			ID: "root-turn", Items: []rpcItem{{
 				Type: "collabAgentToolCall", SenderThreadID: "root", ReceiverThreadIDs: []string{"child"},
@@ -262,6 +405,19 @@ func (p *fakeProxy) serve(connection net.Conn) {
 			_ = json.Unmarshal(envelope.Params, &request)
 			request.SourceKinds = append([]string(nil), request.SourceKinds...)
 			p.listRequests = append(p.listRequests, request)
+			if p.disconnectNextList {
+				p.disconnectNextList = false
+				p.mu.Unlock()
+				p.listEnterOnce.Do(func() { close(p.listEntered) })
+				<-p.listRelease
+				p.mu.Lock()
+				p.server = nil
+				p.encoder = nil
+				p.mu.Unlock()
+				_ = connection.Close()
+				p.listDisconnectOnce.Do(func() { close(p.listDisconnected) })
+				return
+			}
 			result = threadListResult{Data: descendants}
 		case "initialized":
 			p.mu.Unlock()
@@ -283,6 +439,25 @@ func (p *fakeProxy) serve(connection net.Conn) {
 func (p *fakeProxy) Notify(envelope rpcEnvelope) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// Keep the fake's authoritative snapshot coherent with emitted status
+	// notifications. Otherwise a concurrent resnapshot can legitimately
+	// supersede the notification with test-only stale state.
+	if envelope.Method == "thread/status/changed" {
+		var params struct {
+			ThreadID string    `json:"threadId"`
+			Status   rpcStatus `json:"status"`
+		}
+		if json.Unmarshal(envelope.Params, &params) == nil {
+			if p.root.ID == params.ThreadID {
+				p.root.Status = params.Status
+			}
+			for i := range p.descendants {
+				if p.descendants[i].ID == params.ThreadID {
+					p.descendants[i].Status = params.Status
+				}
+			}
+		}
+	}
 	if p.encoder != nil {
 		_ = p.encoder.Encode(envelope)
 	}
@@ -302,6 +477,16 @@ func (p *fakeProxy) SetAvailable(available bool) {
 	p.mu.Lock()
 	p.available = available
 	p.mu.Unlock()
+}
+
+func (p *fakeProxy) DisconnectOnNextList() (<-chan struct{}, func(), <-chan struct{}) {
+	p.mu.Lock()
+	p.disconnectNextList = true
+	entered := p.listEntered
+	release := func() { p.listReleaseOnce.Do(func() { close(p.listRelease) }) }
+	done := p.listDisconnected
+	p.mu.Unlock()
+	return entered, release, done
 }
 
 func (p *fakeProxy) SetSnapshot(root rpcThread, descendants []rpcThread) {
@@ -329,6 +514,18 @@ func (p *fakeProxy) ListRequests() []fakeListRequest {
 	return out
 }
 
+type rejectingConnector struct {
+	called chan struct{}
+	once   sync.Once
+	calls  int
+}
+
+func (c *rejectingConnector) Connect(context.Context) (Connection, error) {
+	c.calls++
+	c.once.Do(func() { close(c.called) })
+	return nil, errors.New("fake proxy unavailable")
+}
+
 func waitUpdate(t *testing.T, updates <-chan provider.RootKey, timeout time.Duration) provider.RootKey {
 	t.Helper()
 	if timeout <= 0 {
@@ -353,9 +550,42 @@ func drainUpdates(updates <-chan provider.RootKey) {
 	}
 }
 
+func waitCondition(t *testing.T, timeout time.Duration, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("timed out waiting for condition")
+}
+
 func waitCompleteObservation(t *testing.T, observer *Observer, ref provider.RootRef, timeout time.Duration) agentgraph.Observation {
 	t.Helper()
 	return waitObservation(t, observer, ref, timeout, func(observation agentgraph.Observation) bool { return observation.Complete })
+}
+
+// waitUpdateObservation follows the provider invalidation contract: a key says
+// to Observe again, but may be an older coalesced snapshot invalidation rather
+// than a one-to-one event acknowledgement. It succeeds only after an update
+// signal is followed by the requested semantic state.
+func waitUpdateObservation(t *testing.T, observer *Observer, ref provider.RootRef, timeout time.Duration, accept func(agentgraph.Observation) bool) agentgraph.Observation {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			t.Fatal("timed out waiting for observer invalidation and semantic state")
+			return agentgraph.Observation{}
+		}
+		waitUpdate(t, observer.Updates(), remaining)
+		observation, err := observer.Observe(context.Background(), ref, time.Now())
+		if err == nil && accept(observation) {
+			return observation
+		}
+	}
 }
 
 func waitObservation(t *testing.T, observer *Observer, ref provider.RootRef, timeout time.Duration, accept func(agentgraph.Observation) bool) agentgraph.Observation {
