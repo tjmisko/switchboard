@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/agentgraph"
 	"github.com/tjmisko/switchboard/internal/barlayout"
 	sblabel "github.com/tjmisko/switchboard/internal/label"
 	"github.com/tjmisko/switchboard/internal/projectname"
@@ -21,6 +22,106 @@ var (
 	testAvail   = 100000.0
 	testMetrics = barlayout.DefaultMetrics()
 )
+
+func TestAgentTooltipPrioritizesWaitsAndFoldsWithoutAddingSlots(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	nodes := []state.AgentNode{{ID: "root"}}
+	for i := 0; i < maxTooltipAgentRows+2; i++ {
+		nodes = append(nodes, state.AgentNode{
+			ID: fmt.Sprintf("child-%d", i), ParentID: "root", Nickname: fmt.Sprintf("child-%d", i),
+			Runtime: agentgraph.RuntimeIdle, Lifecycle: agentgraph.LifecycleRunning, UpdatedAt: now.Add(-time.Minute),
+		})
+	}
+	nodes = append(nodes, state.AgentNode{
+		ID: "question", ParentID: "root", Nickname: "needs-input",
+		Attention: agentgraph.AttentionUserInput, Lifecycle: agentgraph.LifecycleRunning, UpdatedAt: now.Add(-30 * time.Second),
+	})
+	graph := &state.AgentGraph{
+		RootID: "root", ObservedAt: now.Add(-time.Second), FreshUntil: now.Add(time.Minute), Complete: true,
+		Summary: state.AgentGraphSummary{Status: state.StatusPermission}, Nodes: nodes,
+	}
+	snap := state.Snapshot{Sessions: []state.Session{{
+		PID: 1, CWD: "/home/u/proj", Agent: state.AgentKindCodex, AgentGraph: graph,
+	}}}
+	out := renderSlot(snap, 0, testAvail, testMetrics, &nameConfig{}, &sblabel.NameCache{})
+	if !slices.Contains(out.Class, state.StatusPermission) {
+		t.Fatalf("root class did not use projected summary: %v", out.Class)
+	}
+	tip := agentTooltip(snap.Sessions[0], now)
+	if !strings.Contains(tip, "needs-input — question · 30s") {
+		t.Fatalf("tooltip did not distinguish/prioritize user input:\n%s", tip)
+	}
+	if strings.Index(tip, "needs-input") > strings.Index(tip, "child-0") {
+		t.Fatalf("attention row should precede idle rows:\n%s", tip)
+	}
+	if !strings.Contains(tip, "+3 more") {
+		t.Fatalf("tooltip missing folded count:\n%s", tip)
+	}
+	if got, max := strings.Count(tip, "\n")+1, 1+maxTooltipAgentRows+1; got > max {
+		t.Fatalf("agent tooltip has %d lines, want <= %d:\n%s", got, max, tip)
+	}
+	if extra := renderSlot(snap, 1, testAvail, testMetrics, &nameConfig{}, &sblabel.NameCache{}); !slices.Contains(extra.Class, "empty") {
+		t.Fatalf("children must not create slots: %#v", extra)
+	}
+}
+
+func TestAgentTooltipDistinguishesApprovalErrorStaleAndUsage(t *testing.T) {
+	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	graph := &state.AgentGraph{
+		RootID: "root", ObservedAt: now.Add(-time.Minute), FreshUntil: now,
+		Nodes: []state.AgentNode{
+			{ID: "root"},
+			{ID: "approve", ParentID: "root", Role: "reviewer", Attention: agentgraph.AttentionApproval, Lifecycle: agentgraph.LifecycleRunning, Usage: state.AgentUsage{TotalTokens: 42}},
+			{ID: "error", ParentID: "root", Nickname: "broken", Runtime: agentgraph.RuntimeSystemError, Lifecycle: agentgraph.LifecycleRunning},
+			{ID: "unknown", ParentID: "root", Nickname: "mystery", Runtime: agentgraph.RuntimeUnknown, Lifecycle: agentgraph.LifecycleUnknown},
+		},
+	}
+	s := state.Session{PID: 1, CWD: "/tmp/x", AgentGraph: graph}
+	tip := agentTooltip(s, now)
+	for _, want := range []string{"reviewer — approval · stale · 42 tok", "broken — system error · stale", "mystery — unknown · stale"} {
+		if !strings.Contains(tip, want) {
+			t.Errorf("tooltip missing %q:\n%s", want, tip)
+		}
+	}
+	if strings.Contains(tip, "0 tok") {
+		t.Fatalf("tooltip fabricated absent usage:\n%s", tip)
+	}
+}
+
+func TestSessionTooltipWithoutAgentGraphKeepsLegacyDetail(t *testing.T) {
+	s := state.Session{PID: 1, CWD: "/tmp/x", Claude: &state.AgentInfo{Status: state.StatusDelegating, InFlightSubagents: 2}}
+	tip := sessionTooltip(projectname.Config{}, &sblabel.NameCache{}, s, time.Now())
+	if !strings.Contains(tip, "delegating · 2 agents") {
+		t.Fatalf("legacy fallback detail missing:\n%s", tip)
+	}
+	if strings.Contains(tip, "\nagents\n") {
+		t.Fatalf("graph tree appeared without agent_graph:\n%s", tip)
+	}
+}
+
+func TestSessionTooltipWithAgentGraphDoesNotDuplicateLegacyDetail(t *testing.T) {
+	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	s := state.Session{
+		PID: 1, CWD: "/tmp/x",
+		Claude: &state.AgentInfo{
+			Status: state.StatusDelegating, InFlightSubagents: 3,
+			Workflows: []state.WorkflowStatus{{RunID: "legacy-run", Name: "legacy-workflow", InFlight: 3}},
+		},
+		AgentGraph: &state.AgentGraph{
+			RootID: "root", ObservedAt: now.Add(-time.Second), FreshUntil: now.Add(time.Minute),
+			Nodes: []state.AgentNode{{ID: "root"}, {ID: "child", ParentID: "root", Nickname: "canonical", Runtime: agentgraph.RuntimeActive}},
+		},
+	}
+	tip := sessionTooltip(projectname.Config{}, &sblabel.NameCache{}, s, now)
+	if !strings.Contains(tip, "canonical — active") {
+		t.Fatalf("canonical graph detail missing:\n%s", tip)
+	}
+	if strings.Contains(tip, "legacy-workflow") || strings.Contains(tip, "3 agents") {
+		t.Fatalf("legacy detail duplicated a present graph:\n%s", tip)
+	}
+}
 
 func TestSessionTooltipShowsStatusDuration(t *testing.T) {
 	now := time.Date(2026, 6, 26, 14, 30, 0, 0, time.UTC)

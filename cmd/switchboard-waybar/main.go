@@ -40,6 +40,8 @@ type waybarOutput struct {
 	Alt     string   `json:"alt,omitempty"`
 }
 
+const maxTooltipAgentRows = 6
+
 func main() {
 	socketPath := flag.String("socket", defaultSocketPath(), "daemon socket")
 	slot := flag.Int("slot", -1, "emit JSON for Nth session only (waybar slot mode)")
@@ -240,7 +242,7 @@ func chipClass(status string) string {
 // inspection (`switchboard-waybar | jq .`) but not driven by the live bar.
 func renderAggregate(snap state.Snapshot, names *nameConfig, cache *sblabel.NameCache) waybarOutput {
 	if len(snap.Sessions) == 0 {
-		return waybarOutput{Text: "", Tooltip: "no claude sessions", Class: []string{"empty"}}
+		return waybarOutput{Text: "", Tooltip: "no agent sessions", Class: []string{"empty"}}
 	}
 	cfg := names.config()
 	var parts []string
@@ -260,10 +262,13 @@ func renderAggregate(snap state.Snapshot, names *nameConfig, cache *sblabel.Name
 
 func sessionStatus(s state.Session) string {
 	info := s.Enrichment()
-	if info == nil || info.Status == "" {
-		return "unknown"
+	if info != nil && info.Status != "" {
+		return info.Status
 	}
-	return info.Status
+	if s.AgentGraph != nil && s.AgentGraph.Summary.Status != "" {
+		return s.AgentGraph.Summary.Status
+	}
+	return "unknown"
 }
 
 // sessionTooltip renders the Compact-stacked hover with pango markup:
@@ -279,6 +284,7 @@ func sessionTooltip(cfg projectname.Config, cache *sblabel.NameCache, s state.Se
 	abbrev := projectname.CanonicalForDir(cfg, s.CWD)
 	task := projectname.TaskForDir(cfg, s.CWD, cache.RawName(s))
 	status := sessionStatus(s)
+	hasAgentTree := len(barlayout.AgentRows(s.AgentGraph)) > 0
 
 	statusText := status
 	// A delegating chip is green but idle on the main thread; spell out why so the
@@ -286,7 +292,7 @@ func sessionTooltip(cfg projectname.Config, cache *sblabel.NameCache, s state.Se
 	// workflow run is the richer answer to the same question — name the workflow
 	// and its progress ("workflow simplification-audit · 7/17 agents") instead of
 	// the bare count, mirroring the CLI's own "N/M agents done" line.
-	if status == state.StatusDelegating {
+	if !hasAgentTree && status == state.StatusDelegating {
 		if wf := workflowAnnotation(s); wf != "" {
 			statusText = wf
 		} else if n := subagentCount(s); n > 0 {
@@ -305,8 +311,10 @@ func sessionTooltip(cfg projectname.Config, cache *sblabel.NameCache, s state.Se
 	// prompt appeared and shrank when it cleared would re-abbreviate every OTHER
 	// chip on the row twice per prompt — and would break the stable chip identity
 	// the user navigates by.
-	if w := cache.BlockedWriters(s); w != "" {
-		statusText += " · " + w
+	if !hasAgentTree {
+		if w := cache.BlockedWriters(s); w != "" {
+			statusText += " · " + w
+		}
 	}
 	// How long the session has held this status: "idle · 3m", "permission · 45s".
 	// Skipped while suspended — the status (and its clock) is stale until resume.
@@ -328,12 +336,57 @@ func sessionTooltip(cfg projectname.Config, cache *sblabel.NameCache, s state.Se
 	}
 	dot := fmt.Sprintf("<span foreground='%s'>●</span>", statusColor(status))
 	meta := fmt.Sprintf("%s · ws %s · pid %d", contractHome(s.CWD), ws, s.PID)
-	return fmt.Sprintf(
+	tip := fmt.Sprintf(
 		"<b>%s</b>   %s %s\n%s\n<span foreground='#6c7086' size='smaller'>%s</span>",
 		pangoEscape(abbrev), dot, pangoEscape(statusText),
 		pangoEscape(task),
 		pangoEscape(meta),
 	)
+	if tree := agentTooltip(s, now); tree != "" {
+		tip += "\n" + tree
+	}
+	return tip
+}
+
+// agentTooltip renders a compact, bounded detail tree. It may prioritize rows
+// for scanability, but it never re-reduces them: the chip class remains the
+// daemon-projected session summary from sessionStatus.
+func agentTooltip(s state.Session, now time.Time) string {
+	rows := barlayout.PrioritizeAgentRows(barlayout.AgentRows(s.AgentGraph))
+	rows, folded := barlayout.LimitAgentRows(rows, maxTooltipAgentRows)
+	if len(rows) == 0 && folded == 0 {
+		return ""
+	}
+	stale := s.Suspended || !s.AgentGraph.Fresh(now)
+	lines := []string{"<span foreground='#6c7086' size='smaller'>agents</span>"}
+	for _, row := range rows {
+		stateText := barlayout.AgentStateText(row.Node)
+		if stateText == "user input" {
+			stateText = "question"
+		}
+		if stale {
+			if s.Suspended {
+				stateText += " · stale (root suspended)"
+			} else {
+				stateText += " · stale"
+			}
+		} else if at := barlayout.AgentStateAt(row.Node); !at.IsZero() {
+			stateText += " · " + durfmt.Compact(now.Sub(at))
+		}
+		if usage := barlayout.AgentUsageText(row.Node); usage != "" {
+			stateText += " · " + usage
+		}
+		prefix := strings.Repeat("  ", row.Depth) + "↳ "
+		if row.Depth > 6 {
+			prefix = "  " + strings.Repeat("  ", 5) + "… "
+		}
+		lines = append(lines, fmt.Sprintf("%s%s — %s",
+			prefix, pangoEscape(barlayout.AgentName(row.Node)), pangoEscape(stateText)))
+	}
+	if folded > 0 {
+		lines = append(lines, fmt.Sprintf("  +%d more", folded))
+	}
+	return strings.Join(lines, "\n")
 }
 
 // statusColor maps a session status to the pango hex color of its tooltip dot,
@@ -409,7 +462,12 @@ func workflowAnnotation(s state.Session) string {
 // duration counter.
 func statusSince(s state.Session) *time.Time {
 	if info := s.Enrichment(); info != nil {
-		return info.StatusSinceWire
+		if info.StatusSinceWire != nil {
+			return info.StatusSinceWire
+		}
+	}
+	if s.AgentGraph != nil && !s.AgentGraph.Summary.Since.IsZero() {
+		return &s.AgentGraph.Summary.Since
 	}
 	return nil
 }

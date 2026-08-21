@@ -1,0 +1,7 @@
+switchboard · 1 session · navigate · wm=hyprland term=wezterm
+
+* ● permission  ~/Projects/switchboard                   pid 4821  ws 4  5m
+  ├─ ● documents         user input · 22m
+  │  └─ ● tagging           active · 21m · 321 tok
+  ├─ ○ keyboard          completed · 20m
+  └─ ● metadata          approval · 3m

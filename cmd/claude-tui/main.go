@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/barlayout"
 	"github.com/tjmisko/switchboard/internal/durfmt"
 	sblabel "github.com/tjmisko/switchboard/internal/label"
 	"github.com/tjmisko/switchboard/internal/rpc"
@@ -140,6 +141,9 @@ const (
 	colRed    = "\033[31m"
 	colGrey   = "\033[90m"
 	colBold   = "\033[1m"
+
+	maxAgentRows      = 32
+	maxAgentTreeDepth = 6
 )
 
 func drawFrame(body string) { fmt.Print(clearHome + body) }
@@ -188,7 +192,7 @@ func renderSnapshot(snap state.Snapshot, home string, color bool, now time.Time,
 		c(colBold, "switchboard"), n, plural(n), tierSummary(snap.Capabilities))
 
 	if n == 0 {
-		b.WriteString(c(colGrey, "no claude sessions") + "\r\n")
+		b.WriteString(c(colGrey, "no agent sessions") + "\r\n")
 		return b.String()
 	}
 
@@ -231,14 +235,72 @@ func renderSnapshot(snap state.Snapshot, home string, color bool, now time.Time,
 		// in the status color rather than the trailing grey, because it is the one
 		// thing on the row the user is meant to act on.
 		blocked := ""
-		if w := writers.BlockedWriters(s); w != "" {
-			blocked = "  blocked: " + w
+		if len(barlayout.AgentRows(s.AgentGraph)) == 0 {
+			if w := writers.BlockedWriters(s); w != "" {
+				blocked = "  blocked: " + w
+			}
 		}
 		fmt.Fprintf(&b, "%s %s %s %s %s%s%s%s\r\n",
 			focus, c(gcol, glyph), label, cwd,
 			c(colGrey, fmt.Sprintf("pid %d", s.PID)), c(colGrey, ws), c(colGrey, dur), c(gcol, blocked))
+		renderAgentTree(&b, s, now, c)
 	}
 	return b.String()
+}
+
+// renderAgentTree adds bounded, non-focusable child rows below their owning
+// root session. The state projection already carries canonical DFS order; this
+// renderer preserves it instead of inferring provider-specific ordering.
+func renderAgentTree(b *strings.Builder, s state.Session, now time.Time, paint func(string, string) string) {
+	rows := barlayout.AgentRows(s.AgentGraph)
+	rows, folded := barlayout.LimitAgentRows(rows, maxAgentRows)
+	if len(rows) == 0 && folded == 0 {
+		return
+	}
+	stale := s.Suspended || !s.AgentGraph.Fresh(now)
+	for _, row := range rows {
+		kind := barlayout.AgentStateKind(row.Node)
+		glyph, color := agentStyle(kind)
+		stateText := barlayout.AgentStateText(row.Node)
+		if stale {
+			color = colGrey
+			if s.Suspended {
+				stateText += " · stale (root suspended)"
+			} else {
+				stateText += " · stale"
+			}
+		} else if at := barlayout.AgentStateAt(row.Node); !at.IsZero() {
+			stateText += " · " + durfmt.Compact(now.Sub(at))
+		}
+		if usage := barlayout.AgentUsageText(row.Node); usage != "" {
+			stateText += " · " + usage
+		}
+		name := fmt.Sprintf("%-16s", barlayout.AgentName(row.Node))
+		prefix := row.TreePrefix
+		if row.Depth > maxAgentTreeDepth {
+			prefix = "  " + strings.Repeat("   ", maxAgentTreeDepth-1) + "… "
+		}
+		fmt.Fprintf(b, "%s%s %s  %s\r\n",
+			paint(colGrey, prefix), paint(color, glyph), name, paint(color, stateText))
+	}
+	if folded > 0 {
+		fmt.Fprintf(b, "  %s\r\n", paint(colGrey, fmt.Sprintf("+%d more agents", folded)))
+	}
+}
+
+func agentStyle(kind string) (glyph, color string) {
+	switch kind {
+	case "waiting":
+		return "●", colRed
+	case "active":
+		return "●", colGreen
+	case "idle":
+		return "●", colYellow
+	case "error":
+		return "!", colRed
+	default:
+		return "○", colGrey
+	}
 }
 
 func tierSummary(caps *state.Capabilities) string {
@@ -254,10 +316,13 @@ func tierSummary(caps *state.Capabilities) string {
 
 func sessionStatus(s state.Session) string {
 	info := s.Enrichment()
-	if info == nil || info.Status == "" {
-		return "unknown"
+	if info != nil && info.Status != "" {
+		return info.Status
 	}
-	return info.Status
+	if s.AgentGraph != nil && s.AgentGraph.Summary.Status != "" {
+		return s.AgentGraph.Summary.Status
+	}
+	return "unknown"
 }
 
 // statusSince returns the wire timestamp the current status began (nil when no
@@ -265,7 +330,12 @@ func sessionStatus(s state.Session) string {
 // counter on each session line.
 func statusSince(s state.Session) *time.Time {
 	if info := s.Enrichment(); info != nil {
-		return info.StatusSinceWire
+		if info.StatusSinceWire != nil {
+			return info.StatusSinceWire
+		}
+	}
+	if s.AgentGraph != nil && !s.AgentGraph.Summary.Since.IsZero() {
+		return &s.AgentGraph.Summary.Since
 	}
 	return nil
 }

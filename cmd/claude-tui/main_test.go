@@ -8,8 +8,94 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/agentgraph"
 	"github.com/tjmisko/switchboard/internal/state"
 )
+
+var graphRenderNow = time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+
+func TestRenderSnapshotCodexRootPlusTreeGolden(t *testing.T) {
+	since := graphRenderNow.Add(-5 * time.Minute)
+	snap := state.Snapshot{
+		Capabilities: &state.Capabilities{Observe: true, Navigate: true, WM: "hyprland", Terminal: "wezterm"},
+		Sessions: []state.Session{{
+			PID: 4821, CWD: "/home/u/Projects/switchboard", Focused: true, Agent: state.AgentKindCodex,
+			Hyprland: &state.HyprlandInfo{Workspace: "4"},
+			Codex:    &state.AgentInfo{Status: state.StatusPermission, StatusSinceWire: &since},
+			AgentGraph: graphFixture("codex-root", []state.AgentNode{
+				{ID: "codex-root", Runtime: agentgraph.RuntimeIdle, Lifecycle: agentgraph.LifecycleRunning},
+				{ID: "documents-id", ParentID: "codex-root", Nickname: "documents", Attention: agentgraph.AttentionUserInput, Lifecycle: agentgraph.LifecycleRunning, UpdatedAt: graphRenderNow.Add(-22 * time.Minute)},
+				{ID: "nested-123456789", ParentID: "documents-id", Role: "tagging", Runtime: agentgraph.RuntimeActive, Lifecycle: agentgraph.LifecycleRunning, UpdatedAt: graphRenderNow.Add(-21 * time.Minute), Usage: state.AgentUsage{TotalTokens: 321}},
+				{ID: "keyboard-id", ParentID: "codex-root", Nickname: "keyboard", Runtime: agentgraph.RuntimeNotLoaded, Lifecycle: agentgraph.LifecycleCompleted, CompletedAt: graphRenderNow.Add(-20 * time.Minute)},
+				{ID: "metadata-id", ParentID: "codex-root", Nickname: "metadata", Attention: agentgraph.AttentionApproval, Lifecycle: agentgraph.LifecycleRunning, UpdatedAt: graphRenderNow.Add(-3 * time.Minute)},
+			}),
+		}},
+	}
+	assertFrameGolden(t, "codex-tree.golden.txt", renderSnapshot(snap, "/home/u", false, graphRenderNow, nil))
+}
+
+func TestRenderSnapshotClaudeRootPlusTreeGolden(t *testing.T) {
+	snap := state.Snapshot{Sessions: []state.Session{{
+		PID: 5102, CWD: "/home/u/proj", Agent: state.AgentKindClaude,
+		Claude: &state.AgentInfo{Status: state.StatusDelegating, InFlightSubagents: 2},
+		AgentGraph: graphFixture("claude-root", []state.AgentNode{
+			{ID: "claude-root", Runtime: agentgraph.RuntimeIdle, Lifecycle: agentgraph.LifecycleRunning},
+			{ID: "research-id", ParentID: "claude-root", Nickname: "research", Runtime: agentgraph.RuntimeActive, Lifecycle: agentgraph.LifecycleRunning, UpdatedAt: graphRenderNow.Add(-45 * time.Second)},
+			{ID: "fedcba9876543210", ParentID: "claude-root", Runtime: agentgraph.RuntimeUnknown, Lifecycle: agentgraph.LifecycleUnknown},
+		}),
+	}}}
+	assertFrameGolden(t, "claude-tree.golden.txt", renderSnapshot(snap, "/home/u", false, graphRenderNow, nil))
+}
+
+func TestRenderSnapshotMarksExpiredAndSuspendedChildrenStale(t *testing.T) {
+	graph := graphFixture("root", []state.AgentNode{
+		{ID: "root"},
+		{ID: "error", ParentID: "root", Nickname: "failure", Runtime: agentgraph.RuntimeSystemError, Lifecycle: agentgraph.LifecycleRunning},
+	})
+	graph.FreshUntil = graphRenderNow
+	snap := state.Snapshot{Sessions: []state.Session{{
+		PID: 1, CWD: "/tmp/x", Suspended: true, AgentGraph: graph,
+	}}}
+	got := renderSnapshot(snap, "/home/u", false, graphRenderNow, nil)
+	if !strings.Contains(got, "system error · stale (root suspended)") {
+		t.Fatalf("suspended child did not retain an explicitly stale error state:\n%s", got)
+	}
+}
+
+func TestRenderSnapshotBoundsAgentRows(t *testing.T) {
+	nodes := []state.AgentNode{{ID: "root"}}
+	for i := 0; i < maxAgentRows+3; i++ {
+		nodes = append(nodes, state.AgentNode{ID: fmt.Sprintf("child-%02d", i), ParentID: "root", Runtime: agentgraph.RuntimeIdle})
+	}
+	snap := state.Snapshot{Sessions: []state.Session{{PID: 1, CWD: "/tmp/x", AgentGraph: graphFixture("root", nodes)}}}
+	got := renderSnapshot(snap, "/home/u", false, graphRenderNow, nil)
+	if !strings.Contains(got, "+3 more agents") {
+		t.Fatalf("bounded frame missing fold marker:\n%s", got)
+	}
+	if strings.Contains(got, "child-32") {
+		t.Fatalf("folded child leaked into frame:\n%s", got)
+	}
+}
+
+func graphFixture(rootID string, nodes []state.AgentNode) *state.AgentGraph {
+	return &state.AgentGraph{
+		RootID: rootID, Source: agentgraph.SourceCodexAppServer,
+		ObservedAt: graphRenderNow.Add(-time.Second), FreshUntil: graphRenderNow.Add(time.Minute), Complete: true,
+		Summary: state.AgentGraphSummary{Status: state.StatusDelegating, Runtime: agentgraph.RuntimeIdle}, Nodes: nodes,
+	}
+}
+
+func assertFrameGolden(t *testing.T, name, got string) {
+	t.Helper()
+	want, err := os.ReadFile(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalized := strings.ReplaceAll(got, "\r\n", "\n")
+	if normalized != string(want) {
+		t.Fatalf("frame differs from %s\n--- got ---\n%s--- want ---\n%s", name, normalized, want)
+	}
+}
 
 func TestRenderSnapshotShowsStatusDuration(t *testing.T) {
 	now := time.Date(2026, 6, 26, 14, 30, 0, 0, time.UTC)
@@ -118,7 +204,7 @@ func TestRenderSnapshotEmptyAndNoCaps(t *testing.T) {
 	if !strings.Contains(got, "0 sessions") {
 		t.Errorf("want '0 sessions', got:\n%s", got)
 	}
-	if !strings.Contains(got, "no claude sessions") {
+	if !strings.Contains(got, "no agent sessions") {
 		t.Errorf("want empty-state line, got:\n%s", got)
 	}
 	// nil capabilities → bare "observe" tier, no panic.

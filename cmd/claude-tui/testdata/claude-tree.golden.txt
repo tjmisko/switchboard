@@ -1,0 +1,5 @@
+switchboard · 1 session · observe
+
+  ● delegating  ~/proj                                   pid 5102
+  ├─ ● research          active · 45s
+  └─ ○ fedcba98          unknown
