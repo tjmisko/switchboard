@@ -304,8 +304,8 @@ cannot inherit a binding.
 
 Hooks are therefore optional identity and fallback enrichment, not the primary
 Codex status source. If process-environment access is unavailable, this valid
-`~/.codex/hooks.json` shape supplies exact hook identity and a
-short-lived partial root status while app-server reconnects:
+`~/.codex/hooks.json` shape supplies exact hook identity and a bounded partial
+root status while app-server reconnects:
 
 ```json
 {
@@ -327,7 +327,10 @@ Codex requires non-managed command hooks to be reviewed and trusted; use
 `/hooks` after adding or changing the file. The fallback maps
 `UserPromptSubmit`/`PreToolUse`/`PostToolUse` to active, `PermissionRequest` to
 an approval wait (`AskUserQuestion` to user input), and `Stop`/`SessionStart` to
-idle. It is partial, root-only, and fresh for 15 seconds.
+idle. It is partial and root-only. Active evidence remains fresh for 10 minutes,
+approval or user-input waits for 24 hours, and idle edges for 7 days. Every
+later hook replaces and refreshes that evidence; the finite deadlines bound the
+effect of a missed resolution edge.
 
 Automatic degradation is fail-open for the root and fail-closed for status:
 

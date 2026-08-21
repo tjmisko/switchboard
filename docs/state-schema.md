@@ -150,8 +150,10 @@ is present.
 #### Legacy hook fallback mapping
 
 Claude compatibility still consumes its hook/transcript state machine. Codex
-uses app-server as primary truth; only its lower-authority, 15-second partial
-fallback maps hook events directly. The event mapping is:
+uses app-server as primary truth; only its lower-authority partial fallback
+maps hook events directly. Active evidence expires after 10 minutes, approval
+or user-input waits after 24 hours, and idle edges after 7 days. Each later hook
+replaces and refreshes that evidence. The event mapping is:
 
 | Hook event | `claude` status | `codex` status |
 |------------|-----------------|----------------|

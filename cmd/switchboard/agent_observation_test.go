@@ -236,6 +236,39 @@ func TestCodexPersistedExactIdentityRestoresObserverBindingAfterDaemonRestart(t 
 	}
 }
 
+func TestCodexHookFallbackFreshnessIsBoundedByState(t *testing.T) {
+	now := time.Date(2026, 8, 21, 16, 0, 0, 0, time.UTC)
+	startedAt := now.Add(-time.Hour)
+	tests := []struct {
+		name  string
+		event string
+		tool  string
+		want  time.Duration
+	}{
+		{name: "active", event: "UserPromptSubmit", want: codexHookActiveFreshness},
+		{name: "approval", event: "PermissionRequest", tool: "Bash", want: codexHookAttentionFreshness},
+		{name: "user input", event: "PermissionRequest", tool: "AskUserQuestion", want: codexHookAttentionFreshness},
+		{name: "idle", event: "Stop", want: codexHookIdleFreshness},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			observation, mapped := codexHookObservation("codex-root", tt.event, tt.tool, startedAt, now)
+			if !mapped {
+				t.Fatalf("event %q did not map", tt.event)
+			}
+			if got := observation.FreshUntil.Sub(now); got != tt.want {
+				t.Fatalf("freshness = %v, want %v", got, tt.want)
+			}
+			if !observation.Fresh(observation.FreshUntil.Add(-time.Nanosecond)) {
+				t.Fatal("observation expired before its state-specific deadline")
+			}
+			if observation.Fresh(observation.FreshUntil) {
+				t.Fatal("observation remained fresh at the half-open deadline")
+			}
+		})
+	}
+}
+
 func TestAgentObservationDoesNotHoldStoreLockAndFencesLateGeneration(t *testing.T) {
 	startedAt := time.Now().Add(-time.Hour)
 	store := state.New("")

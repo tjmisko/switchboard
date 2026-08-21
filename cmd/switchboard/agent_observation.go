@@ -16,7 +16,15 @@ import (
 	"github.com/tjmisko/switchboard/internal/state"
 )
 
-const codexHookFreshness = 15 * time.Second
+const (
+	// Hook fallback is deliberately finite because it is partial, edge-triggered
+	// evidence. State-specific windows keep ordinary colors useful when a Codex
+	// TUI has no attachable app-server while bounding the damage from a missed
+	// resolution edge.
+	codexHookActiveFreshness    = 10 * time.Minute
+	codexHookAttentionFreshness = 24 * time.Hour
+	codexHookIdleFreshness      = 7 * 24 * time.Hour
+)
 
 type claudeObserver interface {
 	provider.Observer
@@ -648,9 +656,15 @@ func codexHookObservation(rootID, event, tool string, startedAt, now time.Time) 
 	default:
 		return agentgraph.Observation{}, false
 	}
+	freshness := codexHookIdleFreshness
+	if attention != agentgraph.AttentionNone {
+		freshness = codexHookAttentionFreshness
+	} else if runtime == agentgraph.RuntimeActive {
+		freshness = codexHookActiveFreshness
+	}
 	return agentgraph.Observation{
 		Provider: agentgraph.ProviderCodex, RootID: rootID, Source: agentgraph.SourceHook,
-		ObservedAt: now, FreshUntil: now.Add(codexHookFreshness), Complete: false,
+		ObservedAt: now, FreshUntil: now.Add(freshness), Complete: false,
 		Nodes: []agentgraph.Node{{
 			ID: rootID, Runtime: runtime, Attention: attention,
 			Lifecycle: agentgraph.LifecycleRunning, StartedAt: startedAt, UpdatedAt: now,

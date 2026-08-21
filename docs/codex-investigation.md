@@ -4,7 +4,7 @@
 > superseded.** Switchboard now treats Codex app-server as the primary source
 > for thread runtime, attention, lifecycle, and parentage. Hooks provide an
 > exact root binding when process-environment identity is unavailable and a
-> short-lived partial fallback. The implementation plan and merge contract are
+> bounded partial fallback. The implementation plan and merge contract are
 > in [`docs/codex-session-status/`](codex-session-status/README.md); the captured,
 > sanitized 0.149 evidence is in
 > [`evidence-report.md`](codex-session-status/evidence-report.md).
@@ -125,8 +125,10 @@ still carries an old runtime/attention value.
 Hooks are lower-authority, partial observations. `SessionStart`/`Stop` map the
 root to idle; `UserPromptSubmit`/`PreToolUse`/`PostToolUse` map it active; and
 `PermissionRequest` maps approval, except `AskUserQuestion`, which maps user
-input. The fallback is root-only, incomplete, and fresh for 15 seconds. A fresh
-app-server observation outranks it.
+input. The fallback is root-only and incomplete. Active evidence remains fresh
+for 10 minutes, approval or user-input waits for 24 hours, and idle edges for 7
+days. Each later hook replaces and refreshes it, and a fresh app-server
+observation outranks it.
 
 ## Historical findings retained
 
