@@ -105,9 +105,10 @@ type Request struct {
 }
 
 type Response struct {
-	Snapshot *state.Snapshot `json:"snapshot,omitempty"`
-	OK       bool            `json:"ok,omitempty"`
-	Error    string          `json:"error,omitempty"`
+	Snapshot    *state.Snapshot   `json:"snapshot,omitempty"`
+	Diagnostics []AgentDiagnostic `json:"diagnostics,omitempty"`
+	OK          bool              `json:"ok,omitempty"`
+	Error       string            `json:"error,omitempty"`
 }
 
 // rawResponse mirrors Response field-for-field — same names, same order, same
@@ -118,19 +119,41 @@ type Response struct {
 // ⚠ The two structs must be edited together: their encodings are required to be
 // byte-identical, which TestSubscribeFrameMatchesResponseEncoding pins.
 type rawResponse struct {
-	Snapshot json.RawMessage `json:"snapshot,omitempty"`
-	OK       bool            `json:"ok,omitempty"`
-	Error    string          `json:"error,omitempty"`
+	Snapshot    json.RawMessage   `json:"snapshot,omitempty"`
+	Diagnostics []AgentDiagnostic `json:"diagnostics,omitempty"`
+	OK          bool              `json:"ok,omitempty"`
+	Error       string            `json:"error,omitempty"`
 }
 
+// AgentDiagnostic is a bounded, content-free health counter for provider
+// observation. Categories are finite implementation labels; messages, paths,
+// prompts, commands, and raw provider payloads never cross this RPC surface.
+type AgentDiagnostic struct {
+	Provider string    `json:"provider"`
+	Category string    `json:"category"`
+	Count    uint64    `json:"count"`
+	LastAt   time.Time `json:"last_at"`
+}
+
+// AgentHookHandler receives an already-attributed hook and a detached snapshot
+// of its root session. The handler owns provider-specific interpretation. It is
+// invoked without the state-store lock held, including while walking /proc to
+// attribute wrapper processes.
+type AgentHookHandler func(Request, state.Session)
+
+// AgentDiagnosticSource supplies the content-free provider health snapshot.
+type AgentDiagnosticSource func() []AgentDiagnostic
+
 type Server struct {
-	store      *state.Store
-	socketPath string
-	term       terminal.Locator
-	wm         wm.Manager
-	tun        statustune.Tuning
-	hist       *history.Sink
-	fanout     *fanout.Observer
+	store       *state.Store
+	socketPath  string
+	term        terminal.Locator
+	wm          wm.Manager
+	tun         statustune.Tuning
+	hist        *history.Sink
+	fanout      *fanout.Observer
+	agentHook   AgentHookHandler
+	diagnostics AgentDiagnosticSource
 	// readProc is the seam findTrackedAncestor walks the ppid chain through.
 	// Production is proc.Read; tests substitute a synthetic chain so hook
 	// attribution can be exercised against process shapes (a nested `claude -p`,
@@ -157,6 +180,14 @@ func (s *Server) SetHistory(h *history.Sink) { s.hist = h }
 // reconcile loop). Call once at startup before Serve. A nil Observer (the default)
 // disables the hook-speed trigger, leaving the reconcile tick to pick fanouts up.
 func (s *Server) SetFanout(o *fanout.Observer) { s.fanout = o }
+
+// SetAgentHookHandler installs the graph-aware provider hook path. When set,
+// hook attribution and the callback run outside Store.Apply; legacy hook logic
+// remains the default for compatibility tests and embedders that do not opt in.
+func (s *Server) SetAgentHookHandler(handler AgentHookHandler) { s.agentHook = handler }
+
+// SetAgentDiagnosticSource installs the additive, content-free diagnostics RPC.
+func (s *Server) SetAgentDiagnosticSource(source AgentDiagnosticSource) { s.diagnostics = source }
 
 // Serve listens on the socket path and accepts connections until ctx is done.
 // The socket file is removed on startup (in case of unclean shutdown) and on
@@ -215,6 +246,12 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		case "hook":
 			s.handleHook(req)
 			_ = enc.Encode(Response{OK: true})
+		case "agent-diagnostics":
+			var diagnostics []AgentDiagnostic
+			if s.diagnostics != nil {
+				diagnostics = s.diagnostics()
+			}
+			_ = enc.Encode(Response{OK: true, Diagnostics: diagnostics})
 		case "activity":
 			err := s.handleActivity(req)
 			if err != nil {
@@ -379,6 +416,10 @@ func byIndex(sessions []state.Session, idx int) *state.Session {
 // session or an unrecognized event is silently ignored, so a misconfigured
 // hook can never corrupt state.
 func (s *Server) handleHook(req Request) {
+	if s.agentHook != nil {
+		s.dispatchAgentHook(req)
+		return
+	}
 	// THE choke point for hook identity: every consumer below (and every future
 	// one — the T5 Pending map, the T7 clear rule, the T8/T9 subagent transcript
 	// routing) sees the canonical bare id, so none of them can key a map on a
@@ -681,6 +722,22 @@ func (s *Server) handleHook(req Request) {
 			}
 		}
 	})
+}
+
+// dispatchAgentHook attributes against a detached snapshot and performs all
+// process reads before invoking the provider-aware handler. In particular, no
+// /proc read, transcript read, or provider callback runs under Store.Apply.
+func (s *Server) dispatchAgentHook(req Request) {
+	snap := s.store.Snapshot()
+	tracked := make(map[int]*state.Session, len(snap.Sessions))
+	for i := range snap.Sessions {
+		tracked[snap.Sessions[i].PID] = &snap.Sessions[i]
+	}
+	pid := findTrackedAncestor(tracked, req.PID, s.readProc)
+	if pid == 0 {
+		return
+	}
+	s.agentHook(req, *tracked[pid])
 }
 
 // agentIDPrefix is the "agent-" that brackets a subagent id in its on-disk file

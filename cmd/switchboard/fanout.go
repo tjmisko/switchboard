@@ -51,9 +51,9 @@ func newReconcileState(obs *fanout.Observer, mem *memorySampler) *reconcileState
 }
 
 // observe updates c.InFlightSubagents and emits any new subagent_spawn/stop and
-// usage_sample events for one claude session. It runs inside the reconcile Apply
-// (under the store lock); sink.Record is non-blocking, and the transcript reads
-// are bounded — the same I/O profile as the status self-heals in the same loop.
+// usage_sample events for one claude session. It runs on a detached reconcile
+// snapshot before Store.Apply; sink.Record is non-blocking and all transcript
+// reads finish before the live session map is locked.
 func (rs *reconcileState) observe(sink *history.Sink, sess *state.Session, c *state.AgentInfo, now time.Time) {
 	// The session label is derived from disk/window title, not the transcript, so
 	// it is tracked even before the transcript exists.
@@ -63,6 +63,17 @@ func (rs *reconcileState) observe(sink *history.Sink, sess *state.Session, c *st
 	}
 	rs.observeFanout(sink, sess, c, now)
 	rs.observeUsage(sink, sess, c, now)
+}
+
+// observeAuxiliary preserves provider-independent Claude label and token-usage
+// history after the structured adapter becomes graph-authoritative. Fanout and
+// status remain exclusively adapter-owned; these two reads do not mutate the
+// live session projection.
+func (rs *reconcileState) observeAuxiliary(sink *history.Sink, sess *state.Session, c *state.AgentInfo, now time.Time) {
+	rs.observeLabel(sink, sess, c, now)
+	if c.Transcript != "" {
+		rs.observeUsage(sink, sess, c, now)
+	}
 }
 
 // observeLabel records the session's current display name when it changes. The
@@ -82,8 +93,8 @@ func (rs *reconcileState) observe(sink *history.Sink, sess *state.Session, c *st
 // session id is also the safer key in the other direction: it never repeats, so
 // a recycled pid can never inherit a dead session's name.
 //
-// The name lookup goes through rs.names because this runs under the store lock,
-// once per session per tick, and label.RawName reads and unmarshals a file on
+// The name lookup goes through rs.names because it runs once per session per
+// tick, and label.RawName reads and unmarshals a file on
 // every call. The cache re-reads when the file's stamp moves, so a `/name` still
 // lands an EventSessionLabel on the next tick.
 func (rs *reconcileState) observeLabel(sink *history.Sink, sess *state.Session, c *state.AgentInfo, now time.Time) {

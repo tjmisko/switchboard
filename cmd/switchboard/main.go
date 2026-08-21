@@ -27,6 +27,8 @@ import (
 	"github.com/tjmisko/switchboard/internal/osproc"
 	"github.com/tjmisko/switchboard/internal/proc"
 	"github.com/tjmisko/switchboard/internal/projectname"
+	claudeprovider "github.com/tjmisko/switchboard/internal/provider/claude"
+	codexprovider "github.com/tjmisko/switchboard/internal/provider/codex"
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/statustune"
@@ -74,12 +76,6 @@ func main() {
 		memSampler = newMemorySampler()
 	}
 
-	// One fanout Observer is the single source of truth for subagent detection,
-	// shared by the reconcile loop and the SubagentStart/Stop hook handler (one
-	// writer, two triggers). It seeds its per-session seen-set from the same history
-	// dir the sink writes, so a daemon restart does not re-emit historical spawns.
-	fanoutObs := fanout.NewObserver(sink.Dir())
-
 	// tun holds every status-color knob (statustune.Tuning). It is built once here
 	// and threaded into both decision sites — the RPC hook gate and the reconciler
 	// — so all color behavior is tuned from one place. Defaults encode the §8
@@ -106,6 +102,26 @@ func main() {
 	dropStaleSessions(store, procSrc, sink, scanner.Forget, tun.TailBytes)
 	resolver := mapping.NewResolver(term, manager)
 
+	// Provider observation is process-wide and graph-authoritative. Both periodic
+	// and app-server/hook invalidations land through agentRuntime's generation
+	// fence; observer I/O never runs under Store.Apply. The Codex proxy is a
+	// disposable read-only child and is closed exactly once with the daemon.
+	claudeObs := claudeprovider.NewObserver(sink.Dir(), claudeprovider.WithTuning(tun))
+	codexObs := codexprovider.NewObserver(codexprovider.Config{Diagnostic: func(string) {
+		// The adapter guarantees this callback contains only a finite, content-free
+		// protocol category. Keep the log equally content-free.
+		log.Printf("agent-observer: provider=codex category=unknown_protocol_enum count=1")
+	}})
+	agentRuntime := newAgentCoordinator(store, sink, claudeObs, codexObs)
+	agentRuntime.Start(ctx, *reconcileInterval)
+	defer agentRuntime.Close()
+	forgetRoot := func(pid int) {
+		scanner.Forget(pid)
+		// Forget/Close work is performed by the coordinator after this callback's
+		// Store.Apply has released its lock.
+		agentRuntime.RequestCleanup()
+	}
+
 	onAgentAppeared := func(info osproc.Info) {
 		kind := discovery.Classify(info)
 		headless := kind == discovery.AgentClaude && discovery.IsHeadless(info)
@@ -117,7 +133,19 @@ func main() {
 		sess := resolver.Resolve(ctx, info)
 		sess.Agent = string(kind)
 		sess.Headless = headless
-		store.Apply(func(m map[int]*state.Session) { m[sess.PID] = &sess })
+		store.Apply(func(m map[int]*state.Session) {
+			// A surviving hydrated root keeps its process-lifetime key and last-known
+			// provider projection while discovery refreshes only live process/window
+			// fields. This is what lets restored graphs remain authoritative until
+			// their explicit freshness deadline instead of being erased on scan one.
+			if prior := m[sess.PID]; prior != nil && prior.Agent == sess.Agent {
+				sess.StartedAt = prior.StartedAt
+				sess.Claude, sess.Codex, sess.AgentGraph = prior.Claude, prior.Codex, prior.AgentGraph
+				sess.MemAgentBytes, sess.MemTreeBytes = prior.MemAgentBytes, prior.MemTreeBytes
+			}
+			m[sess.PID] = &sess
+		})
+		agentRuntime.Request(providerRootKey(sess))
 		// session_start bounds the session's first interval. The session id is not
 		// known until the first hook fires, so this event carries only pid/agent/cwd.
 		sink.Record(history.Event{Ts: time.Now(), Type: history.EventSessionStart,
@@ -131,7 +159,7 @@ func main() {
 		if err := procSrc.Watch(ctx, info.PID, func() {
 			log.Printf("%s pid=%d died", kind, info.PID)
 			store.Apply(func(m map[int]*state.Session) {
-				endSession(m, info.PID, sink, scanner.Forget, time.Now())
+				endSession(m, info.PID, sink, forgetRoot, time.Now())
 			})
 		}); err != nil {
 			log.Printf("watch pid=%d: %v (liveness sweep will close its lane)", info.PID, err)
@@ -146,13 +174,14 @@ func main() {
 	// One turn shared by both resolve producers, so an older enumeration can never
 	// land after a newer one. See resolveTurn.
 	turn := &resolveTurn{}
-	go runWMLoop(ctx, store, resolver, manager, sink, procSrc, scanner.Forget, turn)
-	go runReconciler(ctx, store, resolver, manager, stack, *reconcileInterval, tun, sink, fanoutObs, memSampler, scanner.Forget, turn)
+	go runWMLoop(ctx, store, resolver, manager, sink, procSrc, forgetRoot, turn)
+	go runReconciler(ctx, store, resolver, manager, stack, *reconcileInterval, tun, sink, nil, memSampler, forgetRoot, turn)
 
 	server := rpc.New(store, *socketPath, term, manager)
 	server.SetTuning(tun)
 	server.SetHistory(sink)
-	server.SetFanout(fanoutObs)
+	server.SetAgentHookHandler(agentRuntime.HandleHook)
+	server.SetAgentDiagnosticSource(agentRuntime.Diagnostics)
 	if err := os.MkdirAll(filepath.Dir(*socketPath), 0o755); err != nil {
 		log.Fatalf("mkdir socket dir: %v", err)
 	}
@@ -259,11 +288,27 @@ func dropStaleSessions(store *state.Store, procSrc osproc.Source, sink *history.
 	// Sampled BEFORE the lock, per the direction the recent perf work established
 	// (§9.4). Nothing is serving yet so there is no contention to create, but the
 	// rule that transcript I/O stays outside store.Apply is worth keeping absolute.
-	verdicts := hydratePendingVerdicts(store.Snapshot(), tailBytes)
+	snapshot := store.Snapshot()
+	verdicts := hydratePendingVerdicts(snapshot, tailBytes)
+	type processVerdict struct {
+		alive      bool
+		definitive bool
+	}
+	processes := make(map[int]processVerdict, len(snapshot.Sessions))
+	for _, sess := range snapshot.Sessions {
+		info, err := procSrc.Read(sess.PID)
+		processes[sess.PID] = processVerdict{
+			alive:      err == nil && discovery.Classify(info) != discovery.AgentNone,
+			definitive: errors.Is(err, osproc.ErrGone) || err == nil,
+		}
+	}
 	store.Apply(func(m map[int]*state.Session) {
 		for pid := range m {
-			info, err := procSrc.Read(pid)
-			if err == nil && discovery.Classify(info) != discovery.AgentNone {
+			process, sampled := processes[pid]
+			if !sampled {
+				continue
+			}
+			if process.alive {
 				// StatusSince is in-memory only (json:"-"), so it loads as zero. Stamp
 				// it to startup time: the attention self-heal compares transcript
 				// resolution times against it, and a zero value would read every old
@@ -280,7 +325,7 @@ func dropStaleSessions(store *state.Store, procSrc osproc.Source, sink *history.
 			// end that closes the lane. A non-definitive read error still drops the
 			// stale entry, exactly as it always has, but must not fabricate an end for
 			// a session that may well still be running.
-			if errors.Is(err, osproc.ErrGone) || err == nil {
+			if process.definitive {
 				endSession(m, pid, sink, forget, now)
 			}
 			delete(m, pid)
@@ -537,15 +582,24 @@ func handleWMEvent(ctx context.Context, store *state.Store, resolver *mapping.Re
 		// outlived its window (detached, or a stale window mapping) keeps its lane,
 		// which is what L4 demands — liveness is never inferred from a proxy signal.
 		now := time.Now()
+		type deadWindowRoot struct {
+			pid       int
+			startedAt time.Time
+		}
+		var dead []deadWindowRoot
+		for _, sess := range store.Snapshot().Sessions {
+			if sess.Hyprland == nil || sess.Hyprland.Address != evt.Address || !sessionDead(src, sess.PID) {
+				continue
+			}
+			dead = append(dead, deadWindowRoot{pid: sess.PID, startedAt: sess.StartedAt})
+		}
 		store.Apply(func(m map[int]*state.Session) {
-			for pid, sess := range m {
-				if sess.Hyprland == nil || sess.Hyprland.Address != evt.Address {
+			for _, root := range dead {
+				sess := m[root.pid]
+				if sess == nil || !sess.StartedAt.Equal(root.startedAt) || sess.Hyprland == nil || sess.Hyprland.Address != evt.Address {
 					continue
 				}
-				if !sessionDead(src, pid) {
-					continue
-				}
-				endSession(m, pid, sink, forget, now)
+				endSession(m, root.pid, sink, forget, now)
 			}
 		})
 	case wm.EventFocusChanged:
@@ -584,9 +638,21 @@ func reresolveAll(ctx context.Context, store *state.Store, resolver *mapping.Res
 	turn.Do(func() {
 		panes, clients := resolver.Enumerate(ctx)
 		now := time.Now()
+		snapshot := store.Snapshot()
+		resolved := make(map[int]state.Session, len(snapshot.Sessions))
+		for _, sess := range snapshot.Sessions {
+			copy := cloneSessionForReconcile(sess)
+			resolveSession(ctx, resolver, &copy, panes, clients, now)
+			resolved[sess.PID] = copy
+		}
 		store.Apply(func(m map[int]*state.Session) {
-			for _, sess := range m {
-				resolveSession(ctx, resolver, sess, panes, clients, now)
+			for pid, value := range resolved {
+				sess := m[pid]
+				if sess == nil || !sess.StartedAt.Equal(value.StartedAt) {
+					continue
+				}
+				sess.Wezterm = value.Wezterm
+				sess.Hyprland = value.Hyprland
 			}
 		})
 	})
@@ -697,19 +763,73 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 	// RPC reader and every hook for as long as it holds. Only the assignment and
 	// the sink.Record below run under the lock. See memorySampler.
 	mem := rstate.sampleMemory(store)
+
+	// Prepare every per-session process/provider decision from a detached
+	// snapshot. This is the lock boundary for the reconcile path: /proc liveness
+	// and suspension, terminal fallback resolution, transcript status recovery,
+	// fanout, label, and usage reads all finish before Store.Apply begins.
+	type preparedSession struct {
+		before    state.Session
+		after     state.Session
+		dead      bool
+		suspended *bool
+	}
+	snapshot := store.Snapshot()
+	prepared := make(map[int]preparedSession, len(snapshot.Sessions))
+	legacy := make(map[int]*state.Session)
+	for i := range snapshot.Sessions {
+		before := snapshot.Sessions[i]
+		item := preparedSession{before: before, after: cloneSessionForReconcile(before)}
+		item.dead = sessionDead(stack.OSProc, before.PID)
+		if !item.dead {
+			resolveSession(ctx, resolver, &item.after, panes, clients, now)
+			if processState, err := proc.State(before.PID); err == nil {
+				suspended := proc.Suspended(processState)
+				item.suspended = &suspended
+			}
+			if item.after.Claude != nil {
+				if item.after.AgentGraph == nil {
+					rstate.observe(sink, &item.after, item.after.Claude, now)
+					legacy[item.after.PID] = &item.after
+				} else {
+					rstate.observeAuxiliary(sink, &item.after, item.after.Claude, now)
+				}
+			}
+		}
+		prepared[before.PID] = item
+	}
+	// The legacy recovery remains only for sessions that have not entered graph
+	// authority. Its bounded transcript reads now run against detached values.
+	selfHealStaleAttention(legacy, now, tun, sink)
+	selfHealStuckStatus(legacy, now, tun, sink)
+	for pid, sess := range legacy {
+		item := prepared[pid]
+		item.after = *sess
+		prepared[pid] = item
+	}
+
 	store.Apply(func(m map[int]*state.Session) {
-		// Close the lanes of any session whose process is gone, BEFORE the per-tick
-		// work below — a dead session earns none of it.
-		sweepDeadSessions(m, stack.OSProc, sink, forget, now)
-		for _, sess := range m {
-			resolveSession(ctx, resolver, sess, panes, clients, now)
+		for pid, item := range prepared {
+			sess := m[pid]
+			if sess == nil || !sess.StartedAt.Equal(item.before.StartedAt) {
+				continue
+			}
+			if item.dead {
+				if endSession(m, pid, sink, forget, now) {
+					log.Printf("liveness sweep: pid=%d gone, closed its lane", pid)
+				}
+				continue
+			}
+			// Only detached, already-resolved values are copied under the lock.
+			sess.Wezterm = item.after.Wezterm
+			sess.Hyprland = item.after.Hyprland
 			// Refresh job-control suspension (Ctrl-Z). On ErrGone the sweep above has
 			// already dropped the session, so this only ever sees a live pid; leave
 			// the last-known value on any other read error rather than flapping. A
 			// change is logged to history as a suspend/resume edge (it greys/un-greys
 			// the chip in a timeline).
-			if st, err := proc.State(sess.PID); err == nil {
-				susp := proc.Suspended(st)
+			if item.suspended != nil {
+				susp := *item.suspended
 				if susp != sess.Suspended {
 					evType := history.EventResume
 					if susp {
@@ -719,6 +839,13 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 						SessionID: enrichmentID(sess), PID: sess.PID, Agent: sess.Agent, CWD: sess.CWD})
 				}
 				sess.Suspended = susp
+			}
+			// A graph that landed after the detached preparation wins. Otherwise copy
+			// the legacy adapter-less projection only if its session identity did not
+			// rotate while the reads were in flight.
+			if item.after.Claude != nil && sess.AgentGraph == nil &&
+				(sess.Claude == nil || sess.Claude.SessionID == item.before.Claude.SessionID) {
+				sess.Claude = item.after.Claude
 			}
 			// The session's resident cost, read outside this lock at the top of the
 			// tick. The live fields take whatever the tick has, including a repeated
@@ -733,22 +860,41 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 			if ev, ok := mem.event(sess, now); ok {
 				sink.Record(ev)
 			}
-			// Recompute the S dimension — in-flight subagent Tasks — from the main
-			// transcript so the self-heals (and the wire/tooltip) see current
-			// delegation, and emit fanout (subagent spawn/stop) + usage (token)
-			// history events derived from the same read. Claude-only.
-			if c := sess.Claude; c != nil {
-				rstate.observe(sink, sess, c, now)
-			}
 		}
 		// Re-sync focus against the active window (the backstop for any focus event
 		// the live socket2 stream missed) and record a focus edge on a real change.
 		// Runs after the resolve loop so every session's Hyprland address is current.
 		applyFocus(m, active, sink, now)
-		selfHealStaleAttention(m, now, tun, sink)
-		selfHealStuckStatus(m, now, tun, sink)
 		rstate.prune(m)
 	})
+}
+
+// cloneSessionForReconcile detaches the mutable pointers touched by terminal
+// resolution and legacy Claude recovery. AgentGraph is immutable at this
+// boundary and is never mutated by the legacy path.
+func cloneSessionForReconcile(sess state.Session) state.Session {
+	clone := sess
+	if sess.Wezterm != nil {
+		value := *sess.Wezterm
+		clone.Wezterm = &value
+	}
+	if sess.Hyprland != nil {
+		value := *sess.Hyprland
+		clone.Hyprland = &value
+	}
+	if sess.Claude != nil {
+		value := *sess.Claude
+		value.Workflows = append([]state.WorkflowStatus(nil), sess.Claude.Workflows...)
+		value.PendingWriters = append([]string(nil), sess.Claude.PendingWriters...)
+		if sess.Claude.Pending != nil {
+			value.Pending = make(map[string]state.PendingPrompt, len(sess.Claude.Pending))
+			for writer, prompt := range sess.Claude.Pending {
+				value.Pending[writer] = prompt
+			}
+		}
+		clone.Claude = &value
+	}
+	return clone
 }
 
 // recordReconcileTransition mirrors a hookless reconciler status edge into the
@@ -860,15 +1006,13 @@ func enrichmentID(s *state.Session) string {
 // it the generalized hold (T3) lets a crashed teammate's prompt latch red forever
 // — plan risk R3, which T3 widened. See writerQuiescentPastCap.
 //
-// It runs inside the reconcile Apply, so it operates on the locked session map
-// directly (no shared-pointer race) and folds into the tick's single persist.
-// The bounded transcript reads under the lock are consistent with the per-session
-// /proc and WM I/O the same loop already performs; the read count is bounded by
-// the number of BLOCKED writers, which is one in every case but case 18.
+// It runs against detached session copies prepared before reconcile Apply. Only
+// the already-decided projection is assigned under the store lock; the bounded
+// transcript reads therefore never delay RPC readers or graph-hook delivery.
 func selfHealStaleAttention(m map[int]*state.Session, now time.Time, tun statustune.Tuning, sink *history.Sink) {
 	for _, sess := range m {
 		c := sess.Claude
-		if c == nil || c.Status != state.StatusPermission {
+		if c == nil || sess.AgentGraph != nil || c.Status != state.StatusPermission {
 			continue
 		}
 		age := now.Sub(c.StatusSince)
@@ -1089,7 +1233,7 @@ func writerQuiescentPastCap(path string, since, now time.Time, staleCap time.Dur
 // A cheap stat short-circuits the common quiescent case: if nothing has been
 // written since the chip's last transition, no signal can be newer than it, so
 // the tail read is skipped. The read itself is bounded and runs inside the
-// reconcile Apply, exactly like selfHealStaleAttention. Every flip re-stamps
+// detached pre-Apply reconcile pass, exactly like selfHealStaleAttention. Every flip re-stamps
 // StatusSince, so the entry that triggered it is older than the new StatusSince
 // on the next tick and cannot cause a reverse flip — no flapping.
 //
@@ -1100,7 +1244,7 @@ func writerQuiescentPastCap(path string, since, now time.Time, staleCap time.Dur
 func selfHealStuckStatus(m map[int]*state.Session, now time.Time, tun statustune.Tuning, sink *history.Sink) {
 	for _, sess := range m {
 		c := sess.Claude
-		if c == nil {
+		if c == nil || sess.AgentGraph != nil {
 			continue
 		}
 		// Delegating (cases 5/14, fixes complaint #2): an idle main thread with
