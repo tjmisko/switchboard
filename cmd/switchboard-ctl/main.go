@@ -617,10 +617,9 @@ commands:
                             watch      long-running; show/hide bar with sessions
                             reconcile  one-shot; re-derive bar visibility (F8)
                             stop       kill the bottom bar
-  diagnose [flags] [desc] explain a wrong chip color: pull the status-decision
-                            log lines for a time window and name the Tuning knob
-                            behind each, e.g. diagnose --around 14:32 red stuck.
-                            Reads the journal (or --file); needs no daemon.
+  diagnose [flags] [desc] explain a wrong chip color, or use --observer for
+                            content-free provider binding/graph health. Reads
+                            state.json plus the journal; needs no daemon.
   history <sub>           the durable activity log (opt-in): path, tail, stat,
                             purge, calibrate. Reads the on-disk files; needs no
                             daemon.
