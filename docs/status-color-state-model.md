@@ -1,9 +1,8 @@
-# Status-Color State Model — diagnosis & redesign
+# Status-Color State Model — diagnosis, redesign, and neutral graph reducer
 
-> **Goal:** make the chip color as faithful as possible to the agent's *actual*
-> state. Two live complaints drive this: (1) RED lingers 10–30 s after it is no
-> longer warranted; (2) a session whose main thread is idle but is waiting on
-> running subagents/teammates shows ORANGE when it should show GREEN.
+> **Status:** the four-color contract and provider-neutral graph reducer are
+> shipped. The original Claude-specific diagnosis remains below as the design
+> record that motivated the reducer. The authoritative current fold is §0.1.
 >
 > This document maps the real state space, assigns a color to every state with
 > an explicit error-cost justification, enumerates the transitions and their
@@ -13,15 +12,14 @@
 
 ## 0. Color semantics (the contract we are encoding)
 
-Color is an **action semantic**, not a mechanism. The renderer maps
-`AgentInfo.Status` → CSS class (`cmd/switchboard-waybar/main.go:120` `sessionStatus`),
-and the bar CSS paints it (canonical example palette: permission `#e06c75` red,
-idle `#e5c07b` yellow, working green).
+Color is an **action semantic**, not a mechanism. The daemon reduces the
+provider-neutral graph to a legacy status, and renderers map that status to the
+existing palette. Legacy `AgentInfo.Status` remains a compatibility projection.
 
 | Color | Status | Meaning to the user | Salience |
 |-------|--------|---------------------|----------|
 | **RED** | `permission` | "I need you **now**. Work is **blocked** until you act." | highest — grabs the eye |
-| **GREEN** | `working` | "Work is happening. **Do nothing.** Don't look here." | calm/positive |
+| **GREEN** | `working` / `delegating` | "Work is happening. **Do nothing.** Don't look here." | calm/positive |
 | **ORANGE** | `idle` | "I'm done/stopped, **your turn** — but nothing is stuck. Come back when convenient." | medium |
 | **GRAY** | `unknown` | "I don't know the state." | low |
 | grey-out overlay | `suspended` | Ctrl-Z'd; deliberately paused by the user. | de-emphasized |
@@ -43,11 +41,59 @@ happening?
 complaint #2. The rest of this doc is about making the *transitions* into and
 out of these states fast and faithful — which fixes complaint #1.
 
+### 0.1 Current provider-neutral reducer
+
+Every root graph carries three independent node axes:
+
+| Axis | Values | Purpose |
+|------|--------|---------|
+| runtime | `unknown`, `not_loaded`, `idle`, `active`, `system_error` | what the thread is doing now |
+| attention | `none`, `approval`, `user_input` | whether and why a person must respond |
+| lifecycle | `unknown`, `pending`, `running`, `completed`, `interrupted`, `errored`, `shutdown`, `not_found` | orchestration state, especially for children |
+
+`approval` and `user_input` are never conflated on a child node. Either makes
+the root chip red because both require action; the row/tooltip retains the exact
+reason. If both kinds exist at once, compact summary `attention` chooses
+`approval`, while `approval_nodes` and `user_input_nodes` preserve both counts.
+
+The reducer ignores provider/source names and uses only a valid graph plus its
+half-open freshness interval (`observed_at <= now < fresh_until`). It evaluates
+the following table top to bottom:
+
+| Fresh valid graph | Live waits | Root runtime | Live descendant activity/lifecycle | Legacy status | Color |
+|-------------------|------------|--------------|------------------------------------|---------------|-------|
+| no | any | any | any | `""` (unknown) | gray |
+| yes | any `approval` | any | any | `permission` | red |
+| yes | no approval, any `user_input` | any | any | `permission` | red |
+| yes | none | `active` | any | `working` | green |
+| yes | none | `system_error` | any | `""` (explicit error axis retained) | gray root; error detail |
+| yes | none | any other value | any child runtime `active` or lifecycle `pending`/`running` | `delegating` | green |
+| yes | none | `idle` | none | `idle` | orange |
+| yes | none | `not_loaded`/`unknown` | none | `""` (unknown) | gray |
+
+A child lifecycle is terminal at `completed`, `interrupted`, `errored`,
+`shutdown`, or `not_found`. Terminal children remain available as bounded
+display/history evidence but do not count as live work or waiting attention;
+their stale attention cannot keep the root red. Error counts remain explicit
+for nodes whose runtime is `system_error` or lifecycle is `errored`.
+
+Freshness is authority, not decoration. A disconnected observer can leave the
+last graph structure visible until/after its deadline, but once expired the
+summary becomes unknown and renderers grey child detail as stale. A restored
+last-known graph obeys the same deadline. A newer, fresh high-authority source
+(`codex_app_server` or `claude_transcript`) outranks hook/rollout/restored
+fallbacks in daemon orchestration; the reducer itself stays source-neutral.
+
+Only root `Session` rows are switchable. Child rows have colors and labels for
+visibility but never add Waybar slots, focus selectors, picker entries, or cycle
+targets.
+
 ---
 
-## 1. The current model (and why it is one-dimensional)
+## 1. The legacy pre-graph model (and why it was one-dimensional)
 
-Today the entire state of a session is collapsed onto a single enum,
+Before the neutral graph landed, the entire state of a session was collapsed
+onto a single enum,
 `AgentInfo.Status ∈ {working, idle, permission, unknown}`
 (`internal/state/state.go:108`), driven two ways:
 
@@ -63,14 +109,17 @@ Today the entire state of a session is collapsed onto a single enum,
    - `selfHealStuckStatus` (`main.go:284`): `idle→working` on fresh transcript
      activity, `working→idle` on an interrupt marker (`transcript.NewestSignal`).
 
-The model has **no representation of subagent activity at all** (confirmed
-repo-wide). It cannot express "main idle, teammates working," so it cannot color
-it green. And because `permission` is one undifferentiated state, it cannot tell
+That model had **no structured representation of subagent activity**. It could
+not express "main idle, teammates working" without Claude-specific enrichment.
+And because `permission` was one undifferentiated state, it could not tell
 "resolved-by-approve → resume working" from "resolved-by-decline → your turn."
 
 ---
 
 ## 2. Root-cause analysis (with measured evidence)
+
+This section is a historical Claude incident analysis. “Today” in quoted or
+retained notes means the capture date, not the current graph implementation.
 
 ### 2.1 Stale RED is a *resolution-latency* problem, not a TTL problem
 
@@ -142,15 +191,16 @@ subagent to its spawning `Task` tool_use in the **main** transcript. **In-flight
 Task count is directly derivable**: `tool_use`(name∈{Task,Agent}).id minus
 `tool_result`.tool_use_id over the main transcript tail. And `SubagentStop`
 **is** emitted (fires on the parent session_id; carries `agent_id`,
-`agent_transcript_path`) — it is just **not wired** to switchboard today (only to
-the temporary `.claude/hook-logger.sh`). There is **no** `SubagentStart` hook.
+`agent_transcript_path`) — it was **not wired** to Switchboard at the time (only
+to the temporary `.claude/hook-logger.sh`). There was no `SubagentStart` hook in
+that capture.
 
 ---
 
-## 3. The real state space
+## 3. The Claude compatibility state space that motivated the graph
 
-The true state of a session is a tuple of orthogonal dimensions; the current
-model is a lossy projection of it onto one axis.
+The true state of a session is a tuple of orthogonal dimensions; the legacy
+model was a lossy projection of it onto one axis.
 
 | Dim | Name | Values | Source signal |
 |-----|------|--------|---------------|
@@ -308,18 +358,13 @@ for `{main}`, `subagents/agent-<a>.jsonl` and `agent_id`-matched hooks for `{a}`
 Rows 9/10/11 therefore describe removal of `{main}` specifically; teammate
 activity is not evidence about it, and vice versa.
 
-The rows that change today's behavior: **5, 9, 11, 14** (subagent-awareness and
-direct red→green), **16–19** (the writer dimension, unimplemented), and the
-*latency* of **8→9/10** (earlier resolution).
-
-> **⚠ Cases 12 and 16 are violated in practice.** The shipped
-> `case9-approve-toolmatch` clears red on a bare teammate `PostToolUse` whenever
-> that teammate's `tool_name` collides with the pending prompt's — routine when
-> the tool is `Bash`. A subagent-raised prompt then renders green/orange instead
-> of RED, and flaps between them on the reconcile tick. The table is right; the
-> implementation cannot currently distinguish case 12 from case 9. Diagnosis,
-> evidence and fixes:
-> [subagent-permission-oscillation.md](subagent-permission-oscillation.md).
+Rows **5, 9, 11, and 14** motivated subagent-awareness and direct red→green;
+rows **16–19** motivated the per-writer pending map. The earlier implementation
+did violate cases 12 and 16 by correlating only on tool name. That diagnosis is
+preserved in
+[subagent-permission-oscillation.md](subagent-permission-oscillation.md); the
+current Claude compatibility adapter preserves writer-keyed pending ownership,
+while the neutral graph independently represents each node's attention.
 
 ---
 
@@ -327,8 +372,8 @@ direct red→green), **16–19** (the writer dimension, unimplemented), and the
 
 States: `WORKING(green)`, `IDLE(orange)`, `DELEGATING(green; idle-but-S>0)`,
 `PERMISSION(red)`, `UNKNOWN(gray)`, plus the `SUSPENDED`/`GONE` overlays.
-`DELEGATING` need not be a stored enum value — it can be `Status=idle` rendered
-green when `InFlightSubagents>0` — but naming it clarifies the transitions.
+`DELEGATING` is now a stored legacy summary value derived by the neutral
+reducer. It renders green like `WORKING` but remains distinct on the wire.
 
 ```
                          UserPromptSubmit / activity
@@ -361,7 +406,7 @@ green when `InFlightSubagents>0` — but naming it clarifies the transitions.
 
 ---
 
-## 7. Implementation plan (test-first, pin-then-fix per §0.9 convention)
+## 7. Historical implementation plan (test-first, pin-then-fix)
 
 Phased so each step is independently shippable and independently verifiable.
 Each item names the seam and the Definition of Done.
@@ -480,7 +525,10 @@ the unreadable-transcript backstop only.
 
 ## 9. Implementation status (shipped)
 
-Phases A and B landed together. Decisions taken — all wired as `statustune.Tuning`
+Phases A and B landed together, followed by the provider-neutral graph. The
+graph is now the canonical cross-provider authority; `statustune.Tuning` and the
+details below remain the Claude compatibility/self-heal layer. Decisions taken —
+all wired as `statustune.Tuning`
 fields so they are retunable in one place (`cmd/switchboard/main.go` builds the
 `Tuning`; override a field there):
 
@@ -508,9 +556,39 @@ What shipped, by seam:
 | B3 wire `SubagentStop` for hook-speed drain | — | ⏭ deferred (the tick-based recount works; this only sharpens the green→orange revert) |
 | C UNKNOWN/GRAY fidelity on rehydrate | — | ⏭ deferred |
 
+The later neutral work added:
+
+| Item | Where | Status |
+|------|-------|--------|
+| independent runtime/attention/lifecycle axes | `internal/agentgraph` | ✅ |
+| approval vs user-input preservation | graph nodes + summary counts | ✅ |
+| one shared reducer and `delegating` projection | `agentgraph.Reduce`, `state.SetAgentGraph` | ✅ |
+| explicit source freshness and stale/unknown expiry | provider observations + daemon authority gate | ✅ |
+| nested, non-switchable child presentation | reference TUI + Waybar tooltip | ✅ |
+| canonical `agent_state` history and child timeline | `internal/history`, `switchboard-ctl timeline` | ✅ |
+| Claude compatibility shadow/projection | `internal/provider/claude` | ✅ |
+
 ## 10. Operating it: diagnosing a wrong color, then retuning
 
 This is the loop for "the chip was X, it should have been Y."
+
+For provider binding, graph authority, or stale/unknown failures, start with the
+content-free observer view:
+
+```text
+switchboard-ctl diagnose --observer
+switchboard-ctl diagnose --observer --json
+switchboard-ctl diagnose --observer --state /path/to/state.json --file /path/to/journal.txt
+```
+
+It reports bound/unbound state, binding source, graph source, fresh/expired
+status, complete/partial snapshot, live/wait/error counts, observer rollout
+mode, the latest finite error category, and Claude graph-vs-legacy shadow
+agreement. It never emits cwd, transcript paths, node names/descriptions,
+prompts, commands, or raw provider payloads. For an unbound Codex root, verify
+that the daemon can read `CODEX_THREAD_ID` from the root process or that the
+root `SessionStart` hook is trusted and reaching Switchboard. Never “repair” a
+binding with cwd correlation.
 
 **0. Use `switchboard-ctl diagnose` (the built tool).** It pulls the relevant
 decision lines for a time window, keeps the ones a plain-English symptom makes

@@ -1,12 +1,13 @@
 # Switchboard
 
-**See all your Claude Code sessions at a glance, and jump between them.**
+**See all your coding-agent sessions at a glance, including their child agents,
+and jump between the roots.**
 
-You run `claude` in a few different projects and lose track of which is working,
-which is waiting on you, and where each one lives. Switchboard is a small daemon
-that discovers every `claude` process on your machine — no pre-naming, no
-tagging, no registration — and tells you, in real time, how many are running,
-their working directories, and what each one is doing.
+You run Claude Code or Codex in a few different projects and lose track of which
+root is working, which child is waiting on you, and where each terminal lives.
+Switchboard is a small daemon that discovers the interactive root processes on
+your machine — no pre-naming or registration — and tells you, in real time,
+what each root and its nested agent threads are doing.
 
 It installs as a single binary, **detects your environment at runtime**, and
 degrades gracefully: it works on any Linux box with zero desktop configuration,
@@ -56,16 +57,22 @@ claude-tui
 ```
 
 `claude-tui` is the reference renderer: a zero-dependency live list of every
-session with its cwd, status, and (if resolved) workspace. No window manager,
-bar, or terminal integration required.
+root session with its cwd, status, nested agent rows, and (if resolved)
+workspace. No window manager, bar, or terminal integration required.
 
 ```
 switchboard · 3 sessions · navigate · wm=hyprland term=wezterm
 
-  * ● working     ~/Projects/switchboard                   pid 4821  ws 4
+  * ● permission  ~/Projects/switchboard                   pid 4821  ws 4
+      ├─ ● reviewer          active · 18s
+      └─ ● metadata          approval · 3m
     ● idle        ~/Tools/other                            pid 5102  ws 2
     ○ unknown     ~/scratch                                pid 5390
 ```
+
+Only the root lines are navigation targets. Child agents do not own independent
+terminal targets or Switchboard sessions; they appear as indented, non-focusable
+rows in the TUI and as bounded detail in Waybar tooltips.
 
 Prefer your own UI? Read `~/.cache/switchboard/state.json` directly — see the
 [schema](docs/state-schema.md) and [bar recipes](docs/bars/README.md) for
@@ -86,7 +93,7 @@ file, `$XDG_CONFIG_HOME/switchboard/history.json`:
 { "enabled": true, "detail": "minimal", "retain_days": 90, "max_bytes": 104857600 }
 ```
 
-The log is one JSON-per-line file per UTC day under
+The log is one JSON-per-line file per local calendar day under
 `$XDG_STATE_HOME/switchboard/history/`, local-only, with a privacy tier
 (`minimal` omits cwd / task descriptions). Inspect and render it — no daemon
 needed:
@@ -108,12 +115,13 @@ tokens used. See the [activity-log schema](docs/history-schema.md) and the
 ```
                   ┌────────────────────────────────────────────┐
                   │            switchboard (daemon)            │
-  OS process  ───►│  discovery: comm == "claude"  (Observe)    │
+  OS process  ───►│  discovery: interactive roots   (Observe)  │
    layer          │  death watch: pidfd/kqueue → drop session  │
                   │                                            │
   WM seam     ───►│  window lifecycle + focus  (Navigate)      │
   terminal    ───►│  pane locate + focus       (Navigate)      │
-  claude hooks ──►│  RPC "hook": enrich status                 │
+  providers   ───►│  root + nested agent graph                 │
+  hooks       ───►│  exact identity / fallback enrichment      │
                   │                                            │
                   │  → ~/.cache/switchboard/state.json         │
                   │  → $XDG_RUNTIME_DIR/switchboard.sock (RPC) │
@@ -126,10 +134,11 @@ tokens used. See the [activity-log schema](docs/history-schema.md) and the
 
 Two load-bearing invariants:
 
-- **Discovery is the source of truth.** Hooks are pure enrichment — if your
-  `~/.claude/settings.json` lost its hooks tomorrow, Switchboard would still
-  know every session exists and (on a Navigate stack) which window owns it. It
-  would only lose the working/idle/permission status.
+- **Discovery is the source of truth for roots.** Provider observers and hooks
+  enrich a discovered root with status and nested threads; they never create a
+  second switchable session for a child. If an enrichment source fails,
+  Switchboard still knows the root exists and, on a Navigate stack, which
+  window owns it.
 - **Death is observed, never inferred.** Each tracked PID has a kernel death
   handle (`pidfd_open(2)` on Linux); the session disappears the instant the
   process dies, however it died (Ctrl+C, `/exit`, kill, OOM, shell hangup).
@@ -140,7 +149,7 @@ The join from a `claude` PID to a focusable window is anchored on the
 **controlling tty**, which the kernel can't lose:
 
 ```
-claude PID ──/proc──► cwd, tty, pidfd death signal
+root PID   ──/proc──► cwd, tty, pidfd death signal
    tty      ──terminal seam──► pane (mux, pane id, window title)
    mux+title──WM seam──► window address, workspace   (opaque, backend-owned ref)
 ```
@@ -164,12 +173,14 @@ internal/
   wm/          Seam 3 — window manager (hyprland, sway/i3, x11, none)
   detect/      runtime backend selection + capability reporting
   proc/        Linux /proc reader — pid metadata (cwd, tty, comm, state)
-  discovery/   1 Hz claude scan filter
+  discovery/   1 Hz interactive Claude/Codex root classifier
   hyprland/    Hyprland IPC client (wrapped by wm/hyprland)
   wezterm/     wezterm multi-mux cli client (wrapped by terminal/wezterm)
   mapping/     orchestrates proc → pane → window
   state/       in-memory store + atomic state.json mirror
   rpc/         Unix socket: list / focus / subscribe / hook
+  agentgraph/  provider-neutral root/child graph + status reducer
+  provider/    Claude and Codex graph observers
   conformance/ backend-agnostic contract suites reused by every backend
   testsupport/ fixtures (fake conn, fake /proc, real-child death helpers)
 ```
@@ -190,6 +201,7 @@ switchboard-ctl focus <n>           # PID n if present, else index n (back-compa
 switchboard-ctl cycle next|prev     # focus next/prev session, wrapping
 switchboard-ctl attention           # first permission, else first idle, else cycle green if all green (repeat to cycle the tier)
 switchboard-ctl pick                # pid<TAB>label<TAB>ws<TAB>cwd lines (for fzf)
+switchboard-ctl diagnose --observer # content-free binding/freshness/graph health
 ```
 
 On an Observe-only stack, `focus` returns a clean "navigate unsupported"
@@ -206,6 +218,8 @@ systemctl --user enable --now switchboard.service
 
 Force a backend (e.g. to test degradation) with the daemon flags
 `-wm auto|hyprland|sway|i3|x11|none` and `-terminal auto|wezterm|tmux|none`.
+The Codex observer separately accepts `-codex-observer auto|off` (default
+`auto`).
 
 ## Claude Code hooks (optional status enrichment)
 
@@ -213,14 +227,16 @@ Status colors come from Claude Code hooks. Without them, sessions still appear
 (Observe) but show `unknown` status. In `~/.claude/settings.json`:
 
 ```json
-"hooks": {
-  "SessionStart":      [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook SessionStart",      "timeout": 2 }] }],
-  "UserPromptSubmit":  [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook UserPromptSubmit",  "timeout": 2 }] }],
-  "PostToolUse":       [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook PostToolUse",       "timeout": 2 }] }],
-  "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook PermissionRequest", "timeout": 2 }] }],
-  "Stop":              [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook Stop",              "timeout": 2 }] }],
-  "SubagentStart":     [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook SubagentStart",     "timeout": 2 }] }],
-  "SubagentStop":      [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook SubagentStop",       "timeout": 2 }] }]
+{
+  "hooks": {
+    "SessionStart":      [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook SessionStart",      "timeout": 2 }] }],
+    "UserPromptSubmit":  [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook UserPromptSubmit",  "timeout": 2 }] }],
+    "PostToolUse":       [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook PostToolUse",       "timeout": 2 }] }],
+    "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook PermissionRequest", "timeout": 2 }] }],
+    "Stop":              [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook Stop",              "timeout": 2 }] }],
+    "SubagentStart":     [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook SubagentStart",     "timeout": 2 }] }],
+    "SubagentStop":      [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook SubagentStop",      "timeout": 2 }] }]
+  }
 }
 ```
 
@@ -235,53 +251,92 @@ reduce the latency on the `delegating` chip and the "N agents" count. The hook i
 a pure trigger; the daemon's Observer remains the single source of truth, so a
 duplicated or dropped subagent hook can never miscount.
 
-## Codex hooks (optional status enrichment)
+## Codex app-server observer and optional hooks
 
-Switchboard also discovers **OpenAI Codex** TUI sessions (`comm == "codex"`,
-excluding `exec`/`mcp`/`app-server`/… subcommands) and tracks their status the
-same way. They reach the Navigate tier identically — the focus join keys on the
-tty, which is agent-agnostic. Status comes from Codex's hooks via
-`switchboard-ctl codex-hook <Event>`, which reads the hook's stdin JSON exactly
-like the Claude forwarder.
+Switchboard discovers interactive **OpenAI Codex** TUI roots while excluding
+wrappers and non-interactive subcommands such as `exec`, `mcp`, and
+`app-server`. Navigation remains rooted in the OS process and controlling tty.
+Codex child agents are app-server threads nested beneath that root; they never
+become focus/cycle/pick targets of their own.
 
-Recent Codex ships a Claude-Code-style hooks system. In `~/.codex/hooks.json`
-(or an inline `[hooks]` table in `~/.codex/config.toml`), wire each lifecycle
-event to the codex forwarder:
+In the default `-codex-observer auto` mode, Switchboard uses Codex app-server as
+the primary status source. It reads the bound root with `thread/read`, snapshots
+spawned descendants with `thread/list`, and consumes live thread/turn/item
+notifications. This preserves distinct `approval` and `user_input` waits: both
+make the root chip red, while the child row says `approval` or `user input`
+(`question` in the compact Waybar tooltip). The public app-server documentation
+defines the JSON-RPC/JSONL protocol, thread reads/listing, descendant filters,
+runtime status, approvals, and streamed events. See the
+[official OpenAI app-server documentation](https://learn.chatgpt.com/docs/app-server)
+and [Codex subagent documentation](https://learn.chatgpt.com/docs/agent-configuration/subagents).
 
-```jsonc
-// representative — confirm the exact file shape against the Codex hooks docs
+The transport used here is `codex app-server proxy`: a disposable stdio child
+that connects to the already-running app-server control socket. That proxy
+subcommand was verified locally in Codex CLI **0.149.0** and Switchboard rejects
+older or unparseable versions. The current public app-server page does not
+document the proxy subcommand, so this is a locally verified capability—not a
+general OpenAI protocol guarantee.
+
+Root binding is exact and never uses cwd, rollout recency, or timestamp
+correlation:
+
+1. `CODEX_THREAD_ID` from the discovered root process environment on Linux.
+2. The `session_id` delivered by that root's `SessionStart` hook.
+
+`CODEX_SESSION_ID` is intentionally ignored because captured 0.149 process
+evidence showed it can name an ancestor rather than the current thread. A PID is
+always paired with Switchboard's process-lifetime `started_at`, so PID reuse
+cannot inherit a binding.
+
+Hooks are therefore optional identity and fallback enrichment, not the primary
+Codex status source. If process-environment access is unavailable, this valid
+`~/.codex/hooks.json` shape supplies the exact `SessionStart` identity and a
+short-lived partial root status while app-server reconnects:
+
+```json
 {
+  "description": "Switchboard Codex identity and fallback status",
   "hooks": {
-    "SessionStart":      [{ "command": "switchboard-ctl codex-hook SessionStart" }],
-    "UserPromptSubmit":  [{ "command": "switchboard-ctl codex-hook UserPromptSubmit" }],
-    "PreToolUse":        [{ "command": "switchboard-ctl codex-hook PreToolUse" }],
-    "PostToolUse":       [{ "command": "switchboard-ctl codex-hook PostToolUse" }],
-    "PermissionRequest": [{ "command": "switchboard-ctl codex-hook PermissionRequest" }],
-    "Stop":              [{ "command": "switchboard-ctl codex-hook Stop" }]
+    "SessionStart": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook SessionStart", "timeout": 2}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook UserPromptSubmit", "timeout": 2}]}],
+    "PreToolUse": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook PreToolUse", "timeout": 2}]}],
+    "PostToolUse": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook PostToolUse", "timeout": 2}]}],
+    "PermissionRequest": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook PermissionRequest", "timeout": 2}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook Stop", "timeout": 2}]}]
   }
 }
 ```
 
-The status mapping mirrors Claude's (`UserPromptSubmit`/`PreToolUse`/
-`PostToolUse` → working, `PermissionRequest` → permission, `Stop`/`SessionStart`
-→ idle). Two honest limitations today:
+This three-level event → matcher group → handler shape follows the
+[official OpenAI hooks documentation](https://learn.chatgpt.com/docs/hooks).
+Codex requires non-managed command hooks to be reviewed and trusted; use
+`/hooks` after adding or changing the file. The fallback maps
+`UserPromptSubmit`/`PreToolUse`/`PostToolUse` to active, `PermissionRequest` to
+an approval wait (`AskUserQuestion` to user input), and `Stop`/`SessionStart` to
+idle. It is partial, root-only, and fresh for 15 seconds.
 
-- **`permission` needs the live hook.** Codex does not record approval requests
-  in its on-disk rollout, so a "blocked on approval" state is observable only via
-  the `PermissionRequest` hook — there is no transcript-tail self-heal for it as
-  there is for Claude. A Codex session with no hooks configured shows only
-  `working`/`idle`.
-- **Self-heal is Claude-only** for now. The idle↔working / stale-permission
-  reconcilers read the Claude transcript format; the analogous Codex rollout
-  parser is future work (see [`docs/codex-investigation.md`](docs/codex-investigation.md),
-  phase C-4). Codex status therefore tracks the hooks directly.
+Automatic degradation is fail-open for the root and fail-closed for status:
 
-Without any hooks, Codex sessions still appear (Observe) with `unknown` status,
-exactly like an un-hooked Claude session.
+- proxy/version/connection failure leaves discovery and navigation working;
+- the last complete graph remains visible only until its explicit freshness
+  deadline, then its summary becomes unknown/stale rather than freezing a
+  confident color;
+- the observer reconnects with bounded exponential backoff and resnapshots;
+- `-codex-observer off` never constructs the proxy. Codex hooks can still supply
+  the partial root view; without them the root remains visible with unknown
+  status and no child graph.
+
+Use `switchboard-ctl diagnose --observer` to inspect content-free binding,
+source, freshness, completeness, node counts, observer mode, and finite error
+categories from `state.json` and the daemon journal. It never prints cwd,
+transcripts, thread labels, prompts, commands, or raw provider payloads.
 
 ## Requirements
 
 - **Observe:** Linux with `pidfd_open(2)` (kernel 5.3+). Go 1.25 to build.
+- **Codex graph observer:** a locally verified Codex CLI 0.149.0+ installation
+  exposing `codex app-server proxy`; otherwise use `-codex-observer off` or the
+  automatic degraded root-only behavior above.
 - **Navigate:** a supported WM (Hyprland / sway / i3 / X11) **and** terminal
   (wezterm / tmux) on `PATH`.
 - macOS support (Observe tier) is planned (see the plan).
@@ -291,8 +346,10 @@ exactly like an un-hooked Claude session.
 Done: runtime-detecting `osproc` / `terminal` / `wm` seams behind a reusable
 conformance contract; Hyprland + sway/i3 + X11/EWMH WM backends; wezterm + tmux
 terminal backends with per-session locator chaining; capability reporting;
-`claude-tui` reference renderer; the Hyprland + waybar two-bar appliance
-(appendix).
+`claude-tui` reference renderer; provider-neutral root/child agent graphs;
+Codex app-server observation with bounded degradation; Claude compatibility
+projection; canonical agent history/timeline output; the Hyprland + waybar
+two-bar appliance (appendix).
 
 Next: macOS OS backend (`libproc` + `kqueue`); verified polybar/eww recipes;
 the tmux→WM-window focus bridge.
@@ -307,7 +364,7 @@ does not depend on it.
 
 ### Waybar — two bars, two processes
 
-The top bar and the bottom claude strip run as **separate waybar processes** so
+The top bar and the bottom agent strip run as **separate waybar processes** so
 the bottom one can be shown/hidden without touching the top. The split is done
 with two config files:
 
@@ -357,7 +414,7 @@ exec-once = switchboard-ctl bottombar watch
 ### Auto-hiding the bottom bar
 
 ```
-bottom bar runs  ⟺  (top bar visible)  AND  (≥1 claude session)
+bottom bar runs  ⟺  (top bar visible)  AND  (≥1 agent session)
 ```
 
 Visibility is **process existence**, not a toggle: `switchboard-ctl bottombar`

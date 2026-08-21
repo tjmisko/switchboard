@@ -106,6 +106,16 @@ minimal log still labels each event by project.
   "tool_use_id": "toolu_abc",        // links a spawn to its stop
   "agent_type": "Explore",           // the subagent kind
 
+  // canonical provider-neutral graph payload (agent_state):
+  "thread_id": "child-thread",
+  "parent_thread_id": "root-thread",
+  "nickname": "metadata",            // full detail only
+  "role": "explorer",                // full detail only
+  "from_runtime": "active", "to_runtime": "idle",
+  "from_attention": "none", "to_attention": "user_input",
+  "from_lifecycle": "running", "to_lifecycle": "running",
+  "source": "codex_app_server",
+
   // usage payload (usage_sample) — tokens accrued since the previous sample:
   "tok_in": 4200, "tok_out": 1850,
   "tok_cache_read": 920000, "tok_cache_create": 15000,
@@ -182,6 +192,7 @@ fix are unaffected.
 | `session_end` | the process is observed gone — by the pidfd death-watch, the reconciler's liveness sweep, or the startup stale-drop (one writer, three triggers; see `session-lifecycle-hazards.md`) | closes the last interval |
 | `subagent_spawn` | a `Task`/`Agent` subagent is launched (seen in the main transcript) | `tool_use_id`, `agent_type`, `description` |
 | `subagent_stop` | that subagent's result lands | `tool_use_id`, `agent_type` |
+| `agent_state` | one or more neutral runtime/attention/lifecycle axes change for a provider graph node | `session_id`, `thread_id`, `parent_thread_id`, all six from/to axis fields, `source`, `dur_prev_ms`; optional `nickname`/`role` |
 | `usage_sample` | tokens accrued since the last sample (each reconcile tick), one per model | `tok_in`, `tok_out`, `tok_cache_read`, `tok_cache_create`, `model` |
 | `session_label` | the session's name/label changed (deduped per **session id**, so a `/clear` re-announces the unchanged name to the new session) | `session_id`, `label` (full tier) |
 | `focus` | window focus moved to/away from an agent session (Hyprland) | `session_id` = focused agent session, empty = focus left all agent windows |
@@ -197,6 +208,66 @@ primed at discovery so a pre-existing transcript's backlog is not double-counted
 (`UserPromptSubmit`→working, `Stop`→idle, `PermissionRequest`→permission) and the
 hookless reconciler edges (permission self-heal, delegating promotion,
 interrupt/resume recovery) all funnel one `transition` event apiece.
+
+### Canonical `agent_state` transitions
+
+`agent_state` is the provider-neutral child/thread history contract. It is
+additive to the legacy session `transition` and Claude `subagent_spawn`/
+`subagent_stop` streams; it does not replace or rewrite old day-files.
+
+Example at the default minimal privacy tier:
+
+```json
+{"ts":"2026-08-21T16:00:30Z","type":"agent_state","session_id":"root-thread","pid":42,"agent":"codex","project":"switchboard","dur_prev_ms":30000,"thread_id":"child-thread","parent_thread_id":"root-thread","from_runtime":"active","to_runtime":"idle","from_attention":"none","to_attention":"user_input","from_lifecycle":"running","to_lifecycle":"running","source":"codex_app_server"}
+```
+
+| Field | Presence | Meaning |
+|-------|----------|---------|
+| `session_id` | when known; always on projector output | Provider root id. This scopes `thread_id` and is the canonical root join. |
+| `pid`, `agent`, `project` | optional wire fields; populated when context is available | Root process/provider/project metadata. `agent` is `claude` or `codex`. |
+| `thread_id` | always on `agent_state` | Node whose axes changed. Root transitions use the root id; child transitions use the child id. |
+| `parent_thread_id` | omitted for root | Immediate parent id. Its presence identifies child transitions used by `agent_timeline`. |
+| `nickname`, `role` | optional, full tier only | Display metadata from the graph. Both are scrubbed at minimal detail. |
+| `from_runtime`, `to_runtime` | explicit projector values | Runtime before/after the event: `unknown`, `not_loaded`, `idle`, `active`, `system_error`, or a future value. |
+| `from_attention`, `to_attention` | explicit projector values | Attention before/after: `none`, `approval`, `user_input`, or a future value. |
+| `from_lifecycle`, `to_lifecycle` | explicit projector values | Lifecycle before/after: `unknown`, `pending`, `running`, `completed`, `interrupted`, `errored`, `shutdown`, `not_found`, or a future value. |
+| `source` | omitted when unknown | Observation source (`codex_app_server`, `hook`, `claude_transcript`, `codex_rollout`, or `restored_last_known`). |
+| `dur_prev_ms` | omitted when zero | How long the prior **combined three-axis state** was held. It is clamped to zero when timing would go backward. |
+
+An event is emitted when any of the three axes changes. All three before/after
+pairs are copied onto that event, even when only one changed, so a consumer does
+not need provider-specific inference or a prior line to understand the full
+edge. Initial observation compares against
+`unknown`/`none`/`unknown`. Metadata-only changes do not emit `agent_state`.
+
+The event timestamp uses the most specific provider time available: terminal
+`completed_at`, otherwise node `updated_at`, otherwise an initial
+`started_at`, otherwise the observation time. Events discovered together are
+sorted by timestamp; equal timestamps preserve normalized graph preorder.
+
+The in-memory dedupe identity is:
+
+```text
+(provider, root_id, thread_id, changed_axis, target_value, transition_timestamp)
+```
+
+This suppresses a reconnect replay of the same transition without suppressing a
+later legitimate return to the same value. The lane is forgotten when the root
+process lifetime ends or the provider root id rotates. Partial observations do
+not manufacture removal events; only a complete observation can transition an
+omitted prior node to `not_found`.
+
+At `minimal` detail, opaque root/thread/parent ids, provider, source, state axes,
+timing, and project abbreviation remain because they are required to build the
+timeline. `nickname`, `role`, raw cwd, and descriptions are removed. `full`
+retains them. No prompt, command, tool input, or raw app-server payload is ever
+part of `agent_state`.
+
+Claude compatibility deliberately emits both canonical and legacy evidence
+during migration. Raw `history tail --json` retains both. The human
+`history tail` view suppresses a legacy `subagent_spawn`/`subagent_stop` line
+only when an `agent_state` lifecycle edge for the same root, child id, edge kind,
+and timestamp is present; no durable record is deleted.
 
 ## Cost (pricing)
 
@@ -301,10 +372,59 @@ always present and read `0` on a clean day:
               "tok_cache_create": 0, "subagents": 1, "cost_usd": 10.5 },
   "activity": [{ "state": "active", "start": "…", "end": "…" },             // global idle/active timeline (C2)
                { "state": "idle",   "start": "…", "end": "…" }],
+  "agent_timeline": {                                                       // omitted when no child agent_state events exist
+    "roots": [{
+      "session_id": "root-thread", "pid": 4821, "provider": "codex",
+      "nodes": [{
+        "thread_id": "child-thread", "parent_thread_id": "root-thread",
+        "nickname": "metadata", "role": "explorer", "depth": 1,
+        "runtime": "idle", "attention_state": "none", "lifecycle": "completed",
+        "activity": [{"start": "…", "end": "…"}],
+        "attention": [{"reason": "user_input", "start": "…", "end": "…"}]
+      }],
+      "agent_activity": 40000000000,
+      "user_attention": 10000000000
+    }],
+    "summary": {
+      "agent_activity": 40000000000, "activity_union": 40000000000,
+      "user_attention": 10000000000, "user_attention_union": 10000000000,
+      "approval_attention": 0, "user_input_attention": 10000000000,
+      "suspect_spans": 0, "suspect_duration": 0
+    }
+  },
   "plan_window": { "hours": 5, "from": "…", "to": "…", "cost_usd": 10.5,    // only with --plan-window (A4)
                    "tok_in": 0, "tok_out": 0, "tok_cache_read": 0, "tok_cache_create": 0 }
 }
 ```
+
+**`agent_timeline`** is a canonical, additive child-thread surface built only
+from `agent_state` events with a non-empty `parent_thread_id`. Root-thread work
+stays in the legacy session swimlane, so it is not counted twice. Old history
+with no canonical child edges omits the whole field and retains its prior JSON
+shape.
+
+Each root groups by `session_id` (falling back to pid when absent) and carries
+its provider, process id, ordered child nodes, summed child-agent activity, and
+the union of that root's child wait spans. Each node carries its last observed
+axes and depth plus:
+
+- `activity`: lifecycle `pending`/`running` spans, continuous across the
+  pending→running edge and closed by a terminal lifecycle or `session_end`;
+- `attention`: distinct `approval` and `user_input` spans.
+
+All durations are JSON numbers in nanoseconds. Summary `agent_activity` is the
+sum of non-suspect child spans; `activity_union` removes overlap across all
+children/roots. `user_attention` sums the per-root unions;
+`user_attention_union` removes overlap across all roots. The approval and
+user-input totals preserve their separate reasons (and are per-root unions
+before summing).
+
+An open child activity or attention span closes at the query bound. If its
+length reaches the same subagent suspect cap used by the legacy timeline, it is
+marked `suspect` with `suspect_reason`, excluded from all activity/attention
+totals, and counted in `suspect_spans`/`suspect_duration`. This surface is
+explicitly separate from the established session attention/cost formulas; it
+does not silently change them.
 
 **Carried names.** A name is recorded once, when it is set, so a session named
 before the window opened — yesterday evening, for one still running this morning —

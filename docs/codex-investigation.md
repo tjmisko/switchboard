@@ -1,329 +1,217 @@
-# Investigation — a Codex status indicator in switchboard
+# Investigation — Codex status and agent graphs in Switchboard
 
-> Status: **investigation + a basic implementation**. This document is the
-> design record; phases **C-1 (discovery), C-2 (schema), C-3 (hooks)** are
-> implemented in the same branch (Codex discovery via `comm == "codex"` + argv
-> filter, the additive `agent`/`codex` state fields, and the
-> `switchboard-ctl codex-hook` forwarder). Phases **C-4 (rollout self-heal),
-> C-5 (notify fallback), C-6 (polish)** remain future work, and the ⚠
-> live-verification gaps below still stand (no Codex plan here to run a session).
->
-> Scope: what it would take to give OpenAI **Codex CLI** sessions the same
-> Observe-tier status chip switchboard gives Claude Code — `working` / `idle` /
-> `permission` — plus Navigate.
->
-> Grounding: read against `openai/codex@main` source + developers.openai.com
-> docs (June 2026), and corroborated against the real on-disk artifacts of a
-> local Codex install (`~/.codex/config.toml`, `~/.codex/sessions/**/*.jsonl`).
-> Live behavioural claims (hook process parentage, payload paths) are flagged
-> ⚠ because there is **no Codex plan on this machine to run an interactive
-> session** — those need verification on a box that can.
+> Status: **implemented; the earlier hook-primary recommendation is
+> superseded.** Switchboard now treats Codex app-server as the primary source
+> for thread runtime, attention, lifecycle, and parentage. Hooks provide an
+> exact root binding when process-environment identity is unavailable and a
+> short-lived partial fallback. The implementation plan and merge contract are
+> in [`docs/codex-session-status/`](codex-session-status/README.md); the captured,
+> sanitized 0.149 evidence is in
+> [`evidence-report.md`](codex-session-status/evidence-report.md).
 
-## TL;DR
+This document preserves the useful findings from the original investigation,
+records which conclusions changed, and describes the shipped observer boundary.
 
-Switchboard is already cleanly layered into an **agent-neutral half** and a
-**Claude-specific half**. The agent-neutral half — discovery loop, pidfd death
-watch, RPC, the store, `state.json`, chip ordering, focus, and the *entire*
-Navigate stack (tty → pane → window) — needs **zero Codex-specific work**; it
-keys on the controlling tty, which is agent-blind. A discovered `codex` process
-maps to its window exactly like a `claude` one.
+## Current conclusion
 
-Only three seams are Claude-specific, and each has a Codex analog:
+Switchboard has two different kinds of truth:
 
-| Seam | Claude mechanism | Codex equivalent | Verdict |
-|------|------------------|------------------|---------|
-| **Discovery** | `comm == "claude"` + exe under `/claude/` + verb filter | `comm == "codex"` + **argv[1] subcommand filter** | Easy; the verb filter already exists |
-| **Status enrichment** | 5 Claude Code hooks → `switchboard-ctl hook` → RPC | **Codex hooks** (recent) → reuse the *same* plumbing; **`notify`** (legacy) fallback | The big win: recent Codex copied Claude Code's hook design almost 1:1 |
-| **Status self-heal** | tail the `.jsonl` transcript | tail the **rollout** `.jsonl` (different schema) | Idle/working is *easier*; **permission is not passively observable** ⚠ |
+- OS discovery owns the interactive **root process**, its PID/tty/cwd, and its
+  navigation target.
+- A provider observer owns the root's **agent graph**: the root thread plus
+  nested, non-switchable child threads.
 
-**The one hard finding** (§4): Codex deliberately does **not** write approval
-("waiting on the user") events to its on-disk rollout file. So the `permission`
-chip for Codex is only obtainable from the live **hook** stream — there is no
-transcript-tail fallback for it the way there is for Claude. On older Codex
-without hooks, "blocked on an approval" is invisible to a passive monitor.
+For Codex, `internal/provider/codex` uses the app-server protocol through a
+disposable `codex app-server proxy` child. It initializes a read-only client,
+reads the exact root, lists all descendants with an explicit subagent
+`sourceKinds` filter and `ancestorThreadId`, then consumes thread/turn/item
+notifications. The daemon normalizes that evidence into `internal/agentgraph`,
+projects it into `state.json`, and expires authority when the observation is no
+longer fresh.
 
----
+OpenAI's public documentation establishes that app-server is a bidirectional
+JSON-RPC interface, uses JSONL on stdio, exposes `thread/read` and `thread/list`,
+returns thread runtime status, supports descendant filters, and streams agent
+events and approval requests. See the
+[official OpenAI app-server documentation](https://learn.chatgpt.com/docs/app-server).
+The public page does **not** currently document `app-server proxy`. That command
+was verified against the locally installed Codex 0.149.0 CLI and is guarded by a
+minimum-version preflight in Switchboard. It should not be described as a
+general public protocol promise.
 
-## 1. What switchboard already gives Codex for free
+OpenAI documents subagents as separate agent threads that supported clients can
+inspect. Switchboard preserves that model in the graph, but navigation stays on
+the discovered OS root because a child thread does not provide an independent
+terminal target. See the
+[official OpenAI subagent documentation](https://learn.chatgpt.com/docs/agent-configuration/subagents).
 
-These layers never name an agent; they operate on `proc.Info` and the tty:
+## Exact root binding
 
-- **Discovery scan loop** (`internal/discovery`) — generic `/proc` walk with a
-  seen-set; only the `IsClaude` predicate is agent-specific.
-- **Death watch** (`internal/osproc`, pidfd) — keyed on PID.
-- **Navigate** (`internal/terminal`, `internal/wm`, `internal/mapping`, and
-  `rpc.focus`) — the join is `claude PID → tty → pane → window`. The tty match
-  (`internal/rpc/rpc.go:176`) is what makes focus work, and it is identical for
-  any tty-attached process. **A Codex session reaches the Navigate tier with no
-  new code.**
-- **Store / RPC / subscription / `state.json` / chip order / `focused` /
-  `suspended` / capabilities** — all PID- and tty-keyed.
+A correct graph is useless if attached to the wrong TUI. Binding therefore
+accepts only exact identity sources, in this order:
 
-So the work is confined to the three seams below. Everything in
-`docs/portability-plan.md`'s Navigate work is reused verbatim.
+1. `CODEX_THREAD_ID` read from the discovered root process environment on
+   Linux.
+2. The root `SessionStart` hook's `session_id`, registered against the same
+   `(pid, started_at)` process lifetime.
 
----
+The observer never binds by cwd, timestamp proximity, rollout recency, title,
+or a same-directory heuristic. `CODEX_SESSION_ID` is intentionally ignored:
+sanitized 0.149 capture showed `CODEX_THREAD_ID` and `CODEX_SESSION_ID` can
+differ, with the latter naming a parent session.
 
-## 2. Codex process model (Discovery)
+The official hooks documentation defines `SessionStart`, the common
+`session_id` field, and the three-level event → matcher group → command-handler
+configuration. It also states that subagent hooks use the parent session id.
+See the [official OpenAI hooks documentation](https://learn.chatgpt.com/docs/hooks).
+The use of `CODEX_THREAD_ID` is a locally verified Switchboard binding, not a
+claim made by that public hooks page.
 
-Confirmed: the binary is a single Rust executable, `[[bin]] name = "codex"`
-(`codex-rs/cli/Cargo.toml`), so **every** invocation shares `comm == "codex"`
-and `argv[0] == codex`. The subcommand is **`argv[1]`** — unlike Claude, where
-the interactive session has no verb and the binary name alone nearly suffices.
-Codex *requires* an argv[1] filter:
+## Primary observation and degradation
 
-| argv[1] | Kind | Track as a session? |
-|---------|------|----------------------|
-| *(none)*, `resume`, `fork` | interactive TUI | **yes** |
-| `exec` (`e`) | headless/non-interactive | no |
-| `app-server`, `mcp-server`, `mcp`, `remote-control`, `sandbox` | server/daemon | no (the `claude daemon`/`claude mcp` analog) |
-| `login`/`logout`, `doctor`, `update`, `completion`, `apply`, `cloud`, `resume --last`-style utils, … | one-shot util | no |
+The observer's normal path is:
 
-`internal/discovery/discovery.go` **already reads `p.Args`** and already has a
-verb blocklist (`backgroundSubcommands` → `isBackgroundSubcommand`). An
-`IsCodex` predicate is the same shape, inverted to an interactive **allowlist**
-(empty verb / `resume` / `fork`) because Codex's surface is mostly non-session
-subcommands. No exe-path check is needed (Codex isn't installed under a
-distinctive dir the way Claude is under `~/.local/share/claude/`); a bare
-`comm == "codex"` + argv filter is enough, with the same "kernel masked exe →
-benefit of the doubt" tolerance.
+1. Version-check the `codex` CLI (minimum locally verified proxy capability:
+   `0.149.0`).
+2. Start only the disposable stdio proxy. Never open the private control socket
+   directly and never start or stop the shared app-server.
+3. Send `initialize` with `experimentalApi`, then `initialized`.
+4. Call `thread/read` with `includeTurns: true` for the bound root.
+5. Page `thread/list` with `ancestorThreadId`, `useStateDbOnly`, and all accepted
+   0.149 subagent source kinds. Omitting `sourceKinds` would select only the
+   interactive `cli`/`vscode` defaults and lose descendants.
+6. Apply live `thread/*`, `turn/*`, and `item/*` notifications, periodically
+   resnapshot, and fence events/results by connection generation.
 
-> Note: the `notify`/hook payload carries `client: "codex-tui"` for TUI turns,
-> which is a clean post-hoc confirmation — but it is only available at hook
-> time, not from `/proc`, so the argv[1] filter remains the discovery signal.
+Production defaults are a 10-second resnapshot interval, 15-second observation
+freshness, 5-second request timeout, reconnect backoff from 100 ms to 5 seconds
+with jitter, and retention of at most 32 recent out-of-cohort terminal nodes
+plus all ancestors required by retained/live nodes.
 
-**Verified locally:** `codex` is on `PATH` (`/usr/local/bin/codex`) and
-`~/.codex/sessions/` exists with the dated rollout layout below.
+On disconnect, the last graph is not erased immediately. Its existing
+`fresh_until` remains the authority boundary; once expired, the shared reducer
+produces unknown rather than a frozen confident status. The supervisor keeps
+reconnecting and performs a complete resnapshot before queued notifications
+become authoritative. Unknown protocol enums degrade the affected axis to
+`unknown` and emit only a rate-limited, content-free diagnostic.
 
----
+The daemon flag `-codex-observer auto|off` controls rollout. `auto` is the
+default. `off` does not construct or run the proxy, but OS discovery/navigation
+and configured Codex hook fallback remain active.
 
-## 3. Status enrichment — two paths, version-gated
+## Attention and lifecycle fidelity
 
-### 3a. Codex hooks (recent Codex — the primary path)
+App-server status is mapped onto independent neutral axes:
 
-Recent Codex (community-dated ~v0.135+, exact version unconfirmed ⚠) ships a
-**Claude-Code-style hooks system** — same vocabulary, same **stdin-JSON**
-convention, same allow/deny gating (`codex-rs/hooks/`, docs:
-developers.openai.com/codex/hooks). Event names (from `schema.rs`
-`HookEventNameWire`):
+- runtime: `notLoaded`, `idle`, `active`, `systemError` → `not_loaded`, `idle`,
+  `active`, `system_error`;
+- attention flags: `waitingOnApproval` → `approval`,
+  `waitingOnUserInput` → `user_input`;
+- collaborative lifecycle: `pendingInit`, `running`, `completed`,
+  `interrupted`, `errored`, `shutdown`, `notFound` → the corresponding neutral
+  snake-case values.
 
-`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
-`PermissionRequest`, `Stop`, plus `PreCompact`/`PostCompact`,
-`SubagentStart`/`SubagentStop`.
+Approval and user input deliberately remain distinct. Either makes the root's
+legacy summary `permission` (red), but child rows show `approval` versus `user
+input` (`question` in the compact Waybar tooltip). Terminal nodes no longer
+count as live work or waiting attention even if a partial provider payload
+still carries an old runtime/attention value.
 
-This maps almost **1:1** onto the existing `statusFromHookEvent`
-(`internal/rpc/rpc.go:354`):
+Hooks are lower-authority, partial observations. `SessionStart`/`Stop` map the
+root to idle; `UserPromptSubmit`/`PreToolUse`/`PostToolUse` map it active; and
+`PermissionRequest` maps approval, except `AskUserQuestion`, which maps user
+input. The fallback is root-only, incomplete, and fresh for 15 seconds. A fresh
+app-server observation outranks it.
 
-| Codex hook event | switchboard status |
-|------------------|--------------------|
-| `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `SubagentStart`/`Stop` | `working` |
-| `PermissionRequest` | `permission` |
-| `Stop`, `SessionStart` | `idle` |
+## Historical findings retained
 
-Why this is the big win: the hook payload's common fields are `session_id`,
-`transcript_path`, `cwd`, `hook_event_name` — **the same snake_case keys
-`cmdHook` already parses from stdin** (`cmd/switchboard-ctl/main.go:274`). The
-forwarder, the RPC `hook` command, the ancestor-walk PID resolution, and the
-status state machine are reusable with only a new event→status mapping. Wiring
-is a `~/.codex/hooks.json` (or inline `[hooks]` in `config.toml`) pointing at
-`switchboard-ctl hook <event>`, mirroring the README's Claude block.
+### Process discovery
 
-⚠ **Must verify on a live box:** (1) the hook command runs as a **child of the
-codex TUI process** so `getppid()`/the ancestor-walk resolves to the tracked
-PID; (2) `transcript_path` in the payload points at the rollout `.jsonl` (needed
-for §3c). Both are true for Claude; both are *expected* for Codex but unproven
-here (no plan to run a session). Locally, `~/.codex/config.toml` has **neither**
-`notify` nor `[hooks]` set, so nothing is wired today.
+Codex invocations share the `codex` executable name, so `comm` alone is not a
+session classifier. Switchboard uses exact executable/argv basenames and an
+interactive allowlist, accepting the TUI forms while rejecting wrappers,
+servers, and one-shot utilities such as `exec`, `app-server`, `mcp-server`,
+`mcp`, `remote-control`, and `sandbox`. Ambiguous evidence fails closed. This
+prevents helper processes from becoming duplicate root chips.
 
-### 3b. `notify` (legacy Codex — the fallback)
+The whole Navigate join remains provider-neutral:
 
-Older Codex has only `notify = ["prog", "arg"]` in `config.toml`. It fires
-**one** event type, `agent-turn-complete`, and passes the JSON payload as the
-**last argv** (not stdin), fire-and-forget (`codex-rs/hooks/src/legacy_notify.rs`).
-Payload: `{type, thread-id, turn-id, cwd, client, input-messages,
-last-assistant-message}` (kebab-case).
-
-This is a **Stop-only** signal → it can drive `idle`, nothing else. It gives no
-`working` edge (you'd re-derive that from the rollout file or a proc heuristic)
-and no `permission` edge at all. Supporting it means a tiny
-`switchboard-ctl codex-notify` shim that reads argv-JSON instead of stdin. It is
-the lowest-common-denominator, present on every Codex version.
-
-### 3c. Rollout-file self-heal (the transcript analog)
-
-Codex persists every session — including the interactive TUI — to
-`~/.codex/sessions/YYYY/MM/DD/rollout-<ISO8601>-<uuid>.jsonl`
-(`codex-rs/rollout/src/recorder.rs`). **Verified locally**: the path layout and
-the line shape match exactly. Every line is three keys:
-
-```
-{"timestamp":"<RFC3339 ms>","type":"<record_type>","payload":{ ... }}
+```text
+root PID -> controlling tty -> terminal pane -> window target
 ```
 
-with top-level `type` ∈ `session_meta`, `response_item`, `event_msg`,
-`turn_context`, `compacted`, `inter_agent_communication`. This is a **different
-schema** from Claude's (`message.role` + content blocks); the existing
-`internal/transcript` parser cannot read it. But the *abstractions* port:
+Child threads do not participate in that join.
 
-| `internal/transcript` concept | Claude signal | Codex rollout signal |
-|-------------------------------|---------------|----------------------|
-| `NewestSignal` → activity | newest assistant/user entry | `event_msg`/`task_started`, `response_item`/`message` role=assistant |
-| `NewestSignal` → interrupt | `[Request interrupted by user]` text | `event_msg`/`task_complete`; `event_msg`/`turn_aborted` reason=`interrupted` |
-| `ResolutionState` (permission cleared) | assistant msg / interrupt after prompt | **not recordable — see §4** |
+### Rollout files
 
-Good news: idle↔working self-heal is **more reliable** for Codex than for
-Claude. Codex writes *explicit, persisted* turn boundaries — `task_started`,
-`task_complete`, `turn_aborted{reason}` (`rollout/src/policy.rs` allows these) —
-where Claude forces a heuristic over a free-text interrupt marker. A
-Codex-aware parser behind the same interface is arguably simpler.
+Codex rollouts remain useful degraded evidence and forensic input. The observed
+layout is `~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<uuid>.jsonl`, with
+records shaped as `timestamp`, `type`, and `payload`. Explicit turn boundaries
+can support working/idle recovery.
 
-The cleanest refactor: lift `internal/transcript` to an interface
-(`SessionLog` with `NewestSignal`/`ResolutionState`) and add a `codexrollout`
-implementation selected by the session's agent kind. The self-heal call sites in
-`cmd/switchboard/main.go` (`selfHealStuckStatus`, `selfHealStaleAttention`)
-dispatch on kind.
+The important limitation also remains true: the rollout does not provide a
+reliable passive distinction between a command still executing and one blocked
+on approval. The original investigation therefore correctly rejected rollout
+tailing as the primary source for approval state. In the shipped design this is
+no longer a product limitation because live app-server status carries distinct
+approval and user-input flags; rollout is degraded evidence only.
 
----
+### Hooks and legacy `notify`
 
-## 4. The hard constraint: `permission` is not passively observable on Codex
+The original investigation correctly found that hooks deliver lifecycle events
+as stdin JSON and that legacy `notify` is too narrow for a full state machine.
+It was wrong to promote hooks to primary truth. Hooks are edge-triggered,
+root-biased, and cannot snapshot already-running descendants after a missed
+event or daemon restart. They now serve exact identity and fallback enrichment.
 
-This is the single most important finding and it shapes the whole design.
+Legacy `notify` remains unimplemented. Its turn-complete signal cannot provide
+the graph, parentage, or wait-reason fidelity that app-server provides.
 
-Codex's `should_persist_event_msg` (`codex-rs/rollout/src/policy.rs`)
-**deliberately drops** every approval-related event from the on-disk rollout:
-`ExecApprovalRequest`, `ApplyPatchApprovalRequest`, `RequestPermissions`,
-`RequestUserInput`, `ElicitationRequest` — and the user's decision
-(`ReviewDecision`) is consumed in-memory, never written. So while a Codex
-session sits blocked on "approve this command?", the rollout tail shows a
-`function_call` with no `function_call_output` yet — **byte-for-byte identical
-to a command that is simply still running.** You cannot tell "blocked on the
-user" from "busy" from the file.
+### State schema choice
 
-Contrast Claude Code, where the transcript records enough that
-`transcript.ResolutionState` can recover the permission state with no live hook
-(this is exactly what `selfHealStaleAttention` exploits). Codex has no such
-fallback. Consequences:
+The earlier A/B choice between only parallel `claude`/`codex` blocks and a
+replacement neutral block has been resolved additively:
 
-- **With hooks (3a):** `permission` works fully — `PermissionRequest` sets it
-  live. But its *clearing* can't be confirmed from the rollout file. Resolution
-  must be inferred from a **subsequent `task_complete` / new assistant message /
-  `turn_aborted` after the prompt** (feasible, just a different rule), or fall
-  back to the TTL backstop (`permissionDecayTTL`) that already exists.
-- **Without hooks (notify-only / old Codex):** there is **no** `permission`
-  signal at all for a passively-discovered session. The chip can only ever show
-  `working`/`idle`. This must be documented as a tier limit, not a bug.
+- `agent` plus the existing `claude`/`codex` `AgentInfo` blocks preserve legacy
+  consumers and summary status.
+- `agent_graph` adds the provider-neutral structured root/child view.
 
-The richer live protocols (`app-server` `thread/status/changed` with
-`waitingOnApproval`; `codex mcp` `elicitation/create`; `exec --json`) all expose
-approval state cleanly — but **every one requires owning/launching the codex
-process.** None is a side-channel into a user-started interactive TUI. They are
-irrelevant to a `/proc`-discovery monitor and should be explicitly ruled out.
+No legacy wire key was renamed. Renderers prefer existing enrichment status
+when present and otherwise the graph summary; child detail always comes from
+the graph.
 
-**Observability matrix (passive monitor, session discovered via `/proc`):**
+## Diagnostics and privacy boundary
 
-| Signal | Hooks (recent) | notify (legacy) | rollout tail | app-server/mcp/exec |
-|--------|:--:|:--:|:--:|:--:|
-| working | ✅ | ➖ (infer) | ✅ (`task_started`) | ✅ but owns proc |
-| idle / turn-complete | ✅ | ✅ | ✅ (`task_complete`/`turn_aborted`) | ✅ but owns proc |
-| **permission / waiting-on-approval** | ✅ live only | ❌ | ❌ **dropped from file** | ✅ but owns proc |
-| interrupt | ✅ | ❌ | ✅ (`turn_aborted` reason=`interrupted`) | ✅ but owns proc |
+`switchboard-ctl diagnose --observer` combines the persisted snapshot with
+finite-label observer journal records. It reports binding presence, graph
+source, freshness, complete/partial state, live/wait/error counts, observer
+mode, and Claude shadow agreement. It intentionally excludes cwd, transcript
+paths, names, roles, descriptions, prompts, commands, tool input, raw protocol
+payloads, and OS error text.
 
----
+The history sink has a separate opt-in privacy contract. Canonical
+`agent_state` events retain opaque thread ids and all three state axes at the
+minimal tier, while nickname/role/cwd/description are scrubbed.
 
-## 5. State-schema decision
+## Remaining boundaries
 
-`state.json` is a frozen public contract (`docs/state-schema.md`), and the
-`claude` block (`status`, `session_id`, `transcript`) is agent-specific. Two
-ways to carry Codex status:
+- The proxy integration depends on the locally verified CLI capability and may
+  need revision if Codex changes or publicly specifies that surface.
+- Non-Linux process-environment binding needs an injected platform reader or a
+  trusted `SessionStart` hook.
+- Rollout/SQLite captures are characterization evidence, not stable OpenAI
+  APIs. Implementation protocol fixtures are generated from version-specific
+  app-server schemas and are preferred over guessing undocumented fields.
+- Child threads remain display/history detail. Making one independently
+  focusable would require a separate product and terminal-target contract.
 
-- **(A) Additive `codex` block** — mirror `claude` with a parallel optional
-  block; renderers gain an `agentStatus(s)` helper that reads whichever is
-  present. **Non-breaking** (additive optional fields are explicitly allowed by
-  the versioning rules). Downside: two near-identical blocks; a `kind` is
-  implicit in which block exists.
-- **(B) Neutral `agent` block** — `{ "kind": "claude"|"codex", "status": …,
-  "session_id": …, "transcript": … }`, with `claude` retained as a deprecated
-  alias for one version. Cleaner long-term, models multi-agent directly, but
-  touches the golden fixture and the contract doc (a deliberate, reviewed
-  change).
+## Source map
 
-Recommendation: **(B)**, because the moment there's a second agent the right
-model is "a session has *an* agent," not "a session has a claude *and* a codex."
-But (A) ships faster with zero contract risk. This is a genuine call for the
-maintainer — see Open Questions.
-
-Either way the renderers (`cmd/claude-tui/main.go:223`,
-`cmd/switchboard-waybar/main.go:121`) need one new helper; the status *values*
-(`working`/`idle`/`permission`) and their colors are unchanged. Consider a
-fourth value `waiting-input` for Codex's `RequestUserInput` (distinct from a
-command approval) — optional polish.
-
----
-
-## 6. Proposed work breakdown
-
-Phased to match the project's existing style; effort is rough, risk is the
-honest part.
-
-| Phase | Work | Effort | Risk |
-|-------|------|--------|------|
-| **C-1 Discovery** | `IsCodex` predicate (comm + argv[1] allowlist); tag session with agent kind; conformance fixtures for codex argv shapes | S | Low — mirrors `IsClaude`, well-tested seam |
-| **C-2 Schema** | Decide (A)/(B); add the block + `kind`; update golden + `state-schema.md`; `agentStatus` helper in both renderers | S–M | Low–Med — touches the frozen contract (gated, reviewed) |
-| **C-3 Hooks** | Codex event→status map; confirm `cmdHook` getppid model on a live session; ship a `~/.codex/hooks.json` recipe in README | S | **Med — needs a live Codex box to verify** ⚠ |
-| **C-4 Rollout self-heal** | `SessionLog` interface; `codexrollout` parser (`task_started`/`task_complete`/`turn_aborted`); dispatch self-heal by kind; Codex permission-resolution rule (no file fallback) | M | Med — new parser, but explicit turn records make it cleaner than Claude's |
-| **C-5 notify fallback** *(optional)* | `switchboard-ctl codex-notify` argv-JSON shim → idle edge for legacy Codex | S | Low — but idle-only, no permission |
-| **C-6 Docs/polish** | README Codex section; capability/limitation note on the permission gap; optional `waiting-input` status | S | Low |
-
-Sequencing: C-1 → C-2 unlock everything; C-3 is the high-value path and the one
-true unknown (live verification); C-4 backstops C-3 and is the only path on
-notify-only Codex; C-5/C-6 are polish.
-
-The reusable surface is large: the entire Navigate stack, the daemon core, the
-RPC hook command, the forwarder, and the self-heal *scaffolding* are kept. The
-genuinely new code is one predicate, one schema block, one event map, and one
-rollout parser.
-
----
-
-## 7. Open questions (need a live Codex session — blocked here, no plan)
-
-1. **Hook process parentage** — does `switchboard-ctl hook` run as a child of
-   the codex TUI PID (so `getppid()`/ancestor-walk resolves)? (Expected; the
-   load-bearing assumption of C-3.)
-2. **`transcript_path` target** — does the hook payload's `transcript_path`
-   point at the `~/.codex/sessions/**/rollout-*.jsonl`? (Needed to wire C-4 to
-   C-3.)
-3. **Hook availability floor** — exact minimum Codex version with the hooks
-   system, to gate C-3 vs the C-5 notify fallback.
-4. **Permission-clear rule** — confirm that a `task_complete` / assistant
-   message reliably follows an approved-and-run command in the rollout, so C-4
-   can clear a `permission` chip without a live decision event.
-5. **Schema choice (A) vs (B)** — maintainer call on the public contract.
-6. **`exec`/headless sessions** — out of scope (not interactive TUIs), but
-   confirm none should surface as chips.
-
-## 8. Recommendation
-
-Build **C-1 → C-2 → C-3 → C-4**, with **(B)** the neutral `agent` block, gating
-`permission` honestly: full fidelity on hooks-capable Codex, and an explicit
-"Codex (no hooks): working/idle only — approval state not observable" capability
-note otherwise. Skip the live-protocol routes (app-server/mcp/exec) entirely —
-they require owning the process and don't serve a discovery monitor. Treat the
-permission-observability gap (§4) as a documented tier boundary, exactly how the
-project already documents Observe-vs-Navigate degradation.
-
-The headline for a maintainer: **~80% of a Codex indicator already exists and is
-agent-neutral; the new work is one discovery predicate, one schema block, one
-hook map, and one rollout parser — and the only real risk is that the highest-
-value signal (`permission`) depends on Codex's recent hooks system and on a live
-verification this machine can't perform.**
-
----
-
-### Source pointers
-
-- Process model: `codex-rs/cli/Cargo.toml`; CLI reference — developers.openai.com/codex/cli/reference
-- Hooks: `codex-rs/hooks/src/schema.rs`, `legacy_notify.rs`; developers.openai.com/codex/hooks, /config-advanced
-- Rollout schema + filter: `codex-rs/rollout/src/{recorder,policy}.rs`, `codex-rs/protocol/src/protocol.rs`
-- Live protocols (ruled out): `codex-rs/app-server-protocol/src/protocol/v2/thread.rs` (`ThreadStatus`/`ThreadActiveFlag`), `codex-rs/exec/src/exec_events.rs`, `codex-rs/mcp-server/src/`
-- Local corroboration: `~/.codex/config.toml`, `~/.codex/sessions/2026/**/rollout-*.jsonl`
+- Public protocol: [OpenAI Codex app-server](https://learn.chatgpt.com/docs/app-server)
+- Public lifecycle configuration: [OpenAI Codex hooks](https://learn.chatgpt.com/docs/hooks)
+- Public child-thread model: [OpenAI Codex subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents)
+- Sanitized local evidence: [`evidence-report.md`](codex-session-status/evidence-report.md)
+- Observer: `internal/provider/codex/`
+- Neutral contract: `internal/agentgraph/`
+- Daemon authority/freshness: `cmd/switchboard/agent_observation.go`
+- Wire projection: `internal/state/agent_graph.go`

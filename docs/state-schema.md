@@ -63,8 +63,8 @@ should key on `pid`.
 
 The session record. Five fields are always present; `suspended` and `headless`
 appear only when true; the two `mem_*` fields appear only when a reading
-succeeded; three nested blocks are optional and omitted entirely when their
-data has not been resolved yet.
+succeeded; the backend/enrichment blocks are optional and omitted entirely when
+their data has not been resolved yet.
 
 ```jsonc
 {
@@ -81,14 +81,15 @@ data has not been resolved yet.
   "wezterm":  { /* WeztermInfo, optional */ },
   "hyprland": { /* HyprlandInfo, optional */ },
   "claude":   { /* AgentInfo, optional — present for a claude session */ },
-  "codex":    { /* AgentInfo, optional — present for a codex session */ }
+  "codex":    { /* AgentInfo, optional — present for a codex session */ },
+  "agent_graph": { /* AgentGraph, optional — root + nested child threads */ }
 }
 ```
 
 | Field | JSON type | Presence | Stability | Meaning |
 |-------|-----------|----------|-----------|---------|
-| `pid` | integer | always | **stable key** | OS process id of the `claude` process. The primary identity of a session. Unique within a snapshot. |
-| `cwd` | string | always | stable | Working directory of the Claude process. May be `""` if the kernel masked it. Resolved from `/proc/<pid>/cwd`, falling back to the terminal pane's reported cwd. |
+| `pid` | integer | always | **stable key** | OS process id of the interactive Claude or Codex root. The primary identity of a switchable session. Unique within a snapshot. Child graph nodes do not get separate `Session` records or PIDs. |
+| `cwd` | string | always | stable | Working directory of the coding-agent root process. May be `""` if the kernel masked it. Resolved from `/proc/<pid>/cwd`, falling back to the terminal pane's reported cwd. It is never used to bind a provider thread. |
 | `tty` | string | always | stable | Controlling pseudo-terminal, e.g. `/dev/pts/3`. **OS-specific literal** (macOS will report `/dev/ttysNNN`); consumers should treat it as an opaque join key, never parse the prefix. May be `""` for a non-tty-attached process — such a session cannot be mapped to a terminal/window (Observe-only). |
 | `started_at` | RFC 3339 timestamp | always | stable | When Switchboard first observed the session (wall clock at discovery), **not** the process's real start time. |
 | `focused` | boolean | always | stable | Whether this session's window is the active window in the WM. Best-effort; `false` for any session without a resolved WM address. |
@@ -99,8 +100,9 @@ data has not been resolved yet.
 | `mem_tree_bytes` | integer | omitted when unmeasured | additive | Same measure summed over the agent process **and every descendant** — the session's whole process tree. Subagents have no PIDs of their own, so the tree is the only unit that captures spawned work. Subtract `mem_agent_bytes` to get what the session's children cost. Same units, cadence, and absence semantics as above. |
 | `wezterm` | object \| absent | optional | provisional | Terminal-locator data. Present once the tty is matched to a **wezterm** pane. Other terminal backends (e.g. tmux) do **not** populate it — those sessions are still observed via `/proc`, and focus re-locates the pane by tty at request time. Field set is terminal-backend-specific and may generalize when the seam grows a neutral terminal block. |
 | `hyprland` | object \| absent | optional | provisional | Window-manager data. Present once the pane is matched to a WM window. WM-backend-specific; will generalize behind a neutral window block as other WM backends land. |
-| `claude` | object \| absent | optional | stable | Claude-side enrichment fed by Claude Code hooks. Present once at least one hook fires for a **claude** session. Shape is `AgentInfo` (below). |
-| `codex` | object \| absent | optional | additive | Codex-side enrichment fed by Codex hooks. Present once at least one hook fires for a **codex** session. Same `AgentInfo` shape as `claude`. A session populates exactly one of `claude`/`codex`, matching `agent`. |
+| `claude` | object \| absent | optional | stable | Claude compatibility enrichment fed by the Claude provider adapter. Shape is `AgentInfo` (below). |
+| `codex` | object \| absent | optional | additive | Codex compatibility enrichment projected from the authoritative graph or a hook fallback. Same `AgentInfo` shape as `claude`. A session populates exactly one of `claude`/`codex`, matching `agent`. |
+| `agent_graph` | object \| absent | optional | additive | Provider-neutral, bounded current view of the root thread and nested child threads. Present after a valid provider observation or restored last-known projection. Child nodes are display/history detail only and are never navigation sessions. See `AgentGraph` below. |
 
 ### `wezterm` (`WeztermInfo`) — provisional
 
@@ -130,23 +132,26 @@ fields always present when the block exists.
 
 ### `claude` / `codex` (`AgentInfo`) — claude stable, codex additive
 
-The per-agent enrichment block. A session populates exactly one, under the key
-matching its `agent`. Both share one shape (`AgentInfo`) and appear once that
-agent's first hook fires. Renderers read whichever is present.
+The legacy per-agent enrichment block. A session populates exactly one, under
+the key matching its `agent`. Both share one shape (`AgentInfo`). Hooks can
+populate it, and `SetAgentGraph` also projects the graph root id and reduced
+legacy status into it so old consumers keep working. Renderers read whichever
+is present.
 
 | Field | JSON type | Presence | Meaning |
 |-------|-----------|----------|---------|
-| `session_id` | string | omitted when empty | Agent session UUID, supplied by hooks (Claude Code's session id; Codex's thread/conversation id). **Write-once**: set on the first hook that carries it and never overwritten. |
+| `session_id` | string | omitted when empty | Provider root id (Claude session id or Codex thread id), supplied by exact provider evidence and/or hooks. It may change when a live root process starts a new provider session; consumers key navigation on the enclosing `Session.pid`, not this field alone. |
 | `transcript` | string | omitted when empty | Path to the session transcript when known: Claude Code's project `.jsonl`, or Codex's `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. |
 | `status_since` | RFC 3339 timestamp \| absent | optional | When `status` last transitioned to its current value — the wire projection of the daemon's in-memory `StatusSince`, stamped onto the snapshot. Renderers compute the hover duration (`idle · 3m`, `permission · 45s`) as `now - status_since`. **Omitted** (never `null`/zero) until the first status edge stamps it; absent on a block that only carries `session_id`/`transcript`. Additive (Phase: usage-history); consumers tolerate its absence. Formatted identically to `started_at`. |
-| `status` | string | always (when block present) | Session activity. One of: `working`, `idle`, `permission`, `delegating`. `delegating` is daemon-derived (added with the status-color state-model work): an idle main thread with subagents still in flight — it renders the **same green as `working`** ("work is happening, no action needed"). Consumers that do not know it MUST treat it as `working`, never as attention-worthy. ⚠ The doc-comment also lists `unknown`, but the daemon **never emits it** — tolerate an unrecognized value defensively. May be `""` before the first status-bearing hook. |
+| `status` | string | always (when block present) | Legacy root-chip activity. One of: `working`, `idle`, `permission`, `delegating`; `""` means no fresh authoritative reduction. `delegating` is an idle root with live descendant work and renders the **same green as `working`**. `permission` folds both approval and user-input waits; use `agent_graph.summary`/nodes when that distinction matters. Consumers must tolerate unknown future strings. |
 | `in_flight_subagents` | number | omitted when 0 | How many subagent `Task`s the main thread has launched but not yet collected, recomputed each reconcile tick from the transcript tail. It is the signal behind a `delegating` chip; renderers show it as "N agents" in the tooltip, and `switchboard-ctl list --json` exposes it so a green chip's true state (genuinely working vs delegating) is visible. Claude-only. |
 | `pending_writers` | array of string | omitted when empty | Which **writers** are currently blocked on a permission prompt. A session is not one thread but 1 + N concurrent writers — the main thread plus each in-flight subagent — that share a pid and a chip, write to different files, and can each block independently. Each element is a bare subagent `agent_id` (the `<id>` stem of `<session>/subagents/agent-<id>.jsonl`), or the literal **`"main"`** for the main thread. **Sorted ascending**, so a renderer can diff two snapshots directly. A non-empty array means the chip is `permission`; a renderer may name the blocked teammate from it. Claude-only. Additive; consumers tolerate its absence. |
 
-#### `status` value mapping
+#### Legacy hook fallback mapping
 
-`status` is derived from the hook `event` that last fired. The two agents share
-most of the vocabulary; Codex additionally maps `PreToolUse`:
+Claude compatibility still consumes its hook/transcript state machine. Codex
+uses app-server as primary truth; only its lower-authority, 15-second partial
+fallback maps hook events directly. The event mapping is:
 
 | Hook event | `claude` status | `codex` status |
 |------------|-----------------|----------------|
@@ -157,11 +162,11 @@ most of the vocabulary; Codex additionally maps `PreToolUse`:
 | `Stop`, `SessionStart` | `idle` | `idle` |
 | (any other / unknown) | unchanged | unchanged |
 
-⚠ Codex caveat: Codex does **not** record approval requests in its on-disk
-rollout, so the `permission` status is recoverable only from a live
-`PermissionRequest` hook — there is no transcript-tail self-heal for it (see the
-`permission` self-heal below, which is Claude-only today). A Codex session with
-no hooks configured shows only `working`/`idle`.
+For Codex, `PermissionRequest` with tool `AskUserQuestion` becomes structured
+attention `user_input`; other permission requests become `approval`. Either
+reduces to legacy `permission`. A fresh app-server graph outranks the hook
+fallback, so missed hook edges cannot overwrite a current complete snapshot.
+Rollout files alone still cannot recover approval state, but app-server can.
 
 ##### `permission` self-heal (reconciler)
 
@@ -274,6 +279,249 @@ relevant lines, names the `statustune.Tuning` knob behind each, and reports the
 RED-episode durations — so a wrong-color complaint maps directly to the field to
 change. (Grepping the prefix by hand still works.)
 
+## `agent_graph` (`AgentGraph`) — additive neutral contract
+
+`agent_graph` is a bounded current-session view attached to one switchable root
+`Session`. It is not a list of additional sessions and it is not durable
+history. The enclosing session owns the PID, tty, cwd, focus target, and
+navigation actions; graph child nodes own only provider thread state and display
+metadata.
+
+### Graph fields
+
+| Field | JSON type | Presence | Meaning |
+|-------|-----------|----------|---------|
+| `root_id` | string | always | Stable provider id of the root node. Exactly one element of `nodes` has this id and that node has no `parent_id`. |
+| `source` | string | omitted when empty | Evidence source: `codex_app_server`, `hook`, `claude_transcript`, `codex_rollout`, `restored_last_known`, or absent/unknown. Source precedence is daemon policy, not a confidence score consumers should recompute. |
+| `observed_at` | RFC 3339 timestamp | omitted when unknown | Start of the observation's authority interval. |
+| `fresh_until` | RFC 3339 timestamp | omitted when unknown | Exclusive end of the authority interval. A graph is fresh only when `observed_at <= now < fresh_until`. |
+| `complete` | boolean | always | `true` means omission is authoritative for that observation; `false` means a partial view. Completeness does not imply freshness and freshness does not imply completeness. |
+| `summary` | object | always | Shared root-chip reduction described below. |
+| `nodes` | array | always | Root and descendants in deterministic root-first depth-first preorder. May contain retained terminal nodes. |
+
+Known `source` values are additive. Consumers must tolerate an absent or
+unrecognized value and should still use the explicit freshness timestamps.
+
+### `summary` (`AgentGraphSummary`)
+
+| Field | JSON type | Always present | Meaning |
+|-------|-----------|----------------|---------|
+| `runtime` | string | yes | Root runtime: `unknown`, `not_loaded`, `idle`, `active`, or `system_error`. Becomes `unknown` when the observation is not fresh or invalid. |
+| `attention` | string | yes | Folded wait reason: `none`, `approval`, or `user_input`. If both wait kinds exist, `approval` wins only in this compact field; the two counts below preserve both. |
+| `status` | string | yes | Legacy root-chip value: `working`, `idle`, `permission`, `delegating`, or `""` when no fresh rule produces a confident status. |
+| `live_children` | integer | yes | Non-terminal descendants. Terminal means lifecycle `completed`, `interrupted`, `errored`, `shutdown`, or `not_found`. |
+| `waiting_nodes` | integer | yes | Live root/descendant nodes waiting for either approval or user input. Equals `approval_nodes + user_input_nodes`. |
+| `approval_nodes` | integer | yes | Live nodes whose attention is `approval`. |
+| `user_input_nodes` | integer | yes | Live nodes whose attention is `user_input`. |
+| `error_nodes` | integer | yes | Nodes with runtime `system_error` or lifecycle `errored`; unlike live/wait counts this includes retained terminal evidence. |
+| `since` | RFC 3339 timestamp | omitted when unknown | When this complete derived tuple last changed. Count-only changes move it even when `status` stays the same. The legacy `AgentInfo.status_since` moves only when legacy `status` changes. |
+
+The reducer is source-neutral. Given a fresh valid graph it applies, in order:
+
+1. any live approval/user-input wait → `permission`;
+2. active root → `working`;
+3. root `system_error` → empty/unknown legacy status (error remains explicit);
+4. any live descendant active/pending/running → `delegating`;
+5. idle root → `idle`;
+6. otherwise empty/unknown.
+
+An expired graph keeps `root_id`, `source`, `complete`, and its normalized node
+structure for stale display, but its summary is no longer authoritative:
+`runtime=unknown`, `attention=none`, empty `status`, and zero live/wait/error
+counts. Renderers grey the child detail and label it stale.
+
+### `nodes[]` (`AgentNode`)
+
+| Field | JSON type | Presence | Meaning |
+|-------|-----------|----------|---------|
+| `id` | string | always | Stable provider thread/node id; unique within this graph. |
+| `parent_id` | string | omitted on root | Immediate parent id. Every child has an explicit chain to `root_id`. |
+| `nickname` | string | omitted when empty | Provider display nickname. Optional and potentially user/content-derived. |
+| `role` | string | omitted when empty | Provider agent role/type. |
+| `description` | string | omitted when empty | Optional task description. Renderers do not require it. |
+| `runtime` | string | always | `unknown`, `not_loaded`, `idle`, `active`, or `system_error`. |
+| `attention` | string | always | `none`, `approval`, or `user_input`. Independent of runtime and lifecycle. |
+| `lifecycle` | string | always | `unknown`, `pending`, `running`, `completed`, `interrupted`, `errored`, `shutdown`, or `not_found`. |
+| `started_at` | RFC 3339 timestamp | omitted when unknown | Provider-reported node start time. |
+| `updated_at` | RFC 3339 timestamp | omitted when unknown | Best provider transition/update time. |
+| `completed_at` | RFC 3339 timestamp | omitted when unknown | Terminal completion time when available. |
+| `usage` | object | omitted when wholly unmeasured | Optional token accounting; absence means unavailable, not measured zero. |
+
+`usage`, when present, can contain `input_tokens`, `cached_input_tokens`,
+`cache_write_input_tokens`, `output_tokens`, `reasoning_output_tokens`,
+`total_tokens`, and `model_context_window`. Each is an integer omitted when
+zero. Status reduction never depends on usage.
+
+Axis strings are designed for additive evolution. A consumer must treat an
+unrecognized future runtime/lifecycle as unknown and an unrecognized attention
+value as no actionable reason unless a newer contract says otherwise; it must
+not crash or silently turn a future value red. The current daemon canonicalizes
+empty/unrecognized provider values to `unknown`/`none` before emitting state.
+
+### Ordering, authority, and legacy projection
+
+The daemon validates each graph and emits nodes in deterministic root-first DFS
+preorder. Siblings sort lexicographically by `nickname`, then `role`, then `id`.
+Consumers may preserve that order directly; it is stable for equal input but is
+not an identity key.
+
+For partial observations (`complete=false`), a missing node is not a deletion.
+Canonical history retains prior nodes until complete evidence removes them. For
+complete observations, a previously known omitted node transitions to
+`not_found`. Provider adapters may retain a bounded terminal cohort for current
+display, so `nodes` is not an unbounded archive.
+
+Applying a graph updates only these legacy compatibility values:
+
+- the matching `claude.session_id` or `codex.session_id` becomes `root_id`;
+- its `status` becomes `summary.status`;
+- its `status_since` moves when that legacy status changes.
+
+Claude-only `in_flight_subagents`, workflows, pending writers, transcript, and
+other compatibility fields remain owned by the Claude adapter. Existing
+consumers can continue reading `.claude.status // .codex.status`; new consumers
+should read the graph when they need parentage or distinct wait reasons.
+
+### Agent-graph examples
+
+These are complete `Snapshot` values and round-trip through the merged Go state
+types. Timestamps are illustrative; freshness is evaluated against the reader's
+current time, not `updated_at`.
+
+**Root only, no provider graph yet.** The session is discoverable and
+switchable, but its status is unknown.
+
+```json
+{
+  "sessions": [{
+    "pid": 4100,
+    "cwd": "/work/root-only",
+    "tty": "/dev/pts/4",
+    "started_at": "2026-08-21T16:00:00Z",
+    "focused": false,
+    "agent": "codex"
+  }],
+  "updated_at": "2026-08-21T16:00:01Z"
+}
+```
+
+**Codex tree.** The waiting child makes the legacy root summary red while
+preserving `user_input` as the exact reason.
+
+```json
+{
+  "sessions": [{
+    "pid": 4200,
+    "cwd": "/work/codex-tree",
+    "tty": "/dev/pts/5",
+    "started_at": "2026-08-21T16:00:00Z",
+    "focused": true,
+    "agent": "codex",
+    "codex": {"session_id": "codex-root", "status": "permission", "status_since": "2026-08-21T16:00:10Z"},
+    "agent_graph": {
+      "root_id": "codex-root",
+      "source": "codex_app_server",
+      "observed_at": "2026-08-21T16:00:10Z",
+      "fresh_until": "2026-08-21T16:00:25Z",
+      "complete": true,
+      "summary": {"runtime": "idle", "attention": "user_input", "status": "permission", "live_children": 1, "waiting_nodes": 1, "approval_nodes": 0, "user_input_nodes": 1, "error_nodes": 0, "since": "2026-08-21T16:00:10Z"},
+      "nodes": [
+        {"id": "codex-root", "runtime": "idle", "attention": "none", "lifecycle": "running", "started_at": "2026-08-21T16:00:00Z", "updated_at": "2026-08-21T16:00:10Z"},
+        {"id": "child-question", "parent_id": "codex-root", "nickname": "metadata", "role": "explorer", "runtime": "idle", "attention": "user_input", "lifecycle": "running", "started_at": "2026-08-21T16:00:05Z", "updated_at": "2026-08-21T16:00:10Z", "usage": {"total_tokens": 42}}
+      ]
+    }
+  }],
+  "updated_at": "2026-08-21T16:00:10Z"
+}
+```
+
+**Claude tree with compatibility fields.** The neutral graph is additive; the
+legacy Claude fanout projection remains intact.
+
+```json
+{
+  "sessions": [{
+    "pid": 4300,
+    "cwd": "/work/claude-tree",
+    "tty": "/dev/pts/6",
+    "started_at": "2026-08-21T16:01:00Z",
+    "focused": false,
+    "agent": "claude",
+    "claude": {"session_id": "claude-root", "status": "delegating", "status_since": "2026-08-21T16:01:05Z", "in_flight_subagents": 1},
+    "agent_graph": {
+      "root_id": "claude-root",
+      "source": "claude_transcript",
+      "observed_at": "2026-08-21T16:01:10Z",
+      "fresh_until": "2026-08-21T16:01:25Z",
+      "complete": true,
+      "summary": {"runtime": "idle", "attention": "none", "status": "delegating", "live_children": 1, "waiting_nodes": 0, "approval_nodes": 0, "user_input_nodes": 0, "error_nodes": 0, "since": "2026-08-21T16:01:05Z"},
+      "nodes": [
+        {"id": "claude-root", "runtime": "idle", "attention": "none", "lifecycle": "running"},
+        {"id": "worker-a", "parent_id": "claude-root", "role": "Explore", "runtime": "active", "attention": "none", "lifecycle": "running"}
+      ]
+    }
+  }],
+  "updated_at": "2026-08-21T16:01:10Z"
+}
+```
+
+**Stale/disconnected.** Structure and its prior node axes remain available for
+grey stale detail, but the summary is explicitly non-authoritative.
+
+```json
+{
+  "sessions": [{
+    "pid": 4400,
+    "cwd": "/work/disconnected",
+    "tty": "/dev/pts/7",
+    "started_at": "2026-08-21T15:59:00Z",
+    "focused": false,
+    "agent": "codex",
+    "codex": {"session_id": "stale-root", "status": ""},
+    "agent_graph": {
+      "root_id": "stale-root",
+      "source": "codex_app_server",
+      "observed_at": "2026-08-21T16:00:00Z",
+      "fresh_until": "2026-08-21T16:00:15Z",
+      "complete": true,
+      "summary": {"runtime": "unknown", "attention": "none", "status": "", "live_children": 0, "waiting_nodes": 0, "approval_nodes": 0, "user_input_nodes": 0, "error_nodes": 0, "since": "2026-08-21T16:00:15Z"},
+      "nodes": [
+        {"id": "stale-root", "runtime": "idle", "attention": "none", "lifecycle": "running"},
+        {"id": "old-child", "parent_id": "stale-root", "runtime": "idle", "attention": "none", "lifecycle": "completed", "completed_at": "2026-08-21T16:00:10Z"}
+      ]
+    }
+  }],
+  "updated_at": "2026-08-21T16:00:15Z"
+}
+```
+
+**Fresh but unknown.** This differs from disconnection: the provider recently
+reported a node whose state it could not map.
+
+```json
+{
+  "sessions": [{
+    "pid": 4500,
+    "cwd": "/work/unknown",
+    "tty": "/dev/pts/8",
+    "started_at": "2026-08-21T16:02:00Z",
+    "focused": false,
+    "agent": "codex",
+    "codex": {"session_id": "unknown-root", "status": ""},
+    "agent_graph": {
+      "root_id": "unknown-root",
+      "source": "hook",
+      "observed_at": "2026-08-21T16:02:10Z",
+      "fresh_until": "2026-08-21T16:02:25Z",
+      "complete": false,
+      "summary": {"runtime": "unknown", "attention": "none", "status": "", "live_children": 0, "waiting_nodes": 0, "approval_nodes": 0, "user_input_nodes": 0, "error_nodes": 0, "since": "2026-08-21T16:02:10Z"},
+      "nodes": [{"id": "unknown-root", "runtime": "unknown", "attention": "none", "lifecycle": "running"}]
+    }
+  }],
+  "updated_at": "2026-08-21T16:02:10Z"
+}
+```
+
 ## The `capabilities` block (Phase 1.4)
 
 Emitted since Phase 1.4. A top-level `capabilities` object reports the detected
@@ -360,7 +608,7 @@ re-locates the pane by `tty` at request time.
   retained or aliased. Treat `hyprland.address` as an opaque ref.
 - **Additive changes** (new optional fields like `status_since`,
   `pending_writers`, the `capabilities` block, the `agent` discriminator and the
-  `codex` enrichment block) are **not** breaking;
+  `codex` enrichment block, and `agent_graph`) are **not** breaking;
   consumers must ignore unknown fields and tolerate missing optional fields. The
   `claude` block is unchanged — a consumer reading `.claude.status` keeps working;
   to be agent-aware, read `.codex.status` too (e.g. `.claude.status // .codex.status`).
@@ -369,7 +617,10 @@ re-locates the pane by `tty` at request time.
 - **Empty vs. absent:** always-present string fields use `""` for "unknown";
   optional blocks are **omitted** entirely (never `null`) when unresolved.
   `claude.session_id`/`transcript` are omitted when empty; `claude.status` is
-  present-but-`""` before the first status hook.
+  present-but-`""` before the first authoritative status. `agent_graph` is
+  omitted until a valid/restored graph exists; once present, its
+  `complete`/`summary`/`nodes` fields are always emitted even when false, empty,
+  or unknown.
 - The golden fixture is the tripwire: any change to field name, order, type, or
   omitempty behavior breaks `TestStateGoldenRoundTrips`, forcing a deliberate
   `UPDATE_GOLDEN=1` regen and a review of this document. **Adding an optional
