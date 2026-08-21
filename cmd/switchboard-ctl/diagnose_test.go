@@ -243,3 +243,24 @@ func TestParseObserverLogRecordsIsStrictAndContentFree(t *testing.T) {
 		t.Fatalf("diagnostic retained raw content: %s", b)
 	}
 }
+
+func TestObserverRolloutCategoriesSetModeWithoutClaimingConnection(t *testing.T) {
+	diagnostics := []observerDiagnostic{{
+		Provider: "codex", ObserverMode: "not_reported",
+		ObserverConnection: "not_reported", LastErrorCategory: "not_reported",
+	}}
+	records := parseObserverLogRecords([]string{
+		`2026-08-21T18:00:01+0000 host switchboard[9]: agent-observer: provider=codex category=observer_enabled count=1`,
+		`2026-08-21T18:00:02+0000 host switchboard[9]: agent-observer: provider=codex category=observer_disabled count=1`,
+	})
+	if len(records) != 2 {
+		t.Fatalf("rollout records = %+v", records)
+	}
+	applyObserverLogDiagnostics(diagnostics, records)
+	if diagnostics[0].ObserverMode != "disabled" {
+		t.Fatalf("mode = %q, want latest disabled", diagnostics[0].ObserverMode)
+	}
+	if diagnostics[0].ObserverConnection != "not_reported" || diagnostics[0].LastErrorCategory != "not_reported" {
+		t.Fatalf("rollout category implied health: %+v", diagnostics[0])
+	}
+}

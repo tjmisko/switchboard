@@ -135,6 +135,7 @@ type observerDiagnostic struct {
 	Source             string    `json:"graph_source,omitempty"`
 	Freshness          string    `json:"freshness"`
 	Snapshot           string    `json:"snapshot"`
+	ObserverMode       string    `json:"observer_mode"`
 	ObserverConnection string    `json:"observer_connection"`
 	LiveNodes          int       `json:"live_nodes"`
 	WaitingNodes       int       `json:"waiting_nodes"`
@@ -178,7 +179,7 @@ func buildObserverDiagnostics(snap state.Snapshot, now time.Time) []observerDiag
 		d := observerDiagnostic{
 			PID: session.PID, Provider: session.Agent, BindingSource: "none",
 			Freshness: "absent", Snapshot: "absent",
-			ObserverConnection: "not_reported", LastErrorCategory: "not_reported",
+			ObserverMode: "not_reported", ObserverConnection: "not_reported", LastErrorCategory: "not_reported",
 		}
 		info := session.Enrichment()
 		if info != nil {
@@ -293,18 +294,28 @@ func finiteDiagnosticLabel(value string) bool {
 }
 
 func applyObserverLogDiagnostics(diagnostics []observerDiagnostic, records []observerLogRecord) {
-	last := make(map[string]observerLogRecord)
+	lastError := make(map[string]observerLogRecord)
+	lastMode := make(map[string]observerLogRecord)
 	for _, record := range records {
-		if !observerErrorCategory(record.Category) {
+		var target map[string]observerLogRecord
+		switch {
+		case observerErrorCategory(record.Category):
+			target = lastError
+		case observerModeCategory(record.Category):
+			target = lastMode
+		default:
 			continue
 		}
-		prior, exists := last[record.Provider]
+		prior, exists := target[record.Provider]
 		if !exists || prior.At.IsZero() || record.At.IsZero() || !record.At.Before(prior.At) {
-			last[record.Provider] = record
+			target[record.Provider] = record
 		}
 	}
 	for i := range diagnostics {
-		record, ok := last[diagnostics[i].Provider]
+		if mode, ok := lastMode[diagnostics[i].Provider]; ok {
+			diagnostics[i].ObserverMode = strings.TrimPrefix(mode.Category, "observer_")
+		}
+		record, ok := lastError[diagnostics[i].Provider]
 		if !ok {
 			continue
 		}
@@ -319,6 +330,10 @@ func applyObserverLogDiagnostics(diagnostics []observerDiagnostic, records []obs
 			diagnostics[i].ObserverConnection = "error"
 		}
 	}
+}
+
+func observerModeCategory(category string) bool {
+	return category == "observer_enabled" || category == "observer_disabled"
 }
 
 func observerErrorCategory(category string) bool {
@@ -342,9 +357,9 @@ func renderObserverDiagnostics(w io.Writer, diagnostics []observerDiagnostic) {
 		if d.Bound {
 			binding = "bound"
 		}
-		fmt.Fprintf(w, "  pid %d %s: %s (%s) · source=%s freshness=%s snapshot=%s connection=%s · live=%d waiting=%d errors=%d · error=%s",
+		fmt.Fprintf(w, "  pid %d %s: %s (%s) · source=%s freshness=%s snapshot=%s mode=%s connection=%s · live=%d waiting=%d errors=%d · error=%s",
 			d.PID, orUnknown(d.Provider), binding, d.BindingSource, orUnknown(d.Source), d.Freshness, d.Snapshot,
-			d.ObserverConnection, d.LiveNodes, d.WaitingNodes, d.ErrorNodes, d.LastErrorCategory)
+			orUnknown(d.ObserverMode), d.ObserverConnection, d.LiveNodes, d.WaitingNodes, d.ErrorNodes, d.LastErrorCategory)
 		if d.LastErrorCount > 0 {
 			fmt.Fprintf(w, " count=%d", d.LastErrorCount)
 		}
