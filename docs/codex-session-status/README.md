@@ -6,6 +6,13 @@
 > waits remain distinct on child rows while either makes the root need
 > attention.
 
+> **Post-rollout finding (2026-08-21):** shared app-server ownership invalidates
+> the implemented hook-parent-to-visible-TUI binding for newly created threads.
+> The planning packet remains useful design history, but its shared-daemon
+> assumption is not operationally safe until an exact client/thread association
+> exists. See the
+> [incident report](../codex-app-server-hook-attribution-incident.md).
+
 This directory is an implementation-ready planning packet for adding accurate
 Codex status and fanout visibility to the Go daemon without forcing Codex
 through Claude-specific transcript heuristics. It is organized for a

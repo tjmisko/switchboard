@@ -9,6 +9,13 @@
 > sanitized 0.149 evidence is in
 > [`evidence-report.md`](codex-session-status/evidence-report.md).
 
+> **Known incompatibility (2026-08-21):** enabling the shared Codex app-server
+> moved newly created threads under the background daemon and broke the current
+> hook-parent-to-visible-TUI identity join. The hooks were configured and
+> trusted, but new roots remained unbound and grey. Do not start the shared
+> daemon solely for Switchboard until that exact-binding gap is fixed. See the
+> [incident report](codex-app-server-hook-attribution-incident.md).
+
 This document preserves the useful findings from the original investigation,
 records which conclusions changed, and describes the shipped observer boundary.
 
@@ -79,7 +86,10 @@ The observer's normal path is:
 1. Version-check the `codex` CLI (minimum locally verified proxy capability:
    `0.149.0`).
 2. Start only the disposable stdio proxy. Never open the private control socket
-   directly and never start or stop the shared app-server.
+   directly and never start or stop the shared app-server. The
+   [2026-08-21 incident](codex-app-server-hook-attribution-incident.md) shows
+   that enabling the shared daemon changes new-thread ownership and currently
+   breaks hook-to-TUI attribution.
 3. Send `initialize` with `experimentalApi`, then `initialized`.
 4. Call `thread/read` with `includeTurns: true` for the bound root.
 5. Page `thread/list` with `ancestorThreadId`, `useStateDbOnly`, and all accepted
@@ -254,6 +264,7 @@ minimal tier, while nickname/role/cwd/description are scrubbed.
 - Public protocol: [OpenAI Codex app-server](https://learn.chatgpt.com/docs/app-server)
 - Public lifecycle configuration: [OpenAI Codex hooks](https://learn.chatgpt.com/docs/hooks)
 - Public child-thread model: [OpenAI Codex subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents)
+- Shared-daemon attribution incident: [`codex-app-server-hook-attribution-incident.md`](codex-app-server-hook-attribution-incident.md)
 - Sanitized local evidence: [`evidence-report.md`](codex-session-status/evidence-report.md)
 - Observer: `internal/provider/codex/`
 - Neutral contract: `internal/agentgraph/`

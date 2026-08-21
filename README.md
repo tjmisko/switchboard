@@ -286,14 +286,13 @@ older or unparseable versions. The current public app-server page does not
 document the proxy subcommand, so this is a locally verified capability—not a
 general OpenAI protocol guarantee.
 
-The local app-server control daemon must already be running. Switchboard never
-starts or stops another application's service. With the locally verified 0.149
-CLI, check or start it explicitly:
-
-```bash
-codex app-server daemon version
-codex app-server daemon start
-```
+The proxy transport expects the local app-server control daemon, but there is a
+known Codex 0.149 integration incompatibility: enabling the shared daemon moved
+new threads under the background process and broke Switchboard's exact
+hook-to-visible-TUI attribution. New roots then stayed `unknown` even though the
+hooks were configured and trusted. Do **not** start the shared daemon solely for
+Switchboard until that binding gap is fixed; use the hook fallback instead. See
+the [incident report](docs/codex-app-server-hook-attribution-incident.md).
 
 Root binding is exact and never uses cwd, rollout recency, or timestamp
 correlation:
