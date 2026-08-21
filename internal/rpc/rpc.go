@@ -217,6 +217,14 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 }
 
+// ServeConnection serves the ordinary JSONL RPC protocol over one already-open
+// connection and owns closing it. The daemon uses Serve's Unix listener;
+// in-memory transports use this seam to exercise the identical request and
+// subscription paths without creating a filesystem socket.
+func (s *Server) ServeConnection(ctx context.Context, conn net.Conn) {
+	s.handle(ctx, conn)
+}
+
 func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 	dec := json.NewDecoder(conn)
