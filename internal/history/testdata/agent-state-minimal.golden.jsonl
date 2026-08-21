@@ -1,0 +1,1 @@
+{"ts":"2026-08-21T16:00:30Z","type":"agent_state","session_id":"root-thread","pid":42,"agent":"codex","project":"switchboard","dur_prev_ms":30000,"thread_id":"child-thread","parent_thread_id":"root-thread","from_runtime":"active","to_runtime":"idle","from_attention":"none","to_attention":"user_input","from_lifecycle":"running","to_lifecycle":"running","source":"codex_app_server"}

@@ -56,6 +56,11 @@ type Session struct {
 	// bar consumers while adding "codex" purely additively.
 	Claude *AgentInfo `json:"claude,omitempty"`
 	Codex  *AgentInfo `json:"codex,omitempty"`
+
+	// AgentGraph is the additive provider-neutral view of the root thread and
+	// its descendants. Child nodes are display/history detail only; they are not
+	// independently switchable Sessions.
+	AgentGraph *AgentGraph `json:"agent_graph,omitempty"`
 }
 
 // Agent kind identifiers, stored in Session.Agent. They match the string values
@@ -149,7 +154,9 @@ type HyprlandInfo struct {
 // shape is identical for every agent (Claude Code, Codex); Session.Agent and the
 // wire key it sits under ("claude"/"codex") say which agent produced it.
 type AgentInfo struct {
-	SessionID  string `json:"session_id,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
+	// Transcript is provider-specific legacy enrichment retained for existing
+	// Claude/Codex consumers. The neutral graph never exposes transcript paths.
 	Transcript string `json:"transcript,omitempty"`
 	Status     string `json:"status"` // working|idle|permission|delegating (never "unknown")
 
@@ -162,7 +169,8 @@ type AgentInfo struct {
 	// first status edge and so encoding/json formats it exactly like started_at.
 	StatusSinceWire *time.Time `json:"status_since,omitempty"`
 
-	// InFlightSubagents is how many subagent Tasks the main thread has launched
+	// InFlightSubagents is a Claude-specific legacy compatibility projection: how
+	// many subagent Tasks the main thread has launched
 	// but not yet collected (transcript.InFlightTasks), recomputed each reconcile
 	// tick. It is the S dimension: >0 with an idle main thread is the delegating
 	// (green) case. Exposed on the wire (omitempty, so absent when 0 — the golden
@@ -172,7 +180,8 @@ type AgentInfo struct {
 	// spawnDepth-1 children, listed per-run in Workflows below).
 	InFlightSubagents int `json:"in_flight_subagents,omitempty"`
 
-	// Workflows lists the ultracode Workflow runs currently ACTIVE in this
+	// Workflows is a Claude-specific legacy compatibility projection listing the
+	// ultracode Workflow runs currently ACTIVE in this
 	// session — fan-outs the Workflow tool orchestrates, whose subagents live
 	// under <session-dir>/subagents/workflows/wf_*/ and fire no hooks. Derived
 	// each reconcile tick by the fanout Observer from those on-disk records
@@ -194,7 +203,8 @@ type AgentInfo struct {
 	// the first reconcile; dropStaleSessions re-stamps it to startup time).
 	StatusSince time.Time `json:"-"`
 
-	// Pending maps each WRITER currently blocked on a permission prompt to that
+	// Pending is Claude's legacy per-writer compatibility state. It maps each
+	// WRITER currently blocked on a permission prompt to that
 	// prompt's correlators. A session is 1 + N concurrent writers — the main thread
 	// plus every in-flight subagent — that share a pid, a chip and a transcript_path
 	// but write to different files and can each block independently
@@ -674,6 +684,7 @@ func (s *Store) snapshotLocked() Snapshot {
 		// in-memory StatusSince onto the wire-only StatusSinceWire on that copy.
 		cp.Claude = enrichForWire(sess.Claude)
 		cp.Codex = enrichForWire(sess.Codex)
+		cp.AgentGraph = sess.AgentGraph.Clone()
 		sessions = append(sessions, cp)
 	}
 	// Sort into chip order (lessChipOrder), which carries a PID tie-break for
@@ -862,11 +873,13 @@ func (s *Store) Load() error {
 	if err := json.NewDecoder(f).Decode(&snap); err != nil {
 		return err
 	}
+	hydratedAt := time.Now()
 	s.mu.Lock()
 	for i := range snap.Sessions {
 		sess := snap.Sessions[i]
 		hydratePendingWriters(sess.Claude)
 		hydratePendingWriters(sess.Codex)
+		hydrateAgentGraph(&sess, hydratedAt)
 		s.sessions[sess.PID] = &sess
 	}
 	s.mu.Unlock()

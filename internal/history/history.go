@@ -23,6 +23,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/tjmisko/switchboard/internal/agentgraph"
 )
 
 // Event types. A transition closes one colored interval and opens the next; the
@@ -49,6 +51,9 @@ const (
 	// with WorkflowRunID); these two bracket the run itself.
 	EventWorkflowStart = "workflow_start" // a Workflow run's records appeared on disk (the fan-out began)
 	EventWorkflowStop  = "workflow_stop"  // the run drained: no agent in flight and its journal went quiet
+	// v5 — provider-neutral graph-node state transitions. Existing Claude
+	// subagent_spawn/stop events continue alongside this canonical record.
+	EventAgentState = "agent_state"
 )
 
 // Detail tiers. Minimal records only what a timeline needs (ids, status, timing,
@@ -91,6 +96,22 @@ type Event struct {
 	ToolUseID  string `json:"tool_use_id,omitempty"` // links a spawn to its stop (absent on teammates/grandchildren)
 	AgentType  string `json:"agent_type,omitempty"`  // e.g. "Explore", "general-purpose"
 	Background bool   `json:"background,omitempty"`  // the fanout was launched run_in_background (best-effort; from the parent tool_use)
+
+	// Canonical agent graph payload (agent_state). SessionID is the provider root
+	// ID; ThreadID identifies this node. All three from/to axes are explicit even
+	// when only one changed, so readers never need provider-specific inference.
+	// Nickname and Role are display metadata and are scrubbed at minimal detail.
+	ThreadID       string                    `json:"thread_id,omitempty"`
+	ParentThreadID string                    `json:"parent_thread_id,omitempty"`
+	Nickname       string                    `json:"nickname,omitempty"`
+	Role           string                    `json:"role,omitempty"`
+	FromRuntime    agentgraph.RuntimeState   `json:"from_runtime,omitempty"`
+	ToRuntime      agentgraph.RuntimeState   `json:"to_runtime,omitempty"`
+	FromAttention  agentgraph.AttentionState `json:"from_attention,omitempty"`
+	ToAttention    agentgraph.AttentionState `json:"to_attention,omitempty"`
+	FromLifecycle  agentgraph.LifecycleState `json:"from_lifecycle,omitempty"`
+	ToLifecycle    agentgraph.LifecycleState `json:"to_lifecycle,omitempty"`
+	Source         agentgraph.SourceKind     `json:"source,omitempty"`
 
 	// Workflow payload (workflow_start / workflow_stop, and the subagent events a
 	// workflow's agents emit). WorkflowRunID is the run dir's basename

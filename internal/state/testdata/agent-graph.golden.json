@@ -1,0 +1,75 @@
+{
+  "sessions": [
+    {
+      "pid": 42,
+      "cwd": "/workspace",
+      "tty": "/dev/pts/42",
+      "started_at": "2026-08-21T15:00:00Z",
+      "focused": false,
+      "agent": "codex",
+      "codex": {
+        "session_id": "root-thread",
+        "status": "permission",
+        "status_since": "2026-08-21T16:00:00Z"
+      },
+      "agent_graph": {
+        "root_id": "root-thread",
+        "source": "codex_app_server",
+        "observed_at": "2026-08-21T16:00:00Z",
+        "fresh_until": "2026-08-21T16:01:00Z",
+        "complete": true,
+        "summary": {
+          "runtime": "idle",
+          "attention": "user_input",
+          "status": "permission",
+          "live_children": 2,
+          "waiting_nodes": 1,
+          "approval_nodes": 0,
+          "user_input_nodes": 1,
+          "error_nodes": 0,
+          "since": "2026-08-21T16:00:00Z"
+        },
+        "nodes": [
+          {
+            "id": "root-thread",
+            "runtime": "idle",
+            "attention": "none",
+            "lifecycle": "running",
+            "started_at": "2026-08-21T15:50:00Z",
+            "updated_at": "2026-08-21T16:00:00Z"
+          },
+          {
+            "id": "child-a",
+            "parent_id": "root-thread",
+            "nickname": "documents",
+            "role": "explorer",
+            "runtime": "idle",
+            "attention": "user_input",
+            "lifecycle": "running",
+            "started_at": "2026-08-21T15:57:00Z",
+            "updated_at": "2026-08-21T15:59:58Z"
+          },
+          {
+            "id": "child-z",
+            "parent_id": "root-thread",
+            "nickname": "tagging",
+            "role": "worker",
+            "description": "safe display description",
+            "runtime": "active",
+            "attention": "none",
+            "lifecycle": "running",
+            "started_at": "2026-08-21T15:58:00Z",
+            "updated_at": "2026-08-21T15:59:59Z",
+            "usage": {
+              "input_tokens": 120,
+              "cached_input_tokens": 40,
+              "output_tokens": 15,
+              "total_tokens": 175
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "updated_at": "2026-08-21T16:00:00Z"
+}

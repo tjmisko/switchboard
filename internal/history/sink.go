@@ -150,6 +150,8 @@ func (s *Sink) scrub(ev *Event) {
 	ev.Reason = ""
 	ev.Description = ""
 	ev.Label = "" // a session name can reveal what you are working on
+	ev.Nickname = ""
+	ev.Role = ""
 	// Model is minimal-safe (names the model, not your work) and is kept.
 }
 
