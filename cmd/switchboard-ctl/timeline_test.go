@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/agentgraph"
 	"github.com/tjmisko/switchboard/internal/history"
 )
 
@@ -420,5 +421,166 @@ func TestTimelineJSONPlanWindowOmittedByDefault(t *testing.T) {
 	})
 	if strings.Contains(out, "plan_window") {
 		t.Errorf("plan_window should be omitted without the flag:\n%s", out)
+	}
+	if strings.Contains(out, "agent_timeline") {
+		t.Errorf("old history should retain the pre-graph JSON shape:\n%s", out)
+	}
+}
+
+func TestBuildAgentTimelineCanonicalSpansAndReconnectDedupe(t *testing.T) {
+	t0 := atSec(0)
+	events := []history.Event{
+		{Ts: t0, Type: history.EventAgentState, SessionID: "root", PID: 7, Agent: "codex",
+			ThreadID: "child", ParentThreadID: "root", Nickname: "documents", Role: "explorer",
+			FromLifecycle: agentgraph.LifecycleUnknown, ToLifecycle: agentgraph.LifecyclePending},
+		{Ts: t0.Add(5 * time.Second), Type: history.EventAgentState, SessionID: "root", PID: 7, Agent: "codex",
+			ThreadID: "child", ParentThreadID: "root",
+			FromLifecycle: agentgraph.LifecyclePending, ToLifecycle: agentgraph.LifecycleRunning},
+		// Reconnect replay: identical target state must not open another lane.
+		{Ts: t0.Add(5 * time.Second), Type: history.EventAgentState, SessionID: "root", PID: 7, Agent: "codex",
+			ThreadID: "child", ParentThreadID: "root",
+			FromLifecycle: agentgraph.LifecyclePending, ToLifecycle: agentgraph.LifecycleRunning},
+		{Ts: t0.Add(10 * time.Second), Type: history.EventAgentState, SessionID: "root", PID: 7, Agent: "codex",
+			ThreadID: "child", ParentThreadID: "root",
+			FromAttention: agentgraph.AttentionNone, ToAttention: agentgraph.AttentionApproval},
+		{Ts: t0.Add(20 * time.Second), Type: history.EventAgentState, SessionID: "root", PID: 7, Agent: "codex",
+			ThreadID: "child", ParentThreadID: "root",
+			FromAttention: agentgraph.AttentionApproval, ToAttention: agentgraph.AttentionUserInput},
+		{Ts: t0.Add(30 * time.Second), Type: history.EventAgentState, SessionID: "root", PID: 7, Agent: "codex",
+			ThreadID: "child", ParentThreadID: "root",
+			FromAttention: agentgraph.AttentionUserInput, ToAttention: agentgraph.AttentionNone},
+		{Ts: t0.Add(40 * time.Second), Type: history.EventAgentState, SessionID: "root", PID: 7, Agent: "codex",
+			ThreadID: "child", ParentThreadID: "root",
+			FromLifecycle: agentgraph.LifecycleRunning, ToLifecycle: agentgraph.LifecycleCompleted},
+	}
+	got := buildAgentTimeline(events, t0, t0.Add(time.Minute), history.DefaultSuspectSubagentCap)
+	if len(got.Roots) != 1 || len(got.Roots[0].Nodes) != 1 {
+		t.Fatalf("roots/nodes = %+v", got)
+	}
+	node := got.Roots[0].Nodes[0]
+	if len(node.Activity) != 1 || node.Activity[0].Start != t0 || node.Activity[0].End != t0.Add(40*time.Second) {
+		t.Fatalf("activity = %+v, want one pending-through-terminal span", node.Activity)
+	}
+	if len(node.Attention) != 2 || node.Attention[0].Reason != agentgraph.AttentionApproval || node.Attention[1].Reason != agentgraph.AttentionUserInput {
+		t.Fatalf("attention = %+v", node.Attention)
+	}
+	if got.Summary.AgentActivity != 40*time.Second || got.Summary.UserAttention != 20*time.Second || got.Summary.UserAttentionUnion != 20*time.Second ||
+		got.Summary.ApprovalAttention != 10*time.Second || got.Summary.UserInputAttention != 10*time.Second {
+		t.Fatalf("summary = %+v", got.Summary)
+	}
+}
+
+func TestBuildAgentTimelineOpenSpanUsesSuspectProtection(t *testing.T) {
+	t0 := atSec(0)
+	events := []history.Event{{
+		Ts: t0, Type: history.EventAgentState, SessionID: "root", PID: 7, Agent: "codex",
+		ThreadID: "child", ParentThreadID: "root",
+		FromLifecycle: agentgraph.LifecycleUnknown, ToLifecycle: agentgraph.LifecycleRunning,
+		FromAttention: agentgraph.AttentionNone, ToAttention: agentgraph.AttentionApproval,
+	}}
+	got := buildAgentTimeline(events, t0, t0.Add(3*time.Hour), history.DefaultSuspectSubagentCap)
+	node := got.Roots[0].Nodes[0]
+	if len(node.Activity) != 1 || !node.Activity[0].Suspect || len(node.Attention) != 1 || !node.Attention[0].Suspect {
+		t.Fatalf("open spans were not marked suspect: %+v", node)
+	}
+	if got.Summary.AgentActivity != 0 || got.Summary.UserAttention != 0 || got.Summary.SuspectSpans != 2 {
+		t.Fatalf("suspect spans entered totals: %+v", got.Summary)
+	}
+}
+
+func TestBuildAgentTimelineAttributesConcurrentChildWaitAsRootUnion(t *testing.T) {
+	t0 := atSec(0)
+	var events []history.Event
+	for _, id := range []string{"child-a", "child-b"} {
+		events = append(events,
+			history.Event{Ts: t0, Type: history.EventAgentState, SessionID: "root", ThreadID: id, ParentThreadID: "root",
+				FromAttention: agentgraph.AttentionNone, ToAttention: agentgraph.AttentionApproval},
+			history.Event{Ts: t0.Add(10 * time.Second), Type: history.EventAgentState, SessionID: "root", ThreadID: id, ParentThreadID: "root",
+				FromAttention: agentgraph.AttentionApproval, ToAttention: agentgraph.AttentionNone},
+		)
+	}
+	got := buildAgentTimeline(events, t0, t0.Add(time.Minute), time.Hour)
+	if got.Roots[0].UserAttention != 10*time.Second || got.Summary.UserAttention != 10*time.Second ||
+		got.Summary.UserAttentionUnion != 10*time.Second || got.Summary.ApprovalAttention != 10*time.Second {
+		t.Fatalf("concurrent child waits were double-counted: %+v", got.Summary)
+	}
+}
+
+func TestBuildAgentTimelineUsesHeldDurationForCarriedState(t *testing.T) {
+	from, closedAt := atSec(0), atSec(10)
+	events := []history.Event{{
+		Ts: closedAt, Type: history.EventAgentState, SessionID: "root", ThreadID: "child", ParentThreadID: "root",
+		FromLifecycle: agentgraph.LifecycleRunning, ToLifecycle: agentgraph.LifecycleCompleted,
+		FromAttention: agentgraph.AttentionApproval, ToAttention: agentgraph.AttentionNone,
+		DurPrevMs: int64((20 * time.Second) / time.Millisecond),
+	}}
+	events = append(events, events[0]) // reconnect replay of a closing edge
+	got := buildAgentTimeline(events, from, atSec(20), time.Hour)
+	node := got.Roots[0].Nodes[0]
+	if len(node.Activity) != 1 || node.Activity[0].Start != from || node.Activity[0].End != closedAt {
+		t.Fatalf("carried activity = %+v", node.Activity)
+	}
+	if len(node.Attention) != 1 || node.Attention[0].Start != from || node.Attention[0].End != closedAt {
+		t.Fatalf("carried attention = %+v", node.Attention)
+	}
+	if got.Summary.AgentActivity != 10*time.Second || got.Summary.UserAttention != 10*time.Second {
+		t.Fatalf("carried totals = %+v", got.Summary)
+	}
+}
+
+func TestBuildAgentTimelineOldHistoryStaysAbsent(t *testing.T) {
+	got := buildAgentTimeline([]history.Event{{Ts: atSec(0), Type: history.EventSubagentSpawn, SessionID: "old", AgentID: "legacy"}}, atSec(0), atSec(20), time.Hour)
+	if len(got.Roots) != 0 {
+		t.Fatalf("old-only history grew a canonical surface: %+v", got)
+	}
+}
+
+func TestBuildAgentTimelinePreservesUnknownForwardValues(t *testing.T) {
+	events := []history.Event{{
+		Ts: atSec(0), Type: history.EventAgentState, SessionID: "root", ThreadID: "child", ParentThreadID: "root",
+		ToRuntime:   agentgraph.RuntimeState("future_runtime"),
+		ToAttention: agentgraph.AttentionState("future_attention"),
+		ToLifecycle: agentgraph.LifecycleState("future_lifecycle"),
+	}}
+	got := buildAgentTimeline(events, atSec(0), atSec(10), time.Hour)
+	node := got.Roots[0].Nodes[0]
+	if node.Runtime != "future_runtime" || node.AttentionState != "future_attention" || node.Lifecycle != "future_lifecycle" {
+		t.Fatalf("unknown values were discarded: %+v", node)
+	}
+}
+
+func TestTimelineJSONMixedHistoryAddsCanonicalSectionWithoutChangingLegacy(t *testing.T) {
+	dir := t.TempDir()
+	day := time.Now().AddDate(0, 0, -2).Format("2006-01-02")
+	t0, err := time.ParseInLocation("2006-01-02 15:04:05", day+" 12:00:00", time.Local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeDay(t, dir, day,
+		history.Event{Ts: t0, Type: history.EventSessionStart, SessionID: "root", PID: 7, Agent: "claude"},
+		history.Event{Ts: t0, Type: history.EventTransition, SessionID: "root", PID: 7, To: "working"},
+		history.Event{Ts: t0.Add(time.Second), Type: history.EventSubagentSpawn, SessionID: "root", PID: 7, AgentID: "child"},
+		history.Event{Ts: t0.Add(time.Second), Type: history.EventAgentState, SessionID: "root", PID: 7, Agent: "claude",
+			ThreadID: "child", ParentThreadID: "root", FromLifecycle: agentgraph.LifecycleUnknown, ToLifecycle: agentgraph.LifecycleRunning},
+		history.Event{Ts: t0.Add(11 * time.Second), Type: history.EventSubagentStop, SessionID: "root", PID: 7, AgentID: "child"},
+		history.Event{Ts: t0.Add(11 * time.Second), Type: history.EventAgentState, SessionID: "root", PID: 7, Agent: "claude",
+			ThreadID: "child", ParentThreadID: "root", FromLifecycle: agentgraph.LifecycleRunning, ToLifecycle: agentgraph.LifecycleCompleted},
+		history.Event{Ts: t0.Add(12 * time.Second), Type: history.EventSessionEnd, SessionID: "root", PID: 7},
+	)
+
+	out := captureStdout(t, func() { cmdTimeline([]string{"--dir", dir, "--day", day, "--json"}) })
+	var env struct {
+		Lanes  []history.Swimlane `json:"lanes"`
+		Totals history.Totals     `json:"totals"`
+		Agents *agentTimeline     `json:"agent_timeline"`
+	}
+	if err := json.Unmarshal([]byte(out), &env); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out)
+	}
+	if env.Agents == nil || len(env.Agents.Roots) != 1 || env.Agents.Summary.AgentActivity != 10*time.Second {
+		t.Fatalf("canonical timeline missing: %+v", env.Agents)
+	}
+	if len(env.Lanes) != 1 || len(env.Lanes[0].Subagents) != 1 || env.Totals.Subagents != 1 {
+		t.Fatalf("legacy timeline changed: lanes=%+v totals=%+v", env.Lanes, env.Totals)
 	}
 }

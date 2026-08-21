@@ -2,8 +2,15 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/tjmisko/switchboard/internal/agentgraph"
+	"github.com/tjmisko/switchboard/internal/state"
 )
 
 func TestResolveSymptom(t *testing.T) {
@@ -114,5 +121,125 @@ func TestExtractTime(t *testing.T) {
 	}
 	if _, ok := extractTime(`status: pid=1 session=x working->idle (agent=claude event=Stop)`); ok {
 		t.Error("a line with no timestamp prefix should report ok=false")
+	}
+}
+
+func TestBuildObserverDiagnosticsContentFreeStatesAndShadowMismatch(t *testing.T) {
+	now := time.Date(2026, 8, 21, 18, 0, 0, 0, time.UTC)
+	snap := state.Snapshot{Sessions: []state.Session{
+		{
+			PID: 12, Agent: state.AgentKindCodex, CWD: "/secret/project",
+			Codex: &state.AgentInfo{SessionID: "codex-root", Status: state.StatusPermission},
+			AgentGraph: &state.AgentGraph{
+				RootID: "codex-root", Source: agentgraph.SourceCodexAppServer,
+				ObservedAt: now.Add(-time.Second), FreshUntil: now.Add(time.Second), Complete: false,
+				Summary: state.AgentGraphSummary{Status: state.StatusPermission},
+				Nodes: []state.AgentNode{
+					{ID: "codex-root", Nickname: "private root", Runtime: agentgraph.RuntimeIdle, Attention: agentgraph.AttentionNone, Lifecycle: agentgraph.LifecycleRunning},
+					{ID: "child", Description: "private prompt", Runtime: agentgraph.RuntimeSystemError, Attention: agentgraph.AttentionApproval, Lifecycle: agentgraph.LifecycleRunning},
+				},
+			},
+		},
+		{PID: 13, Agent: state.AgentKindCodex},
+		{
+			PID: 14, Agent: state.AgentKindClaude,
+			Claude: &state.AgentInfo{SessionID: "claude-root", Status: state.StatusIdle},
+			AgentGraph: &state.AgentGraph{
+				RootID: "claude-root", Source: agentgraph.SourceClaudeTranscript,
+				ObservedAt: now.Add(-time.Minute), FreshUntil: now.Add(-time.Second), Complete: true,
+				Summary: state.AgentGraphSummary{Status: state.StatusDelegating},
+				Nodes:   []state.AgentNode{{ID: "claude-root", Runtime: agentgraph.RuntimeIdle, Attention: agentgraph.AttentionNone, Lifecycle: agentgraph.LifecycleRunning}},
+			},
+		},
+	}}
+
+	got := buildObserverDiagnostics(snap, now)
+	if len(got) != 3 {
+		t.Fatalf("diagnostics = %+v", got)
+	}
+	if !got[0].Bound || got[0].Freshness != "fresh" || got[0].Snapshot != "partial" || got[0].LiveNodes != 2 || got[0].WaitingNodes != 1 || got[0].ErrorNodes != 1 {
+		t.Fatalf("fresh codex diagnostic = %+v", got[0])
+	}
+	if got[1].Bound || got[1].Freshness != "absent" {
+		t.Fatalf("unbound codex diagnostic = %+v", got[1])
+	}
+	if got[2].Freshness != "expired" || got[2].ShadowMismatch == nil || !*got[2].ShadowMismatch {
+		t.Fatalf("stale shadow diagnostic = %+v", got[2])
+	}
+
+	b, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"/secret/project", "private root", "private prompt"} {
+		if strings.Contains(string(b), secret) {
+			t.Fatalf("diagnostics leaked %q: %s", secret, b)
+		}
+	}
+}
+
+func TestRenderObserverDiagnosticsBoundUnboundAndUnknownErrors(t *testing.T) {
+	diagnostics := []observerDiagnostic{
+		{PID: 1, Provider: "codex", Bound: true, Freshness: "fresh", Snapshot: "complete", Source: "codex_app_server", LiveNodes: 2, WaitingNodes: 1},
+		{PID: 2, Provider: "codex", Bound: false, Freshness: "absent", Snapshot: "absent", LastErrorCategory: "unknown"},
+	}
+	var buf bytes.Buffer
+	renderObserverDiagnostics(&buf, diagnostics)
+	out := buf.String()
+	for _, want := range []string{"pid 1 codex: bound", "fresh", "complete", "live=2 waiting=1", "pid 2 codex: unbound", "error=unknown"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "cwd") {
+		t.Fatalf("unbound guidance must not recommend CWD correlation:\n%s", out)
+	}
+}
+
+func TestDiagnoseObserverReadsSnapshotWithoutJournal(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	logPath := filepath.Join(dir, "observer.log")
+	b, err := json.Marshal(state.Snapshot{Sessions: []state.Session{{PID: 9, Agent: state.AgentKindCodex}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte(""), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() { cmdDiagnose([]string{"--observer", "--state", path, "--file", logPath, "--json"}) })
+	var got []observerDiagnostic
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("unmarshal observer output: %v\n%s", err, out)
+	}
+	if len(got) != 1 || got[0].PID != 9 || got[0].Bound {
+		t.Fatalf("diagnostics = %+v", got)
+	}
+}
+
+func TestParseObserverLogRecordsIsStrictAndContentFree(t *testing.T) {
+	lines := []string{
+		`2026-08-21T18:00:01+0000 host switchboard[9]: agent-observer: provider=codex category=observe_error count=3 raw="secret prompt"`,
+		`2026-08-21T18:00:02+0000 host switchboard[9]: agent-observer: provider=codex category=not-safe! count=4`,
+		`agent-observer: provider=other category=observe_error count=5`,
+	}
+	got := parseObserverLogRecords(lines)
+	if len(got) != 1 || got[0].Provider != "codex" || got[0].Category != "observe_error" || got[0].Count != 3 {
+		t.Fatalf("records = %+v", got)
+	}
+	diagnostics := []observerDiagnostic{{Provider: "codex", ObserverConnection: "not_reported", LastErrorCategory: "not_reported"}}
+	applyObserverLogDiagnostics(diagnostics, got)
+	if diagnostics[0].ObserverConnection != "error" || diagnostics[0].LastErrorCategory != "observe_error" || diagnostics[0].LastErrorCount != 3 {
+		t.Fatalf("merged = %+v", diagnostics[0])
+	}
+	b, err := json.Marshal(diagnostics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "secret prompt") || strings.Contains(string(b), "raw") {
+		t.Fatalf("diagnostic retained raw content: %s", b)
 	}
 }

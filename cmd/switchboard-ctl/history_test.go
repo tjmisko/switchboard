@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/agentgraph"
 	"github.com/tjmisko/switchboard/internal/history"
 )
 
@@ -87,6 +88,72 @@ func TestOrDash(t *testing.T) {
 	}
 	if got := orDash("working"); got != "working" {
 		t.Errorf(`orDash("working") = %q, want passthrough`, got)
+	}
+}
+
+func TestFormatAgentStateEventShowsNeutralAxesAndPrivacySafeFallback(t *testing.T) {
+	ev := history.Event{
+		Ts: evTime(), Type: history.EventAgentState, SessionID: "root-thread-1234", PID: 42,
+		ThreadID: "child-thread-abcdef", ParentThreadID: "root-thread-1234",
+		Nickname: "documents", Role: "explorer",
+		FromRuntime: agentgraph.RuntimeIdle, ToRuntime: agentgraph.RuntimeActive,
+		FromAttention: agentgraph.AttentionNone, ToAttention: agentgraph.AttentionUserInput,
+		FromLifecycle: agentgraph.LifecyclePending, ToLifecycle: agentgraph.LifecycleRunning,
+	}
+	got := formatEvent(ev)
+	for _, want := range []string{
+		"agent_state", "root-thr", "└─ documents (explorer)",
+		"runtime idle→active", "attention none→user_input", "lifecycle pending→running",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("formatEvent missing %q:\n%s", want, got)
+		}
+	}
+
+	// Minimal-tier history has already scrubbed nickname and role. The renderer
+	// must fall back to an opaque short id rather than inventing or recovering
+	// content from another field.
+	ev.Nickname, ev.Role = "", ""
+	got = formatEvent(ev)
+	if !strings.Contains(got, "child-th") || strings.Contains(got, "documents") || strings.Contains(got, "explorer") {
+		t.Fatalf("minimal fallback leaked or lost identity: %s", got)
+	}
+}
+
+func TestFormatHistoryEventsDedupesOnlyMatchingLegacyProjection(t *testing.T) {
+	ts := evTime()
+	events := []history.Event{
+		{Ts: ts, Type: history.EventSubagentSpawn, SessionID: "root", AgentID: "child", AgentType: "Explore"},
+		{Ts: ts, Type: history.EventAgentState, SessionID: "root", ThreadID: "child", ParentThreadID: "root",
+			FromLifecycle: agentgraph.LifecycleUnknown, ToLifecycle: agentgraph.LifecycleRunning},
+		// A legacy event with a different node is not the canonical event's
+		// compatibility projection and must remain visible.
+		{Ts: ts, Type: history.EventSubagentSpawn, SessionID: "root", AgentID: "other", AgentType: "Explore"},
+	}
+	lines := formatHistoryEvents(events)
+	if len(lines) != 2 {
+		t.Fatalf("lines = %d, want canonical + unmatched legacy:\n%s", len(lines), strings.Join(lines, "\n"))
+	}
+	if !strings.Contains(lines[0], "agent_state") || !strings.Contains(lines[1], "subagent_spawn") {
+		t.Fatalf("unexpected dedupe/order:\n%s", strings.Join(lines, "\n"))
+	}
+}
+
+func TestHistoryTailKeepsBothRawEventsButDedupesHumanProjection(t *testing.T) {
+	dir := t.TempDir()
+	day := evTime().Local().Format("2006-01-02")
+	legacy := history.Event{Ts: evTime(), Type: history.EventSubagentSpawn, SessionID: "root", AgentID: "child", AgentType: "Explore"}
+	canonical := history.Event{Ts: evTime(), Type: history.EventAgentState, SessionID: "root", ThreadID: "child", ParentThreadID: "root",
+		FromLifecycle: agentgraph.LifecycleUnknown, ToLifecycle: agentgraph.LifecycleRunning}
+	writeDay(t, dir, day, legacy, canonical)
+
+	human := captureStdout(t, func() { cmdHistoryTail([]string{"--dir", dir, "--day", day, "-n", "20"}) })
+	if strings.Contains(human, history.EventSubagentSpawn) || strings.Count(human, history.EventAgentState) != 1 {
+		t.Fatalf("human projection did not dedupe:\n%s", human)
+	}
+	raw := captureStdout(t, func() { cmdHistoryTail([]string{"--dir", dir, "--day", day, "-n", "20", "--json"}) })
+	if strings.Count(raw, `"type":"subagent_spawn"`) != 1 || strings.Count(raw, `"type":"agent_state"`) != 1 {
+		t.Fatalf("raw JSON lost an event:\n%s", raw)
 	}
 }
 

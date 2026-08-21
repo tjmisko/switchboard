@@ -8,10 +8,14 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/agentgraph"
+	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/statustune"
 )
 
@@ -27,18 +31,20 @@ import (
 func cmdDiagnose(args []string) {
 	fs := flag.NewFlagSet("diagnose", flag.ExitOnError)
 	var (
-		around  = fs.String("around", "", "center the window on this time (e.g. 14:30, \"2026-06-23 14:30:00\")")
-		window  = fs.Duration("window", 2*time.Minute, "half-width of the --around window")
-		since   = fs.String("since", "", "journalctl --since (default: 1 hour ago, or --around-window)")
-		until   = fs.String("until", "", "journalctl --until")
-		session = fs.String("session", "", "only this session id (matches the short id in the logs)")
-		pid     = fs.Int("pid", 0, "only this pid")
-		unit    = fs.String("unit", "switchboard.service", "systemd unit to read")
-		system  = fs.Bool("system", false, "read the system journal (default: --user)")
-		file    = fs.String("file", "", "read log lines from this file (or - for stdin) instead of journalctl")
-		symFlag = fs.String("symptom", "", "force the symptom: red|green|orange|all (default: infer from the description)")
-		asJSON  = fs.Bool("json", false, "emit the parsed/filtered records as JSON")
-		limit   = fs.Int("limit", 200, "max decision lines to display")
+		around    = fs.String("around", "", "center the window on this time (e.g. 14:30, \"2026-06-23 14:30:00\")")
+		window    = fs.Duration("window", 2*time.Minute, "half-width of the --around window")
+		since     = fs.String("since", "", "journalctl --since (default: 1 hour ago, or --around-window)")
+		until     = fs.String("until", "", "journalctl --until")
+		session   = fs.String("session", "", "only this session id (matches the short id in the logs)")
+		pid       = fs.Int("pid", 0, "only this pid")
+		unit      = fs.String("unit", "switchboard.service", "systemd unit to read")
+		system    = fs.Bool("system", false, "read the system journal (default: --user)")
+		file      = fs.String("file", "", "read log lines from this file (or - for stdin) instead of journalctl")
+		symFlag   = fs.String("symptom", "", "force the symptom: red|green|orange|all (default: infer from the description)")
+		asJSON    = fs.Bool("json", false, "emit the parsed/filtered records as JSON")
+		limit     = fs.Int("limit", 200, "max decision lines to display")
+		observer  = fs.Bool("observer", false, "report content-free provider observer health from state.json")
+		statePath = fs.String("state", defaultObserverStatePath(), "state.json mirror for --observer")
 	)
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, strings.TrimSpace(`
@@ -50,12 +56,50 @@ tuning knob to change. Examples:
   switchboard-ctl diagnose --around 14:32 red was stuck for ages
   switchboard-ctl diagnose --since "20 min ago" should have been green not orange
   switchboard-ctl diagnose --session ce13c0f2 --symptom green went green too early
+  switchboard-ctl diagnose --observer
   journalctl --user -u switchboard.service -o short-iso | switchboard-ctl diagnose --file - red
 
 flags:`))
 		fs.PrintDefaults()
 	}
 	_ = fs.Parse(args)
+	if *observer {
+		snap, err := readObserverSnapshot(*statePath)
+		if err != nil {
+			fail("observer state: %v", err)
+		}
+		s, u := *since, *until
+		if *around != "" {
+			center, parseErr := parseAround(*around)
+			if parseErr != nil {
+				fail("--around %q: %v", *around, parseErr)
+			}
+			s = center.Add(-*window).Format("2006-01-02 15:04:05")
+			u = center.Add(*window).Format("2006-01-02 15:04:05")
+		} else if s == "" && *file == "" {
+			s = "1 hour ago"
+		}
+		lines, logErr := gatherLines(*file, *unit, *system, s, u)
+		if logErr != nil && *file != "" {
+			fail("%v", logErr)
+		}
+		diagnostics := buildObserverDiagnostics(snap, time.Now())
+		records := parseObserverLogRecords(lines)
+		if *limit <= 0 {
+			records = nil
+		} else if len(records) > *limit {
+			records = records[len(records)-*limit:]
+		}
+		applyObserverLogDiagnostics(diagnostics, records)
+		if *asJSON {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			_ = enc.Encode(diagnostics)
+		} else {
+			renderObserverDiagnostics(os.Stdout, diagnostics)
+		}
+		return
+	}
 
 	// Resolve the time window. --around computes since/until around a point;
 	// otherwise pass --since/--until straight through, defaulting to the last hour.
@@ -78,6 +122,257 @@ flags:`))
 
 	sym := resolveSymptom(*symFlag, fs.Args())
 	runDiagnose(os.Stdout, lines, sym, *session, *pid, *limit, *asJSON)
+}
+
+// observerDiagnostic is deliberately content-free. It carries process and
+// protocol health, never cwd, transcript paths, node labels/descriptions, raw
+// provider payloads, prompts, or commands.
+type observerDiagnostic struct {
+	PID                int       `json:"pid"`
+	Provider           string    `json:"provider"`
+	Bound              bool      `json:"bound"`
+	BindingSource      string    `json:"binding_source"`
+	Source             string    `json:"graph_source,omitempty"`
+	Freshness          string    `json:"freshness"`
+	Snapshot           string    `json:"snapshot"`
+	ObserverConnection string    `json:"observer_connection"`
+	LiveNodes          int       `json:"live_nodes"`
+	WaitingNodes       int       `json:"waiting_nodes"`
+	ErrorNodes         int       `json:"error_nodes"`
+	LastErrorCategory  string    `json:"last_error_category"`
+	LastErrorCount     uint64    `json:"last_error_count,omitempty"`
+	LastErrorAt        time.Time `json:"last_error_at,omitzero"`
+	LegacySummary      string    `json:"legacy_summary,omitempty"`
+	GraphSummary       string    `json:"graph_summary,omitempty"`
+	ShadowMismatch     *bool     `json:"shadow_mismatch,omitempty"`
+	ObservedAt         time.Time `json:"observed_at,omitzero"`
+	FreshUntil         time.Time `json:"fresh_until,omitzero"`
+}
+
+func readObserverSnapshot(path string) (state.Snapshot, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return state.Snapshot{}, fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+	var snap state.Snapshot
+	if err := json.NewDecoder(f).Decode(&snap); err != nil {
+		return state.Snapshot{}, fmt.Errorf("decode %s: %w", path, err)
+	}
+	return snap, nil
+}
+
+func defaultObserverStatePath() string {
+	if dir := os.Getenv("XDG_CACHE_HOME"); dir != "" {
+		return filepath.Join(dir, "switchboard", "state.json")
+	}
+	return filepath.Join(os.Getenv("HOME"), ".cache", "switchboard", "state.json")
+}
+
+func buildObserverDiagnostics(snap state.Snapshot, now time.Time) []observerDiagnostic {
+	out := make([]observerDiagnostic, 0, len(snap.Sessions))
+	for _, session := range snap.Sessions {
+		if session.Agent != state.AgentKindCodex && session.Agent != state.AgentKindClaude && session.AgentGraph == nil {
+			continue
+		}
+		d := observerDiagnostic{
+			PID: session.PID, Provider: session.Agent, BindingSource: "none",
+			Freshness: "absent", Snapshot: "absent",
+			ObserverConnection: "not_reported", LastErrorCategory: "not_reported",
+		}
+		info := session.Enrichment()
+		if info != nil {
+			d.LegacySummary = info.Status
+			if info.SessionID != "" {
+				d.Bound = true
+				d.BindingSource = "enrichment"
+			}
+		}
+		graph := session.AgentGraph
+		if graph != nil {
+			d.Source = string(graph.Source)
+			d.ObservedAt = graph.ObservedAt
+			d.FreshUntil = graph.FreshUntil
+			d.GraphSummary = graph.Summary.Status
+			if graph.RootID != "" {
+				d.Bound = true
+				d.BindingSource = "graph"
+			}
+			if graph.Complete {
+				d.Snapshot = "complete"
+			} else {
+				d.Snapshot = "partial"
+			}
+			switch {
+			case graph.ObservedAt.IsZero() || graph.FreshUntil.IsZero():
+				d.Freshness = "undated"
+			case now.Before(graph.ObservedAt):
+				d.Freshness = "not_yet_valid"
+			case !now.Before(graph.FreshUntil):
+				d.Freshness = "expired"
+			default:
+				d.Freshness = "fresh"
+			}
+			for _, node := range graph.Nodes {
+				live := node.ID == graph.RootID || !node.Lifecycle.Terminal()
+				if live {
+					d.LiveNodes++
+				}
+				if live && agentAttentionWaiting(node.Attention) {
+					d.WaitingNodes++
+				}
+				if node.Runtime == agentgraph.RuntimeSystemError || node.Lifecycle == agentgraph.LifecycleErrored {
+					d.ErrorNodes++
+				}
+			}
+			if session.Agent == state.AgentKindClaude && d.LegacySummary != "" && d.GraphSummary != "" {
+				mismatch := d.LegacySummary != d.GraphSummary
+				d.ShadowMismatch = &mismatch
+			}
+		}
+		out = append(out, d)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].PID != out[j].PID {
+			return out[i].PID < out[j].PID
+		}
+		return out[i].Provider < out[j].Provider
+	})
+	return out
+}
+
+type observerLogRecord struct {
+	Provider string
+	Category string
+	Count    uint64
+	At       time.Time
+}
+
+// parseObserverLogRecords accepts only C6's stable finite-label line. It never
+// retains the surrounding journal line or unknown key/value payload, which
+// keeps the diagnostic surface content-free even when unrelated log content is
+// present in the same input.
+func parseObserverLogRecords(lines []string) []observerLogRecord {
+	const marker = "agent-observer:"
+	var out []observerLogRecord
+	for _, line := range lines {
+		idx := strings.Index(line, marker)
+		if idx < 0 {
+			continue
+		}
+		values := map[string]string{}
+		for _, field := range strings.Fields(line[idx+len(marker):]) {
+			key, value, ok := strings.Cut(field, "=")
+			if ok && (key == "provider" || key == "category" || key == "count") {
+				values[key] = value
+			}
+		}
+		if (values["provider"] != state.AgentKindClaude && values["provider"] != state.AgentKindCodex) || !finiteDiagnosticLabel(values["category"]) {
+			continue
+		}
+		count, err := strconv.ParseUint(values["count"], 10, 64)
+		if err != nil {
+			continue
+		}
+		at, _ := extractTime(line)
+		out = append(out, observerLogRecord{Provider: values["provider"], Category: values["category"], Count: count, At: at})
+	}
+	return out
+}
+
+func finiteDiagnosticLabel(value string) bool {
+	if value == "" || len(value) > 64 {
+		return false
+	}
+	for _, r := range value {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+func applyObserverLogDiagnostics(diagnostics []observerDiagnostic, records []observerLogRecord) {
+	last := make(map[string]observerLogRecord)
+	for _, record := range records {
+		if !observerErrorCategory(record.Category) {
+			continue
+		}
+		prior, exists := last[record.Provider]
+		if !exists || prior.At.IsZero() || record.At.IsZero() || !record.At.Before(prior.At) {
+			last[record.Provider] = record
+		}
+	}
+	for i := range diagnostics {
+		record, ok := last[diagnostics[i].Provider]
+		if !ok {
+			continue
+		}
+		diagnostics[i].LastErrorCategory = record.Category
+		diagnostics[i].LastErrorCount = record.Count
+		diagnostics[i].LastErrorAt = record.At
+		// A fresh observation newer than the last broad observe_error proves
+		// recovery. Otherwise the only exact statement the category supports is
+		// "error"; it does not prove a transport disconnect.
+		if record.Category == "observe_error" &&
+			(diagnostics[i].ObservedAt.IsZero() || record.At.IsZero() || !record.At.Before(diagnostics[i].ObservedAt)) {
+			diagnostics[i].ObserverConnection = "error"
+		}
+	}
+}
+
+func observerErrorCategory(category string) bool {
+	switch category {
+	case "exact_binding_unavailable", "observe_error", "restore_error", "binding_conflict",
+		"hook_provider_mismatch", "invalid_observation", "history_projection_error", "unknown_protocol_enum":
+		return true
+	default:
+		return false
+	}
+}
+
+func renderObserverDiagnostics(w io.Writer, diagnostics []observerDiagnostic) {
+	fmt.Fprintln(w, "switchboard observer diagnostics (content-free)")
+	if len(diagnostics) == 0 {
+		fmt.Fprintln(w, "\nno provider roots in state snapshot")
+		return
+	}
+	for _, d := range diagnostics {
+		binding := "unbound"
+		if d.Bound {
+			binding = "bound"
+		}
+		fmt.Fprintf(w, "  pid %d %s: %s (%s) · source=%s freshness=%s snapshot=%s connection=%s · live=%d waiting=%d errors=%d · error=%s",
+			d.PID, orUnknown(d.Provider), binding, d.BindingSource, orUnknown(d.Source), d.Freshness, d.Snapshot,
+			d.ObserverConnection, d.LiveNodes, d.WaitingNodes, d.ErrorNodes, d.LastErrorCategory)
+		if d.LastErrorCount > 0 {
+			fmt.Fprintf(w, " count=%d", d.LastErrorCount)
+		}
+		if !d.LastErrorAt.IsZero() {
+			fmt.Fprintf(w, " at=%s", d.LastErrorAt.Local().Format(time.RFC3339))
+		}
+		if d.ShadowMismatch != nil {
+			fmt.Fprintf(w, " · shadow=%s graph=%s legacy=%s", matchWord(*d.ShadowMismatch), orUnknown(d.GraphSummary), orUnknown(d.LegacySummary))
+		}
+		fmt.Fprintln(w)
+		if d.Provider == state.AgentKindCodex && !d.Bound {
+			fmt.Fprintln(w, "    exact thread identity unavailable; verify CODEX_THREAD_ID visibility or SessionStart hook delivery")
+		}
+	}
+}
+
+func orUnknown(value string) string {
+	if value == "" {
+		return "unknown"
+	}
+	return value
+}
+
+func matchWord(mismatch bool) string {
+	if mismatch {
+		return "mismatch"
+	}
+	return "match"
 }
 
 // gatherLines reads candidate log lines from a file/stdin or by invoking

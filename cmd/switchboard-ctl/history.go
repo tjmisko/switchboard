@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/agentgraph"
 	"github.com/tjmisko/switchboard/internal/history"
 )
 
@@ -102,9 +103,73 @@ func cmdHistoryTail(args []string) {
 		}
 		return
 	}
-	for _, ev := range evs {
-		fmt.Println(formatEvent(ev))
+	for _, line := range formatHistoryEvents(evs) {
+		fmt.Println(line)
 	}
+}
+
+// formatHistoryEvents renders the human history view. Raw --json deliberately
+// bypasses it: compatibility projections remain durable evidence even when the
+// human view suppresses a legacy subagent edge duplicated by agent_state.
+func formatHistoryEvents(events []history.Event) []string {
+	canonical := make(map[legacyAgentEdge]struct{})
+	for _, ev := range events {
+		if ev.Type != history.EventAgentState {
+			continue
+		}
+		if edge, ok := canonicalLegacyEdge(ev); ok {
+			canonical[edge] = struct{}{}
+		}
+	}
+	lines := make([]string, 0, len(events))
+	for _, ev := range events {
+		if edge, ok := projectedLegacyEdge(ev); ok {
+			if _, duplicate := canonical[edge]; duplicate {
+				continue
+			}
+		}
+		lines = append(lines, formatEvent(ev))
+	}
+	return lines
+}
+
+type legacyAgentEdge struct {
+	root string
+	node string
+	kind string
+	at   int64
+}
+
+func canonicalLegacyEdge(ev history.Event) (legacyAgentEdge, bool) {
+	kind := ""
+	switch {
+	case !agentLifecycleLive(ev.FromLifecycle) && agentLifecycleLive(ev.ToLifecycle):
+		kind = history.EventSubagentSpawn
+	case !ev.FromLifecycle.Terminal() && ev.ToLifecycle.Terminal():
+		kind = history.EventSubagentStop
+	}
+	if kind == "" || ev.SessionID == "" || ev.ThreadID == "" || ev.ParentThreadID == "" {
+		return legacyAgentEdge{}, false
+	}
+	return legacyAgentEdge{root: ev.SessionID, node: ev.ThreadID, kind: kind, at: ev.Ts.UnixNano()}, true
+}
+
+func projectedLegacyEdge(ev history.Event) (legacyAgentEdge, bool) {
+	if ev.Type != history.EventSubagentSpawn && ev.Type != history.EventSubagentStop {
+		return legacyAgentEdge{}, false
+	}
+	node := ev.AgentID
+	if node == "" {
+		node = ev.ToolUseID
+	}
+	if ev.SessionID == "" || node == "" {
+		return legacyAgentEdge{}, false
+	}
+	return legacyAgentEdge{root: ev.SessionID, node: node, kind: ev.Type, at: ev.Ts.UnixNano()}, true
+}
+
+func agentLifecycleLive(value agentgraph.LifecycleState) bool {
+	return value == agentgraph.LifecyclePending || value == agentgraph.LifecycleRunning
 }
 
 // formatEvent renders one event as a compact human line:
@@ -132,6 +197,8 @@ func formatEvent(ev history.Event) string {
 		}
 	case history.EventSubagentStop:
 		detail = ev.AgentType
+	case history.EventAgentState:
+		detail = formatAgentStateDetail(ev)
 	case history.EventUsageSample:
 		detail = fmt.Sprintf("in=%d out=%d cache=%d", ev.TokIn, ev.TokOut, ev.TokCacheRead+ev.TokCacheCreate)
 	default:
@@ -146,6 +213,53 @@ func formatEvent(ev history.Event) string {
 		line += fmt.Sprintf("  (%s)", ev.Rule)
 	}
 	return strings.TrimRight(line, " ")
+}
+
+func formatAgentStateDetail(ev history.Event) string {
+	label := ev.Nickname
+	if label != "" && ev.Role != "" {
+		label += " (" + ev.Role + ")"
+	} else if label == "" {
+		label = ev.Role
+	}
+	if label == "" {
+		label = shortAgentID(ev.ThreadID)
+	}
+	if ev.ParentThreadID != "" {
+		label = "└─ " + label
+	}
+
+	var axes []string
+	if ev.FromRuntime != ev.ToRuntime {
+		axes = append(axes, "runtime "+agentAxisValue(string(ev.FromRuntime))+"→"+agentAxisValue(string(ev.ToRuntime)))
+	}
+	if ev.FromAttention != ev.ToAttention {
+		axes = append(axes, "attention "+agentAxisValue(string(ev.FromAttention))+"→"+agentAxisValue(string(ev.ToAttention)))
+	}
+	if ev.FromLifecycle != ev.ToLifecycle {
+		axes = append(axes, "lifecycle "+agentAxisValue(string(ev.FromLifecycle))+"→"+agentAxisValue(string(ev.ToLifecycle)))
+	}
+	if len(axes) == 0 {
+		axes = append(axes, "state unchanged")
+	}
+	return label + "  " + strings.Join(axes, " · ")
+}
+
+func shortAgentID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	if id == "" {
+		return "unknown"
+	}
+	return id
+}
+
+func agentAxisValue(value string) string {
+	if value == "" {
+		return "unknown"
+	}
+	return value
 }
 
 func orDash(s string) string {
