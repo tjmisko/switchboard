@@ -37,6 +37,40 @@ import (
 	"github.com/tjmisko/switchboard/internal/wm"
 )
 
+type codexObserverMode string
+
+const (
+	defaultCodexObserverMode codexObserverMode = "auto"
+	codexObserverAuto        codexObserverMode = "auto"
+	codexObserverOff         codexObserverMode = "off"
+)
+
+func parseCodexObserverMode(value string) (codexObserverMode, error) {
+	switch mode := codexObserverMode(value); mode {
+	case codexObserverAuto, codexObserverOff:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("invalid Codex observer mode %q (want auto or off)", value)
+	}
+}
+
+// codexObserverForMode keeps construction behind the rollout gate. In off
+// mode the coordinator still projects Codex hooks; it simply has no app-server
+// observer to register with, start, or request.
+func codexObserverForMode(mode codexObserverMode, factory func() codexObserver) codexObserver {
+	if mode == codexObserverOff {
+		return nil
+	}
+	return factory()
+}
+
+func codexObserverModeCategory(mode codexObserverMode) string {
+	if mode == codexObserverOff {
+		return "observer_disabled"
+	}
+	return "observer_enabled"
+}
+
 func main() {
 	statePath := flag.String("state", defaultStatePath(), "path to state.json mirror")
 	socketPath := flag.String("socket", defaultSocketPath(), "path to RPC unix socket")
@@ -45,7 +79,12 @@ func main() {
 	wmFlag := flag.String("wm", "auto", "WM backend: auto|hyprland|sway|i3|x11|none")
 	terminalFlag := flag.String("terminal", "auto", "terminal backend: auto|wezterm|tmux|none")
 	historyDir := flag.String("history-dir", "", "activity-log directory (default $XDG_STATE_HOME/switchboard/history)")
+	codexObserverFlag := flag.String("codex-observer", string(defaultCodexObserverMode), "Codex app-server observer: auto|off")
 	flag.Parse()
+	codexMode, err := parseCodexObserverMode(*codexObserverFlag)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -107,11 +146,14 @@ func main() {
 	// fence; observer I/O never runs under Store.Apply. The Codex proxy is a
 	// disposable read-only child and is closed exactly once with the daemon.
 	claudeObs := claudeprovider.NewObserver(sink.Dir(), claudeprovider.WithTuning(tun))
-	codexObs := codexprovider.NewObserver(codexprovider.Config{Diagnostic: func(string) {
-		// The adapter guarantees this callback contains only a finite, content-free
-		// protocol category. Keep the log equally content-free.
-		log.Printf("agent-observer: provider=codex category=unknown_protocol_enum count=1")
-	}})
+	codexObs := codexObserverForMode(codexMode, func() codexObserver {
+		return codexprovider.NewObserver(codexprovider.Config{Diagnostic: func(string) {
+			// The adapter guarantees this callback contains only a finite, content-free
+			// protocol category. Keep the log equally content-free.
+			log.Printf("agent-observer: provider=codex category=unknown_protocol_enum count=1")
+		}})
+	})
+	log.Printf("agent-observer: provider=codex category=%s count=1", codexObserverModeCategory(codexMode))
 	agentRuntime := newAgentCoordinator(store, sink, claudeObs, codexObs)
 	agentRuntime.Start(ctx, *reconcileInterval)
 	defer agentRuntime.Close()

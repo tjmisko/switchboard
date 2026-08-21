@@ -591,14 +591,11 @@ func (c *agentCoordinator) HandleHook(req rpc.Request, sess state.Session) {
 		}
 		c.applyObservation(ref, generation, result.Observation, result.Projection, now)
 	case agentgraph.ProviderCodex:
-		if c.codex == nil {
-			return
-		}
 		rootID := req.SessionID
 		if rootID == "" {
 			rootID = ref.ProviderSessionID
 		}
-		if req.Event == "SessionStart" && rootID != "" {
+		if c.codex != nil && req.Event == "SessionStart" && rootID != "" {
 			if err := c.codex.RegisterHookBinding(ref.Key(), rootID); err != nil {
 				c.recordDiagnostic(ref.Provider, "binding_conflict", now)
 				return
@@ -609,7 +606,9 @@ func (c *agentCoordinator) HandleHook(req rpc.Request, sess state.Session) {
 			generation := c.begin(ref.Key())
 			c.applyObservation(ref, generation, observation, claudeprovider.Compatibility{}, now)
 		}
-		c.Request(ref.Key())
+		if c.codex != nil {
+			c.Request(ref.Key())
+		}
 	}
 }
 

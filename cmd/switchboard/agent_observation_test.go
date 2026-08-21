@@ -95,6 +95,101 @@ func seedCoordinatorSession(store *state.Store, pid int, started time.Time, agen
 	return ref
 }
 
+func TestCodexObserverModeValidationAndConstruction(t *testing.T) {
+	if defaultCodexObserverMode != codexObserverAuto {
+		t.Fatalf("default mode = %q, want auto", defaultCodexObserverMode)
+	}
+	for _, value := range []string{"auto", "off"} {
+		mode, err := parseCodexObserverMode(value)
+		if err != nil || string(mode) != value {
+			t.Fatalf("parseCodexObserverMode(%q) = %q, %v", value, mode, err)
+		}
+	}
+	for _, value := range []string{"", "on", "AUTO"} {
+		if _, err := parseCodexObserverMode(value); err == nil {
+			t.Fatalf("parseCodexObserverMode(%q) accepted invalid mode", value)
+		}
+	}
+
+	fake := newFakeCodexCoordinatorObserver()
+	constructed := 0
+	factory := func() codexObserver {
+		constructed++
+		return fake
+	}
+	if got := codexObserverForMode(codexObserverOff, factory); got != nil {
+		t.Fatalf("off observer = %T, want nil", got)
+	}
+	if constructed != 0 {
+		t.Fatalf("off constructed observer %d times", constructed)
+	}
+	if got := codexObserverForMode(codexObserverAuto, factory); got != fake {
+		t.Fatalf("auto observer = %T, want factory result", got)
+	}
+	if constructed != 1 {
+		t.Fatalf("auto constructed observer %d times, want 1", constructed)
+	}
+	if got := codexObserverModeCategory(codexObserverAuto); got != "observer_enabled" {
+		t.Fatalf("auto category = %q", got)
+	}
+	if got := codexObserverModeCategory(codexObserverOff); got != "observer_disabled" {
+		t.Fatalf("off category = %q", got)
+	}
+}
+
+func TestCodexObserverOffKeepsHookFallbackAndClaudeGraph(t *testing.T) {
+	store := state.New("")
+	started := time.Now().Add(-time.Hour)
+	codexRef := provider.RootRef{PID: 4051, StartedAt: started, Provider: agentgraph.ProviderCodex, CWD: "/codex"}
+	claudeRef := provider.RootRef{
+		PID: 4052, StartedAt: started.Add(time.Second), Provider: agentgraph.ProviderClaude,
+		ProviderSessionID: "claude-root", CWD: "/claude",
+	}
+	store.Apply(func(sessions map[int]*state.Session) {
+		sessions[codexRef.PID] = &state.Session{
+			PID: codexRef.PID, StartedAt: codexRef.StartedAt,
+			Agent: state.AgentKindCodex, CWD: codexRef.CWD,
+		}
+		sessions[claudeRef.PID] = &state.Session{
+			PID: claudeRef.PID, StartedAt: claudeRef.StartedAt,
+			Agent: state.AgentKindClaude, CWD: claudeRef.CWD,
+			Claude: &state.AgentInfo{SessionID: claudeRef.ProviderSessionID},
+		}
+	})
+	realClaude := claudeprovider.NewObserver(t.TempDir())
+	coordinator := newAgentCoordinator(store, nil, realClaude, nil)
+	coordinator.refreshTrackedRoots()
+	defer coordinator.Close()
+
+	codexSession, ok := sessionForKey(store.Snapshot(), codexRef.Key())
+	if !ok {
+		t.Fatal("Codex root discovery was lost in off mode")
+	}
+	coordinator.HandleHook(rpc.Request{
+		Agent: state.AgentKindCodex, Event: "SessionStart", SessionID: "codex-root",
+	}, codexSession)
+	codexSession, _ = sessionForKey(store.Snapshot(), codexRef.Key())
+	if codexSession.AgentGraph == nil || codexSession.AgentGraph.Source != agentgraph.SourceHook ||
+		codexSession.AgentGraph.Summary.Status != state.StatusIdle {
+		t.Fatalf("off-mode Codex hook graph = %#v", codexSession.AgentGraph)
+	}
+	if codexSession.Codex == nil || codexSession.Codex.SessionID != "codex-root" || codexSession.Codex.Status != state.StatusIdle {
+		t.Fatalf("off-mode Codex legacy projection = %#v", codexSession.Codex)
+	}
+
+	claudeSession, ok := sessionForKey(store.Snapshot(), claudeRef.Key())
+	if !ok {
+		t.Fatal("Claude root discovery was lost in Codex off mode")
+	}
+	coordinator.HandleHook(rpc.Request{
+		Agent: state.AgentKindClaude, Event: "PermissionRequest", SessionID: "claude-root", ToolName: "Bash",
+	}, claudeSession)
+	claudeSession, _ = sessionForKey(store.Snapshot(), claudeRef.Key())
+	if claudeSession.AgentGraph == nil || claudeSession.AgentGraph.Summary.Status != state.StatusPermission {
+		t.Fatalf("Claude graph while Codex observer is off = %#v", claudeSession.AgentGraph)
+	}
+}
+
 func TestAgentObservationDoesNotHoldStoreLockAndFencesLateGeneration(t *testing.T) {
 	startedAt := time.Now().Add(-time.Hour)
 	store := state.New("")
