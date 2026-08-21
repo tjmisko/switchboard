@@ -1,0 +1,4 @@
+{"method":"thread/status/changed","params":{"threadId":"01890f00-0000-7000-8000-000000000002","status":{"type":"active","activeFlags":["waitingOnApproval"]}}}
+{"id":"approval-1","method":"item/commandExecution/requestApproval","params":{"threadId":"01890f00-0000-7000-8000-000000000002","turnId":"01890f00-0000-7000-8000-000000000011","itemId":"01890f00-0000-7000-8000-000000000030","startedAtMs":1700000010000,"command":null,"reason":null,"approvalId":null}}
+{"id":"approval-1","result":{"decision":"accept"}}
+{"method":"thread/status/changed","params":{"threadId":"01890f00-0000-7000-8000-000000000002","status":{"type":"active","activeFlags":[]}}}

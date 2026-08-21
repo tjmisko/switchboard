@@ -1,0 +1,2 @@
+{"id":1,"method":"initialize","params":{"clientInfo":{"name":"switchboard-evidence","title":"Switchboard evidence capture","version":"0.0.0"},"capabilities":{"experimentalApi":true}}}
+{"id":1,"result":{"userAgent":"codex_app_server/0.149.0","platformFamily":"unix","platformOs":"linux","codexHome":"/synthetic-codex-home"}}

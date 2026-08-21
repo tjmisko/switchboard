@@ -1,0 +1,4 @@
+{"method":"thread/status/changed","params":{"threadId":"01890f00-0000-7000-8000-000000000003","status":{"type":"active","activeFlags":["waitingOnUserInput"]}}}
+{"id":"user-input-1","method":"item/tool/requestUserInput","params":{"threadId":"01890f00-0000-7000-8000-000000000003","turnId":"01890f00-0000-7000-8000-000000000012","itemId":"01890f00-0000-7000-8000-000000000031","isBlocking":true,"autoResolutionMs":null,"questions":[{"id":"choice","header":"Synthetic","question":"[sanitized]","isOther":false,"isSecret":false,"options":[{"label":"A","description":"[sanitized]"},{"label":"B","description":"[sanitized]"}]}]}}
+{"id":"user-input-1","result":{"answers":{"choice":{"answers":["[sanitized]"]}}}}
+{"method":"thread/status/changed","params":{"threadId":"01890f00-0000-7000-8000-000000000003","status":{"type":"active","activeFlags":[]}}}

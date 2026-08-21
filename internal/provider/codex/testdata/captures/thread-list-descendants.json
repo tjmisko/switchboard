@@ -1,0 +1,16 @@
+{
+  "parentQuery": {
+    "request": {"id": 20, "method": "thread/list", "params": {"parentThreadId": "01890f00-0000-7000-8000-000000000001", "archived": false, "limit": 100, "sortKey": "created_at", "sortDirection": "asc", "useStateDbOnly": true}},
+    "response": {"id": 20, "result": {"data": [
+      {"id":"01890f00-0000-7000-8000-000000000002","sessionId":"01890f00-0000-7000-8000-000000000001","parentThreadId":"01890f00-0000-7000-8000-000000000001","agentNickname":"Atlas","agentRole":"researcher","createdAt":1700000001,"updatedAt":1700000020,"status":{"type":"notLoaded"},"source":{"subAgent":{"thread_spawn":{"parent_thread_id":"01890f00-0000-7000-8000-000000000001","depth":1,"agent_path":"agents/researcher","agent_nickname":"Atlas","agent_role":"researcher"}}},"threadSource":"subagent","modelProvider":"openai","cliVersion":"0.149.0","cwd":"/synthetic-workspace","preview":"","turns":[],"ephemeral":false,"projectId":null},
+      {"id":"01890f00-0000-7000-8000-000000000003","sessionId":"01890f00-0000-7000-8000-000000000001","parentThreadId":"01890f00-0000-7000-8000-000000000001","agentNickname":"Nova","agentRole":"reviewer","createdAt":1700000003,"updatedAt":1700000021,"status":{"type":"notLoaded"},"source":{"subAgent":{"thread_spawn":{"parent_thread_id":"01890f00-0000-7000-8000-000000000001","depth":1,"agent_path":"agents/reviewer","agent_nickname":"Nova","agent_role":"reviewer"}}},"threadSource":"subagent","modelProvider":"openai","cliVersion":"0.149.0","cwd":"/synthetic-workspace","preview":"","turns":[],"ephemeral":false,"projectId":null}
+    ], "nextCursor": null, "backwardsCursor": "synthetic-parent-cursor"}}
+  },
+  "ancestorQuery": {
+    "request": {"id": 21, "method": "thread/list", "params": {"ancestorThreadId": "01890f00-0000-7000-8000-000000000001", "archived": false, "limit": 100, "sortKey": "created_at", "sortDirection": "asc", "useStateDbOnly": true}},
+    "response": {"id": 21, "result": {"data": [
+      {"id":"01890f00-0000-7000-8000-000000000002","sessionId":"01890f00-0000-7000-8000-000000000001","parentThreadId":"01890f00-0000-7000-8000-000000000001","agentNickname":"Atlas","agentRole":"researcher","createdAt":1700000001,"updatedAt":1700000020,"status":{"type":"notLoaded"},"source":{"subAgent":{"thread_spawn":{"parent_thread_id":"01890f00-0000-7000-8000-000000000001","depth":1,"agent_path":"agents/researcher","agent_nickname":"Atlas","agent_role":"researcher"}}},"threadSource":"subagent","modelProvider":"openai","cliVersion":"0.149.0","cwd":"/synthetic-workspace","preview":"","turns":[],"ephemeral":false,"projectId":null},
+      {"id":"01890f00-0000-7000-8000-000000000003","sessionId":"01890f00-0000-7000-8000-000000000001","parentThreadId":"01890f00-0000-7000-8000-000000000001","agentNickname":"Nova","agentRole":"reviewer","createdAt":1700000003,"updatedAt":1700000021,"status":{"type":"notLoaded"},"source":{"subAgent":{"thread_spawn":{"parent_thread_id":"01890f00-0000-7000-8000-000000000001","depth":1,"agent_path":"agents/reviewer","agent_nickname":"Nova","agent_role":"reviewer"}}},"threadSource":"subagent","modelProvider":"openai","cliVersion":"0.149.0","cwd":"/synthetic-workspace","preview":"","turns":[],"ephemeral":false,"projectId":null}
+    ], "nextCursor": null, "backwardsCursor": "synthetic-ancestor-cursor"}}
+  }
+}

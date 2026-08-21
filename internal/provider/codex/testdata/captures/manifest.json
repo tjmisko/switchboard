@@ -1,0 +1,60 @@
+{
+  "formatVersion": 1,
+  "codexCliVersion": "0.149.0",
+  "appServerVersion": null,
+  "schemaBundle": {
+    "generator": "codex app-server generate-json-schema --experimental",
+    "version": "0.149.0",
+    "sha256": "4f4a8d8f53f971b97f818639f58c8d26bb68bfcdfa2d2f20572cb97e6761ab91"
+  },
+  "liveCapture": {
+    "attempted": true,
+    "connected": false,
+    "reason": "no already-running control socket was available"
+  },
+  "synthetic": {
+    "rootThreadId": "01890f00-0000-7000-8000-000000000001",
+    "childThreadIds": [
+      "01890f00-0000-7000-8000-000000000002",
+      "01890f00-0000-7000-8000-000000000003"
+    ],
+    "fixedEpochSeconds": 1700000000
+  },
+  "artifacts": [
+    {
+      "path": "initialize.jsonl",
+      "provenance": "schema-derived",
+      "description": "Initialization request and response with experimental API negotiation."
+    },
+    {
+      "path": "root-with-two-children.jsonl",
+      "provenance": "schema-derived",
+      "description": "Root snapshot, two child starts, spawn-before-thread and status-before-metadata permutations, turn starts, and spawn/message/follow-up collaboration items."
+    },
+    {
+      "path": "child-waiting-approval.jsonl",
+      "provenance": "schema-derived",
+      "description": "Approval attention flag, request, sanitized resolution, and cleared flag."
+    },
+    {
+      "path": "child-waiting-user-input.jsonl",
+      "provenance": "schema-derived",
+      "description": "User-input attention flag, request, sanitized resolution, and cleared flag."
+    },
+    {
+      "path": "drain-to-idle.jsonl",
+      "provenance": "schema-derived",
+      "description": "Child completion, wait/close collaboration lifecycle, and root idle state."
+    },
+    {
+      "path": "thread-list-descendants.json",
+      "provenance": "schema-derived",
+      "description": "Direct-parent and ancestor list request/response envelopes with completed synthetic descendants."
+    },
+    {
+      "path": "proxy-help.txt",
+      "provenance": "installed-cli-help",
+      "description": "Sanitized installed help evidence for the supported proxy command and socket option."
+    }
+  ]
+}

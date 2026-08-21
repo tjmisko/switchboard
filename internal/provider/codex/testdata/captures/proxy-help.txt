@@ -1,0 +1,15 @@
+Installed CLI evidence (codex-cli 0.149.0), sanitized and transcribed from
+`codex app-server --help` and `codex app-server proxy --help`:
+
+  proxy  Proxy stdio bytes to the running app-server control socket
+
+Usage: codex app-server proxy [OPTIONS]
+
+Options:
+  --sock <SOCKET_PATH>  Path to the app-server Unix domain socket to connect to
+  -h, --help            Print help
+
+The command is visible in installed CLI help. The capture attempt used the
+default endpoint and reported that no control socket existed. The endpoint path
+and the CLI's unrelated configuration override help text are intentionally not
+retained.
