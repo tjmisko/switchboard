@@ -25,6 +25,17 @@ const (
 	DefaultTerminalLimit    = 32
 )
 
+// descendantSourceKinds is explicit because thread/list otherwise defaults to
+// interactive cli/vscode threads and silently excludes Codex descendants.
+// These are all subagent source kinds in the accepted 0.149 protocol.
+var descendantSourceKinds = []string{
+	"subAgent",
+	"subAgentReview",
+	"subAgentCompact",
+	"subAgentThreadSpawn",
+	"subAgentOther",
+}
+
 // Config controls observer I/O and bounded retention. Zero durations receive
 // production defaults. Connector and Environment are injectable so tests never
 // touch an installed Codex binary, socket, or live process environment.
@@ -366,6 +377,7 @@ func (o *Observer) snapshot(client *rpcClient, rootID string) (*graphState, erro
 		params := map[string]any{
 			"ancestorThreadId": rootID, "archived": false, "limit": 100,
 			"sortKey": "created_at", "sortDirection": "asc", "useStateDbOnly": true,
+			"sourceKinds": descendantSourceKinds,
 		}
 		if cursor != "" {
 			params["cursor"] = cursor

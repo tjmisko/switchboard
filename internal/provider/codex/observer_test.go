@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -48,6 +49,18 @@ func TestObserverReconnectFreshnessGenerationAndCoalescing(t *testing.T) {
 			continue
 		}
 		t.Fatalf("observer emitted non-allowlisted method %q", method)
+	}
+	listRequests := proxy.ListRequests()
+	if len(listRequests) == 0 {
+		t.Fatal("observer sent no descendant thread/list request")
+	}
+	for i, request := range listRequests {
+		if request.AncestorThreadID != "root" {
+			t.Errorf("thread/list request %d ancestorThreadId = %q", i, request.AncestorThreadID)
+		}
+		if !reflect.DeepEqual(request.SourceKinds, descendantSourceKinds) {
+			t.Errorf("thread/list request %d sourceKinds = %v, want %v", i, request.SourceKinds, descendantSourceKinds)
+		}
 	}
 	drainUpdates(observer.Updates())
 
@@ -186,6 +199,12 @@ type fakeProxy struct {
 	server       net.Conn
 	encoder      *json.Encoder
 	methods      []string
+	listRequests []fakeListRequest
+}
+
+type fakeListRequest struct {
+	AncestorThreadID string   `json:"ancestorThreadId"`
+	SourceKinds      []string `json:"sourceKinds"`
 }
 
 func newFakeProxy() *fakeProxy {
@@ -239,6 +258,10 @@ func (p *fakeProxy) serve(connection net.Conn) {
 		case "thread/read":
 			result = threadReadResult{Thread: root}
 		case "thread/list":
+			var request fakeListRequest
+			_ = json.Unmarshal(envelope.Params, &request)
+			request.SourceKinds = append([]string(nil), request.SourceKinds...)
+			p.listRequests = append(p.listRequests, request)
 			result = threadListResult{Data: descendants}
 		case "initialized":
 			p.mu.Unlock()
@@ -293,6 +316,17 @@ func (p *fakeProxy) Methods() []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]string(nil), p.methods...)
+}
+
+func (p *fakeProxy) ListRequests() []fakeListRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]fakeListRequest, len(p.listRequests))
+	for i, request := range p.listRequests {
+		out[i] = request
+		out[i].SourceKinds = append([]string(nil), request.SourceKinds...)
+	}
+	return out
 }
 
 func waitUpdate(t *testing.T, updates <-chan provider.RootKey, timeout time.Duration) provider.RootKey {
