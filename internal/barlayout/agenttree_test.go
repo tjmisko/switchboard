@@ -103,6 +103,13 @@ func TestAgentStateTextKeepsWaitsErrorsAndTerminalDistinct(t *testing.T) {
 	if got := AgentStateKind(state.AgentNode{Runtime: agentgraph.RuntimeIdle, Lifecycle: agentgraph.LifecycleRunning}); got != "idle" {
 		t.Errorf("idle running-lifecycle node kind = %q, want idle", got)
 	}
+	notLoadedRunning := state.AgentNode{Runtime: agentgraph.RuntimeNotLoaded, Lifecycle: agentgraph.LifecycleRunning}
+	if got := AgentStateText(notLoadedRunning); got != "not loaded" {
+		t.Errorf("not-loaded running-lifecycle node text = %q, want not loaded", got)
+	}
+	if got := AgentStateKind(notLoadedRunning); got != "unknown" {
+		t.Errorf("not-loaded running-lifecycle node kind = %q, want grey/unknown", got)
+	}
 }
 
 func TestLimitAgentRowsReportsFoldedCount(t *testing.T) {

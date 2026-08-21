@@ -148,6 +148,9 @@ func AgentStateText(node state.AgentNode) string {
 	if node.Runtime == agentgraph.RuntimeSystemError {
 		return "system error"
 	}
+	if node.Runtime == agentgraph.RuntimeNotLoaded {
+		return "not loaded"
+	}
 	switch node.Lifecycle {
 	case agentgraph.LifecyclePending:
 		return "pending"
@@ -183,6 +186,9 @@ func AgentStateKind(node state.AgentNode) string {
 	}
 	if node.Runtime == agentgraph.RuntimeSystemError {
 		return "error"
+	}
+	if node.Runtime == agentgraph.RuntimeNotLoaded {
+		return "unknown"
 	}
 	if node.Lifecycle == agentgraph.LifecyclePending {
 		return "active"
@@ -245,6 +251,9 @@ func agentPriority(node state.AgentNode) int {
 	}
 	if node.Attention == agentgraph.AttentionApproval || node.Attention == agentgraph.AttentionUserInput {
 		return 0
+	}
+	if node.Runtime == agentgraph.RuntimeNotLoaded {
+		return 2
 	}
 	if node.Lifecycle == agentgraph.LifecyclePending || node.Runtime == agentgraph.RuntimeActive || (node.Lifecycle == agentgraph.LifecycleRunning && node.Runtime != agentgraph.RuntimeIdle) {
 		return 1
