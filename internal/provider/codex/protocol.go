@@ -5,7 +5,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/tjmisko/switchboard/internal/agentgraph"
 )
@@ -27,7 +26,6 @@ type rpcThread struct {
 	ID             string    `json:"id"`
 	ParentThreadID string    `json:"parentThreadId"`
 	Name           string    `json:"name"`
-	Preview        string    `json:"preview"`
 	AgentNickname  string    `json:"agentNickname"`
 	AgentRole      string    `json:"agentRole"`
 	CreatedAt      int64     `json:"createdAt"`
@@ -64,10 +62,8 @@ type rpcAgentState struct {
 }
 
 type nodeState struct {
-	node          agentgraph.Node
-	cohort        string
-	threadName    string
-	threadPreview string
+	node   agentgraph.Node
+	cohort string
 }
 
 type graphState struct {
@@ -119,11 +115,9 @@ func (s *graphState) upsertThread(thread rpcThread, root bool) {
 	} else if thread.ParentThreadID != "" {
 		state.node.ParentID = thread.ParentThreadID
 	}
-	state.threadName = strings.TrimSpace(thread.Name)
-	state.threadPreview = thread.Preview
 	state.node.Nickname = strings.TrimSpace(thread.AgentNickname)
 	if root {
-		state.node.Nickname = threadDisplayName(state.threadName, state.threadPreview)
+		state.node.Nickname = strings.TrimSpace(thread.Name)
 	}
 	state.node.Role = thread.AgentRole
 	if startedAt := unixSeconds(thread.CreatedAt); !startedAt.IsZero() {
@@ -138,109 +132,19 @@ func (s *graphState) upsertThread(thread rpcThread, root bool) {
 }
 
 // setThreadName applies Codex's thread/name/updated notification without
-// needing a full thread snapshot. Root names fall back to the stable preview
-// slug when a user clears an explicit name; child display remains owned by the
-// agent nickname supplied with its spawn metadata.
+// needing a full thread snapshot. The graph carries only Codex's explicit
+// user-facing root name; renderers own the short thread-ID fallback used while
+// it is unnamed. Child display remains owned by the agent nickname supplied
+// with its spawn metadata.
 func (s *graphState) setThreadName(id, name string) bool {
 	state := s.nodes[id]
 	if state == nil {
 		return false
 	}
-	state.threadName = strings.TrimSpace(name)
 	if id == s.rootID {
-		state.node.Nickname = threadDisplayName(state.threadName, state.threadPreview)
+		state.node.Nickname = strings.TrimSpace(name)
 	}
 	return true
-}
-
-// threadDisplayName prefers Codex's explicit user-facing thread name. Unnamed
-// threads otherwise expose a UUID in the configurable terminal-title item, so
-// Switchboard derives a short, deterministic slug from the first-message
-// preview instead. This is display metadata only: it never renames the Codex
-// thread or participates in status reduction.
-func threadDisplayName(name, preview string) string {
-	if name = strings.TrimSpace(name); name != "" {
-		return name
-	}
-	return previewSlug(preview)
-}
-
-const (
-	previewSlugWords = 5
-	previewSlugRunes = 40
-)
-
-var previewStopWords = map[string]struct{}{
-	"a": {}, "an": {}, "and": {}, "are": {}, "can": {}, "could": {},
-	"d": {}, "for": {}, "from": {}, "help": {}, "i": {},
-	"in": {}, "is": {}, "it": {}, "like": {}, "me": {}, "my": {},
-	"of": {}, "on": {}, "please": {}, "that": {}, "the": {}, "this": {},
-	"to": {}, "us": {}, "want": {}, "we": {}, "with": {}, "would": {},
-	"you": {}, "your": {},
-}
-
-// previewSlug extracts a compact task label from an unnamed thread's first
-// user message. It keeps the first useful sentence, drops conversational glue,
-// and has hard word/rune caps so prompt text cannot balloon a bar chip. Unicode
-// letters and digits are retained; punctuation becomes a word boundary.
-func previewSlug(preview string) string {
-	words := make([]string, 0, previewSlugWords)
-	var token strings.Builder
-
-	flush := func() {
-		if token.Len() == 0 || len(words) == previewSlugWords {
-			token.Reset()
-			return
-		}
-		word := strings.ToLower(token.String())
-		token.Reset()
-		if _, skip := previewStopWords[word]; skip {
-			return
-		}
-		words = append(words, word)
-	}
-
-	for _, r := range strings.TrimSpace(preview) {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			token.WriteRune(r)
-			continue
-		}
-		flush()
-		if len(words) == previewSlugWords || ((r == '.' || r == '!' || r == '?' || r == '\n') && len(words) >= 2) {
-			break
-		}
-	}
-	flush()
-	if len(words) == 0 {
-		return ""
-	}
-
-	var slug strings.Builder
-	usedRunes := 0
-	for _, word := range words {
-		separator := 0
-		if usedRunes > 0 {
-			separator = 1
-		}
-		remaining := previewSlugRunes - usedRunes - separator
-		if remaining <= 0 {
-			break
-		}
-		wordRunes := []rune(word)
-		if len(wordRunes) > remaining {
-			wordRunes = wordRunes[:remaining]
-		}
-		if usedRunes > 0 {
-			slug.WriteByte('-')
-			usedRunes++
-		}
-		slug.WriteString(string(wordRunes))
-		usedRunes += len(wordRunes)
-		if len(wordRunes) < len([]rune(word)) {
-			break
-		}
-	}
-	return strings.Trim(slug.String(), "-")
 }
 
 func (s *graphState) ensureNode(id, parentID string) *nodeState {

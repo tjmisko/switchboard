@@ -85,76 +85,36 @@ func TestThreadListFixtureUsesExplicitParentage(t *testing.T) {
 	}
 }
 
-func TestThreadDisplayNamePrefersExplicitNameAndDerivesStablePreviewSlug(t *testing.T) {
-	cases := []struct {
-		name     string
-		explicit string
-		preview  string
-		want     string
-	}{
-		{
-			name: "explicit Codex rename wins", explicit: "Release audit",
-			preview: "Please investigate the failing release workflow.", want: "Release audit",
-		},
-		{
-			name:    "conversational lead-in is removed",
-			preview: "I'd like you to help me with Codex session naming. Currently the title is a UUID.",
-			want:    "codex-session-naming",
-		},
-		{
-			name:    "first useful sentence wins",
-			preview: "Please help. Fix the authentication timeout in the API client.",
-			want:    "fix-authentication-timeout-api-client",
-		},
-		{
-			name:    "long content is bounded",
-			preview: "Supercalifragilisticexpialidociousplusmore should never make the switchboard chip enormous",
-			want:    "supercalifragilisticexpialidociousplusmo",
-		},
-		{name: "empty stays empty", preview: "Please help me with this.", want: ""},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := threadDisplayName(tc.explicit, tc.preview); got != tc.want {
-				t.Errorf("threadDisplayName(%q, %q) = %q, want %q", tc.explicit, tc.preview, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestRootThreadNameSnapshotAndUpdateRemainDisplayOnly(t *testing.T) {
+func TestRootThreadNameSnapshotAndUpdateRemainExplicitAndDisplayOnly(t *testing.T) {
 	state := newGraphState(rpcThread{
-		ID: "root", Name: "Initial title", Preview: "Investigate the session naming behavior.",
+		ID: fixtureRoot, Name: "Initial title",
 		Status: rpcStatus{Type: "idle"},
 	}, nil, 32)
 	observation, err := state.observation(fixtureNow, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertNode(t, observation, "root", "", "Initial title", "", agentgraph.RuntimeIdle, agentgraph.AttentionNone, agentgraph.LifecycleUnknown)
+	assertNode(t, observation, fixtureRoot, "", "Initial title", "", agentgraph.RuntimeIdle, agentgraph.AttentionNone, agentgraph.LifecycleUnknown)
 
-	if !state.setThreadName("root", "Short rename") {
+	if !state.setThreadName(fixtureRoot, "Short rename") {
 		t.Fatal("root thread name update was not applied")
 	}
-	if got := state.nodes["root"].node.Nickname; got != "Short rename" {
+	if got := state.nodes[fixtureRoot].node.Nickname; got != "Short rename" {
 		t.Fatalf("updated root nickname = %q, want Short rename", got)
 	}
-	if !state.setThreadName("root", "") {
+	if !state.setThreadName(fixtureRoot, "") {
 		t.Fatal("root thread name clear was not applied")
 	}
-	if got := state.nodes["root"].node.Nickname; got != "investigate-session-naming-behavior" {
-		t.Fatalf("cleared root nickname = %q, want preview fallback", got)
+	if got := state.nodes[fixtureRoot].node.Nickname; got != "" {
+		t.Fatalf("cleared root nickname = %q, want empty explicit name", got)
 	}
-	if state.nodes["root"].node.Runtime != agentgraph.RuntimeIdle || state.nodes["root"].node.Attention != agentgraph.AttentionNone {
+	if state.nodes[fixtureRoot].node.Runtime != agentgraph.RuntimeIdle || state.nodes[fixtureRoot].node.Attention != agentgraph.AttentionNone {
 		t.Fatal("display-name update changed status axes")
 	}
 }
 
 func TestThreadNameUpdatedNotificationRefreshesRootMetadata(t *testing.T) {
 	observer, key := fixtureObserver(t)
-	root := observer.roots[key].graph.nodes[fixtureRoot]
-	root.threadPreview = "Diagnose Codex title animation."
-	root.node.Nickname = previewSlug(root.threadPreview)
 
 	changed, unknown := observer.applyNotificationLocked(rpcNotification{
 		Generation: 1,
@@ -180,7 +140,7 @@ func TestThreadNameUpdatedNotificationRefreshesRootMetadata(t *testing.T) {
 	if len(changed) != 1 {
 		t.Fatalf("name clear changed keys = %#v", changed)
 	}
-	if got := findNode(observer.roots[key].observation, fixtureRoot); got == nil || got.Nickname != "diagnose-codex-title-animation" {
+	if got := findNode(observer.roots[key].observation, fixtureRoot); got == nil || got.Nickname != "" {
 		t.Fatalf("name clear observation root = %#v", got)
 	}
 }

@@ -271,12 +271,12 @@ runtime status, approvals, and streamed events. See the
 and [Codex subagent documentation](https://learn.chatgpt.com/docs/agent-configuration/subagents).
 
 The observer also reads Codex's optional user-facing thread `name` and follows
-`thread/name/updated`. For an unnamed thread it derives a bounded, stable task
-slug from the first-message `preview` (for example,
-`codex-session-naming`) instead of showing the thread UUID. Codex terminal
-titles are deliberately excluded from label fallback: their configurable
-spinner/run-state items animate while work runs and their unnamed-thread item
-falls back to the UUID. Colors continue to come only from structured app-server
+`thread/name/updated`. An unnamed thread uses only the first two characters of
+its stable thread ID; after project prefixing that renders as, for example,
+`sb-01`. An explicit rename replaces that fallback (`sb-my-short-name`). Codex
+terminal titles are deliberately excluded from label fallback: their
+configurable spinner/run-state, branch, and model items do not belong in the
+session label. Colors continue to come only from structured app-server
 runtime/attention state; names do not affect status.
 
 The transport used here is `codex app-server proxy`: a disposable stdio child

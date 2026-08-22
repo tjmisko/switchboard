@@ -32,11 +32,12 @@ import (
 var spinnerPrefixes = []string{"✳ ", "⠂ ", "⠐ ", "⠁ ", "⠈ ", "⠠ ", "⠄ ", "⡀ ", "⢀ "}
 
 // RawName picks the human name for a session before project prefixing. Codex
-// uses the root node name supplied by app-server and deliberately never uses
-// its terminal title: that title is configurable, may be an unnamed thread's
-// UUID, and can repaint an animated activity spinner. Claude prefers its
-// authoritative ~/.claude/sessions/<pid>.json name, then a spinner-stripped
-// terminal title. Both providers fall back to cwd and finally pid.
+// uses an explicit root name supplied by app-server, then the first two
+// characters of its stable thread ID; it deliberately never uses its terminal
+// title, whose configurable branch/model fields and activity spinner do not
+// belong in a session label. Claude prefers its authoritative
+// ~/.claude/sessions/<pid>.json name, then a spinner-stripped terminal title.
+// Both providers fall back to cwd and finally pid.
 func RawName(s state.Session) string {
 	return rawName(s, claudeSessionName)
 }
@@ -52,6 +53,12 @@ func rawName(s state.Session, claudeName func(pid int) string) string {
 	if s.Agent == state.AgentKindCodex {
 		if n := graphRootName(s.AgentGraph); n != "" {
 			return n
+		}
+		if s.AgentGraph != nil && s.AgentGraph.RootID != "" {
+			return shortCodexSessionID(s.AgentGraph.RootID)
+		}
+		if info := s.Enrichment(); info != nil && info.SessionID != "" {
+			return shortCodexSessionID(info.SessionID)
 		}
 	} else {
 		if n := claudeName(s.PID); n != "" {
@@ -72,6 +79,19 @@ func rawName(s state.Session, claudeName func(pid int) string) string {
 		return filepath.Base(s.CWD)
 	}
 	return fmt.Sprintf("pid %d", s.PID)
+}
+
+const shortCodexSessionIDRunes = 2
+
+// shortCodexSessionID is the compact identity for an unnamed Codex thread.
+// Thread IDs are currently UUIDs, but counting runes keeps the display helper
+// correct if a future provider emits another opaque identifier shape.
+func shortCodexSessionID(id string) string {
+	runes := []rune(strings.TrimSpace(id))
+	if len(runes) <= shortCodexSessionIDRunes {
+		return string(runes)
+	}
+	return string(runes[:shortCodexSessionIDRunes])
 }
 
 func graphRootName(graph *state.AgentGraph) string {

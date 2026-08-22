@@ -171,11 +171,12 @@ title. Watching the title would lose information and add failure modes:
 
 The existing app-server observer is already the simplification: it consumes
 Codex's structured runtime projection directly. Titles remain terminal/WM
-metadata only. For display naming, the observer prefers `Thread.name`; when it
-is empty, it derives a bounded stable slug from `Thread.preview`. Codex labels
-never fall back to terminal titles, so neither spinner animation nor UUIDs can
-appear on Switchboard. This derivation is display-only and does not mutate the
-Codex thread via `thread/name/set`.
+metadata only. For display naming, Switchboard prefers `Thread.name`; when it is
+empty, the label layer uses the first two characters of the stable root thread
+ID. Codex labels never fall back to terminal titles, so spinner animation,
+branch/model suffixes, and the full UUID cannot appear on Switchboard. This
+fallback is display-only and does not mutate the Codex thread via
+`thread/name/set`.
 
 ## Historical findings retained
 

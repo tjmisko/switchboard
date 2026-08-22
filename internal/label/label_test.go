@@ -85,19 +85,19 @@ func TestRawName_CodexPrefersAppServerRootNameOverAnimatedTerminalTitle(t *testi
 		AgentGraph: &state.AgentGraph{
 			RootID: "01890f00-0000-7000-8000-000000000001",
 			Nodes: []state.AgentNode{{
-				ID: "01890f00-0000-7000-8000-000000000001", Nickname: "codex-session-naming",
+				ID: "01890f00-0000-7000-8000-000000000001", Nickname: "my-short-name",
 			}},
 		},
 	}
-	if got := RawName(s); got != "codex-session-naming" {
-		t.Errorf("RawName = %q, want codex-session-naming", got)
+	if got := RawName(s); got != "my-short-name" {
+		t.Errorf("RawName = %q, want my-short-name", got)
 	}
-	if got := Chip(projectname.DefaultConfig(), s); got != "sb-codex-session-naming" {
-		t.Errorf("Chip = %q, want sb-codex-session-naming", got)
+	if got := Chip(projectname.DefaultConfig(), s); got != "sb-my-short-name" {
+		t.Errorf("Chip = %q, want sb-my-short-name", got)
 	}
 }
 
-func TestRawName_CodexNeverUsesMovingOrUUIDTerminalTitleAsFallback(t *testing.T) {
+func TestRawName_CodexUsesShortRootIDInsteadOfTerminalTitle(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	base := state.Session{
 		PID: 4246, Agent: state.AgentKindCodex, CWD: "/home/u/Projects/switchboard",
@@ -113,17 +113,23 @@ func TestRawName_CodexNeverUsesMovingOrUUIDTerminalTitleAsFallback(t *testing.T)
 	} {
 		s := base
 		s.Wezterm = &state.WeztermInfo{WindowTitle: title}
-		if got := RawName(s); got != "switchboard" {
-			t.Errorf("RawName with title %q = %q, want stable cwd fallback", title, got)
+		if got := RawName(s); got != "01" {
+			t.Errorf("RawName with title %q = %q, want short stable root id", title, got)
+		}
+		if got := Chip(projectname.DefaultConfig(), s); got != "sb-01" {
+			t.Errorf("Chip with title %q = %q, want sb-01", title, got)
 		}
 	}
 }
 
 func TestRawName_CodexDoesNotReadClaudePidName(t *testing.T) {
 	writeSessionFile(t, 4247, "unrelated-claude-name")
-	s := state.Session{PID: 4247, Agent: state.AgentKindCodex, CWD: "/home/u/Projects/switchboard"}
-	if got := RawName(s); got != "switchboard" {
-		t.Errorf("RawName = %q, want switchboard", got)
+	s := state.Session{
+		PID: 4247, Agent: state.AgentKindCodex, CWD: "/home/u/Projects/switchboard",
+		Codex: &state.AgentInfo{SessionID: "01a026ea-0273-7272-b8fc-a3940479c065"},
+	}
+	if got := RawName(s); got != "01" {
+		t.Errorf("RawName = %q, want short Codex session id", got)
 	}
 }
 
