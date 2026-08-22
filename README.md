@@ -282,6 +282,11 @@ attention, children, and name, then applies the first new-thread observation.
 Late events for a retired thread or generation are rejected. Every exact hook
 and every app-server poll can discover a rotation, so missed `SessionStart`
 events and app-server restarts self-heal without cwd or timestamp correlation.
+For both wrapped and standard Codex, a `SessionStart` whose source is `clear`,
+`startup`, or `resume` is held for 250 ms: an immediate same-thread
+`UserPromptSubmit` replaces the provisional idle edge, while a standalone
+`/clear` settles to idle. A `compact` start remains active because Codex resumes
+the model immediately after compaction.
 
 In the default `-codex-observer auto` mode, the daemon runs one read-mostly
 observer per registered endpoint. It reconciles `thread/loaded/list`, reads the
@@ -336,12 +341,20 @@ This three-level event → matcher group → handler shape follows the
 [official OpenAI hooks documentation](https://learn.chatgpt.com/docs/hooks).
 Codex requires non-managed command hooks to be reviewed and trusted; use
 `/hooks` after adding or changing the file. The fallback maps
-`UserPromptSubmit`/`PreToolUse`/`PostToolUse` to active, `PermissionRequest` to
-an approval wait (`AskUserQuestion` to user input), and `Stop`/`SessionStart` to
-idle. It is partial and root-only. Active evidence remains fresh for 10 minutes,
-approval or user-input waits for 24 hours, and idle edges for 7 days. Every
-later hook replaces and refreshes that evidence; the finite deadlines bound the
-effect of a missed resolution edge.
+`UserPromptSubmit` and ordinary `PreToolUse`/`PostToolUse` to active,
+`PermissionRequest` to an approval wait, and `Stop` to idle. A
+`request_user_input` `PreToolUse` instead opens a user-input wait keyed by its
+opaque `tool_use_id`; only the matching `PostToolUse`, its turn's `Stop`, or a
+new conversation clears that wait. Unrelated tool hooks cannot repaint it
+green. `SessionStart` uses its documented source as described above. Only
+content-free lifecycle metadata (`source`, `turn_id`, `tool_use_id`, and
+`permission_mode`) is used to correlate the interactive wait; its question,
+answer, and raw tool input stay out of the daemon. The fallback is partial and root-only. Active
+evidence remains fresh for 10 minutes, approval or user-input waits for 24
+hours, and idle edges for 7 days. The finite deadlines bound the effect of a
+missed resolution edge; a daemon restart during an already-open hook-only
+interview cannot reconstruct that wait and therefore remains a documented
+standard-CLI limitation.
 
 Automatic degradation is fail-open for the root and fail-closed for status:
 

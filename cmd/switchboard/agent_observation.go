@@ -29,6 +29,11 @@ const (
 	codexHookActiveFreshness    = 10 * time.Minute
 	codexHookAttentionFreshness = 24 * time.Hour
 	codexHookIdleFreshness      = 7 * 24 * time.Hour
+	// SessionStart(clear/startup/resume) is frequently followed immediately by
+	// UserPromptSubmit for the same new thread. Holding the provisional idle edge
+	// briefly prevents a synthetic idle->working transition while still making a
+	// standalone /clear settle to idle promptly.
+	codexHookStartSettle = 250 * time.Millisecond
 )
 
 type claudeObserver interface {
@@ -59,6 +64,28 @@ type trackedProviderRoot struct {
 	restored bool
 }
 
+type codexPendingInput struct {
+	turnID, toolUseID, writer, toolName, inputHash string
+}
+
+type codexHookRootState struct {
+	sessionID string
+	latestAt  time.Time
+	retired   map[string]struct{}
+	pending   map[string]codexPendingInput
+}
+
+type pendingCodexStart struct {
+	sessionID string
+	timer     *time.Timer
+	ref       provider.RootRef
+	req       rpc.Request
+	now       time.Time
+	done      sync.Once
+}
+
+func (p *pendingCodexStart) finish(wg *sync.WaitGroup) { p.done.Do(wg.Done) }
+
 // agentCoordinator is the single graph-observation landing path. Periodic and
 // event-triggered observations may do slow I/O concurrently with hook delivery,
 // but every root carries a monotonically increasing generation. A hook that
@@ -88,6 +115,12 @@ type agentCoordinator struct {
 	autonamePrompts map[string]autonameInput
 	namer           codexprovider.NameGenerator
 	autonameModel   string
+
+	codexHookMu      sync.Mutex
+	codexHookRoots   map[provider.RootKey]*codexHookRootState
+	codexStarts      map[provider.RootKey]*pendingCodexStart
+	codexStartSettle time.Duration
+	codexTimerWG     sync.WaitGroup
 }
 
 type autonameInput struct {
@@ -108,7 +141,9 @@ func newAgentCoordinator(store *state.Store, sink *history.Sink, claude claudeOb
 		generation: make(map[provider.RootKey]uint64), tracked: make(map[provider.RootKey]trackedProviderRoot),
 		diagnostics: make(map[string]rpc.AgentDiagnostic), lastLog: make(map[string]time.Time),
 		autonames: make(map[string]context.CancelFunc), autonamePrompts: make(map[string]autonameInput), namer: codexprovider.EphemeralNamer{},
-		autonameModel: codexprovider.DefaultAutonameModel,
+		autonameModel:  codexprovider.DefaultAutonameModel,
+		codexHookRoots: make(map[provider.RootKey]*codexHookRootState), codexStarts: make(map[provider.RootKey]*pendingCodexStart),
+		codexStartSettle: codexHookStartSettle,
 	}
 }
 
@@ -140,6 +175,16 @@ func (c *agentCoordinator) Close() {
 		}
 		clear(c.autonames)
 		c.autonameMu.Unlock()
+		c.codexHookMu.Lock()
+		for _, pending := range c.codexStarts {
+			if pending.timer.Stop() {
+				pending.finish(&c.codexTimerWG)
+			}
+		}
+		clear(c.codexStarts)
+		clear(c.codexHookRoots)
+		c.codexHookMu.Unlock()
+		c.codexTimerWG.Wait()
 		c.wg.Wait()
 		if c.claude != nil {
 			_ = c.claude.Close()
@@ -277,6 +322,7 @@ func (c *agentCoordinator) refreshTrackedRoots() []provider.RootRef {
 	}
 	c.mu.Unlock()
 	for _, item := range gone {
+		c.forgetCodexHookState(item.key)
 		if item.root.provider != nil {
 			item.root.provider.Forget(item.key)
 		}
@@ -299,6 +345,18 @@ func (c *agentCoordinator) refreshTrackedRoots() []provider.RootRef {
 		}
 	}
 	return refs
+}
+
+func (c *agentCoordinator) forgetCodexHookState(key provider.RootKey) {
+	c.codexHookMu.Lock()
+	if pending := c.codexStarts[key]; pending != nil {
+		if pending.timer.Stop() {
+			pending.finish(&c.codexTimerWG)
+		}
+		delete(c.codexStarts, key)
+	}
+	delete(c.codexHookRoots, key)
+	c.codexHookMu.Unlock()
 }
 
 func providerRootRef(sess state.Session) (provider.RootRef, bool) {
@@ -793,7 +851,7 @@ func (c *agentCoordinator) HandleHook(req rpc.Request, sess state.Session) {
 		c.recordDiagnostic(ref.Provider, "hook_provider_mismatch", time.Now())
 		return
 	}
-	if req.SessionID != "" {
+	if req.SessionID != "" && ref.Provider != agentgraph.ProviderCodex {
 		ref.ProviderSessionID = req.SessionID
 	}
 	if req.Transcript != "" {
@@ -839,43 +897,244 @@ func (c *agentCoordinator) HandleHook(req rpc.Request, sess state.Session) {
 			c.recordDiagnostic(ref.Provider, "exact_binding_unavailable", now)
 			return
 		}
-		var accepted bool
-		ref, accepted = c.reconcileCodexBinding(ref, rootID, req.Generation, now)
-		if !accepted {
+		if shouldSettleCodexSessionStart(req) {
+			c.deferCodexSessionStart(ref, req, rootID, now)
+			return
+		}
+		acceptedStart, introduced := c.consumeCodexSessionStart(ref.Key(), rootID)
+		if !acceptedStart {
 			c.recordDiagnostic(ref.Provider, "stale_observation_rejected", now)
 			return
 		}
-		if c.codex != nil {
-			if reconciler, ok := c.codex.(codexBindingReconciler); ok {
-				update, err := reconciler.ReconcileHookBinding(ref.Key(), rootID)
-				if err != nil {
-					c.recordDiagnostic(ref.Provider, "binding_error", now)
-					return
-				}
-				if update.Stale {
-					c.recordDiagnostic(ref.Provider, "stale_observation_rejected", now)
-					return
-				}
-			} else if err := c.codex.RegisterHookBinding(ref.Key(), rootID); err != nil {
+		c.handleCodexHookNow(ref, req, rootID, now, introduced)
+	}
+}
+
+func shouldSettleCodexSessionStart(req rpc.Request) bool {
+	if req.Event != "SessionStart" {
+		return false
+	}
+	switch req.HookSource {
+	case "startup", "resume", "clear":
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *agentCoordinator) deferCodexSessionStart(ref provider.RootRef, req rpc.Request, rootID string, now time.Time) {
+	key := ref.Key()
+	pending := &pendingCodexStart{sessionID: rootID, ref: ref, req: req, now: now}
+	c.codexHookMu.Lock()
+	if prior := c.codexStarts[key]; prior != nil {
+		if prior.timer.Stop() {
+			prior.finish(&c.codexTimerWG)
+		}
+	}
+	delay := c.codexStartSettle
+	if delay <= 0 {
+		delay = codexHookStartSettle
+	}
+	c.codexTimerWG.Add(1)
+	pending.timer = time.AfterFunc(delay, func() {
+		defer pending.finish(&c.codexTimerWG)
+		c.codexHookMu.Lock()
+		if c.codexStarts[key] != pending {
+			c.codexHookMu.Unlock()
+			return
+		}
+		delete(c.codexStarts, key)
+		c.codexHookMu.Unlock()
+		c.handleCodexHookNow(pending.ref, pending.req, pending.sessionID, pending.now, false)
+	})
+	c.codexStarts[key] = pending
+	c.codexHookMu.Unlock()
+}
+
+// consumeCodexSessionStart coalesces SessionStart(clear/startup/resume) with
+// the first event for the same thread. An event for the retired thread cannot
+// cancel the pending transition and rotate the stable PID back to stale state.
+func (c *agentCoordinator) consumeCodexSessionStart(key provider.RootKey, rootID string) (accepted, introduced bool) {
+	c.codexHookMu.Lock()
+	defer c.codexHookMu.Unlock()
+	pending := c.codexStarts[key]
+	if pending == nil {
+		return true, false
+	}
+	if pending.sessionID != rootID {
+		return false, false
+	}
+	if pending.timer.Stop() {
+		pending.finish(&c.codexTimerWG)
+	}
+	delete(c.codexStarts, key)
+	return true, true
+}
+
+func (c *agentCoordinator) handleCodexHookNow(ref provider.RootRef, req rpc.Request, rootID string, now time.Time, introduced bool) {
+	currentID, currentAt := ref.ProviderSessionID, time.Time{}
+	if current, ok := sessionForKey(c.store.Snapshot(), ref.Key()); ok && current.AgentGraph != nil {
+		if currentID == "" {
+			currentID = current.AgentGraph.RootID
+		}
+		currentAt = current.AgentGraph.ObservedAt
+	}
+
+	// Serialize the content-free hook reducer through binding reconciliation.
+	// This prevents two concurrent hooks from both deciding they may introduce a
+	// different conversation under the same long-lived TUI PID.
+	c.codexHookMu.Lock()
+	rootState := c.codexHookRoots[ref.Key()]
+	if rootState == nil {
+		rootState = &codexHookRootState{
+			sessionID: currentID, latestAt: currentAt,
+			retired: make(map[string]struct{}), pending: make(map[string]codexPendingInput),
+		}
+		c.codexHookRoots[ref.Key()] = rootState
+	}
+	if !codexHookSessionAllowed(rootState, rootID, req, now, introduced) {
+		c.codexHookMu.Unlock()
+		c.recordDiagnostic(ref.Provider, "stale_observation_rejected", now)
+		return
+	}
+
+	var accepted bool
+	ref, accepted = c.reconcileCodexBinding(ref, rootID, req.Generation, now)
+	if !accepted {
+		c.codexHookMu.Unlock()
+		c.recordDiagnostic(ref.Provider, "stale_observation_rejected", now)
+		return
+	}
+	commitCodexHookSession(rootState, rootID, now)
+	pendingAttention := reduceCodexPendingInput(rootState, req)
+	c.codexHookMu.Unlock()
+
+	if c.codex != nil {
+		if reconciler, ok := c.codex.(codexBindingReconciler); ok {
+			update, err := reconciler.ReconcileHookBinding(ref.Key(), rootID)
+			if err != nil {
 				c.recordDiagnostic(ref.Provider, "binding_error", now)
 				return
 			}
-		}
-		observation, mapped := codexHookObservation(rootID, req.Event, req.ToolName, ref.StartedAt, now)
-		if mapped {
-			if current, ok := sessionForKey(c.store.Snapshot(), ref.Key()); ok {
-				observation = overlayCodexHookObservation(observation, current.AgentGraph)
+			if update.Stale {
+				c.recordDiagnostic(ref.Provider, "stale_observation_rejected", now)
+				return
 			}
-			generation := c.begin(ref.Key())
-			c.applyObservation(ref, generation, observation, claudeprovider.Compatibility{}, now)
-		}
-		if req.Event == "UserPromptSubmit" && req.Prompt != "" && ref.SlotID != "" {
-			c.startAutoname(ref, rootID, req.Prompt, false)
-		}
-		if c.codex != nil {
-			c.Request(ref.Key())
+		} else if err := c.codex.RegisterHookBinding(ref.Key(), rootID); err != nil {
+			c.recordDiagnostic(ref.Provider, "binding_error", now)
+			return
 		}
 	}
+	observation, mapped := codexHookObservation(rootID, req, ref.StartedAt, now)
+	if mapped {
+		observation = applyCodexPendingAttention(observation, pendingAttention, now)
+		if current, ok := sessionForKey(c.store.Snapshot(), ref.Key()); ok {
+			observation = overlayCodexHookObservation(observation, current.AgentGraph)
+		}
+		generation := c.begin(ref.Key())
+		c.applyObservation(ref, generation, observation, claudeprovider.Compatibility{}, now)
+	}
+	if req.Event == "UserPromptSubmit" && req.Prompt != "" && ref.SlotID != "" {
+		c.startAutoname(ref, rootID, req.Prompt, false)
+	}
+	if c.codex != nil {
+		c.Request(ref.Key())
+	}
+}
+
+func codexHookSessionAllowed(state *codexHookRootState, rootID string, req rpc.Request, now time.Time, introduced bool) bool {
+	if rootID == "" || (!state.latestAt.IsZero() && now.Before(state.latestAt)) {
+		return false
+	}
+	if state.sessionID == "" || state.sessionID == rootID {
+		return true
+	}
+	if _, stale := state.retired[rootID]; stale {
+		return false
+	}
+	// SessionStart is the canonical identity edge. UserPromptSubmit is also a
+	// safe introduction edge because it is the first substantive hook after a
+	// coalesced or missed SessionStart; generic tool/stop hooks may never rotate.
+	return introduced || req.Event == "SessionStart" || req.Event == "UserPromptSubmit"
+}
+
+func commitCodexHookSession(state *codexHookRootState, rootID string, now time.Time) {
+	if state.sessionID != "" && state.sessionID != rootID {
+		state.retired[state.sessionID] = struct{}{}
+		clear(state.pending)
+	}
+	state.sessionID = rootID
+	if now.After(state.latestAt) {
+		state.latestAt = now
+	}
+}
+
+func reduceCodexPendingInput(state *codexHookRootState, req rpc.Request) agentgraph.AttentionState {
+	if req.Event == "PreToolUse" && isCodexUserInputTool(req.ToolName) {
+		pending := codexPendingInput{
+			turnID: req.TurnID, toolUseID: req.ToolUseID, writer: req.AgentID,
+			toolName: req.ToolName, inputHash: req.ToolInputHash,
+		}
+		state.pending[codexPendingInputKey(pending)] = pending
+	}
+	if req.Event == "PostToolUse" && isCodexUserInputTool(req.ToolName) {
+		for key, pending := range state.pending {
+			if codexPendingInputMatches(pending, req) {
+				delete(state.pending, key)
+			}
+		}
+	}
+	if req.Event == "Stop" {
+		for key, pending := range state.pending {
+			if req.TurnID == "" || pending.turnID == "" || (pending.turnID == req.TurnID && pending.writer == req.AgentID) {
+				delete(state.pending, key)
+			}
+		}
+	}
+	if len(state.pending) > 0 {
+		return agentgraph.AttentionUserInput
+	}
+	return agentgraph.AttentionNone
+}
+
+func codexPendingInputKey(pending codexPendingInput) string {
+	if pending.toolUseID != "" {
+		return "id:" + pending.toolUseID
+	}
+	return "fallback:" + pending.writer + "\x00" + pending.turnID + "\x00" + pending.toolName + "\x00" + pending.inputHash
+}
+
+func codexPendingInputMatches(pending codexPendingInput, req rpc.Request) bool {
+	if pending.toolUseID != "" || req.ToolUseID != "" {
+		return pending.toolUseID != "" && pending.toolUseID == req.ToolUseID
+	}
+	return pending.inputHash != "" && pending.inputHash == req.ToolInputHash &&
+		pending.writer == req.AgentID && pending.turnID == req.TurnID && pending.toolName == req.ToolName
+}
+
+func isCodexUserInputTool(tool string) bool {
+	if dot := strings.LastIndex(tool, "."); dot >= 0 {
+		tool = tool[dot+1:]
+	}
+	normalized := strings.ReplaceAll(strings.ToLower(tool), "_", "")
+	return normalized == "requestuserinput"
+}
+
+func applyCodexPendingAttention(observation agentgraph.Observation, attention agentgraph.AttentionState, now time.Time) agentgraph.Observation {
+	if attention == agentgraph.AttentionNone {
+		return observation
+	}
+	for i := range observation.Nodes {
+		if observation.Nodes[i].ID != observation.RootID {
+			continue
+		}
+		observation.Nodes[i].Runtime = agentgraph.RuntimeIdle
+		observation.Nodes[i].Attention = attention
+		observation.Nodes[i].UpdatedAt = now
+		observation.FreshUntil = now.Add(codexHookAttentionFreshness)
+		break
+	}
+	return observation
 }
 
 // reconcileCodexBinding performs the slot/conversation split before the hook is
@@ -916,10 +1175,11 @@ func (c *agentCoordinator) reconcileCodexBinding(ref provider.RootRef, threadID 
 			info := sess.Enrichment()
 			rotated = info != nil && info.SessionID != "" && info.SessionID != threadID
 		}
-		if rotated {
-			sess.Codex = &state.AgentInfo{}
-			sess.AgentGraph = nil
-		}
+		// Keep the retired projection visible until the new hook observation is
+		// applied immediately after this identity mutation. Clearing it here would
+		// publish a transient unknown/grey snapshot between /clear and the accepted
+		// plan's working edge. The new graph replaces every projected field below;
+		// pending hook latches are retired separately by commitCodexHookSession.
 		sess.AgentBlock(state.AgentKindCodex).SessionID = threadID
 		accepted = true
 	})
@@ -1221,20 +1481,30 @@ func (c *agentCoordinator) cancelAutoname(slotID string) {
 	c.autonameMu.Unlock()
 }
 
-func codexHookObservation(rootID, event, tool string, startedAt, now time.Time) (agentgraph.Observation, bool) {
+func codexHookObservation(rootID string, req rpc.Request, startedAt, now time.Time) (agentgraph.Observation, bool) {
 	if rootID == "" {
 		return agentgraph.Observation{}, false
 	}
 	runtime, attention := agentgraph.RuntimeUnknown, agentgraph.AttentionNone
-	switch event {
-	case "SessionStart", "Stop":
+	switch req.Event {
+	case "SessionStart":
+		if req.HookSource == "compact" {
+			runtime = agentgraph.RuntimeActive
+		} else {
+			runtime = agentgraph.RuntimeIdle
+		}
+	case "Stop":
 		runtime = agentgraph.RuntimeIdle
 	case "UserPromptSubmit", "PreToolUse", "PostToolUse":
 		runtime = agentgraph.RuntimeActive
+		if req.Event == "PreToolUse" && isCodexUserInputTool(req.ToolName) {
+			runtime = agentgraph.RuntimeIdle
+			attention = agentgraph.AttentionUserInput
+		}
 	case "PermissionRequest":
 		runtime = agentgraph.RuntimeIdle
 		attention = agentgraph.AttentionApproval
-		if tool == "AskUserQuestion" {
+		if isCodexUserInputTool(req.ToolName) || req.ToolName == "AskUserQuestion" {
 			attention = agentgraph.AttentionUserInput
 		}
 	default:

@@ -179,6 +179,10 @@ func TestHashToolInputShouldNotLeakRawInputWhenInputIsSensitive(t *testing.T) {
 // hookRequestForPayload runs cmdHook against a real socket with the given hook
 // payload on stdin, and returns the rpc.Request the daemon side received.
 func hookRequestForPayload(t *testing.T, payload string) rpc.Request {
+	return hookRequestForEventPayload(t, "PermissionRequest", "claude", payload)
+}
+
+func hookRequestForEventPayload(t *testing.T, event, agent, payload string) rpc.Request {
 	t.Helper()
 
 	socket := filepath.Join(t.TempDir(), "s")
@@ -222,7 +226,7 @@ func hookRequestForPayload(t *testing.T, payload string) rpc.Request {
 	}
 	defer client.Close()
 
-	cmdHook(client, "PermissionRequest", "claude")
+	cmdHook(client, event, agent)
 
 	select {
 	case req := <-received:
@@ -230,6 +234,33 @@ func hookRequestForPayload(t *testing.T, payload string) rpc.Request {
 	case <-time.After(5 * time.Second):
 		t.Fatal("daemon side never received the hook request")
 		return rpc.Request{}
+	}
+}
+
+func TestCmdHookShouldForwardContentFreeCodexLifecycleMetadata(t *testing.T) {
+	req := hookRequestForEventPayload(t, "PreToolUse", "codex", `{
+		"session_id": "thread-new",
+		"hook_event_name": "PreToolUse",
+		"source": "clear",
+		"turn_id": "turn-7",
+		"tool_use_id": "call-9",
+		"permission_mode": "plan",
+		"tool_name": "request_user_input",
+		"tool_input": {"questions":[{"question":"secret question"}]}
+	}`)
+
+	if req.HookSource != "clear" || req.TurnID != "turn-7" || req.ToolUseID != "call-9" || req.PermissionMode != "plan" {
+		t.Fatalf("Codex lifecycle metadata was not forwarded: %+v", req)
+	}
+	if req.ToolName != "request_user_input" || req.Agent != "codex" {
+		t.Fatalf("Codex hook routing fields were disturbed: %+v", req)
+	}
+	encoded, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contains(string(encoded), "secret question") {
+		t.Fatalf("raw request_user_input content leaked onto the wire: %s", encoded)
 	}
 }
 

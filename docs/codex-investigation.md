@@ -16,10 +16,11 @@
 > daemon solely for Switchboard until that exact-binding gap is fixed. See the
 > [incident report](codex-app-server-hook-attribution-incident.md).
 
-> **Standard-CLI requirement (2026-08-21):** requiring the
+> **Standard-CLI requirement (updated 2026-08-22):** requiring the
 > `switchboard-codex` private-endpoint launcher is not an acceptable solution.
-> The item-based interview detector is unreachable on the hook-only plain
-> `codex` path and must not be presented as fixing that case. See the
+> Plain `codex` now detects interactive questions through an exact,
+> content-free `PreToolUse`/`PostToolUse` latch. The app-server item detector
+> remains wrapper-only and is not evidence for the standard path. See the
 > [interview-detection retrospective](codex-standard-cli-interview-retrospective.md).
 
 This document preserves the useful findings from the original investigation,
@@ -138,13 +139,18 @@ input` (`question` in the compact Waybar tooltip). Terminal nodes no longer
 count as live work or waiting attention even if a partial provider payload
 still carries an old runtime/attention value.
 
-Hooks are lower-authority, partial observations. `SessionStart`/`Stop` map the
-root to idle; `UserPromptSubmit`/`PreToolUse`/`PostToolUse` map it active; and
-`PermissionRequest` maps approval, except `AskUserQuestion`, which maps user
-input. The fallback is root-only and incomplete. Active evidence remains fresh
-for 10 minutes, approval or user-input waits for 24 hours, and idle edges for 7
-days. Each later hook replaces and refreshes it, and a fresh app-server
-observation outranks it.
+Hooks are lower-authority, partial observations. `Stop` maps the root to idle;
+`UserPromptSubmit` and ordinary `PreToolUse`/`PostToolUse` map it active; and
+`PermissionRequest` maps approval. `request_user_input` is the narrow exception:
+its `PreToolUse` opens a user-input wait keyed by `tool_use_id`, and only the
+matching `PostToolUse`, the turn's `Stop`, or conversation rotation clears it.
+`SessionStart(clear|startup|resume)` is briefly coalesced with a same-thread
+continuation so `/clear` followed by an accepted plan does not create an 11 ms
+idle interval; a standalone `/clear` still settles idle. `SessionStart(compact)`
+stays active because the documented lifecycle continues the model immediately.
+The fallback is root-only and incomplete. Active evidence remains fresh for 10
+minutes, approval or user-input waits for 24 hours, and idle edges for 7 days.
+A fresh app-server observation outranks hook evidence.
 
 ## Terminal titles, spinners, and session names
 

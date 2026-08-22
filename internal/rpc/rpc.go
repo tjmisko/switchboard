@@ -56,6 +56,18 @@ type Request struct {
 	StartedAt  time.Time `json:"started_at,omitzero"`
 	ObservedAt time.Time `json:"observed_at,omitzero"`
 	Generation uint64    `json:"generation,omitempty"`
+	// HookSource is Codex SessionStart.source (startup, resume, clear, compact).
+	// It is lifecycle metadata, not provider content, and lets the daemon avoid
+	// treating an immediate post-/clear continuation as a real idle interval.
+	HookSource string `json:"hook_source,omitempty"`
+	// TurnID and ToolUseID are opaque Codex hook correlation IDs. In particular,
+	// tool_use_id joins request_user_input's PreToolUse and PostToolUse edges so
+	// an unrelated tool completion cannot clear a waiting-for-user state.
+	TurnID    string `json:"turn_id,omitempty"`
+	ToolUseID string `json:"tool_use_id,omitempty"`
+	// PermissionMode records the Codex turn mode (default, plan, and so on).
+	// It is forwarded for lifecycle diagnostics and contains no prompt content.
+	PermissionMode string `json:"permission_mode,omitempty"`
 	// Prompt is an ephemeral, bounded autonaming input. It is never stored or
 	// logged by the daemon.
 	Prompt     string `json:"prompt,omitempty"`
@@ -64,8 +76,8 @@ type Request struct {
 	// empty) or "codex". It routes the enrichment to the right block and selects
 	// the event→status mapping.
 	Agent string `json:"agent,omitempty"`
-	// ToolName is the hook's tool_name when the event carries one (PermissionRequest,
-	// PostToolUse). It is stashed at red-onset (state.PendingPrompt.Tool, under the
+	// ToolName is the hook's tool_name when the event carries one (PreToolUse,
+	// PermissionRequest, PostToolUse). It is stashed at red-onset (state.PendingPrompt.Tool, under the
 	// writer that raised the prompt) and matched on a later
 	// PostToolUse to clear red at hook speed when the approved tool completes —
 	// while a non-matching/Task PostToolUse keeps the chip red. Empty for events
