@@ -69,6 +69,12 @@ type agentCoordinator struct {
 	wg     sync.WaitGroup
 	start  sync.Once
 	once   sync.Once
+
+	codexHookMu      sync.Mutex
+	codexHookRoots   map[provider.RootKey]*codexHookRootState
+	codexStarts      map[provider.RootKey]*pendingCodexStart
+	codexStartSettle time.Duration
+	codexTimerWG     sync.WaitGroup
 }
 
 func newAgentCoordinator(store *state.Store, sink *history.Sink, claude claudeObserver, codex codexObserver) *agentCoordinator {
@@ -77,6 +83,8 @@ func newAgentCoordinator(store *state.Store, sink *history.Sink, claude claudeOb
 		history: history.NewAgentStateProjector(), requests: provider.NewInvalidationQueue(64),
 		generation: make(map[provider.RootKey]uint64), tracked: make(map[provider.RootKey]trackedProviderRoot),
 		diagnostics: make(map[string]rpc.AgentDiagnostic), lastLog: make(map[string]time.Time),
+		codexHookRoots: make(map[provider.RootKey]*codexHookRootState), codexStarts: make(map[provider.RootKey]*pendingCodexStart),
+		codexStartSettle: codexHookStartSettle,
 	}
 }
 
@@ -102,6 +110,16 @@ func (c *agentCoordinator) Close() {
 		if cancel != nil {
 			cancel()
 		}
+		c.codexHookMu.Lock()
+		for _, pending := range c.codexStarts {
+			if pending.timer.Stop() {
+				pending.finish(&c.codexTimerWG)
+			}
+		}
+		clear(c.codexStarts)
+		clear(c.codexHookRoots)
+		c.codexHookMu.Unlock()
+		c.codexTimerWG.Wait()
 		c.wg.Wait()
 		if c.claude != nil {
 			_ = c.claude.Close()
@@ -230,6 +248,7 @@ func (c *agentCoordinator) refreshTrackedRoots() []provider.RootRef {
 	}
 	c.mu.Unlock()
 	for _, item := range gone {
+		c.forgetCodexHookState(item.key)
 		if item.root.provider != nil {
 			item.root.provider.Forget(item.key)
 		}
@@ -367,6 +386,13 @@ func (c *agentCoordinator) current(key provider.RootKey, generation uint64) bool
 }
 
 func (c *agentCoordinator) applyObservation(ref provider.RootRef, generation uint64, observation agentgraph.Observation, compat claudeprovider.Compatibility, now time.Time) bool {
+	return c.applyObservationWithHookOwnership(ref, generation, observation, compat, now, false)
+}
+
+func (c *agentCoordinator) applyObservationWithHookOwnership(ref provider.RootRef, generation uint64, observation agentgraph.Observation, compat claudeprovider.Compatibility, now time.Time, hookOwnsTransition bool) bool {
+	if ref.Provider == agentgraph.ProviderCodex {
+		observation = c.overlayCodexPendingObservation(ref.Key(), observation, now)
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.generation[ref.Key()] != generation {
@@ -377,7 +403,7 @@ func (c *agentCoordinator) applyObservation(ref provider.RootRef, generation uin
 	if !ok || agentgraph.ProviderKind(priorSession.Agent) != ref.Provider {
 		return false
 	}
-	if !shouldApplyObservation(observation, priorSession.AgentGraph, now) {
+	if !hookOwnsTransition && !shouldApplyObservation(observation, priorSession.AgentGraph, now) {
 		return false
 	}
 	graph, err := state.ProjectAgentGraph(observation, priorSession.AgentGraph, now)
@@ -452,6 +478,31 @@ func shouldApplyObservation(observation agentgraph.Observation, current *state.A
 		return false
 	}
 	return !observation.ObservedAt.Before(current.ObservedAt)
+}
+
+// overlayCodexHookObservation keeps the app-server's structural detail while
+// applying a newer hook's immediate root status. A hook is intentionally
+// partial: it must not erase child graph or other complete snapshot fields.
+func overlayCodexHookObservation(hook agentgraph.Observation, current *state.AgentGraph) agentgraph.Observation {
+	if current == nil || current.RootID != hook.RootID || len(hook.Nodes) != 1 {
+		return hook
+	}
+	overlay := observationFromState(agentgraph.ProviderCodex, current)
+	overlay.Source = agentgraph.SourceHook
+	overlay.ObservedAt = hook.ObservedAt
+	overlay.FreshUntil = hook.FreshUntil
+	overlay.Complete = false
+	for i := range overlay.Nodes {
+		if overlay.Nodes[i].ID != hook.RootID {
+			continue
+		}
+		overlay.Nodes[i].Runtime = hook.Nodes[0].Runtime
+		overlay.Nodes[i].Attention = hook.Nodes[0].Attention
+		overlay.Nodes[i].Lifecycle = hook.Nodes[0].Lifecycle
+		overlay.Nodes[i].UpdatedAt = hook.Nodes[0].UpdatedAt
+		break
+	}
+	return overlay
 }
 
 func sourceRank(source agentgraph.SourceKind) int {
@@ -581,13 +632,16 @@ func (c *agentCoordinator) HandleHook(req rpc.Request, sess state.Session) {
 		c.recordDiagnostic(ref.Provider, "hook_provider_mismatch", time.Now())
 		return
 	}
-	if req.SessionID != "" {
+	if req.SessionID != "" && ref.Provider != agentgraph.ProviderCodex {
 		ref.ProviderSessionID = req.SessionID
 	}
 	if req.Transcript != "" {
 		ref.Transcript = req.Transcript
 	}
-	now := time.Now()
+	now := req.ObservedAt
+	if now.IsZero() {
+		now = time.Now()
+	}
 	switch ref.Provider {
 	case agentgraph.ProviderClaude:
 		if c.claude == nil {
@@ -616,60 +670,21 @@ func (c *agentCoordinator) HandleHook(req rpc.Request, sess state.Session) {
 		if rootID == "" {
 			rootID = ref.ProviderSessionID
 		}
-		// SessionStart is normally the first exact identity edge, but it can fire
-		// before discovery has registered the root and be dropped by the RPC
-		// ancestry guard. Every trusted Codex lifecycle hook carries the same exact
-		// root session_id, so any later hook must self-heal that startup race.
-		if c.codex != nil && rootID != "" {
-			if err := c.codex.RegisterHookBinding(ref.Key(), rootID); err != nil {
-				c.recordDiagnostic(ref.Provider, "binding_conflict", now)
-				return
-			}
+		if rootID == "" {
+			c.recordDiagnostic(ref.Provider, "exact_binding_unavailable", now)
+			return
 		}
-		observation, mapped := codexHookObservation(rootID, req.Event, req.ToolName, ref.StartedAt, now)
-		if mapped {
-			generation := c.begin(ref.Key())
-			c.applyObservation(ref, generation, observation, claudeprovider.Compatibility{}, now)
+		if shouldSettleCodexSessionStart(req) {
+			c.deferCodexSessionStart(ref, req, rootID, now)
+			return
 		}
-		if c.codex != nil {
-			c.Request(ref.Key())
+		acceptedStart, introduced := c.consumeCodexSessionStart(ref.Key(), rootID)
+		if !acceptedStart {
+			c.recordDiagnostic(ref.Provider, "stale_observation_rejected", now)
+			return
 		}
+		c.handleCodexHookNow(ref, req, rootID, now, introduced)
 	}
-}
-
-func codexHookObservation(rootID, event, tool string, startedAt, now time.Time) (agentgraph.Observation, bool) {
-	if rootID == "" {
-		return agentgraph.Observation{}, false
-	}
-	runtime, attention := agentgraph.RuntimeUnknown, agentgraph.AttentionNone
-	switch event {
-	case "SessionStart", "Stop":
-		runtime = agentgraph.RuntimeIdle
-	case "UserPromptSubmit", "PreToolUse", "PostToolUse":
-		runtime = agentgraph.RuntimeActive
-	case "PermissionRequest":
-		runtime = agentgraph.RuntimeIdle
-		attention = agentgraph.AttentionApproval
-		if tool == "AskUserQuestion" {
-			attention = agentgraph.AttentionUserInput
-		}
-	default:
-		return agentgraph.Observation{}, false
-	}
-	freshness := codexHookIdleFreshness
-	if attention != agentgraph.AttentionNone {
-		freshness = codexHookAttentionFreshness
-	} else if runtime == agentgraph.RuntimeActive {
-		freshness = codexHookActiveFreshness
-	}
-	return agentgraph.Observation{
-		Provider: agentgraph.ProviderCodex, RootID: rootID, Source: agentgraph.SourceHook,
-		ObservedAt: now, FreshUntil: now.Add(freshness), Complete: false,
-		Nodes: []agentgraph.Node{{
-			ID: rootID, Runtime: runtime, Attention: attention,
-			Lifecycle: agentgraph.LifecycleRunning, StartedAt: startedAt, UpdatedAt: now,
-		}},
-	}, true
 }
 
 func (c *agentCoordinator) recordDiagnostic(provider agentgraph.ProviderKind, category string, at time.Time) {

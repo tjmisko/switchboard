@@ -48,16 +48,29 @@ type Request struct {
 	Selector string `json:"selector,omitempty"`
 
 	// hook fields — set when Cmd == "hook"
-	Event      string `json:"event,omitempty"`
-	PID        int    `json:"pid,omitempty"`
-	SessionID  string `json:"session_id,omitempty"`
-	Transcript string `json:"transcript,omitempty"`
+	Event      string    `json:"event,omitempty"`
+	PID        int       `json:"pid,omitempty"`
+	SessionID  string    `json:"session_id,omitempty"`
+	Transcript string    `json:"transcript,omitempty"`
+	ObservedAt time.Time `json:"observed_at,omitzero"`
+	// HookSource is Codex SessionStart.source (startup, resume, clear, compact).
+	// It is lifecycle metadata, not provider content, and lets the daemon avoid
+	// treating an immediate post-/clear continuation as a real idle interval.
+	HookSource string `json:"hook_source,omitempty"`
+	// TurnID and ToolUseID are opaque Codex hook correlation IDs. In particular,
+	// tool_use_id joins request_user_input's PreToolUse and PostToolUse edges so
+	// an unrelated tool completion cannot clear a waiting-for-user state.
+	TurnID    string `json:"turn_id,omitempty"`
+	ToolUseID string `json:"tool_use_id,omitempty"`
+	// PermissionMode records the content-free Codex turn mode (default, plan,
+	// and so on) at lifecycle boundaries.
+	PermissionMode string `json:"permission_mode,omitempty"`
 	// Agent names which coding agent fired the hook: "claude" (default when
 	// empty) or "codex". It routes the enrichment to the right block and selects
 	// the event→status mapping.
 	Agent string `json:"agent,omitempty"`
-	// ToolName is the hook's tool_name when the event carries one (PermissionRequest,
-	// PostToolUse). It is stashed at red-onset (state.PendingPrompt.Tool, under the
+	// ToolName is the hook's tool_name when the event carries one (PreToolUse,
+	// PermissionRequest, PostToolUse). It is stashed at red-onset (state.PendingPrompt.Tool, under the
 	// writer that raised the prompt) and matched on a later
 	// PostToolUse to clear red at hook speed when the approved tool completes —
 	// while a non-matching/Task PostToolUse keeps the chip red. Empty for events

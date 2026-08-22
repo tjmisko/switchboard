@@ -51,9 +51,12 @@ specific:
 2. **The tree is visible.** Reference renderers show a root row followed by
    indented child rows. Compact renderers may put the same detail in a tooltip,
    but must consume the same graph.
-3. **Codex app-server is primary truth.** The implementation uses the supported
-   proxy command rather than reading the control socket directly. It snapshots
-   existing descendants and then consumes live notifications.
+3. **Codex app-server is primary structural truth.** The implementation uses
+   the supported proxy command rather than reading the control socket directly.
+   It snapshots existing descendants and then consumes live notifications. The
+   standard-CLI `request_user_input` wait is independently owned by exact
+   lifecycle hooks because that launch path does not expose the app-server item
+   edge.
 4. **Do not guess root identity by CWD.** Prefer `CODEX_THREAD_ID` from the root
    process environment on Linux, then an exact lifecycle-hook association.
    `SessionStart` normally establishes it; a later hook self-heals a discovery

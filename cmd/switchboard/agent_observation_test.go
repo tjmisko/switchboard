@@ -252,7 +252,7 @@ func TestCodexHookFallbackFreshnessIsBoundedByState(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			observation, mapped := codexHookObservation("codex-root", tt.event, tt.tool, startedAt, now)
+			observation, mapped := codexHookObservation("codex-root", rpc.Request{Event: tt.event, ToolName: tt.tool}, startedAt, now)
 			if !mapped {
 				t.Fatalf("event %q did not map", tt.event)
 			}

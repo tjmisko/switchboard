@@ -101,6 +101,40 @@ func TestLoadExpiresRestoredAgentGraphWithoutDroppingStructure(t *testing.T) {
 	}
 }
 
+func TestLoadDoesNotRestoreCodexHookUserInputWithoutCorrelationLatch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	testsupport.WriteFile(t, path, `{
+  "sessions": [{
+    "pid": 10,
+    "cwd": "/workspace",
+    "tty": "/dev/pts/10",
+    "started_at": "2026-08-21T15:00:00Z",
+    "agent": "codex",
+    "codex": {"session_id": "root", "status": "permission"},
+    "agent_graph": {
+      "root_id": "root",
+      "source": "hook",
+      "observed_at": "2026-08-21T16:00:00Z",
+      "fresh_until": "2099-08-21T16:00:00Z",
+      "complete": false,
+      "summary": {"runtime":"idle", "attention":"user_input", "status":"permission", "waiting_nodes":1, "user_input_nodes":1},
+      "nodes": [{"id":"root", "runtime":"idle", "attention":"user_input", "lifecycle":"running"}]
+    }
+  }]
+}`)
+	store := state.New(path)
+	if err := store.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	sess := store.Snapshot().Sessions[0]
+	if sess.AgentGraph == nil || sess.AgentGraph.RootID != "root" {
+		t.Fatalf("hook graph identity was dropped: %+v", sess.AgentGraph)
+	}
+	if sess.AgentGraph.Summary.Status != "" || sess.AgentGraph.Summary.Attention != agentgraph.AttentionNone || sess.Codex.Status != "" {
+		t.Fatalf("uncorrelated hook wait remained authoritative after restart: graph=%+v codex=%+v", sess.AgentGraph.Summary, sess.Codex)
+	}
+}
+
 func TestLoadDropsStructurallyInvalidAgentGraphSafely(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	testsupport.WriteFile(t, path, `{

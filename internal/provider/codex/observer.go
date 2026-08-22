@@ -148,9 +148,10 @@ func withDefaults(config Config) Config {
 	return config
 }
 
-// RegisterHookBinding records a daemon-verified exact thread ID. Environment
-// CODEX_THREAD_ID still has precedence. Registration triggers a resnapshot and
-// is safe to call before or after the first Observe.
+// RegisterHookBinding records a daemon-verified exact thread ID. It supersedes
+// the immutable process-start CODEX_THREAD_ID so /clear can rotate the thread
+// under a stable TUI process. Registration triggers a resnapshot and is safe to
+// call before or after the first Observe.
 func (o *Observer) RegisterHookBinding(key provider.RootKey, threadID string) error {
 	if err := o.bindings.RegisterHook(key, threadID); err != nil {
 		return err

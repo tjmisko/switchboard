@@ -81,8 +81,11 @@ Freshness is authority, not decoration. A disconnected observer can leave the
 last graph structure visible until/after its deadline, but once expired the
 summary becomes unknown and renderers grey child detail as stale. A restored
 last-known graph obeys the same deadline. A newer, fresh high-authority source
-(`codex_app_server` or `claude_transcript`) outranks hook/rollout/restored
-fallbacks in daemon orchestration; the reducer itself stays source-neutral.
+(`codex_app_server` or `claude_transcript`) outranks ordinary
+hook/rollout/restored fallbacks in daemon orchestration. The exception is
+Codex's exact, hook-owned `request_user_input` transition: generic app-server
+snapshots cannot resolve a standard-CLI question. The reducer itself stays
+source-neutral.
 
 Only root `Session` rows are switchable. Child rows have colors and labels for
 visibility but never add Waybar slots, focus selectors, picker entries, or cycle
