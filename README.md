@@ -347,6 +347,9 @@ Automatic degradation is fail-open for the root and fail-closed for status:
   deadline, then its summary becomes unknown/stale rather than freezing a
   confident color;
 - the observer reconnects with bounded exponential backoff and resnapshots;
+- The app-server item detector does **not** establish interview waits for the
+  required standard `codex` launch path; see the
+  [standard-CLI retrospective](docs/codex-standard-cli-interview-retrospective.md);
 - `-codex-observer off` never constructs the proxy. Codex hooks can still supply
   the partial root view; without them the root remains visible with unknown
   status and no child graph.

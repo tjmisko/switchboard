@@ -16,6 +16,12 @@
 > daemon solely for Switchboard until that exact-binding gap is fixed. See the
 > [incident report](codex-app-server-hook-attribution-incident.md).
 
+> **Standard-CLI requirement (2026-08-21):** requiring the
+> `switchboard-codex` private-endpoint launcher is not an acceptable solution.
+> The item-based interview detector is unreachable on the hook-only plain
+> `codex` path and must not be presented as fixing that case. See the
+> [interview-detection retrospective](codex-standard-cli-interview-retrospective.md).
+
 This document preserves the useful findings from the original investigation,
 records which conclusions changed, and describes the shipped observer boundary.
 
