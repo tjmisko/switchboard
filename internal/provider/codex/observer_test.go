@@ -400,6 +400,18 @@ func (p *fakeProxy) serve(connection net.Conn) {
 			result = initializeResult{UserAgent: "codex_app_server/0.149.0"}
 		case "thread/read":
 			result = threadReadResult{Thread: root}
+		case "thread/loaded/list":
+			result = threadLoadedListResult{Data: []string{root.ID}}
+		case "thread/name/set":
+			var request struct {
+				ThreadID string `json:"threadId"`
+				Name     string `json:"name"`
+			}
+			_ = json.Unmarshal(envelope.Params, &request)
+			if request.ThreadID == p.root.ID {
+				p.root.Name = request.Name
+			}
+			result = struct{}{}
 		case "thread/list":
 			var request fakeListRequest
 			_ = json.Unmarshal(envelope.Params, &request)

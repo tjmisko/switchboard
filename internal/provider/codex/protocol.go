@@ -22,6 +22,11 @@ type threadListResult struct {
 	NextCursor *string     `json:"nextCursor"`
 }
 
+type threadLoadedListResult struct {
+	Data       []string `json:"data"`
+	NextCursor *string  `json:"nextCursor"`
+}
+
 type rpcThread struct {
 	ID             string    `json:"id"`
 	ParentThreadID string    `json:"parentThreadId"`
@@ -62,19 +67,30 @@ type rpcAgentState struct {
 }
 
 type nodeState struct {
-	node   agentgraph.Node
-	cohort string
+	node            agentgraph.Node
+	statusAttention agentgraph.AttentionState
+	cohort          string
+}
+
+type pendingUserInput struct {
+	threadID  string
+	turnID    string
+	requestID string
 }
 
 type graphState struct {
-	rootID      string
-	rootTurnID  string
-	nodes       map[string]*nodeState
-	unknownEnum bool
+	rootID           string
+	rootTurnID       string
+	nodes            map[string]*nodeState
+	pendingUserInput map[string]pendingUserInput
+	unknownEnum      bool
 }
 
 func newGraphState(root rpcThread, descendants []rpcThread, terminalLimit int) *graphState {
-	state := &graphState{rootID: root.ID, nodes: make(map[string]*nodeState, len(descendants)+1)}
+	state := &graphState{
+		rootID: root.ID, nodes: make(map[string]*nodeState, len(descendants)+1),
+		pendingUserInput: make(map[string]pendingUserInput),
+	}
 	state.upsertThread(root, true)
 	for _, thread := range descendants {
 		state.upsertThread(thread, false)
@@ -82,13 +98,13 @@ func newGraphState(root rpcThread, descendants []rpcThread, terminalLimit int) *
 	for _, turn := range root.Turns {
 		state.rootTurnID = turn.ID
 		for _, item := range turn.Items {
-			state.applyCollaboration(turn.ID, item)
+			state.applyItem(root.ID, turn.ID, item)
 		}
 	}
 	for _, thread := range descendants {
 		for _, turn := range thread.Turns {
 			for _, item := range turn.Items {
-				state.applyCollaboration(turn.ID, item)
+				state.applyItem(thread.ID, turn.ID, item)
 			}
 		}
 	}
@@ -97,10 +113,18 @@ func newGraphState(root rpcThread, descendants []rpcThread, terminalLimit int) *
 }
 
 func (s *graphState) clone() *graphState {
-	out := &graphState{rootID: s.rootID, rootTurnID: s.rootTurnID, nodes: make(map[string]*nodeState, len(s.nodes)), unknownEnum: s.unknownEnum}
+	out := &graphState{
+		rootID: s.rootID, rootTurnID: s.rootTurnID,
+		nodes:            make(map[string]*nodeState, len(s.nodes)),
+		pendingUserInput: make(map[string]pendingUserInput, len(s.pendingUserInput)),
+		unknownEnum:      s.unknownEnum,
+	}
 	for id, state := range s.nodes {
 		copy := *state
 		out.nodes[id] = &copy
+	}
+	for itemID, pending := range s.pendingUserInput {
+		out.pendingUserInput[itemID] = pending
 	}
 	return out
 }
@@ -150,7 +174,10 @@ func (s *graphState) setThreadName(id, name string) bool {
 func (s *graphState) ensureNode(id, parentID string) *nodeState {
 	state := s.nodes[id]
 	if state == nil {
-		state = &nodeState{node: agentgraph.Node{ID: id, ParentID: parentID, Runtime: agentgraph.RuntimeUnknown, Attention: agentgraph.AttentionNone, Lifecycle: agentgraph.LifecycleUnknown}}
+		state = &nodeState{
+			node:            agentgraph.Node{ID: id, ParentID: parentID, Runtime: agentgraph.RuntimeUnknown, Attention: agentgraph.AttentionNone, Lifecycle: agentgraph.LifecycleUnknown},
+			statusAttention: agentgraph.AttentionNone,
+		}
 		s.nodes[id] = state
 	} else if state.node.ParentID == "" && id != s.rootID && parentID != "" {
 		state.node.ParentID = parentID
@@ -163,19 +190,105 @@ func (s *graphState) applyStatus(state *nodeState, status rpcStatus) {
 	if status.Type != "" && state.node.Runtime == agentgraph.RuntimeUnknown && status.Type != "unknown" {
 		s.unknownEnum = true
 	}
-	state.node.Attention = agentgraph.AttentionNone
+	state.statusAttention = agentgraph.AttentionNone
 	for _, flag := range status.ActiveFlags {
 		switch flag {
 		case "waitingOnApproval":
-			state.node.Attention = agentgraph.AttentionApproval
+			state.statusAttention = agentgraph.AttentionApproval
 		case "waitingOnUserInput":
-			if state.node.Attention != agentgraph.AttentionApproval {
-				state.node.Attention = agentgraph.AttentionUserInput
+			if state.statusAttention != agentgraph.AttentionApproval {
+				state.statusAttention = agentgraph.AttentionUserInput
 			}
 		default:
 			s.unknownEnum = true
 		}
 	}
+	s.refreshAttention(state.node.ID)
+}
+
+// applyItem supplements Thread.activeFlags with the durable turn-item shape.
+// Codex 0.149 can leave activeFlags empty while the TUI is displaying a Plan
+// mode interview, but thread/read still reports the built-in
+// request_user_input dynamic tool call as inProgress. Deriving the same
+// attention edge from both representations makes notification loss harmless:
+// the next active poll rebuilds this map from the authoritative turn snapshot.
+func (s *graphState) applyItem(threadID, turnID string, item rpcItem) {
+	s.applyCollaboration(turnID, item)
+	if item.ID == "" {
+		return
+	}
+	requestID := ""
+	if previous, ok := s.pendingUserInput[item.ID]; ok {
+		requestID = previous.requestID
+		delete(s.pendingUserInput, item.ID)
+		s.refreshAttention(previous.threadID)
+	}
+	if item.Type != "dynamicToolCall" || item.Status != "inProgress" || !isUserInputTool(item.Tool) {
+		return
+	}
+	s.beginUserInputRequest(threadID, turnID, item.ID, requestID)
+}
+
+func (s *graphState) beginUserInputRequest(threadID, turnID, itemID, requestID string) {
+	if s.nodes[threadID] == nil || itemID == "" {
+		return
+	}
+	s.pendingUserInput[itemID] = pendingUserInput{threadID: threadID, turnID: turnID, requestID: requestID}
+	s.refreshAttention(threadID)
+}
+
+func (s *graphState) resolveUserInputRequest(threadID, requestID string) {
+	if requestID == "" {
+		return
+	}
+	changed := false
+	for itemID, pending := range s.pendingUserInput {
+		if pending.threadID == threadID && pending.requestID == requestID {
+			delete(s.pendingUserInput, itemID)
+			changed = true
+		}
+	}
+	if changed {
+		s.refreshAttention(threadID)
+	}
+}
+
+func (s *graphState) completeTurn(threadID, turnID string) {
+	changed := false
+	for itemID, pending := range s.pendingUserInput {
+		if pending.threadID == threadID && (turnID == "" || pending.turnID == turnID) {
+			delete(s.pendingUserInput, itemID)
+			changed = true
+		}
+	}
+	if changed {
+		s.refreshAttention(threadID)
+	}
+}
+
+func (s *graphState) refreshAttention(threadID string) {
+	state := s.nodes[threadID]
+	if state == nil {
+		return
+	}
+	state.node.Attention = state.statusAttention
+	if state.node.Attention == agentgraph.AttentionApproval {
+		return
+	}
+	for _, pending := range s.pendingUserInput {
+		if pending.threadID == threadID {
+			state.node.Attention = agentgraph.AttentionUserInput
+			return
+		}
+	}
+}
+
+func isUserInputTool(tool string) bool {
+	tool = strings.TrimSpace(tool)
+	if namespace, name, ok := strings.Cut(tool, "."); ok && namespace == "functions" {
+		tool = name
+	}
+	return tool == "request_user_input" || tool == "requestUserInput"
 }
 
 func (s *graphState) applyCollaboration(turnID string, item rpcItem) {
@@ -225,7 +338,7 @@ func (s *graphState) beginRootTurn(turnID string) {
 	}
 	for id, state := range s.nodes {
 		if id != s.rootID && state.node.Lifecycle.Terminal() && state.cohort != turnID && !required[id] {
-			delete(s.nodes, id)
+			s.deleteNode(id)
 		}
 	}
 }
@@ -235,11 +348,20 @@ func (s *graphState) deleteThread(id string) {
 	for len(children) > 0 {
 		parent := children[len(children)-1]
 		children = children[:len(children)-1]
-		delete(s.nodes, parent)
 		for childID, state := range s.nodes {
 			if state.node.ParentID == parent {
 				children = append(children, childID)
 			}
+		}
+		s.deleteNode(parent)
+	}
+}
+
+func (s *graphState) deleteNode(id string) {
+	delete(s.nodes, id)
+	for itemID, pending := range s.pendingUserInput {
+		if pending.threadID == id {
+			delete(s.pendingUserInput, itemID)
 		}
 	}
 }
@@ -285,7 +407,7 @@ func (s *graphState) boundTerminals(limit int) {
 	}
 	for _, old := range terminal[limit:] {
 		if !required[old.id] {
-			delete(s.nodes, old.id)
+			s.deleteNode(old.id)
 		}
 	}
 }

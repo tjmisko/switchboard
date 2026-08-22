@@ -25,12 +25,22 @@ type fakeCodexCoordinatorObserver struct {
 	forgets      map[provider.RootKey]int
 	closes       int
 	observes     int
+	nameCalls    chan codexNameCall
+	nameErrors   chan error
+}
+
+type codexNameCall struct {
+	key        provider.RootKey
+	threadID   string
+	generation uint64
+	name       string
 }
 
 func newFakeCodexCoordinatorObserver() *fakeCodexCoordinatorObserver {
 	return &fakeCodexCoordinatorObserver{
 		observations: make(map[provider.RootKey]agentgraph.Observation), updates: make(chan provider.RootKey, 64),
 		bindings: make(map[provider.RootKey]string), forgets: make(map[provider.RootKey]int),
+		nameCalls: make(chan codexNameCall, 16),
 	}
 }
 
@@ -69,6 +79,14 @@ func (f *fakeCodexCoordinatorObserver) RegisterHookBinding(key provider.RootKey,
 	f.mu.Lock()
 	f.bindings[key] = id
 	f.mu.Unlock()
+	return nil
+}
+
+func (f *fakeCodexCoordinatorObserver) SetThreadName(_ context.Context, key provider.RootKey, threadID string, generation uint64, name string) error {
+	f.nameCalls <- codexNameCall{key: key, threadID: threadID, generation: generation, name: name}
+	if f.nameErrors != nil {
+		return <-f.nameErrors
+	}
 	return nil
 }
 
@@ -315,24 +333,42 @@ func TestAgentObservationDoesNotHoldStoreLockAndFencesLateGeneration(t *testing.
 	}
 }
 
-func TestFreshCodexAppServerGraphOutranksHookFallback(t *testing.T) {
+func TestNewerCodexHookIsImmediateAndLaterAppServerCorrectsIt(t *testing.T) {
 	startedAt := time.Now().Add(-time.Hour)
 	store := state.New("")
 	ref := seedCoordinatorSession(store, 4102, startedAt, state.AgentKindCodex, "root", "/same")
 	fake := newFakeCodexCoordinatorObserver()
 	coordinator := newAgentCoordinator(store, nil, nil, fake)
 	coordinator.refreshTrackedRoots()
-	now := time.Now()
+	now := time.Now().Add(-time.Second)
 	observation := testCodexObservation(ref, "root", now, agentgraph.RuntimeIdle, agentgraph.AttentionApproval)
+	observation.Nodes[0].Nickname = "kept-name"
+	observation.Nodes = append(observation.Nodes, agentgraph.Node{
+		ID: "child", ParentID: "root", Runtime: agentgraph.RuntimeIdle,
+		Lifecycle: agentgraph.LifecycleCompleted, UpdatedAt: now,
+	})
 	generation := coordinator.begin(ref.Key())
 	if !coordinator.applyObservation(ref, generation, observation, claudeprovider.Compatibility{}, now) {
 		t.Fatal("fresh app-server observation was not applied")
 	}
 
-	coordinator.HandleHook(rpc.Request{Agent: state.AgentKindCodex, Event: "PostToolUse"}, store.Snapshot().Sessions[0])
+	hookAt := now.Add(500 * time.Millisecond)
+	coordinator.HandleHook(rpc.Request{Agent: state.AgentKindCodex, Event: "PostToolUse", ObservedAt: hookAt}, store.Snapshot().Sessions[0])
 	graph := store.Snapshot().Sessions[0].AgentGraph
+	if graph.Source != agentgraph.SourceHook || graph.Summary.Status != state.StatusWorking {
+		t.Fatalf("newer hook did not provide its immediate transition: %#v", graph)
+	}
+	if len(graph.Nodes) != 2 || graph.Nodes[0].Nickname != "kept-name" {
+		t.Fatalf("partial hook erased app-server structure: %#v", graph.Nodes)
+	}
+
+	corrected := testCodexObservation(ref, "root", hookAt.Add(time.Second), agentgraph.RuntimeIdle, agentgraph.AttentionApproval)
+	if !coordinator.applyObservation(ref, coordinator.begin(ref.Key()), corrected, claudeprovider.Compatibility{}, corrected.ObservedAt) {
+		t.Fatal("later app-server correction was not applied")
+	}
+	graph = store.Snapshot().Sessions[0].AgentGraph
 	if graph.Source != agentgraph.SourceCodexAppServer || graph.Summary.Status != state.StatusPermission {
-		t.Fatalf("lower hook fallback cleared authoritative app-server attention: %#v", graph)
+		t.Fatalf("later app-server snapshot did not correct hook state: %#v", graph)
 	}
 }
 

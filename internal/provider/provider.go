@@ -16,6 +16,9 @@ import (
 type RootRef struct {
 	PID               int
 	StartedAt         time.Time
+	SlotID            string
+	ProviderEndpoint  string
+	BindingGeneration uint64
 	Provider          agentgraph.ProviderKind
 	ProviderSessionID string
 	Transcript        string
@@ -24,7 +27,7 @@ type RootRef struct {
 
 // Key returns the PID-reuse-safe identity used by observers.
 func (r RootRef) Key() RootKey {
-	return RootKey{PID: r.PID, StartedAt: r.StartedAt}
+	return RootKey{PID: r.PID, StartedAt: r.StartedAt, SlotID: r.SlotID}
 }
 
 // RootKey identifies one process lifetime. PID alone is insufficient because a
@@ -32,6 +35,7 @@ func (r RootRef) Key() RootKey {
 type RootKey struct {
 	PID       int
 	StartedAt time.Time
+	SlotID    string
 }
 
 // Observer supplies immutable-boundary graph snapshots for roots. Observe may

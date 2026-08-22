@@ -1,4 +1,5 @@
 {
+  "schema_version": 2,
   "sessions": [
     {
       "pid": 4821,
@@ -53,6 +54,7 @@
       "started_at": "2026-05-28T09:02:00Z",
       "focused": false,
       "agent": "codex",
+      "slot_id": "a0f75199-5591-4db6-8468-573b7f1d8ef7",
       "mem_agent_bytes": 298844160,
       "mem_tree_bytes": 298844160,
       "codex": {
@@ -67,6 +69,36 @@
       "tty": "/dev/pts/9",
       "started_at": "2026-05-28T09:05:00Z",
       "focused": false
+    }
+  ],
+  "slots": [
+    {
+      "slot_id": "a0f75199-5591-4db6-8468-573b7f1d8ef7",
+      "endpoint": "/run/user/1000/switchboard/codex/a0f75199-5591-4db6-8468-573b7f1d8ef7/app-server.sock",
+      "pid": 4999,
+      "started_at": "2026-05-28T09:02:00Z",
+      "conversation": {
+        "thread_id": "0199736b-b713-74e2-99a2-f015a1c42816",
+        "generation": 2,
+        "name": "api-cleanup",
+        "name_origin": "generated",
+        "bound_at": "2026-05-28T09:03:00Z",
+        "observed_at": "2026-05-28T09:04:00Z"
+      },
+      "retired": [
+        {
+          "thread_id": "0199736b-old",
+          "generation": 1,
+          "name": "old-work",
+          "name_origin": "user",
+          "retired_at": "2026-05-28T09:02:30Z"
+        }
+      ],
+      "endpoint_connected": true,
+      "snapshot_at": "2026-05-28T09:05:29Z",
+      "diagnostic": "conversation rotated",
+      "last_error": "thread_snapshot_error",
+      "autoname": "generated"
     }
   ],
   "updated_at": "2026-05-28T09:05:30Z"

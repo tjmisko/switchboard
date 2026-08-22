@@ -130,6 +130,10 @@ flags:`))
 type observerDiagnostic struct {
 	PID                int       `json:"pid"`
 	Provider           string    `json:"provider"`
+	SlotID             string    `json:"slot_id,omitempty"`
+	ThreadID           string    `json:"thread_id,omitempty"`
+	BindingGeneration  uint64    `json:"binding_generation,omitempty"`
+	Autoname           string    `json:"autoname,omitempty"`
 	Bound              bool      `json:"bound"`
 	BindingSource      string    `json:"binding_source"`
 	Source             string    `json:"graph_source,omitempty"`
@@ -171,22 +175,50 @@ func defaultObserverStatePath() string {
 }
 
 func buildObserverDiagnostics(snap state.Snapshot, now time.Time) []observerDiagnostic {
+	slots := make(map[string]state.CodexSlot, len(snap.Slots))
+	for _, slot := range snap.Slots {
+		slots[slot.SlotID] = slot
+	}
 	out := make([]observerDiagnostic, 0, len(snap.Sessions))
 	for _, session := range snap.Sessions {
 		if session.Agent != state.AgentKindCodex && session.Agent != state.AgentKindClaude && session.AgentGraph == nil {
 			continue
 		}
 		d := observerDiagnostic{
-			PID: session.PID, Provider: session.Agent, BindingSource: "none",
+			PID: session.PID, Provider: session.Agent, SlotID: session.SlotID, BindingSource: "none",
 			Freshness: "absent", Snapshot: "absent",
 			ObserverMode: "not_reported", ObserverConnection: "not_reported", LastErrorCategory: "not_reported",
+		}
+		if slot, ok := slots[session.SlotID]; ok && session.Agent == state.AgentKindCodex {
+			if slot.EndpointConnected {
+				d.ObserverConnection = "connected"
+			} else {
+				d.ObserverConnection = "disconnected"
+			}
+			if slot.LastError != "" {
+				d.LastErrorCategory = strings.ReplaceAll(slot.LastError, " ", "_")
+			} else if slot.Diagnostic != "" {
+				d.LastErrorCategory = strings.ReplaceAll(slot.Diagnostic, " ", "_")
+			}
+			d.Autoname = string(slot.Autoname)
+			if slot.Conversation != nil {
+				d.ThreadID = slot.Conversation.ThreadID
+				d.BindingGeneration = slot.Conversation.Generation
+				d.Bound = slot.Conversation.ThreadID != ""
+				d.BindingSource = "slot"
+			}
+			if !slot.SnapshotAt.IsZero() && d.ObservedAt.IsZero() {
+				d.ObservedAt = slot.SnapshotAt
+			}
 		}
 		info := session.Enrichment()
 		if info != nil {
 			d.LegacySummary = info.Status
 			if info.SessionID != "" {
 				d.Bound = true
-				d.BindingSource = "enrichment"
+				if d.BindingSource == "none" {
+					d.BindingSource = "enrichment"
+				}
 			}
 		}
 		graph := session.AgentGraph
@@ -197,7 +229,9 @@ func buildObserverDiagnostics(snap state.Snapshot, now time.Time) []observerDiag
 			d.GraphSummary = graph.Summary.Status
 			if graph.RootID != "" {
 				d.Bound = true
-				d.BindingSource = "graph"
+				if d.BindingSource == "none" {
+					d.BindingSource = "graph"
+				}
 			}
 			if graph.Complete {
 				d.Snapshot = "complete"
@@ -339,6 +373,7 @@ func observerModeCategory(category string) bool {
 func observerErrorCategory(category string) bool {
 	switch category {
 	case "exact_binding_unavailable", "observe_error", "restore_error", "binding_conflict",
+		"conversation_rotated", "stale_observation_rejected", "endpoint_disconnected", "slot_alive_but_no_thread_bound",
 		"hook_provider_mismatch", "invalid_observation", "history_projection_error", "unknown_protocol_enum":
 		return true
 	default:
@@ -369,9 +404,12 @@ func renderObserverDiagnostics(w io.Writer, diagnostics []observerDiagnostic) {
 		if d.ShadowMismatch != nil {
 			fmt.Fprintf(w, " · shadow=%s graph=%s legacy=%s", matchWord(*d.ShadowMismatch), orUnknown(d.GraphSummary), orUnknown(d.LegacySummary))
 		}
+		if d.SlotID != "" {
+			fmt.Fprintf(w, " · slot=%s generation=%d autoname=%s", d.SlotID, d.BindingGeneration, orUnknown(d.Autoname))
+		}
 		fmt.Fprintln(w)
 		if d.Provider == state.AgentKindCodex && !d.Bound {
-			fmt.Fprintln(w, "    exact thread identity unavailable; verify CODEX_THREAD_ID visibility or trusted lifecycle hook delivery")
+			fmt.Fprintln(w, "    exact thread identity unavailable; verify the per-TUI endpoint or trusted lifecycle hook delivery")
 		}
 	}
 }

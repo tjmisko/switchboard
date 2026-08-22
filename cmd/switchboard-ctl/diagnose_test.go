@@ -126,9 +126,13 @@ func TestExtractTime(t *testing.T) {
 
 func TestBuildObserverDiagnosticsContentFreeStatesAndShadowMismatch(t *testing.T) {
 	now := time.Date(2026, 8, 21, 18, 0, 0, 0, time.UTC)
-	snap := state.Snapshot{Sessions: []state.Session{
+	snap := state.Snapshot{SchemaVersion: state.CurrentSchemaVersion, Slots: []state.CodexSlot{{
+		SlotID: "slot-one", PID: 12, EndpointConnected: true, SnapshotAt: now.Add(-time.Second),
+		LastError: "thread_snapshot_error", Autoname: state.AutonameGenerated,
+		Conversation: &state.ConversationBinding{ThreadID: "codex-root", Generation: 3},
+	}}, Sessions: []state.Session{
 		{
-			PID: 12, Agent: state.AgentKindCodex, CWD: "/secret/project",
+			PID: 12, Agent: state.AgentKindCodex, SlotID: "slot-one", CWD: "/secret/project",
 			Codex: &state.AgentInfo{SessionID: "codex-root", Status: state.StatusPermission},
 			AgentGraph: &state.AgentGraph{
 				RootID: "codex-root", Source: agentgraph.SourceCodexAppServer,
@@ -159,6 +163,15 @@ func TestBuildObserverDiagnosticsContentFreeStatesAndShadowMismatch(t *testing.T
 	}
 	if !got[0].Bound || got[0].Freshness != "fresh" || got[0].Snapshot != "partial" || got[0].LiveNodes != 2 || got[0].WaitingNodes != 1 || got[0].ErrorNodes != 1 {
 		t.Fatalf("fresh codex diagnostic = %+v", got[0])
+	}
+	if got[0].SlotID != "slot-one" || got[0].ThreadID != "codex-root" || got[0].BindingGeneration != 3 || got[0].Autoname != string(state.AutonameGenerated) || got[0].ObserverConnection != "connected" {
+		t.Fatalf("slot diagnostic = %+v", got[0])
+	}
+	if got[0].LastErrorCategory != "thread_snapshot_error" {
+		t.Fatalf("last endpoint error = %q", got[0].LastErrorCategory)
+	}
+	if got[0].BindingSource != "slot" {
+		t.Fatalf("slot binding lost precedence: %+v", got[0])
 	}
 	if got[1].Bound || got[1].Freshness != "absent" {
 		t.Fatalf("unbound codex diagnostic = %+v", got[1])

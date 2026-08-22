@@ -254,6 +254,9 @@ func TestCmdHookShouldForwardToolInputHashWhenPayloadCarriesToolInput(t *testing
 	if req.ToolName != "Bash" || req.AgentID != "agent-abc" || req.SessionID != "sess-1" {
 		t.Errorf("cmdHook disturbed the existing fields: %+v", req)
 	}
+	if req.ObservedAt.IsZero() {
+		t.Error("cmdHook omitted the observation timestamp")
+	}
 }
 
 func TestCmdHookShouldForwardEmptyToolInputHashWhenPayloadHasNoToolInput(t *testing.T) {
@@ -299,6 +302,21 @@ func TestCmdHookShouldStillSendWhenPayloadIsMalformed(t *testing.T) {
 	}
 	if req.ToolInputHash != "" {
 		t.Errorf("expected no hash from a malformed payload, got %q", req.ToolInputHash)
+	}
+}
+
+func TestTruncatePromptBoundsRunesAndTrims(t *testing.T) {
+	input := "  "
+	for range 1002 {
+		input += "界"
+	}
+	input += "  "
+	got := truncatePrompt(input, 1000)
+	if len([]rune(got)) != 1000 || got[0] == ' ' {
+		t.Fatalf("bounded prompt has %d runes", len([]rune(got)))
+	}
+	if got := truncatePrompt("secret", 0); got != "" {
+		t.Fatalf("zero limit = %q", got)
 	}
 }
 

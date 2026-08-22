@@ -30,6 +30,7 @@ var goldenPath = filepath.Join("testdata", "state.golden.json")
 // function and the fixture to agree.
 func canonicalSnapshot() Snapshot {
 	return Snapshot{
+		SchemaVersion: CurrentSchemaVersion,
 		Sessions: []Session{
 			{
 				PID:       4821,
@@ -97,6 +98,7 @@ func canonicalSnapshot() Snapshot {
 				StartedAt:     time.Date(2026, 5, 28, 9, 2, 0, 0, time.UTC),
 				Focused:       false,
 				Agent:         AgentKindCodex,
+				SlotID:        "a0f75199-5591-4db6-8468-573b7f1d8ef7",
 				MemAgentBytes: 298844160,
 				MemTreeBytes:  298844160,
 				Codex: &AgentInfo{
@@ -113,6 +115,26 @@ func canonicalSnapshot() Snapshot {
 				Focused:   false,
 			},
 		},
+		Slots: []CodexSlot{{
+			SlotID:   "a0f75199-5591-4db6-8468-573b7f1d8ef7",
+			Endpoint: "/run/user/1000/switchboard/codex/a0f75199-5591-4db6-8468-573b7f1d8ef7/app-server.sock",
+			PID:      4999, StartedAt: time.Date(2026, 5, 28, 9, 2, 0, 0, time.UTC),
+			Conversation: &ConversationBinding{
+				ThreadID: "0199736b-b713-74e2-99a2-f015a1c42816", Generation: 2,
+				Name: "api-cleanup", NameOrigin: NameOriginGenerated,
+				BoundAt:    time.Date(2026, 5, 28, 9, 3, 0, 0, time.UTC),
+				ObservedAt: time.Date(2026, 5, 28, 9, 4, 0, 0, time.UTC),
+			},
+			Retired: []RetiredConversation{{
+				ThreadID: "0199736b-old", Generation: 1, Name: "old-work",
+				NameOrigin: NameOriginUser, RetiredAt: time.Date(2026, 5, 28, 9, 2, 30, 0, time.UTC),
+			}},
+			EndpointConnected: true,
+			SnapshotAt:        time.Date(2026, 5, 28, 9, 5, 29, 0, time.UTC),
+			Diagnostic:        "conversation rotated",
+			LastError:         "thread_snapshot_error",
+			Autoname:          AutonameGenerated,
+		}},
 		UpdatedAt: time.Date(2026, 5, 28, 9, 5, 30, 0, time.UTC),
 	}
 }

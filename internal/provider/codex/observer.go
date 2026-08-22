@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -18,7 +19,8 @@ import (
 
 const (
 	DefaultFreshness        = 15 * time.Second
-	DefaultResnapshot       = 10 * time.Second
+	DefaultActiveResnapshot = 1 * time.Second
+	DefaultIdleResnapshot   = 10 * time.Second
 	DefaultRequestTimeout   = 5 * time.Second
 	DefaultReconnectMinimum = 100 * time.Millisecond
 	DefaultReconnectMaximum = 5 * time.Second
@@ -41,9 +43,12 @@ var descendantSourceKinds = []string{
 // touch an installed Codex binary, socket, or live process environment.
 type Config struct {
 	Connector           Connector
+	EndpointConnector   func(string) Connector
 	Environment         EnvironmentReader
 	Freshness           time.Duration
 	ResnapshotInterval  time.Duration
+	ActivePollInterval  time.Duration
+	IdlePollInterval    time.Duration
 	RequestTimeout      time.Duration
 	ReconnectMinimum    time.Duration
 	ReconnectMaximum    time.Duration
@@ -55,12 +60,13 @@ type Config struct {
 }
 
 type rootRecord struct {
-	threadID    string
-	binding     BindingSource
-	graph       *graphState
-	observation agentgraph.Observation
-	generation  uint64
-	expiry      *time.Timer
+	threadID          string
+	binding           BindingSource
+	bindingGeneration uint64
+	graph             *graphState
+	observation       agentgraph.Observation
+	generation        uint64
+	expiry            *time.Timer
 }
 
 // Observer is a supervised provider.Observer. NewObserver starts its proxy
@@ -85,8 +91,19 @@ type Observer struct {
 	pendingStatuses map[string]rpcStatus
 	closed          bool
 	lastDiagnostic  time.Time
+	lastError       string
 
 	refresh chan struct{}
+	cadence chan struct{}
+	control chan nameSetRequest
+}
+
+type nameSetRequest struct {
+	ctx      context.Context
+	key      provider.RootKey
+	threadID string
+	name     string
+	done     chan error
 }
 
 var _ provider.Observer = (*Observer)(nil)
@@ -99,7 +116,7 @@ func NewObserver(config Config) *Observer {
 		config: config, bindings: newBindingRegistry(config.Environment),
 		queue: provider.NewInvalidationQueue(config.UpdateBuffer), ctx: ctx, cancel: cancel,
 		roots: make(map[provider.RootKey]*rootRecord), pendingStatuses: make(map[string]rpcStatus),
-		refresh: make(chan struct{}, 1),
+		refresh: make(chan struct{}, 1), cadence: make(chan struct{}, 1), control: make(chan nameSetRequest),
 	}
 	observer.wg.Add(1)
 	go observer.run()
@@ -113,8 +130,16 @@ func withDefaults(config Config) Config {
 	if config.Freshness <= 0 {
 		config.Freshness = DefaultFreshness
 	}
-	if config.ResnapshotInterval <= 0 {
-		config.ResnapshotInterval = DefaultResnapshot
+	if config.ResnapshotInterval > 0 {
+		config.ActivePollInterval = config.ResnapshotInterval
+		config.IdlePollInterval = config.ResnapshotInterval
+	} else {
+		if config.ActivePollInterval <= 0 {
+			config.ActivePollInterval = DefaultActiveResnapshot
+		}
+		if config.IdlePollInterval <= 0 {
+			config.IdlePollInterval = DefaultIdleResnapshot
+		}
 	}
 	if config.RequestTimeout <= 0 {
 		config.RequestTimeout = DefaultRequestTimeout
@@ -152,11 +177,19 @@ func withDefaults(config Config) Config {
 // CODEX_THREAD_ID still has precedence. Registration triggers a resnapshot and
 // is safe to call before or after the first Observe.
 func (o *Observer) RegisterHookBinding(key provider.RootKey, threadID string) error {
-	if err := o.bindings.RegisterHook(key, threadID); err != nil {
-		return err
+	_, err := o.ReconcileHookBinding(key, threadID)
+	return err
+}
+
+// ReconcileHookBinding exposes rotation/stale classification to the daemon
+// while preserving RegisterHookBinding for older observer implementations.
+func (o *Observer) ReconcileHookBinding(key provider.RootKey, threadID string) (BindingUpdate, error) {
+	update, err := o.bindings.RegisterHook(key, threadID)
+	if err != nil {
+		return BindingUpdate{}, err
 	}
 	o.signalRefresh()
-	return nil
+	return update, nil
 }
 
 // Observe resolves exact identity outside the cache mutex and returns a deep
@@ -172,6 +205,17 @@ func (o *Observer) Observe(ctx context.Context, ref provider.RootRef, _ time.Tim
 	}
 	binding, diagnostic := o.bindings.resolve(ctx, ref)
 	if binding.ThreadID == "" {
+		// A launcher-owned endpoint can discover its current root without guessing
+		// by cwd or process ancestry. The supervisor reconciles loaded threads.
+		if ref.SlotID != "" && ref.ProviderEndpoint != "" {
+			key := ref.Key()
+			o.mu.Lock()
+			if o.roots[key] == nil {
+				o.roots[key] = &rootRecord{}
+			}
+			o.mu.Unlock()
+			o.signalRefresh()
+		}
 		return agentgraph.Observation{Provider: agentgraph.ProviderCodex, Complete: false, Diagnostic: diagnostic}, nil
 	}
 
@@ -184,14 +228,14 @@ func (o *Observer) Observe(ctx context.Context, ref provider.RootRef, _ time.Tim
 	record := o.roots[key]
 	changed := false
 	if record == nil {
-		record = &rootRecord{threadID: binding.ThreadID, binding: binding.Source}
+		record = &rootRecord{threadID: binding.ThreadID, binding: binding.Source, bindingGeneration: binding.Generation}
 		o.roots[key] = record
 		changed = true
-	} else if record.threadID != binding.ThreadID {
+	} else if record.threadID != binding.ThreadID || record.bindingGeneration != binding.Generation {
 		if record.expiry != nil {
 			record.expiry.Stop()
 		}
-		record = &rootRecord{threadID: binding.ThreadID, binding: binding.Source}
+		record = &rootRecord{threadID: binding.ThreadID, binding: binding.Source, bindingGeneration: binding.Generation}
 		o.roots[key] = record
 		changed = true
 	}
@@ -211,6 +255,28 @@ func (o *Observer) Observe(ctx context.Context, ref provider.RootRef, _ time.Tim
 }
 
 func (o *Observer) Updates() <-chan provider.RootKey { return o.queue.Updates() }
+
+// SetThreadName is the observer's sole intentional write. It is serialized on
+// the connection supervisor and gated by the current thread binding.
+func (o *Observer) SetThreadName(ctx context.Context, key provider.RootKey, threadID, name string) error {
+	request := nameSetRequest{ctx: ctx, key: key, threadID: strings.TrimSpace(threadID), name: strings.TrimSpace(name), done: make(chan error, 1)}
+	if request.threadID == "" || request.name == "" {
+		return errors.New("codex: thread name requires thread id and name")
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-o.ctx.Done():
+		return errors.New("codex observer is closed")
+	case o.control <- request:
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-request.done:
+		return err
+	}
+}
 
 // Forget drops all binding, graph, and timer state for one process lifetime.
 // It is idempotent and does not affect another process that reused the PID.
@@ -251,6 +317,7 @@ func (o *Observer) run() {
 		}
 		connection, err := o.config.Connector.Connect(o.ctx)
 		if err != nil {
+			o.recordError("endpoint_connect_error")
 			if !o.waitBackoff(backoff) {
 				return
 			}
@@ -268,6 +335,7 @@ func (o *Observer) run() {
 
 		client := newRPCClient(connection, generation, o.handleNotification)
 		if err := o.initialize(client); err != nil {
+			o.recordError("endpoint_initialize_error")
 			_ = client.Close()
 			o.disconnect(generation)
 			if !o.waitBackoff(backoff) {
@@ -279,7 +347,7 @@ func (o *Observer) run() {
 		o.resnapshotAll(client, generation)
 		o.finishSync(generation)
 
-		ticker := time.NewTicker(o.config.ResnapshotInterval)
+		ticker := time.NewTicker(o.pollInterval())
 		stableAfter := max(time.Second, o.config.ReconnectMinimum*4)
 		stableTimer := time.NewTimer(stableAfter)
 		stable := stableTimer.C
@@ -309,10 +377,27 @@ func (o *Observer) run() {
 				o.beginSync(generation)
 				o.resnapshotAll(client, generation)
 				o.finishSync(generation)
+				ticker.Reset(o.pollInterval())
+			case <-o.cadence:
+				ticker.Reset(o.pollInterval())
+			case request := <-o.control:
+				o.mu.Lock()
+				record := o.roots[request.key]
+				valid := record != nil && record.threadID == request.threadID && o.generation == generation
+				o.mu.Unlock()
+				if !valid {
+					request.done <- errors.New("codex: stale thread name request")
+					continue
+				}
+				ctx, cancel := context.WithTimeout(request.ctx, o.config.RequestTimeout)
+				err := client.request(ctx, "thread/name/set", map[string]any{"threadId": request.threadID, "name": request.name}, &struct{}{})
+				cancel()
+				request.done <- err
 			case <-ticker.C:
 				o.beginSync(generation)
 				o.resnapshotAll(client, generation)
 				o.finishSync(generation)
+				ticker.Reset(o.pollInterval())
 			}
 		}
 	}
@@ -353,12 +438,96 @@ func (o *Observer) resnapshotAll(client *rpcClient, generation uint64) {
 	}
 	o.mu.Unlock()
 	for _, target := range targets {
+		// Per-TUI endpoints reconcile their loaded root on every poll. This heals
+		// missed SessionStart hooks, /clear, and app-server restarts.
+		if target.key.SlotID != "" || target.id == "" {
+			discovered, err := o.discoverLoadedRoot(client)
+			if err != nil {
+				o.recordError("loaded_thread_reconcile_error")
+				continue
+			}
+			if discovered != "" && discovered != target.id {
+				update, bindErr := o.bindings.RegisterHook(target.key, discovered)
+				if bindErr != nil || update.Stale {
+					continue
+				}
+				o.mu.Lock()
+				record := o.roots[target.key]
+				if o.generation != generation || record == nil || record.threadID != target.id {
+					o.mu.Unlock()
+					continue
+				}
+				if record.expiry != nil {
+					record.expiry.Stop()
+				}
+				record.threadID = discovered
+				record.binding = BindingHook
+				record.bindingGeneration = update.Generation
+				record.graph = nil
+				record.observation = agentgraph.Observation{}
+				o.mu.Unlock()
+				target.id = discovered
+			}
+		}
+		if target.id == "" {
+			continue
+		}
 		state, err := o.snapshot(client, target.id)
 		if err != nil {
+			o.recordError("thread_snapshot_error")
 			continue
 		}
 		o.installSnapshot(generation, target.key, target.id, state)
 	}
+}
+
+func (o *Observer) recordError(category string) {
+	o.mu.Lock()
+	o.lastError = category
+	o.mu.Unlock()
+}
+
+func (o *Observer) discoverLoadedRoot(client *rpcClient) (string, error) {
+	ctx, cancel := context.WithTimeout(o.ctx, o.config.RequestTimeout)
+	defer cancel()
+	var candidates []rpcThread
+	var cursor string
+	for {
+		params := map[string]any{}
+		if cursor != "" {
+			params["cursor"] = cursor
+		}
+		var loaded threadLoadedListResult
+		if err := client.request(ctx, "thread/loaded/list", params, &loaded); err != nil {
+			return "", err
+		}
+		for _, id := range loaded.Data {
+			var result threadReadResult
+			if err := client.request(ctx, "thread/read", map[string]any{"threadId": id, "includeTurns": false}, &result); err != nil {
+				continue
+			}
+			if result.Thread.ID == id && result.Thread.ParentThreadID == "" {
+				candidates = append(candidates, result.Thread)
+			}
+		}
+		if loaded.NextCursor == nil || *loaded.NextCursor == "" {
+			break
+		}
+		cursor = *loaded.NextCursor
+	}
+	if len(candidates) == 0 {
+		return "", nil
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].CreatedAt != candidates[j].CreatedAt {
+			return candidates[i].CreatedAt > candidates[j].CreatedAt
+		}
+		if candidates[i].UpdatedAt != candidates[j].UpdatedAt {
+			return candidates[i].UpdatedAt > candidates[j].UpdatedAt
+		}
+		return candidates[i].ID > candidates[j].ID
+	})
+	return candidates[0].ID, nil
 }
 
 func (o *Observer) snapshot(client *rpcClient, rootID string) (*graphState, error) {
@@ -481,20 +650,39 @@ func (o *Observer) handleNotification(notification rpcNotification) {
 	for _, key := range keys {
 		o.queue.Signal(key)
 	}
+	select {
+	case o.cadence <- struct{}{}:
+	default:
+	}
 	if unknown {
 		o.emitUnknownDiagnostic(&graphState{unknownEnum: true})
 	}
 }
 
+func (o *Observer) pollInterval() time.Duration {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for _, record := range o.roots {
+		for _, node := range record.observation.Nodes {
+			if node.ID == record.threadID && node.Runtime == agentgraph.RuntimeActive {
+				return o.config.ActivePollInterval
+			}
+		}
+	}
+	return o.config.IdlePollInterval
+}
+
 func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]provider.RootKey, bool) {
 	type threadParams struct {
-		ThreadID   string    `json:"threadId"`
-		ThreadName *string   `json:"threadName"`
-		TurnID     string    `json:"turnId"`
-		Thread     rpcThread `json:"thread"`
-		Status     rpcStatus `json:"status"`
-		Turn       rpcTurn   `json:"turn"`
-		Item       rpcItem   `json:"item"`
+		ThreadID   string          `json:"threadId"`
+		ThreadName *string         `json:"threadName"`
+		TurnID     string          `json:"turnId"`
+		ItemID     string          `json:"itemId"`
+		RequestID  json.RawMessage `json:"requestId"`
+		Thread     rpcThread       `json:"thread"`
+		Status     rpcStatus       `json:"status"`
+		Turn       rpcTurn         `json:"turn"`
+		Item       rpcItem         `json:"item"`
 	}
 	params, ok := decodeParams[threadParams](notification.Params)
 	if !ok {
@@ -549,11 +737,12 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 			}
 		case "turn/completed":
 			if state.nodes[params.ThreadID] != nil {
+				state.completeTurn(params.ThreadID, params.Turn.ID)
 				touches = true
 			}
 		case "item/started", "item/completed":
 			if state.nodes[params.ThreadID] != nil || state.nodes[params.Item.SenderThreadID] != nil {
-				state.applyCollaboration(params.TurnID, params.Item)
+				state.applyItem(params.ThreadID, params.TurnID, params.Item)
 				for _, childID := range params.Item.ReceiverThreadIDs {
 					if pending, exists := o.pendingStatuses[childID]; exists {
 						if child := state.nodes[childID]; child != nil {
@@ -562,6 +751,16 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 						}
 					}
 				}
+				touches = true
+			}
+		case "item/tool/requestUserInput":
+			if state.nodes[params.ThreadID] != nil && params.ItemID != "" {
+				state.beginUserInputRequest(params.ThreadID, params.TurnID, params.ItemID, notification.RequestID)
+				touches = true
+			}
+		case "serverRequest/resolved":
+			if state.nodes[params.ThreadID] != nil {
+				state.resolveUserInputRequest(params.ThreadID, strings.TrimSpace(string(params.RequestID)))
 				touches = true
 			}
 		case "thread/archived", "thread/deleted":

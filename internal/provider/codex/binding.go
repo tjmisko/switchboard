@@ -3,7 +3,6 @@ package codex
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 	"sync"
 
@@ -29,19 +28,32 @@ const (
 
 // Binding is an exact root-thread association. An empty ThreadID is unbound.
 type Binding struct {
-	ThreadID string
-	Source   BindingSource
+	ThreadID   string
+	Source     BindingSource
+	Generation uint64
 }
 
-// BindingRegistry combines process-environment and hook identities. Process
-// environment wins when CODEX_THREAD_ID is present. CODEX_SESSION_ID is not
-// used: 0.149 evidence shows that it can identify a parent rather than the
-// current thread.
+type BindingUpdate struct {
+	ThreadID   string
+	Generation uint64
+	Rotated    bool
+	Stale      bool
+}
+
+type bindingRecord struct {
+	threadID   string
+	generation uint64
+	retired    map[string]struct{}
+}
+
+// BindingRegistry combines process-environment and hook identities. The
+// environment supplies a startup fallback; an exact hook wins after arrival
+// because /clear changes the thread without replacing the process.
 type BindingRegistry struct {
 	env EnvironmentReader
 
 	mu          sync.RWMutex
-	hooks       map[provider.RootKey]string
+	hooks       map[provider.RootKey]*bindingRecord
 	environment map[provider.RootKey]string
 }
 
@@ -50,26 +62,38 @@ func newBindingRegistry(env EnvironmentReader) *BindingRegistry {
 		env = defaultEnvironmentReader()
 	}
 	return &BindingRegistry{
-		env: env, hooks: make(map[provider.RootKey]string),
+		env: env, hooks: make(map[provider.RootKey]*bindingRecord),
 		environment: make(map[provider.RootKey]string),
 	}
 }
 
 // RegisterHook records an exact hook-supplied thread ID for one process
-// lifetime. It is safe to repeat with the same ID; conflicting exact IDs are
-// rejected instead of being silently replaced.
-func (r *BindingRegistry) RegisterHook(key provider.RootKey, threadID string) error {
+// lifetime. A different non-retired ID is a /clear rotation, never a conflict.
+func (r *BindingRegistry) RegisterHook(key provider.RootKey, threadID string) (BindingUpdate, error) {
 	threadID = strings.TrimSpace(threadID)
 	if key.PID <= 0 || key.StartedAt.IsZero() || threadID == "" {
-		return errors.New("codex: hook binding requires pid, start identity, and thread id")
+		return BindingUpdate{}, errors.New("codex: hook binding requires pid, start identity, and thread id")
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if prior := r.hooks[key]; prior != "" && prior != threadID {
-		return fmt.Errorf("codex: conflicting hook binding for process lifetime")
+	record := r.hooks[key]
+	if record == nil {
+		record = &bindingRecord{generation: 1, retired: make(map[string]struct{})}
+		r.hooks[key] = record
 	}
-	r.hooks[key] = threadID
-	return nil
+	if record.threadID == threadID {
+		return BindingUpdate{ThreadID: threadID, Generation: record.generation}, nil
+	}
+	if _, stale := record.retired[threadID]; stale {
+		return BindingUpdate{ThreadID: threadID, Generation: record.generation, Stale: true}, nil
+	}
+	rotated := record.threadID != ""
+	if rotated {
+		record.retired[record.threadID] = struct{}{}
+		record.generation++
+	}
+	record.threadID = threadID
+	return BindingUpdate{ThreadID: threadID, Generation: record.generation, Rotated: rotated}, nil
 }
 
 // Forget removes hook state for one process lifetime. It is idempotent.
@@ -82,6 +106,13 @@ func (r *BindingRegistry) Forget(key provider.RootKey) {
 
 func (r *BindingRegistry) resolve(ctx context.Context, ref provider.RootRef) (Binding, string) {
 	key := ref.Key()
+	r.mu.RLock()
+	if hook := r.hooks[key]; hook != nil && hook.threadID != "" {
+		binding := Binding{ThreadID: hook.threadID, Source: BindingHook, Generation: hook.generation}
+		r.mu.RUnlock()
+		return binding, ""
+	}
+	r.mu.RUnlock()
 	if r.env != nil {
 		body, err := r.env.Environ(ctx, key)
 		if err == nil {
@@ -89,7 +120,7 @@ func (r *BindingRegistry) resolve(ctx context.Context, ref provider.RootRef) (Bi
 				r.mu.Lock()
 				r.environment[key] = id
 				r.mu.Unlock()
-				return Binding{ThreadID: id, Source: BindingProcessEnvironment}, ""
+				return Binding{ThreadID: id, Source: BindingProcessEnvironment, Generation: 1}, ""
 			}
 		} else if ctx.Err() != nil {
 			return Binding{}, "binding cancelled"
@@ -101,13 +132,9 @@ func (r *BindingRegistry) resolve(ctx context.Context, ref provider.RootRef) (Bi
 	r.mu.RLock()
 	if id := r.environment[key]; id != "" {
 		r.mu.RUnlock()
-		return Binding{ThreadID: id, Source: BindingProcessEnvironment}, ""
+		return Binding{ThreadID: id, Source: BindingProcessEnvironment, Generation: 1}, ""
 	}
-	id := r.hooks[key]
 	r.mu.RUnlock()
-	if id != "" {
-		return Binding{ThreadID: id, Source: BindingHook}, ""
-	}
 	return Binding{}, "exact Codex thread binding unavailable"
 }
 

@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	sblabel "github.com/tjmisko/switchboard/internal/label"
 	"github.com/tjmisko/switchboard/internal/projectname"
@@ -107,6 +108,12 @@ func main() {
 			fail("codex-hook requires an event name")
 		}
 		cmdHook(c, args[1], state.AgentKindCodex)
+	case "autoname":
+		slotID := ""
+		if len(args) > 1 {
+			slotID = args[1]
+		}
+		cmdAutoname(c, slotID)
 	case "activity":
 		if len(args) < 2 {
 			fail("activity requires a value: idle|active")
@@ -387,6 +394,7 @@ func cmdHook(c *rpc.Client, event, agent string) {
 	toolInputHash := ""
 	agentID := ""
 	agentType := ""
+	prompt := ""
 	if body, err := io.ReadAll(os.Stdin); err == nil && len(body) > 0 {
 		var payload struct {
 			SessionID      string `json:"session_id"`
@@ -410,6 +418,7 @@ func cmdHook(c *rpc.Client, event, agent string) {
 			AgentType    string `json:"agent_type"`
 			AgentIDAlt   string `json:"agentId"`
 			AgentTypeAlt string `json:"agentType"`
+			Prompt       string `json:"prompt"`
 		}
 		if json.Unmarshal(body, &payload) == nil {
 			sessionID = payload.SessionID
@@ -418,6 +427,9 @@ func cmdHook(c *rpc.Client, event, agent string) {
 			toolInputHash = hashToolInput(payload.ToolInput)
 			agentID = firstNonEmpty(payload.AgentID, payload.AgentIDAlt)
 			agentType = firstNonEmpty(payload.AgentType, payload.AgentTypeAlt)
+			if agent == state.AgentKindCodex && event == "UserPromptSubmit" {
+				prompt = truncatePrompt(payload.Prompt, 1000)
+			}
 		}
 	}
 	_ = c.Send(rpc.Request{
@@ -431,9 +443,37 @@ func cmdHook(c *rpc.Client, event, agent string) {
 		AgentID:       agentID,
 		AgentType:     agentType,
 		Agent:         agent,
+		SlotID:        strings.TrimSpace(os.Getenv("SWITCHBOARD_SLOT_ID")),
+		Prompt:        prompt,
+		ObservedAt:    time.Now().UTC(),
 	})
 	var resp rpc.Response
 	_ = c.Recv(&resp)
+}
+
+func truncatePrompt(prompt string, limit int) string {
+	prompt = strings.TrimSpace(prompt)
+	if limit <= 0 {
+		return ""
+	}
+	runes := []rune(prompt)
+	if len(runes) > limit {
+		runes = runes[:limit]
+	}
+	return string(runes)
+}
+
+func cmdAutoname(c *rpc.Client, slotID string) {
+	if err := c.Send(rpc.Request{Cmd: "autoname", SlotID: strings.TrimSpace(slotID)}); err != nil {
+		fail("send: %v", err)
+	}
+	var resp rpc.Response
+	if err := c.Recv(&resp); err != nil {
+		fail("recv: %v", err)
+	}
+	if resp.Error != "" {
+		fail("%s", resp.Error)
+	}
 }
 
 // toolInputHashLen is how much of the sha256 hex digest is forwarded. 16 hex
@@ -611,6 +651,7 @@ commands:
                             set-full --cwd --name <full> (pretty display name)
   hook <event>            forward Claude Code hook enrichment (stdin = JSON)
   codex-hook <event>      forward Codex hook enrichment (stdin = JSON)
+  autoname [slot-id]      retry Codex automatic naming for one/all slots
   activity idle|active    report a global user-activity edge for the delegation
                             metrics (idle daemon, e.g. hypridle); session-less
   bottombar [sub]         manage the bottom waybar lifecycle:

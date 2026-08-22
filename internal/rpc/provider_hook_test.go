@@ -103,3 +103,32 @@ func TestAgentDiagnosticsCommandReturnsProviderHealth(t *testing.T) {
 		t.Fatal("RPC handler did not exit")
 	}
 }
+
+func TestSlotIdentityPrecedesPIDAndNeverFallsBack(t *testing.T) {
+	store := state.New("")
+	started := time.Unix(100, 0)
+	store.Apply(func(sessions map[int]*state.Session) {
+		sessions[41] = &state.Session{PID: 41, StartedAt: started, Agent: state.AgentKindCodex, SlotID: "slot-a"}
+		sessions[42] = &state.Session{PID: 42, StartedAt: started, Agent: state.AgentKindCodex, SlotID: "slot-b"}
+	})
+	server := New(store, "", terminal.NewNone(), wm.NewNone())
+	got := make(chan state.Session, 2)
+	server.SetAgentHookHandler(func(_ Request, session state.Session) { got <- session })
+
+	server.handleHook(Request{Cmd: "hook", Agent: state.AgentKindCodex, SlotID: "slot-b", PID: 41, SessionID: "thread-b"})
+	select {
+	case session := <-got:
+		if session.PID != 42 || session.SlotID != "slot-b" {
+			t.Fatalf("slot hook attributed to %+v", session)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("known slot hook was not delivered")
+	}
+
+	server.handleHook(Request{Cmd: "hook", Agent: state.AgentKindCodex, SlotID: "unknown", PID: 41, SessionID: "thread-x"})
+	select {
+	case session := <-got:
+		t.Fatalf("unknown exact slot fell back to pid: %+v", session)
+	case <-time.After(20 * time.Millisecond):
+	}
+}

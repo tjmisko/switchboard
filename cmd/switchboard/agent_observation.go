@@ -2,8 +2,12 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"path/filepath"
+	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,6 +16,7 @@ import (
 	"github.com/tjmisko/switchboard/internal/history"
 	"github.com/tjmisko/switchboard/internal/provider"
 	claudeprovider "github.com/tjmisko/switchboard/internal/provider/claude"
+	codexprovider "github.com/tjmisko/switchboard/internal/provider/codex"
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
 )
@@ -37,6 +42,14 @@ type claudeObserver interface {
 type codexObserver interface {
 	provider.Observer
 	RegisterHookBinding(provider.RootKey, string) error
+}
+
+type codexBindingReconciler interface {
+	ReconcileHookBinding(provider.RootKey, string) (codexprovider.BindingUpdate, error)
+}
+
+type codexEndpointDiagnosticSource interface {
+	Diagnostics() []codexprovider.EndpointDiagnostic
 }
 
 type trackedProviderRoot struct {
@@ -69,6 +82,23 @@ type agentCoordinator struct {
 	wg     sync.WaitGroup
 	start  sync.Once
 	once   sync.Once
+
+	autonameMu      sync.Mutex
+	autonames       map[string]context.CancelFunc
+	autonamePrompts map[string]autonameInput
+	namer           codexprovider.NameGenerator
+	autonameModel   string
+}
+
+type autonameInput struct {
+	ref        provider.RootRef
+	threadID   string
+	generation uint64
+	prompt     string
+}
+
+type codexThreadNameSetter interface {
+	SetThreadName(context.Context, provider.RootKey, string, uint64, string) error
 }
 
 func newAgentCoordinator(store *state.Store, sink *history.Sink, claude claudeObserver, codex codexObserver) *agentCoordinator {
@@ -77,6 +107,8 @@ func newAgentCoordinator(store *state.Store, sink *history.Sink, claude claudeOb
 		history: history.NewAgentStateProjector(), requests: provider.NewInvalidationQueue(64),
 		generation: make(map[provider.RootKey]uint64), tracked: make(map[provider.RootKey]trackedProviderRoot),
 		diagnostics: make(map[string]rpc.AgentDiagnostic), lastLog: make(map[string]time.Time),
+		autonames: make(map[string]context.CancelFunc), autonamePrompts: make(map[string]autonameInput), namer: codexprovider.EphemeralNamer{},
+		autonameModel: codexprovider.DefaultAutonameModel,
 	}
 }
 
@@ -102,6 +134,12 @@ func (c *agentCoordinator) Close() {
 		if cancel != nil {
 			cancel()
 		}
+		c.autonameMu.Lock()
+		for _, cancelName := range c.autonames {
+			cancelName()
+		}
+		clear(c.autonames)
+		c.autonameMu.Unlock()
 		c.wg.Wait()
 		if c.claude != nil {
 			_ = c.claude.Close()
@@ -124,7 +162,7 @@ func (c *agentCoordinator) Request(key provider.RootKey) {
 func (c *agentCoordinator) RequestCleanup() { c.Request(provider.RootKey{}) }
 
 func providerRootKey(sess state.Session) provider.RootKey {
-	return provider.RootKey{PID: sess.PID, StartedAt: sess.StartedAt}
+	return provider.RootKey{PID: sess.PID, StartedAt: sess.StartedAt, SlotID: sess.SlotID}
 }
 
 func (c *agentCoordinator) run(ctx context.Context, interval time.Duration) {
@@ -186,6 +224,15 @@ func (c *agentCoordinator) refreshTrackedRoots() []provider.RootRef {
 		if !ok {
 			continue
 		}
+		for _, slot := range snap.Slots {
+			if slot.SlotID == ref.SlotID {
+				ref.ProviderEndpoint = slot.Endpoint
+				if slot.Conversation != nil {
+					ref.BindingGeneration = slot.Conversation.Generation
+				}
+				break
+			}
+		}
 		refs = append(refs, ref)
 		live[ref.Key()] = ref
 	}
@@ -236,6 +283,9 @@ func (c *agentCoordinator) refreshTrackedRoots() []provider.RootRef {
 		if item.root.rootID != "" {
 			c.history.Forget(item.root.kind, item.root.rootID)
 		}
+		if item.key.SlotID != "" {
+			c.cancelAutoname(item.key.SlotID)
+		}
 	}
 	for _, root := range retired {
 		c.history.Forget(root.kind, root.rootID)
@@ -261,7 +311,7 @@ func providerRootRef(sess state.Session) (provider.RootRef, bool) {
 	default:
 		return provider.RootRef{}, false
 	}
-	ref := provider.RootRef{PID: sess.PID, StartedAt: sess.StartedAt, Provider: kind, CWD: sess.CWD}
+	ref := provider.RootRef{PID: sess.PID, StartedAt: sess.StartedAt, SlotID: sess.SlotID, Provider: kind, CWD: sess.CWD}
 	if info := sess.Enrichment(); info != nil {
 		ref.ProviderSessionID = info.SessionID
 		ref.Transcript = info.Transcript
@@ -303,6 +353,9 @@ func (c *agentCoordinator) observe(ctx context.Context, ref provider.RootRef) {
 	generation := c.begin(ref.Key())
 	now := time.Now()
 	observation, err := observer.Observe(ctx, ref, now)
+	if ref.Provider == agentgraph.ProviderCodex {
+		c.syncCodexEndpointDiagnostics()
+	}
 	if err != nil {
 		c.recordDiagnostic(ref.Provider, "observe_error", now)
 	}
@@ -324,6 +377,34 @@ func (c *agentCoordinator) observe(ctx context.Context, ref provider.RootRef) {
 			c.sink.Record(event)
 		}
 	}
+}
+
+func (c *agentCoordinator) syncCodexEndpointDiagnostics() {
+	source, ok := c.codex.(codexEndpointDiagnosticSource)
+	if !ok {
+		return
+	}
+	diagnostics := source.Diagnostics()
+	c.store.ApplyState(func(_ map[int]*state.Session, slots map[string]*state.CodexSlot) {
+		for _, diagnostic := range diagnostics {
+			slot := slots[diagnostic.SlotID]
+			if slot == nil {
+				continue
+			}
+			slot.EndpointConnected = diagnostic.Connected
+			if diagnostic.LastErrorCategory != "" {
+				slot.LastError = diagnostic.LastErrorCategory
+			}
+			if !diagnostic.SnapshotAt.IsZero() {
+				slot.SnapshotAt = diagnostic.SnapshotAt
+			}
+			if diagnostic.Category != "" {
+				slot.Diagnostic = diagnostic.Category
+			} else if slot.Diagnostic == "endpoint disconnected" || slot.Diagnostic == "slot alive but no thread bound" {
+				slot.Diagnostic = ""
+			}
+		}
+	})
 }
 
 func (c *agentCoordinator) restoreClaude(ref provider.RootRef) {
@@ -377,6 +458,45 @@ func (c *agentCoordinator) applyObservation(ref provider.RootRef, generation uin
 	if !ok || agentgraph.ProviderKind(priorSession.Agent) != ref.Provider {
 		return false
 	}
+	if ref.Provider == agentgraph.ProviderCodex && ref.SlotID != "" &&
+		(priorSession.AgentGraph == nil || priorSession.AgentGraph.RootID != observation.RootID) {
+		accepted, rotated := false, false
+		c.store.ApplyState(func(sessions map[int]*state.Session, slots map[string]*state.CodexSlot) {
+			sess, slot := sessions[ref.PID], slots[ref.SlotID]
+			if sess == nil || slot == nil || !sess.StartedAt.Equal(ref.StartedAt) {
+				return
+			}
+			var stale bool
+			observedAt := observation.ObservedAt
+			if observedAt.IsZero() {
+				observedAt = now
+			}
+			rotated, stale = slot.BindConversation(observation.RootID, observedAt)
+			if stale {
+				return
+			}
+			if rotated {
+				sess.Codex = &state.AgentInfo{}
+				sess.AgentGraph = nil
+			}
+			accepted = true
+		})
+		if !accepted {
+			c.recordDiagnosticLocked(ref.Provider, "stale_observation_rejected", now)
+			return false
+		}
+		if rotated {
+			c.cancelAutoname(ref.SlotID)
+			c.recordDiagnosticLocked(ref.Provider, "conversation_rotated", now)
+			if tracked := c.tracked[ref.Key()]; tracked.rootID != "" {
+				c.history.Forget(tracked.kind, tracked.rootID)
+			}
+		}
+		priorSession, ok = sessionForKey(c.store.Snapshot(), ref.Key())
+		if !ok {
+			return false
+		}
+	}
 	if !shouldApplyObservation(observation, priorSession.AgentGraph, now) {
 		return false
 	}
@@ -406,6 +526,49 @@ func (c *agentCoordinator) applyObservation(ref provider.RootRef, generation uin
 		sess.SetAgentGraph(graph)
 		applied = true
 	})
+	if applied && ref.Provider == agentgraph.ProviderCodex && ref.SlotID != "" {
+		// Only app-server carries authoritative thread names. A hook overlay may
+		// retain the last visible nickname for structural continuity, but it is not
+		// a rename observation and must not suppress first-prompt autonaming.
+		name := ""
+		if observation.Source == agentgraph.SourceCodexAppServer {
+			name = observationRootName(observation)
+		}
+		explicit := false
+		c.store.ApplyState(func(_ map[int]*state.Session, slots map[string]*state.CodexSlot) {
+			slot := slots[ref.SlotID]
+			if slot == nil || slot.Conversation == nil || slot.Conversation.ThreadID != observation.RootID {
+				return
+			}
+			slot.MarkConversationObserved(observation.RootID, slot.Conversation.Generation, observation.ObservedAt)
+			slot.SnapshotAt = observation.ObservedAt
+			slot.EndpointConnected = true
+			slot.Diagnostic = ""
+			if name == "" {
+				return
+			}
+			origin := state.NameOriginUser
+			if slot.PendingName == name && slot.PendingNameOrigin != "" {
+				origin = slot.PendingNameOrigin
+			} else if slot.Conversation.Name == name && slot.Conversation.NameOrigin != "" {
+				origin = slot.Conversation.NameOrigin
+			} else {
+				explicit = true
+			}
+			slot.SetConversationName(name, origin)
+			slot.PendingName, slot.PendingNameOrigin = "", ""
+			if origin == state.NameOriginUser {
+				slot.Autoname = state.AutonameSuppressed
+			} else if origin == state.NameOriginFallback {
+				slot.Autoname = state.AutonameFallback
+			} else {
+				slot.Autoname = state.AutonameGenerated
+			}
+		})
+		if explicit {
+			c.cancelAutoname(ref.SlotID)
+		}
+	}
 	if !applied {
 		c.history.Forget(observation.Provider, observation.RootID)
 		return false
@@ -431,6 +594,15 @@ func (c *agentCoordinator) applyObservation(ref provider.RootRef, generation uin
 	return true
 }
 
+func observationRootName(observation agentgraph.Observation) string {
+	for _, node := range observation.Nodes {
+		if node.ID == observation.RootID {
+			return strings.TrimSpace(node.Nickname)
+		}
+	}
+	return ""
+}
+
 func shouldApplyObservation(observation agentgraph.Observation, current *state.AgentGraph, now time.Time) bool {
 	if observation.RootID == "" || len(observation.Nodes) == 0 {
 		return false
@@ -440,6 +612,21 @@ func shouldApplyObservation(observation agentgraph.Observation, current *state.A
 	}
 	currentFresh := current.Fresh(now)
 	candidateFresh := observation.Fresh(now)
+	if observation.Provider == agentgraph.ProviderCodex {
+		// Exact event time is the first authority within one Codex conversation.
+		// Hooks can therefore provide the immediate edge while a subsequent
+		// app-server sample corrects it, and a delayed sample can never repaint
+		// over a newer hook. Claude retains its established hook/transcript policy.
+		if observation.ObservedAt.Before(current.ObservedAt) {
+			return false
+		}
+		if observation.ObservedAt.After(current.ObservedAt) {
+			if currentFresh && !candidateFresh && current.Source != observation.Source {
+				return false
+			}
+			return true
+		}
+	}
 	currentRank := sourceRank(current.Source)
 	candidateRank := sourceRank(observation.Source)
 	if currentFresh && currentRank > candidateRank {
@@ -452,6 +639,31 @@ func shouldApplyObservation(observation agentgraph.Observation, current *state.A
 		return false
 	}
 	return !observation.ObservedAt.Before(current.ObservedAt)
+}
+
+// overlayCodexHookObservation keeps the app-server's structural detail while
+// applying a newer hook's immediate root status. A hook is intentionally
+// partial: it must not erase the authoritative thread name or child graph.
+func overlayCodexHookObservation(hook agentgraph.Observation, current *state.AgentGraph) agentgraph.Observation {
+	if current == nil || current.RootID != hook.RootID || len(hook.Nodes) != 1 {
+		return hook
+	}
+	overlay := observationFromState(agentgraph.ProviderCodex, current)
+	overlay.Source = agentgraph.SourceHook
+	overlay.ObservedAt = hook.ObservedAt
+	overlay.FreshUntil = hook.FreshUntil
+	overlay.Complete = false
+	for i := range overlay.Nodes {
+		if overlay.Nodes[i].ID != hook.RootID {
+			continue
+		}
+		overlay.Nodes[i].Runtime = hook.Nodes[0].Runtime
+		overlay.Nodes[i].Attention = hook.Nodes[0].Attention
+		overlay.Nodes[i].Lifecycle = hook.Nodes[0].Lifecycle
+		overlay.Nodes[i].UpdatedAt = hook.Nodes[0].UpdatedAt
+		break
+	}
+	return overlay
 }
 
 func sourceRank(source agentgraph.SourceKind) int {
@@ -587,7 +799,10 @@ func (c *agentCoordinator) HandleHook(req rpc.Request, sess state.Session) {
 	if req.Transcript != "" {
 		ref.Transcript = req.Transcript
 	}
-	now := time.Now()
+	now := req.ObservedAt
+	if now.IsZero() {
+		now = time.Now()
+	}
 	switch ref.Provider {
 	case agentgraph.ProviderClaude:
 		if c.claude == nil {
@@ -620,21 +835,390 @@ func (c *agentCoordinator) HandleHook(req rpc.Request, sess state.Session) {
 		// before discovery has registered the root and be dropped by the RPC
 		// ancestry guard. Every trusted Codex lifecycle hook carries the same exact
 		// root session_id, so any later hook must self-heal that startup race.
-		if c.codex != nil && rootID != "" {
-			if err := c.codex.RegisterHookBinding(ref.Key(), rootID); err != nil {
-				c.recordDiagnostic(ref.Provider, "binding_conflict", now)
+		if rootID == "" {
+			c.recordDiagnostic(ref.Provider, "exact_binding_unavailable", now)
+			return
+		}
+		var accepted bool
+		ref, accepted = c.reconcileCodexBinding(ref, rootID, req.Generation, now)
+		if !accepted {
+			c.recordDiagnostic(ref.Provider, "stale_observation_rejected", now)
+			return
+		}
+		if c.codex != nil {
+			if reconciler, ok := c.codex.(codexBindingReconciler); ok {
+				update, err := reconciler.ReconcileHookBinding(ref.Key(), rootID)
+				if err != nil {
+					c.recordDiagnostic(ref.Provider, "binding_error", now)
+					return
+				}
+				if update.Stale {
+					c.recordDiagnostic(ref.Provider, "stale_observation_rejected", now)
+					return
+				}
+			} else if err := c.codex.RegisterHookBinding(ref.Key(), rootID); err != nil {
+				c.recordDiagnostic(ref.Provider, "binding_error", now)
 				return
 			}
 		}
 		observation, mapped := codexHookObservation(rootID, req.Event, req.ToolName, ref.StartedAt, now)
 		if mapped {
+			if current, ok := sessionForKey(c.store.Snapshot(), ref.Key()); ok {
+				observation = overlayCodexHookObservation(observation, current.AgentGraph)
+			}
 			generation := c.begin(ref.Key())
 			c.applyObservation(ref, generation, observation, claudeprovider.Compatibility{}, now)
+		}
+		if req.Event == "UserPromptSubmit" && req.Prompt != "" && ref.SlotID != "" {
+			c.startAutoname(ref, rootID, req.Prompt, false)
 		}
 		if c.codex != nil {
 			c.Request(ref.Key())
 		}
 	}
+}
+
+// reconcileCodexBinding performs the slot/conversation split before the hook is
+// reduced. The same hook that discovers a new thread is therefore applied to a
+// freshly-cleared generation rather than discarded as a conflict.
+func (c *agentCoordinator) reconcileCodexBinding(ref provider.RootRef, threadID string, suppliedGeneration uint64, now time.Time) (provider.RootRef, bool) {
+	accepted := false
+	rotated := false
+	c.store.ApplyState(func(sessions map[int]*state.Session, slots map[string]*state.CodexSlot) {
+		sess := sessions[ref.PID]
+		if sess == nil || !sess.StartedAt.Equal(ref.StartedAt) || sess.Agent != state.AgentKindCodex {
+			return
+		}
+		if ref.SlotID != "" {
+			slot := slots[ref.SlotID]
+			if slot == nil || slot.PID != ref.PID || !slot.StartedAt.Equal(ref.StartedAt) {
+				return
+			}
+			if suppliedGeneration != 0 {
+				expected := uint64(1)
+				if slot.Conversation != nil {
+					expected = slot.Conversation.Generation
+					if slot.Conversation.ThreadID != threadID {
+						expected++
+					}
+				}
+				if suppliedGeneration != expected {
+					return
+				}
+			}
+			var stale bool
+			rotated, stale = slot.BindConversation(threadID, now)
+			if stale {
+				return
+			}
+			ref.BindingGeneration = slot.Conversation.Generation
+		} else {
+			info := sess.Enrichment()
+			rotated = info != nil && info.SessionID != "" && info.SessionID != threadID
+		}
+		if rotated {
+			sess.Codex = &state.AgentInfo{}
+			sess.AgentGraph = nil
+		}
+		sess.AgentBlock(state.AgentKindCodex).SessionID = threadID
+		accepted = true
+	})
+	if rotated {
+		c.cancelAutoname(ref.SlotID)
+		c.mu.Lock()
+		c.generation[ref.Key()]++
+		if tracked := c.tracked[ref.Key()]; tracked.rootID != "" {
+			c.history.Forget(tracked.kind, tracked.rootID)
+			tracked.rootID = ""
+			c.tracked[ref.Key()] = tracked
+		}
+		c.mu.Unlock()
+		c.recordDiagnostic(ref.Provider, "conversation_rotated", now)
+	}
+	ref.ProviderSessionID = threadID
+	return ref, accepted
+}
+
+var codexSlotIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
+// HandleCodexSlot is the launcher/control RPC landing path.
+func (c *agentCoordinator) HandleCodexSlot(req rpc.Request) error {
+	switch req.Cmd {
+	case "codex_slot_register":
+		if !codexSlotIDPattern.MatchString(req.SlotID) {
+			return fmt.Errorf("invalid Codex slot id")
+		}
+		endpoint := strings.TrimSpace(req.Endpoint)
+		if endpoint == "" || (!strings.HasPrefix(endpoint, "unix:///") && !strings.HasPrefix(endpoint, "/")) {
+			return fmt.Errorf("invalid Codex slot endpoint")
+		}
+		if req.PID <= 0 || req.StartedAt.IsZero() {
+			return fmt.Errorf("Codex slot registration requires pid and start time")
+		}
+		actualStartedAt := req.StartedAt
+		var registrationErr error
+		c.store.ApplyState(func(sessions map[int]*state.Session, slots map[string]*state.CodexSlot) {
+			if existing := slots[req.SlotID]; existing != nil {
+				if existing.PID != req.PID || existing.Endpoint != endpoint {
+					registrationErr = fmt.Errorf("Codex slot id is already registered to another TUI")
+					return
+				}
+				actualStartedAt = existing.StartedAt
+				sess := sessions[req.PID]
+				if sess == nil || sess.Agent != state.AgentKindCodex || (sess.SlotID != "" && sess.SlotID != req.SlotID) {
+					registrationErr = fmt.Errorf("Codex slot registration conflicts with the discovered process")
+					return
+				}
+				sess.SlotID = req.SlotID
+				return // idempotent retry: preserve binding, name, and diagnostics
+			}
+			sess := sessions[req.PID]
+			if sess == nil {
+				sess = &state.Session{PID: req.PID, StartedAt: req.StartedAt, Agent: state.AgentKindCodex}
+				sessions[req.PID] = sess
+			}
+			if sess.Agent != state.AgentKindCodex || (sess.SlotID != "" && sess.SlotID != req.SlotID) {
+				registrationErr = fmt.Errorf("Codex slot registration conflicts with the discovered process")
+				return
+			}
+			actualStartedAt = sess.StartedAt
+			sess.SlotID = req.SlotID
+			slots[req.SlotID] = &state.CodexSlot{SlotID: req.SlotID, Endpoint: endpoint, PID: req.PID, StartedAt: actualStartedAt, Diagnostic: "slot alive but no thread bound"}
+		})
+		if registrationErr != nil {
+			return registrationErr
+		}
+		c.Request(provider.RootKey{PID: req.PID, StartedAt: actualStartedAt, SlotID: req.SlotID})
+		return nil
+	case "codex_slot_unregister":
+		if req.SlotID == "" {
+			return fmt.Errorf("Codex slot id is required")
+		}
+		c.store.ApplyState(func(sessions map[int]*state.Session, slots map[string]*state.CodexSlot) {
+			slot := slots[req.SlotID]
+			delete(slots, req.SlotID)
+			if slot != nil {
+				if sess := sessions[slot.PID]; sess != nil && sess.SlotID == req.SlotID {
+					sess.SlotID = ""
+				}
+			}
+		})
+		c.RequestCleanup()
+		c.cancelAutoname(req.SlotID)
+		c.autonameMu.Lock()
+		delete(c.autonamePrompts, req.SlotID)
+		c.autonameMu.Unlock()
+		return nil
+	case "autoname":
+		return c.requestAutoname(req.SlotID, true)
+	default:
+		return fmt.Errorf("unsupported Codex slot command")
+	}
+}
+
+func (c *agentCoordinator) SetCodexAutonamer(namer codexprovider.NameGenerator, model string) {
+	if namer != nil {
+		c.namer = namer
+	}
+	if strings.TrimSpace(model) != "" {
+		c.autonameModel = strings.TrimSpace(model)
+	}
+}
+
+func (c *agentCoordinator) requestAutoname(slotID string, manual bool) error {
+	c.autonameMu.Lock()
+	inputs := make([]autonameInput, 0, len(c.autonamePrompts))
+	for id, input := range c.autonamePrompts {
+		if slotID == "" || id == slotID {
+			inputs = append(inputs, input)
+		}
+	}
+	c.autonameMu.Unlock()
+	if slotID != "" && len(inputs) == 0 {
+		return fmt.Errorf("unknown Codex slot or no naming prompt available")
+	}
+	for _, input := range inputs {
+		c.startAutoname(input.ref, input.threadID, input.prompt, manual)
+	}
+	return nil
+}
+
+func (c *agentCoordinator) startAutoname(ref provider.RootRef, threadID, prompt string, manual bool) {
+	prompt = strings.TrimSpace(prompt)
+	if ref.SlotID == "" || prompt == "" {
+		return
+	}
+	if !manual {
+		c.autonameMu.Lock()
+		_, alreadyAttempted := c.autonamePrompts[ref.SlotID]
+		c.autonameMu.Unlock()
+		if alreadyAttempted {
+			return
+		}
+	}
+	var input autonameInput
+	ready := false
+	c.store.ApplyState(func(_ map[int]*state.Session, slots map[string]*state.CodexSlot) {
+		slot := slots[ref.SlotID]
+		if slot == nil || slot.Conversation == nil || slot.Conversation.ThreadID != threadID {
+			return
+		}
+		if slot.Conversation.Name != "" {
+			if slot.Conversation.NameOrigin == state.NameOriginUser {
+				slot.Autoname = state.AutonameSuppressed
+			}
+			return
+		}
+		if slot.Autoname == state.AutonamePending && !manual {
+			return
+		}
+		input = autonameInput{ref: ref, threadID: threadID, generation: slot.Conversation.Generation, prompt: prompt}
+		slot.Autoname = state.AutonamePending
+		slot.Diagnostic = "autonaming pending"
+		ready = true
+	})
+	if !ready {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	c.autonameMu.Lock()
+	if prior := c.autonames[ref.SlotID]; prior != nil {
+		prior()
+	}
+	c.autonames[ref.SlotID] = cancel
+	c.autonamePrompts[ref.SlotID] = input
+	c.autonameMu.Unlock()
+	// Close the store→autoname-map race: an explicit name can arrive after the
+	// eligibility mutation but before the cancellation function is installed.
+	// Recheck once cancellation is reachable so that race cannot start a naming
+	// turn for an already-named conversation.
+	stillEligible := false
+	for _, slot := range c.store.Snapshot().Slots {
+		if slot.SlotID == ref.SlotID && slot.Conversation != nil &&
+			slot.Conversation.ThreadID == threadID && slot.Conversation.Generation == input.generation &&
+			slot.Conversation.Name == "" {
+			stillEligible = true
+			break
+		}
+	}
+	if !stillEligible {
+		c.cancelAutoname(ref.SlotID)
+		return
+	}
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		defer cancel()
+		c.runAutoname(ctx, input)
+	}()
+}
+
+func (c *agentCoordinator) runAutoname(ctx context.Context, input autonameInput) {
+	var name string
+	origin := state.NameOriginGenerated
+	for attempt := 0; attempt < 2; attempt++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+		candidate, err := c.namer.Generate(attemptCtx, input.prompt, filepath.Base(input.ref.CWD), c.autonameModel)
+		cancel()
+		if err == nil {
+			if normalized, ok := codexprovider.NormalizeGeneratedName(candidate); ok {
+				name = normalized
+				break
+			}
+		}
+		if ctx.Err() != nil {
+			return
+		}
+	}
+	if name == "" {
+		name = codexprovider.FallbackName(input.prompt)
+		origin = state.NameOriginFallback
+	}
+	if !c.prepareGeneratedName(input, name, origin) {
+		return
+	}
+	setter, ok := c.codex.(codexThreadNameSetter)
+	if !ok {
+		c.failGeneratedName(input, "autoname endpoint unavailable")
+		return
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	err := setter.SetThreadName(requestCtx, input.ref.Key(), input.threadID, input.generation, name)
+	cancel()
+	if err != nil {
+		c.failGeneratedName(input, "autoname name update failed")
+		return
+	}
+	c.store.ApplyState(func(sessions map[int]*state.Session, slots map[string]*state.CodexSlot) {
+		slot := slots[input.ref.SlotID]
+		if slot == nil || slot.Conversation == nil || slot.Conversation.ThreadID != input.threadID || slot.Conversation.Generation != input.generation || slot.Conversation.Name != "" {
+			return
+		}
+		slot.SetConversationName(name, origin)
+		slot.PendingName, slot.PendingNameOrigin = name, origin
+		if origin == state.NameOriginFallback {
+			slot.Autoname = state.AutonameFallback
+		} else {
+			slot.Autoname = state.AutonameGenerated
+		}
+		slot.Diagnostic = ""
+		if sess := sessions[input.ref.PID]; sess != nil && sess.AgentGraph != nil && sess.AgentGraph.RootID == input.threadID {
+			for i := range sess.AgentGraph.Nodes {
+				if sess.AgentGraph.Nodes[i].ID == input.threadID {
+					sess.AgentGraph.Nodes[i].Nickname = name
+				}
+			}
+		}
+	})
+	if origin == state.NameOriginGenerated {
+		c.autonameMu.Lock()
+		if current, ok := c.autonamePrompts[input.ref.SlotID]; ok && current.threadID == input.threadID && current.generation == input.generation {
+			delete(c.autonamePrompts, input.ref.SlotID)
+		}
+		c.autonameMu.Unlock()
+	}
+}
+
+func (c *agentCoordinator) prepareGeneratedName(input autonameInput, name string, origin state.NameOrigin) bool {
+	prepared := false
+	c.store.ApplyState(func(_ map[int]*state.Session, slots map[string]*state.CodexSlot) {
+		slot := slots[input.ref.SlotID]
+		if slot == nil || slot.Conversation == nil || slot.Conversation.ThreadID != input.threadID || slot.Conversation.Generation != input.generation || slot.Conversation.Name != "" {
+			return
+		}
+		slot.PendingName, slot.PendingNameOrigin = name, origin
+		prepared = true
+	})
+	return prepared
+}
+
+func (c *agentCoordinator) failGeneratedName(input autonameInput, diagnostic string) {
+	c.store.ApplyState(func(_ map[int]*state.Session, slots map[string]*state.CodexSlot) {
+		slot := slots[input.ref.SlotID]
+		if slot == nil || slot.Conversation == nil || slot.Conversation.ThreadID != input.threadID || slot.Conversation.Generation != input.generation {
+			return
+		}
+		slot.PendingName, slot.PendingNameOrigin = "", ""
+		if slot.Conversation.Name != "" {
+			if slot.Conversation.NameOrigin == state.NameOriginUser {
+				slot.Autoname = state.AutonameSuppressed
+			}
+			slot.Diagnostic = ""
+			return
+		}
+		slot.Autoname = state.AutonameNone
+		slot.Diagnostic = diagnostic
+	})
+}
+
+func (c *agentCoordinator) cancelAutoname(slotID string) {
+	c.autonameMu.Lock()
+	if cancel := c.autonames[slotID]; cancel != nil {
+		cancel()
+		delete(c.autonames, slotID)
+	}
+	delete(c.autonamePrompts, slotID)
+	c.autonameMu.Unlock()
 }
 
 func codexHookObservation(rootID, event, tool string, startedAt, now time.Time) (agentgraph.Observation, bool) {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 )
 
@@ -15,9 +16,17 @@ var (
 )
 
 var allowedRequests = map[string]struct{}{
-	"initialize":  {},
-	"thread/read": {},
-	"thread/list": {},
+	"initialize":         {},
+	"thread/read":        {},
+	"thread/list":        {},
+	"thread/loaded/list": {},
+	"thread/name/set":    {},
+}
+
+var autonameRequests = map[string]struct{}{
+	"initialize":   {},
+	"thread/start": {},
+	"turn/start":   {},
 }
 
 var allowedNotifications = map[string]struct{}{
@@ -57,6 +66,7 @@ type rpcResponse struct {
 type rpcNotification struct {
 	Generation uint64
 	Method     string
+	RequestID  string
 	Params     json.RawMessage
 }
 
@@ -75,12 +85,17 @@ type rpcClient struct {
 	done    chan error
 	onNote  func(rpcNotification)
 	close   sync.Once
+	allowed map[string]struct{}
 }
 
 func newRPCClient(conn Connection, generation uint64, onNote func(rpcNotification)) *rpcClient {
+	return newRPCClientWithRequests(conn, generation, onNote, allowedRequests)
+}
+
+func newRPCClientWithRequests(conn Connection, generation uint64, onNote func(rpcNotification), allowed map[string]struct{}) *rpcClient {
 	c := &rpcClient{
 		conn: conn, generation: generation, enc: json.NewEncoder(conn),
-		waiters: make(map[uint64]chan rpcResponse), done: make(chan error, 1), onNote: onNote,
+		waiters: make(map[uint64]chan rpcResponse), done: make(chan error, 1), onNote: onNote, allowed: allowed,
 	}
 	go c.readLoop()
 	return c
@@ -89,7 +104,7 @@ func newRPCClient(conn Connection, generation uint64, onNote func(rpcNotificatio
 func (c *rpcClient) Done() <-chan error { return c.done }
 
 func (c *rpcClient) request(ctx context.Context, method string, params any, out any) error {
-	if _, ok := allowedRequests[method]; !ok {
+	if _, ok := c.allowed[method]; !ok {
 		return fmt.Errorf("%w: %s", ErrMethodNotAllowed, method)
 	}
 
@@ -180,7 +195,11 @@ func (c *rpcClient) readLoop() {
 		}
 		if envelope.Method != "" {
 			if c.onNote != nil {
-				c.onNote(rpcNotification{Generation: c.generation, Method: envelope.Method, Params: append(json.RawMessage(nil), envelope.Params...)})
+				c.onNote(rpcNotification{
+					Generation: c.generation, Method: envelope.Method,
+					RequestID: strings.TrimSpace(string(envelope.ID)),
+					Params:    append(json.RawMessage(nil), envelope.Params...),
+				})
 			}
 			continue
 		}

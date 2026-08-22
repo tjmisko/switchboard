@@ -47,7 +47,7 @@ func TestRPCGenerationTagsNotificationsAndCloseReleasesWaiter(t *testing.T) {
 		decoder := json.NewDecoder(serverSide)
 		var request map[string]any
 		_ = decoder.Decode(&request)
-		_, _ = serverSide.Write([]byte(`{"method":"thread/status/changed","params":{"threadId":"x","status":{"type":"idle"}}}` + "\n"))
+		_, _ = serverSide.Write([]byte(`{"id":"request-1","method":"thread/status/changed","params":{"threadId":"x","status":{"type":"idle"}}}` + "\n"))
 	}()
 	errCh := make(chan error, 1)
 	go func() {
@@ -57,6 +57,9 @@ func TestRPCGenerationTagsNotificationsAndCloseReleasesWaiter(t *testing.T) {
 	case note := <-notes:
 		if note.Generation != 7 {
 			t.Fatalf("notification generation = %d", note.Generation)
+		}
+		if note.RequestID != `"request-1"` {
+			t.Fatalf("server request id = %q, want quoted JSON id", note.RequestID)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("notification not delivered")

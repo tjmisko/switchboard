@@ -20,6 +20,41 @@ const minimumProxyVersion = "0.149.0"
 // version preflight rejects older or unparseable CLIs.
 type CommandConnector struct {
 	Binary string
+	// Sock connects the disposable proxy to one launcher-owned app-server.
+	// Empty retains the legacy default-control-socket behavior for tests/tools.
+	Sock string
+}
+
+// StdioServerConnector starts an isolated app-server process. It is used only
+// for ephemeral naming threads, never for visible TUI observation.
+type StdioServerConnector struct{ Binary string }
+
+func (c StdioServerConnector) Connect(ctx context.Context) (Connection, error) {
+	binary := c.Binary
+	if binary == "" {
+		binary = "codex"
+	}
+	cmd := exec.CommandContext(ctx, binary, "app-server", "--listen", "stdio://")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = stdin.Close()
+		return nil, err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		_ = stdin.Close()
+		return nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		return nil, fmt.Errorf("start isolated Codex app-server: %w", err)
+	}
+	go func() { _, _ = io.Copy(io.Discard, stderr) }()
+	return &commandConnection{reader: stdout, writer: stdin, cmd: cmd}, nil
 }
 
 func (c CommandConnector) Connect(ctx context.Context) (Connection, error) {
@@ -36,7 +71,11 @@ func (c CommandConnector) Connect(ctx context.Context) (Connection, error) {
 		return nil, err
 	}
 
-	cmd := exec.CommandContext(ctx, binary, "app-server", "proxy")
+	args := []string{"app-server", "proxy"}
+	if c.Sock != "" {
+		args = append(args, "--sock", c.Sock)
+	}
+	cmd := exec.CommandContext(ctx, binary, args...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err

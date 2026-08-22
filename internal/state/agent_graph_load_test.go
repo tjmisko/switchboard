@@ -12,6 +12,7 @@ import (
 func TestLoadHydratesPartialAgentGraphAxesAndOrder(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	testsupport.WriteFile(t, path, `{
+  "schema_version": 2,
   "sessions": [{
     "pid": 7,
     "cwd": "/workspace",
@@ -65,6 +66,7 @@ func TestLoadHydratesPartialAgentGraphAxesAndOrder(t *testing.T) {
 func TestLoadExpiresRestoredAgentGraphWithoutDroppingStructure(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	testsupport.WriteFile(t, path, `{
+  "schema_version": 2,
   "sessions": [{
     "pid": 8,
     "cwd": "/workspace",
@@ -104,6 +106,7 @@ func TestLoadExpiresRestoredAgentGraphWithoutDroppingStructure(t *testing.T) {
 func TestLoadDropsStructurallyInvalidAgentGraphSafely(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	testsupport.WriteFile(t, path, `{
+  "schema_version": 2,
   "sessions": [{
     "pid": 9,
     "cwd": "/workspace",

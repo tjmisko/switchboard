@@ -27,11 +27,11 @@ func TestBindingPrecedenceAndPIDStartIdentity(t *testing.T) {
 		key: []byte("CODEX_SESSION_ID=session-parent\x00CODEX_THREAD_ID=environment-thread\x00"),
 	}}
 	registry := newBindingRegistry(environment)
-	if err := registry.RegisterHook(key, "hook-thread"); err != nil {
+	if _, err := registry.RegisterHook(key, "hook-thread"); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := registry.resolve(context.Background(), provider.RootRef{PID: key.PID, StartedAt: key.StartedAt, CWD: "/same"})
-	if got.ThreadID != "environment-thread" || got.Source != BindingProcessEnvironment {
+	if got.ThreadID != "hook-thread" || got.Source != BindingHook {
 		t.Fatalf("environment precedence = %#v", got)
 	}
 
@@ -41,8 +41,8 @@ func TestBindingPrecedenceAndPIDStartIdentity(t *testing.T) {
 	if got.ThreadID != "" || diagnostic == "" {
 		t.Fatalf("reused PID binding = %#v, diagnostic %q", got, diagnostic)
 	}
-	if len(environment.calls) != 2 || environment.calls[0] == environment.calls[1] {
-		t.Fatalf("environment calls were not keyed by PID+start: %#v", environment.calls)
+	if len(environment.calls) != 1 || environment.calls[0] != reused.Key() {
+		t.Fatalf("only the unbound reused lifetime should read its environment: %#v", environment.calls)
 	}
 }
 
@@ -54,10 +54,10 @@ func TestBindingIgnoresSessionIDAndCWDAndFallsBackToHook(t *testing.T) {
 		errors: map[provider.RootKey]error{keyB: errors.New("permission denied")},
 	}
 	registry := newBindingRegistry(environment)
-	if err := registry.RegisterHook(keyA, "hook-a"); err != nil {
+	if _, err := registry.RegisterHook(keyA, "hook-a"); err != nil {
 		t.Fatal(err)
 	}
-	if err := registry.RegisterHook(keyB, "hook-b"); err != nil {
+	if _, err := registry.RegisterHook(keyB, "hook-b"); err != nil {
 		t.Fatal(err)
 	}
 	for _, test := range []struct {
@@ -76,13 +76,28 @@ func TestBindingIgnoresSessionIDAndCWDAndFallsBackToHook(t *testing.T) {
 	}
 }
 
-func TestRegisterHookRejectsConflict(t *testing.T) {
+func TestRegisterHookRotatesAndRejectsRetiredThread(t *testing.T) {
 	registry := newBindingRegistry(&fakeEnvironment{})
 	key := provider.RootKey{PID: 1, StartedAt: time.Unix(1, 0)}
-	if err := registry.RegisterHook(key, "one"); err != nil {
+	first, err := registry.RegisterHook(key, "one")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := registry.RegisterHook(key, "two"); err == nil {
-		t.Fatal("conflicting exact hook bindings were accepted")
+	if first.Generation != 1 || first.Rotated {
+		t.Fatalf("first binding = %+v", first)
+	}
+	second, err := registry.RegisterHook(key, "two")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.Rotated || second.Generation != 2 {
+		t.Fatalf("rotation = %+v", second)
+	}
+	stale, err := registry.RegisterHook(key, "one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stale.Stale || stale.Generation != 2 {
+		t.Fatalf("retired binding = %+v", stale)
 	}
 }
