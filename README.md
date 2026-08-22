@@ -351,7 +351,10 @@ Automatic degradation is fail-open for the root and fail-closed for status:
   confident color;
 - the observer reconnects with bounded exponential backoff and resnapshots;
 - Codex processes not started through `switchboard-codex` remain on hook-only
-  observation until they exit; no running TUI is forcibly restarted;
+  observation until they exit; no running TUI is forcibly restarted. The
+  app-server item detector therefore does **not** solve interview waits for
+  standard `codex`; see the
+  [standard-CLI retrospective](docs/codex-standard-cli-interview-retrospective.md);
 - `-codex-observer off` never constructs the proxy. Codex hooks can still supply
   the partial root view; without them the root remains visible with unknown
   status and no child graph.
