@@ -148,7 +148,7 @@ func main() {
 	// disposable read-only child and is closed exactly once with the daemon.
 	claudeObs := claudeprovider.NewObserver(sink.Dir(), claudeprovider.WithTuning(tun))
 	codexObs := codexObserverForMode(codexMode, func() codexObserver {
-		return codexprovider.NewObserver(codexprovider.Config{Diagnostic: func(category string) {
+		observer := codexprovider.NewObserver(codexprovider.Config{Diagnostic: func(category string) {
 			// The adapter guarantees this callback contains only a finite, content-free
 			// protocol category. Keep the log equally content-free.
 			log.Printf("agent-observer: provider=codex category=%s count=1", category)
@@ -156,6 +156,8 @@ func main() {
 			log.Printf("agent-observer: provider=codex category=wait_classification source=%s duration_ms=%d suppressed_false_red=%t count=1",
 				diagnostic.Source, diagnostic.Duration.Milliseconds(), diagnostic.SuppressedFalseRed)
 		}})
+		log.Printf("agent-observer: provider=codex category=observer_constructed count=1")
+		return observer
 	})
 	log.Printf("agent-observer: provider=codex category=%s count=1", codexObserverModeCategory(codexMode))
 	agentRuntime := newAgentCoordinator(store, sink, claudeObs, codexObs)

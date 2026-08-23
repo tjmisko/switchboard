@@ -25,22 +25,23 @@ const (
 	DefaultTerminalLimit      = 32
 	DefaultWaitClassification = 500 * time.Millisecond
 
-	DiagnosticUnknownProtocolEnum    = "unknown_protocol_enum"
-	DiagnosticSnapshotThreadRead     = "snapshot_thread_read_error"
-	DiagnosticSnapshotRootMismatch   = "snapshot_root_mismatch"
-	DiagnosticSnapshotThreadList     = "snapshot_thread_list_error"
-	DiagnosticSnapshotGraphInvalid   = "snapshot_graph_invalid"
-	DiagnosticSnapshotUnknownFailure = "snapshot_unknown_error"
-	DiagnosticObserverConnect        = "observer_connect_error"
-	DiagnosticObserverConnectAttempt = "observer_connect_attempt"
-	DiagnosticObserverConnected      = "observer_connected"
-	DiagnosticInitializeRequest      = "observer_initialize_request_error"
-	DiagnosticInitializeVersion      = "observer_initialize_version_error"
-	DiagnosticInitializedNotify      = "observer_initialized_notify_error"
-	DiagnosticObserverInitialized    = "observer_initialized"
-	DiagnosticConnectionLost         = "observer_connection_lost"
-	DiagnosticSnapshotNoTargets      = "snapshot_no_targets"
-	DiagnosticSnapshotTargetsPresent = "snapshot_targets_present"
+	DiagnosticUnknownProtocolEnum     = "unknown_protocol_enum"
+	DiagnosticSnapshotThreadRead      = "snapshot_thread_read_error"
+	DiagnosticSnapshotRootMismatch    = "snapshot_root_mismatch"
+	DiagnosticSnapshotThreadList      = "snapshot_thread_list_error"
+	DiagnosticSnapshotGraphInvalid    = "snapshot_graph_invalid"
+	DiagnosticSnapshotUnknownFailure  = "snapshot_unknown_error"
+	DiagnosticObserverConnect         = "observer_connect_error"
+	DiagnosticObserverConnectAttempt  = "observer_connect_attempt"
+	DiagnosticObserverSupervisorStart = "observer_supervisor_started"
+	DiagnosticObserverConnected       = "observer_connected"
+	DiagnosticInitializeRequest       = "observer_initialize_request_error"
+	DiagnosticInitializeVersion       = "observer_initialize_version_error"
+	DiagnosticInitializedNotify       = "observer_initialized_notify_error"
+	DiagnosticObserverInitialized     = "observer_initialized"
+	DiagnosticConnectionLost          = "observer_connection_lost"
+	DiagnosticSnapshotNoTargets       = "snapshot_no_targets"
+	DiagnosticSnapshotTargetsPresent  = "snapshot_targets_present"
 )
 
 // descendantSourceKinds is explicit because thread/list otherwise defaults to
@@ -290,6 +291,7 @@ func (o *Observer) Close() error {
 
 func (o *Observer) run() {
 	defer o.wg.Done()
+	o.emitDiagnostic(DiagnosticObserverSupervisorStart)
 	backoff := o.config.ReconnectMinimum
 	for {
 		if o.ctx.Err() != nil {

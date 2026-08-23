@@ -346,7 +346,7 @@ func TestObserverDisconnectDuringDescendantListKeepsLastCompleteSnapshot(t *test
 func TestObserverCloseInterruptsReconnectBackoff(t *testing.T) {
 	connector := &rejectingConnector{called: make(chan struct{})}
 	backoffStarted := make(chan struct{})
-	diagnostics := make(chan string, 1)
+	diagnostics := make(chan string, 3)
 	var backoffOnce sync.Once
 	observer := NewObserver(Config{
 		Connector:        connector,
@@ -364,7 +364,7 @@ func TestObserverCloseInterruptsReconnectBackoff(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("observer never attempted connection")
 	}
-	wantDiagnostics := []string{DiagnosticObserverConnectAttempt, DiagnosticObserverConnect}
+	wantDiagnostics := []string{DiagnosticObserverSupervisorStart, DiagnosticObserverConnectAttempt, DiagnosticObserverConnect}
 	for i, want := range wantDiagnostics {
 		select {
 		case category := <-diagnostics:
