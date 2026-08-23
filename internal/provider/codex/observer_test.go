@@ -364,13 +364,16 @@ func TestObserverCloseInterruptsReconnectBackoff(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("observer never attempted connection")
 	}
-	select {
-	case category := <-diagnostics:
-		if category != DiagnosticObserverConnect {
-			t.Fatalf("diagnostic = %q, want %q", category, DiagnosticObserverConnect)
+	wantDiagnostics := []string{DiagnosticObserverConnectAttempt, DiagnosticObserverConnect}
+	for i, want := range wantDiagnostics {
+		select {
+		case category := <-diagnostics:
+			if category != want {
+				t.Fatalf("diagnostic[%d] = %q, want %q", i, category, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("connection failure emitted only %d of %d bounded diagnostics", i, len(wantDiagnostics))
 		}
-	case <-time.After(time.Second):
-		t.Fatal("connection failure emitted no bounded diagnostic")
 	}
 	select {
 	case <-backoffStarted:

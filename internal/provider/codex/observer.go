@@ -32,10 +32,15 @@ const (
 	DiagnosticSnapshotGraphInvalid   = "snapshot_graph_invalid"
 	DiagnosticSnapshotUnknownFailure = "snapshot_unknown_error"
 	DiagnosticObserverConnect        = "observer_connect_error"
+	DiagnosticObserverConnectAttempt = "observer_connect_attempt"
+	DiagnosticObserverConnected      = "observer_connected"
 	DiagnosticInitializeRequest      = "observer_initialize_request_error"
 	DiagnosticInitializeVersion      = "observer_initialize_version_error"
 	DiagnosticInitializedNotify      = "observer_initialized_notify_error"
+	DiagnosticObserverInitialized    = "observer_initialized"
 	DiagnosticConnectionLost         = "observer_connection_lost"
+	DiagnosticSnapshotNoTargets      = "snapshot_no_targets"
+	DiagnosticSnapshotTargetsPresent = "snapshot_targets_present"
 )
 
 // descendantSourceKinds is explicit because thread/list otherwise defaults to
@@ -290,6 +295,7 @@ func (o *Observer) run() {
 		if o.ctx.Err() != nil {
 			return
 		}
+		o.emitDiagnostic(DiagnosticObserverConnectAttempt)
 		connection, err := o.config.Connector.Connect(o.ctx)
 		if err != nil {
 			o.emitDiagnostic(DiagnosticObserverConnect)
@@ -299,6 +305,7 @@ func (o *Observer) run() {
 			backoff = min(backoff*2, o.config.ReconnectMaximum)
 			continue
 		}
+		o.emitDiagnostic(DiagnosticObserverConnected)
 		o.mu.Lock()
 		o.generation++
 		generation := o.generation
@@ -324,6 +331,7 @@ func (o *Observer) run() {
 			backoff = min(backoff*2, o.config.ReconnectMaximum)
 			continue
 		}
+		o.emitDiagnostic(DiagnosticObserverInitialized)
 		o.resnapshotAll(client, generation)
 		o.finishSync(generation)
 
@@ -409,6 +417,11 @@ func (o *Observer) resnapshotAll(client *rpcClient, generation uint64) {
 		targets = append(targets, target{key: key, id: record.threadID})
 	}
 	o.mu.Unlock()
+	if len(targets) == 0 {
+		o.emitDiagnostic(DiagnosticSnapshotNoTargets)
+	} else {
+		o.emitDiagnostic(DiagnosticSnapshotTargetsPresent)
+	}
 	for _, target := range targets {
 		state, err := o.snapshot(client, target.id)
 		if err != nil {
