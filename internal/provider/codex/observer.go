@@ -24,6 +24,13 @@ const (
 	DefaultReconnectMaximum   = 5 * time.Second
 	DefaultTerminalLimit      = 32
 	DefaultWaitClassification = 500 * time.Millisecond
+
+	DiagnosticUnknownProtocolEnum    = "unknown_protocol_enum"
+	DiagnosticSnapshotThreadRead     = "snapshot_thread_read_error"
+	DiagnosticSnapshotRootMismatch   = "snapshot_root_mismatch"
+	DiagnosticSnapshotThreadList     = "snapshot_thread_list_error"
+	DiagnosticSnapshotGraphInvalid   = "snapshot_graph_invalid"
+	DiagnosticSnapshotUnknownFailure = "snapshot_unknown_error"
 )
 
 // descendantSourceKinds is explicit because thread/list otherwise defaults to
@@ -53,8 +60,10 @@ type Config struct {
 	WaitClassification  time.Duration
 	Now                 func() time.Time
 	Jitter              func(time.Duration) time.Duration
-	Diagnostic          func(string)
-	WaitDiagnostic      func(WaitClassificationDiagnostic)
+	// Diagnostic receives finite categories only; raw protocol errors and
+	// payloads never cross this callback.
+	Diagnostic     func(string)
+	WaitDiagnostic func(WaitClassificationDiagnostic)
 }
 
 // WaitClassificationDiagnostic contains finite-label, content-free evidence
@@ -97,7 +106,7 @@ type Observer struct {
 	pendingStatuses map[string]rpcStatus
 	pendingWaits    map[string][]rpcNotification
 	closed          bool
-	lastDiagnostic  time.Time
+	lastDiagnostics map[string]time.Time
 
 	refresh chan struct{}
 }
@@ -112,8 +121,9 @@ func NewObserver(config Config) *Observer {
 		config: config, bindings: newBindingRegistry(config.Environment),
 		queue: provider.NewInvalidationQueue(config.UpdateBuffer), ctx: ctx, cancel: cancel,
 		roots: make(map[provider.RootKey]*rootRecord), pendingStatuses: make(map[string]rpcStatus),
-		pendingWaits: make(map[string][]rpcNotification),
-		refresh:      make(chan struct{}, 1),
+		pendingWaits:    make(map[string][]rpcNotification),
+		lastDiagnostics: make(map[string]time.Time),
+		refresh:         make(chan struct{}, 1),
 	}
 	observer.wg.Add(1)
 	go observer.run()
@@ -387,10 +397,31 @@ func (o *Observer) resnapshotAll(client *rpcClient, generation uint64) {
 	for _, target := range targets {
 		state, err := o.snapshot(client, target.id)
 		if err != nil {
+			o.emitDiagnostic(snapshotDiagnosticCategory(err))
 			continue
 		}
 		o.installSnapshot(generation, target.key, target.id, state)
 	}
+}
+
+type snapshotDiagnosticError struct {
+	category string
+	err      error
+}
+
+func newSnapshotDiagnosticError(category string, err error) error {
+	return &snapshotDiagnosticError{category: category, err: err}
+}
+
+func (e *snapshotDiagnosticError) Error() string { return e.err.Error() }
+func (e *snapshotDiagnosticError) Unwrap() error { return e.err }
+
+func snapshotDiagnosticCategory(err error) string {
+	var diagnostic *snapshotDiagnosticError
+	if errors.As(err, &diagnostic) {
+		return diagnostic.category
+	}
+	return DiagnosticSnapshotUnknownFailure
 }
 
 func (o *Observer) snapshot(client *rpcClient, rootID string) (*graphState, error) {
@@ -398,10 +429,10 @@ func (o *Observer) snapshot(client *rpcClient, rootID string) (*graphState, erro
 	defer cancel()
 	var rootResult threadReadResult
 	if err := client.request(ctx, "thread/read", map[string]any{"threadId": rootID, "includeTurns": true}, &rootResult); err != nil {
-		return nil, err
+		return nil, newSnapshotDiagnosticError(DiagnosticSnapshotThreadRead, err)
 	}
 	if rootResult.Thread.ID != rootID {
-		return nil, errors.New("codex app-server returned a different root thread")
+		return nil, newSnapshotDiagnosticError(DiagnosticSnapshotRootMismatch, errors.New("codex app-server returned a different root thread"))
 	}
 	var descendants []rpcThread
 	var cursor string
@@ -416,7 +447,7 @@ func (o *Observer) snapshot(client *rpcClient, rootID string) (*graphState, erro
 		}
 		var result threadListResult
 		if err := client.request(ctx, "thread/list", params, &result); err != nil {
-			return nil, err
+			return nil, newSnapshotDiagnosticError(DiagnosticSnapshotThreadList, err)
 		}
 		descendants = append(descendants, result.Data...)
 		if result.NextCursor == nil || *result.NextCursor == "" {
@@ -426,7 +457,7 @@ func (o *Observer) snapshot(client *rpcClient, rootID string) (*graphState, erro
 	}
 	state := newGraphState(rootResult.Thread, descendants, o.config.RecentTerminalLimit)
 	if _, err := state.observation(o.config.Now(), o.config.Freshness); err != nil {
-		return nil, err
+		return nil, newSnapshotDiagnosticError(DiagnosticSnapshotGraphInvalid, err)
 	}
 	return state, nil
 }
@@ -919,18 +950,28 @@ func (o *Observer) scheduleExpiryLocked(key provider.RootKey, record *rootRecord
 }
 
 func (o *Observer) emitUnknownDiagnostic(state *graphState) {
-	if !state.unknownEnum || o.config.Diagnostic == nil {
+	if !state.unknownEnum {
+		return
+	}
+	o.emitDiagnostic(DiagnosticUnknownProtocolEnum)
+}
+
+func (o *Observer) emitDiagnostic(category string) {
+	if o.config.Diagnostic == nil {
 		return
 	}
 	o.mu.Lock()
 	now := o.config.Now()
-	if !o.lastDiagnostic.IsZero() && now.Sub(o.lastDiagnostic) < time.Minute {
+	if o.lastDiagnostics == nil {
+		o.lastDiagnostics = make(map[string]time.Time)
+	}
+	if last := o.lastDiagnostics[category]; !last.IsZero() && now.Sub(last) < time.Minute {
 		o.mu.Unlock()
 		return
 	}
-	o.lastDiagnostic = now
+	o.lastDiagnostics[category] = now
 	o.mu.Unlock()
-	o.config.Diagnostic("codex observer received an unknown protocol enum")
+	o.config.Diagnostic(category)
 }
 
 func (o *Observer) signalRefresh() {

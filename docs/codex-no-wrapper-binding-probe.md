@@ -111,3 +111,19 @@ are:
 
 Until one exists, Switchboard should keep plain-Codex roots navigable but report
 their graph/status as degraded or unknown.
+
+## Live result — 2026-08-23
+
+Two simultaneous plain `codex` TUIs in the same cwd were discovered as distinct
+process lifetimes and accepted different exact hook thread IDs. Both projected
+the expected root lifecycle through `source: hook`. No `hook_client_*` outcome
+was emitted because ordinary process ancestry attributed both hooks before the
+fallback probe was needed.
+
+This validates the no-wrapper root-binding path for the tested runtime; it does
+not validate terminal hints under shared-daemon-owned hook ancestry. The
+remaining blocker was the observation transport: both graphs stayed
+`complete: false`, hook-sourced, while `snapshot_pending` increased. The spike
+therefore emits bounded snapshot-stage categories for `thread/read`,
+`thread/list`, root mismatch, and graph validation. Raw protocol errors, thread
+IDs, and payloads remain excluded from diagnostics.

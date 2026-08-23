@@ -79,7 +79,7 @@ trap finish INT TERM
 
 set +e
 journalctl --user -u switchboard.service -f -o cat \
-	| rg --line-buffered 'codex-hook-attribution-probe|hook_client_identity|hook_client_hint'
+	| rg --line-buffered 'codex-hook-attribution-probe|hook_client_identity|hook_client_hint|snapshot_.*(error|invalid|mismatch)'
 set -e
 
 finish

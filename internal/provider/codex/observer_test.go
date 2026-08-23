@@ -14,6 +14,45 @@ import (
 	"github.com/tjmisko/switchboard/internal/provider"
 )
 
+func TestSnapshotDiagnosticsAreFiniteStageLabelsAndRateLimitedPerStage(t *testing.T) {
+	tests := []struct {
+		category string
+		err      error
+	}{
+		{DiagnosticSnapshotThreadRead, newSnapshotDiagnosticError(DiagnosticSnapshotThreadRead, errors.New("raw read detail"))},
+		{DiagnosticSnapshotRootMismatch, newSnapshotDiagnosticError(DiagnosticSnapshotRootMismatch, errors.New("raw root detail"))},
+		{DiagnosticSnapshotThreadList, newSnapshotDiagnosticError(DiagnosticSnapshotThreadList, errors.New("raw list detail"))},
+		{DiagnosticSnapshotGraphInvalid, newSnapshotDiagnosticError(DiagnosticSnapshotGraphInvalid, errors.New("raw graph detail"))},
+		{DiagnosticSnapshotUnknownFailure, errors.New("unclassified raw detail")},
+	}
+
+	var diagnostics []string
+	observer := &Observer{config: Config{
+		Now: func() time.Time { return time.Unix(100, 0) },
+		Diagnostic: func(category string) {
+			diagnostics = append(diagnostics, category)
+		},
+	}}
+	for _, test := range tests {
+		if got := snapshotDiagnosticCategory(test.err); got != test.category {
+			t.Fatalf("category = %q, want %q", got, test.category)
+		}
+		observer.emitDiagnostic(test.category)
+		observer.emitDiagnostic(test.category)
+	}
+	if len(diagnostics) != len(tests) {
+		t.Fatalf("diagnostics = %v, want one per stage", diagnostics)
+	}
+	for i, test := range tests {
+		if diagnostics[i] != test.category {
+			t.Fatalf("diagnostic[%d] = %q, want %q", i, diagnostics[i], test.category)
+		}
+		if diagnostics[i] == test.err.Error() {
+			t.Fatalf("raw error crossed diagnostic callback: %q", diagnostics[i])
+		}
+	}
+}
+
 func TestObserverReconnectFreshnessGenerationAndCoalescing(t *testing.T) {
 	proxy := newFakeProxy()
 	started := time.Unix(100, 0)
