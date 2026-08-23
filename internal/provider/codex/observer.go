@@ -31,6 +31,11 @@ const (
 	DiagnosticSnapshotThreadList     = "snapshot_thread_list_error"
 	DiagnosticSnapshotGraphInvalid   = "snapshot_graph_invalid"
 	DiagnosticSnapshotUnknownFailure = "snapshot_unknown_error"
+	DiagnosticObserverConnect        = "observer_connect_error"
+	DiagnosticInitializeRequest      = "observer_initialize_request_error"
+	DiagnosticInitializeVersion      = "observer_initialize_version_error"
+	DiagnosticInitializedNotify      = "observer_initialized_notify_error"
+	DiagnosticConnectionLost         = "observer_connection_lost"
 )
 
 // descendantSourceKinds is explicit because thread/list otherwise defaults to
@@ -287,6 +292,7 @@ func (o *Observer) run() {
 		}
 		connection, err := o.config.Connector.Connect(o.ctx)
 		if err != nil {
+			o.emitDiagnostic(DiagnosticObserverConnect)
 			if !o.waitBackoff(backoff) {
 				return
 			}
@@ -339,6 +345,9 @@ func (o *Observer) run() {
 				stableTimer.Stop()
 				_ = client.Close()
 				o.disconnect(generation)
+				if o.ctx.Err() == nil {
+					o.emitDiagnostic(DiagnosticConnectionLost)
+				}
 				if !o.waitBackoff(backoff) {
 					return
 				}
@@ -368,12 +377,18 @@ func (o *Observer) initialize(client *rpcClient) error {
 		"clientInfo":   map[string]string{"name": "switchboard", "title": "Switchboard", "version": "1"},
 		"capabilities": map[string]bool{"experimentalApi": true},
 	}, &result); err != nil {
+		o.emitDiagnostic(DiagnosticInitializeRequest)
 		return err
 	}
 	if err := checkAppServerVersion(result.UserAgent); err != nil {
+		o.emitDiagnostic(DiagnosticInitializeVersion)
 		return err
 	}
-	return client.notify("initialized", map[string]any{})
+	if err := client.notify("initialized", map[string]any{}); err != nil {
+		o.emitDiagnostic(DiagnosticInitializedNotify)
+		return err
+	}
+	return nil
 }
 
 func checkAppServerVersion(userAgent string) error {
