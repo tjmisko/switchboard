@@ -65,8 +65,10 @@ specific:
 5. **Status has separate axes.** Runtime activity, attention reason, and child
    lifecycle are represented independently and collapsed only by a shared
    reducer.
-6. **Approval and user input stay distinct.** Both make the root attention-red;
-   the child row says which kind of response is required.
+6. **Only confirmed human attention is red.** Approval and user input stay
+   distinct, and both make the root red only while an exact unresolved request
+   requires the user. Codex wait flags are mechanical gates; automatic review
+   stays green and unknown ownership stays gray.
 7. **Existing wire keys remain compatible.** `claude`, `codex`, and their legacy
    summary statuses remain readable. The agent graph is additive.
 8. **Provider-specific inference stays in provider adapters.** Claude's pending

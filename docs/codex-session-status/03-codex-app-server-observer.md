@@ -155,10 +155,21 @@ Thread runtime:
 - `active` -> `active`
 - `systemError` -> `system_error`
 
-Active flags:
+Active flags are mechanical gates, not attention ownership:
 
-- `waitingOnApproval` -> `approval`
-- `waitingOnUserInput` -> `user_input`
+- `waitingOnApproval` starts or refreshes approval classification;
+- `waitingOnUserInput` starts or refreshes input classification;
+- neither flag alone maps to `approval` or `user_input`.
+
+The adapter preserves inbound JSON-RPC request IDs and correlates them with
+`serverRequest/resolved`. A user-routed approval request becomes `approval`; a
+blocking, non-auto-resolving input request becomes `user_input`. Reviewer mode
+`auto_review`/`guardian_subagent`, auto-review events, or an active guardian
+source keeps runtime active with no attention. Ambiguous approval ownership is
+held for at most 500 ms: a request with no auto evidence then becomes human,
+while a flag with no request becomes runtime `unknown`/gray. The delay is before
+publication, not a renderer debounce, so automated reviews create no red graph
+or history transition.
 
 Collaborative-agent status:
 
@@ -215,6 +226,11 @@ All tests use E0 fixtures or a fake proxy process/transport. They must cover:
 - spawn-before-thread and status-before-metadata ordering;
 - root idle while child active;
 - child approval and child user-input waits;
+- both wait-before-auto-review and auto-review-before-wait ordering;
+- auto-review allow, deny, timeout, and abort with zero attention edges;
+- exact string/integer request resolution and mixed automatic/human waits;
+- nonblocking and auto-resolving user input remaining non-attention;
+- reconnect guardian evidence and unknown-owner timer expiry;
 - simultaneous waiting children;
 - completion/drain;
 - a new root turn pruning older terminal children without losing live ones;

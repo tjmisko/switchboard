@@ -151,6 +151,9 @@ func main() {
 			// The adapter guarantees this callback contains only a finite, content-free
 			// protocol category. Keep the log equally content-free.
 			log.Printf("agent-observer: provider=codex category=unknown_protocol_enum count=1")
+		}, WaitDiagnostic: func(diagnostic codexprovider.WaitClassificationDiagnostic) {
+			log.Printf("agent-observer: provider=codex category=wait_classification source=%s duration_ms=%d suppressed_false_red=%t count=1",
+				diagnostic.Source, diagnostic.Duration.Milliseconds(), diagnostic.SuppressedFalseRed)
 		}})
 	})
 	log.Printf("agent-observer: provider=codex category=%s count=1", codexObserverModeCategory(codexMode))

@@ -56,6 +56,16 @@ the root chip red because both require action; the row/tooltip retains the exact
 reason. If both kinds exist at once, compact summary `attention` chooses
 `approval`, while `approval_nodes` and `user_input_nodes` preserve both counts.
 
+Provider adapters may emit those attention values only for a confirmed,
+unresolved human-owned request. In particular, Codex's
+`waitingOnApproval`/`waitingOnUserInput` active flags describe mechanical
+app-server gates, not who must resolve them. The Codex adapter correlates the
+gate with reviewer settings, exact server-request IDs and resolutions,
+blocking/auto-resolution metadata, auto-review events, and guardian source
+evidence before publishing a neutral graph. An unowned gate is gray/unknown,
+never red. This ownership rule is enforced before graph history is written, so
+an automated review creates no synthetic `permission` interval.
+
 The reducer ignores provider/source names and uses only a valid graph plus its
 half-open freshness interval (`observed_at <= now < fresh_until`). It evaluates
 the following table top to bottom:
@@ -70,6 +80,10 @@ the following table top to bottom:
 | yes | none | any other value | any child runtime `active` or lifecycle `pending`/`running` | `delegating` | green |
 | yes | none | `idle` | none | `idle` | orange |
 | yes | none | `not_loaded`/`unknown` | none | `""` (unknown) | gray |
+
+The table assumes attention has already passed the provider ownership check;
+the shared reducer intentionally has no Codex-specific debounce or reviewer
+logic.
 
 A child lifecycle is terminal at `completed`, `interrupted`, `errored`,
 `shutdown`, or `not_found`. Terminal children remain available as bounded

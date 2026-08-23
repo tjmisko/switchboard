@@ -56,6 +56,7 @@ type rpcResponse struct {
 
 type rpcNotification struct {
 	Generation uint64
+	ID         json.RawMessage
 	Method     string
 	Params     json.RawMessage
 }
@@ -180,7 +181,12 @@ func (c *rpcClient) readLoop() {
 		}
 		if envelope.Method != "" {
 			if c.onNote != nil {
-				c.onNote(rpcNotification{Generation: c.generation, Method: envelope.Method, Params: append(json.RawMessage(nil), envelope.Params...)})
+				c.onNote(rpcNotification{
+					Generation: c.generation,
+					ID:         append(json.RawMessage(nil), envelope.ID...),
+					Method:     envelope.Method,
+					Params:     append(json.RawMessage(nil), envelope.Params...),
+				})
 			}
 			continue
 		}

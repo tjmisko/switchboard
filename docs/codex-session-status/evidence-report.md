@@ -15,6 +15,16 @@ observed server ordering. The fixtures are suitable for parser and reducer
 tests, but an observer must tolerate snapshots and notifications arriving in a
 different order until live ordering evidence is captured.
 
+The experimental schema was regenerated from the same installed 0.149.0 CLI on
+2026-08-23 for wait-ownership feature detection. It confirms
+`thread/settings/updated` with reviewer values `user`, `auto_review`, and legacy
+`guardian_subagent`; string-or-integer request IDs and
+`serverRequest/resolved`; blocking and auto-resolution metadata on user-input
+requests; and `source.subAgent.other`. It also labels
+`item/autoApprovalReview/started|completed` payloads unstable. The adapter
+therefore treats those notifications as supplementary evidence rather than its
+primary ownership key.
+
 | Artifact | Provenance | What it establishes |
 |---|---|---|
 | `initialize.jsonl` | schema-derived | Initialization envelope and experimental API capability request |

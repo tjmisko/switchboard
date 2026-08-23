@@ -34,8 +34,11 @@ func TestSchemaFixturesMapNestedRuntimeLifecycleAndAttention(t *testing.T) {
 		t.Fatalf("idle root with active children = %#v", summary)
 	}
 
-	applyFixture(t, observer, "child-waiting-approval.jsonl", 1)
-	applyFixture(t, observer, "child-waiting-user-input.jsonl", 1)
+	observer.applyNotificationLocked(rpcNotification{Generation: 1, Method: "thread/settings/updated", Params: mustJSON(t, map[string]any{
+		"threadId": fixtureAtlas, "threadSettings": map[string]any{"approvalsReviewer": "user"},
+	})})
+	applyFixture(t, observer, "child-waiting-approval.jsonl", 2)
+	applyFixture(t, observer, "child-waiting-user-input.jsonl", 2)
 	observation = observer.roots[key].observation
 	assertNodeAttention(t, observation, fixtureAtlas, agentgraph.AttentionApproval)
 	assertNodeAttention(t, observation, fixtureNova, agentgraph.AttentionUserInput)
@@ -116,7 +119,7 @@ func TestRootThreadNameSnapshotAndUpdateRemainExplicitAndDisplayOnly(t *testing.
 func TestThreadNameUpdatedNotificationRefreshesRootMetadata(t *testing.T) {
 	observer, key := fixtureObserver(t)
 
-	changed, unknown := observer.applyNotificationLocked(rpcNotification{
+	changed, unknown, _ := observer.applyNotificationLocked(rpcNotification{
 		Generation: 1,
 		Method:     "thread/name/updated",
 		Params: mustJSON(t, map[string]any{
@@ -130,7 +133,7 @@ func TestThreadNameUpdatedNotificationRefreshesRootMetadata(t *testing.T) {
 		t.Fatalf("name update observation root = %#v", got)
 	}
 
-	changed, _ = observer.applyNotificationLocked(rpcNotification{
+	changed, _, _ = observer.applyNotificationLocked(rpcNotification{
 		Generation: 1,
 		Method:     "thread/name/updated",
 		Params: mustJSON(t, map[string]any{
@@ -198,8 +201,14 @@ func TestStatusBeforeMetadataIsGenerationScopedAndAppliedAfterParentage(t *testi
 	observer.applyNotificationLocked(rpcNotification{Generation: 1, Method: "thread/status/changed", Params: mustJSON(t, map[string]any{
 		"threadId": "late-child", "status": map[string]any{"type": "active", "activeFlags": []string{"waitingOnUserInput"}},
 	})})
+	observer.applyNotificationLocked(rpcNotification{Generation: 1, ID: mustJSON(t, "late-input"), Method: "item/tool/requestUserInput", Params: mustJSON(t, map[string]any{
+		"threadId": "late-child", "turnId": "turn", "itemId": "item", "isBlocking": true, "autoResolutionMs": nil,
+	})})
 	if len(observer.pendingStatuses) != 1 {
 		t.Fatalf("pre-metadata status was not retained: %#v", observer.pendingStatuses)
+	}
+	if len(observer.pendingWaits["late-child"]) != 1 {
+		t.Fatalf("pre-metadata request was not retained: %#v", observer.pendingWaits)
 	}
 	observer.applyNotificationLocked(rpcNotification{Generation: 1, Method: "thread/started", Params: mustJSON(t, map[string]any{
 		"thread": map[string]any{"id": "late-child", "parentThreadId": fixtureRoot, "agentNickname": "Late"},
@@ -208,6 +217,9 @@ func TestStatusBeforeMetadataIsGenerationScopedAndAppliedAfterParentage(t *testi
 	assertNode(t, observation, "late-child", fixtureRoot, "Late", "", agentgraph.RuntimeActive, agentgraph.AttentionUserInput, agentgraph.LifecycleUnknown)
 	if len(observer.pendingStatuses) != 0 {
 		t.Fatalf("applied pending status was retained: %#v", observer.pendingStatuses)
+	}
+	if len(observer.pendingWaits) != 0 {
+		t.Fatalf("applied pending request was retained: %#v", observer.pendingWaits)
 	}
 }
 
@@ -315,6 +327,15 @@ func fixtureObserver(t *testing.T) (*Observer, provider.RootKey) {
 		},
 		generation: 1, connected: true, pendingStatuses: make(map[string]rpcStatus),
 	}
+	t.Cleanup(func() {
+		observer.mu.Lock()
+		for _, record := range observer.roots {
+			if record.graph != nil {
+				record.graph.stopClassifications()
+			}
+		}
+		observer.mu.Unlock()
+	})
 	return observer, key
 }
 
@@ -335,7 +356,7 @@ func applyFixture(t *testing.T, observer *Observer, name string, limit int) {
 		if envelope.Method == "" || envelope.Method == "thread/read" || envelope.Method == "thread/list" || envelope.Method == "initialize" {
 			continue
 		}
-		observer.applyNotificationLocked(rpcNotification{Generation: 1, Method: envelope.Method, Params: envelope.Params})
+		observer.applyNotificationLocked(rpcNotification{Generation: 1, ID: envelope.ID, Method: envelope.Method, Params: envelope.Params})
 		count++
 		if limit >= 0 && count >= limit {
 			break

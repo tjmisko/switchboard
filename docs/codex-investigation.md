@@ -125,21 +125,42 @@ and configured Codex hook fallback remain active.
 
 ## Attention and lifecycle fidelity
 
-App-server status is mapped onto independent neutral axes:
+App-server status is mapped onto independent neutral axes, but raw wait flags
+are classified before they reach the graph:
 
 - runtime: `notLoaded`, `idle`, `active`, `systemError` → `not_loaded`, `idle`,
   `active`, `system_error`;
-- attention flags: `waitingOnApproval` → `approval`,
-  `waitingOnUserInput` → `user_input`;
+- mechanical gates: `waitingOnApproval` and `waitingOnUserInput` are retained
+  internally but do not by themselves produce attention;
 - collaborative lifecycle: `pendingInit`, `running`, `completed`,
   `interrupted`, `errored`, `shutdown`, `notFound` → the corresponding neutral
   snake-case values.
 
-Approval and user input deliberately remain distinct. Either makes the root's
-legacy summary `permission` (red), but child rows show `approval` versus `user
-input` (`question` in the compact Waybar tooltip). Terminal nodes no longer
-count as live work or waiting attention even if a partial provider payload
-still carries an old runtime/attention value.
+An unresolved server request becomes `approval` only when it is routed to the
+user, or when no auto-review evidence arrives during the bounded 500 ms
+classification window. A blocking `item/tool/requestUserInput` request with no
+auto-resolution becomes `user_input` immediately. Nonblocking and
+auto-resolving input remains non-attention. `thread/settings/updated`
+`approvalsReviewer`, `item/autoApprovalReview/*`, and an active
+`source.subAgent.other = guardian` thread classify automatic ownership; the
+auto-review notifications are supplementary because their generated schema is
+explicitly unstable. Exact JSON-RPC request IDs and
+`serverRequest/resolved.requestId` bound human attention, including concurrent
+string and integer IDs.
+
+Publication is held only while an ambiguous wait is classified. Auto evidence
+cancels that timer without creating a transient graph or history edge. A
+mechanical gate whose owner remains unknown projects runtime `unknown` with no
+attention, so uncertainty is gray rather than red. Request state is discarded
+on exact resolution, turn/thread completion, deletion, authoritative snapshot
+omission, or reconnect generation replacement. Classification diagnostics
+contain only a finite source label, duration, and suppressed-false-red boolean.
+
+Confirmed approval and user input deliberately remain distinct. Either makes
+the root's legacy summary `permission` (red), but child rows show `approval`
+versus `user input` (`question` in the compact Waybar tooltip). Terminal nodes
+no longer count as live work or waiting attention even if a partial provider
+payload still carries an old runtime/attention value.
 
 Hooks are partial observations, with one independently owned attention latch.
 `Stop` maps the root to idle; `UserPromptSubmit` and ordinary
