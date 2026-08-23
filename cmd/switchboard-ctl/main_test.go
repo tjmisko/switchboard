@@ -1,10 +1,32 @@
 package main
 
 import (
+	"bytes"
 	"testing"
+	"time"
 
+	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
 )
+
+func TestRenderAgentDiagnostics(t *testing.T) {
+	var output bytes.Buffer
+	renderAgentDiagnostics(&output, []rpc.AgentDiagnostic{
+		{Provider: state.AgentKindCodex, Category: "hook_client_identity_unique", Count: 2, LastAt: time.Date(2026, 8, 23, 20, 0, 0, 0, time.FixedZone("offset", -7*60*60))},
+	})
+	want := "codex hook_client_identity_unique count=2 last_at=2026-08-24T03:00:00Z\n"
+	if got := output.String(); got != want {
+		t.Fatalf("output = %q, want %q", got, want)
+	}
+}
+
+func TestRenderAgentDiagnosticsEmpty(t *testing.T) {
+	var output bytes.Buffer
+	renderAgentDiagnostics(&output, nil)
+	if got, want := output.String(), "no agent diagnostics\n"; got != want {
+		t.Fatalf("output = %q, want %q", got, want)
+	}
+}
 
 // sess builds a session with the given pid and Claude status. A status of ""
 // leaves Claude nil, exercising the unknown fallback.

@@ -19,6 +19,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/tjmisko/switchboard/internal/agentgraph"
 	"github.com/tjmisko/switchboard/internal/detect"
 	"github.com/tjmisko/switchboard/internal/discovery"
 	"github.com/tjmisko/switchboard/internal/fanout"
@@ -227,6 +228,13 @@ func main() {
 	server.SetHistory(sink)
 	server.SetAgentHookHandler(agentRuntime.HandleHook)
 	server.SetAgentDiagnosticSource(agentRuntime.Diagnostics)
+	server.SetHookAttributionDiagnostic(func(diagnostic rpc.HookAttributionDiagnostic) {
+		agentRuntime.recordDiagnostic(agentgraph.ProviderCodex, diagnostic.Category, time.Now())
+		if diagnostic.MatchedPID != 0 {
+			log.Printf("codex-hook-attribution-probe: category=%s matched_pid=%d",
+				diagnostic.Category, diagnostic.MatchedPID)
+		}
+	})
 	if err := os.MkdirAll(filepath.Dir(*socketPath), 0o755); err != nil {
 		log.Fatalf("mkdir socket dir: %v", err)
 	}
