@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+probe_commit=c3dfe25c462bd7ddcff430262021a8f8ea5a86a7
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repo_dir=$(cd -- "$script_dir/.." && pwd)
+go_bin=/home/tjmisko/go/bin
+go_cache=/tmp/switchboard-no-wrapper-go-cache
+ctl=$go_bin/switchboard-ctl
+
+require_command() {
+	if ! command -v "$1" >/dev/null 2>&1; then
+		echo "missing required command: $1" >&2
+		exit 1
+	fi
+}
+
+for command in git go systemctl journalctl jq rg tee; do
+	require_command "$command"
+done
+
+if ! git -C "$repo_dir" merge-base --is-ancestor "$probe_commit" HEAD; then
+	echo "this checkout does not contain the no-wrapper probe commit $probe_commit" >&2
+	exit 1
+fi
+
+echo "Installing the no-wrapper probe from $(git -C "$repo_dir" rev-parse --short HEAD)"
+mkdir -p "$go_bin" "$go_cache"
+(
+	cd "$repo_dir"
+	env GOCACHE="$go_cache" GOBIN="$go_bin" \
+		go install ./cmd/switchboard ./cmd/switchboard-ctl
+)
+
+echo "Restarting Switchboard only (the Codex daemon is untouched)"
+systemctl --user restart switchboard.service
+systemctl --user --no-pager --full status switchboard.service
+
+print_snapshot() {
+	echo
+	echo "Agent diagnostics:"
+	"$ctl" --json agent-diagnostics \
+		| tee /tmp/switchboard-no-wrapper-diagnostics.json
+	echo
+	echo "Visible Codex roots:"
+	"$ctl" --json list \
+		| jq '[.sessions[] | select(.agent == "codex") | {pid, cwd, tty, pane_id: (.wezterm.pane_id // null)}]'
+}
+
+print_snapshot
+
+cat <<'EOF'
+
+The probe is ready.
+
+In two separate terminals, use the SAME directory and launch plain Codex:
+
+  cd /home/tjmisko/Projects/switchboard
+  printf 'tty=%s wezterm_pane=%s\n' "$(tty)" "${WEZTERM_PANE:-none}"
+  codex
+
+In TUI A submit: Reply with exactly A_READY.
+In TUI B submit: Reply with exactly B_READY.
+
+Watch matched_pid below. It must equal the visible PID for the TUI that caused
+the event. A unique match to the wrong PID is a failed result. After both TUIs,
+repeat with /clear if the first results are correct.
+
+Press Ctrl-C here when finished; the script will print the final counters and
+root mapping. It does not start, stop, or reconfigure the Codex daemon.
+EOF
+
+finish() {
+	trap - INT TERM
+	print_snapshot
+	exit 0
+}
+trap finish INT TERM
+
+set +e
+journalctl --user -u switchboard.service -f -o cat \
+	| rg --line-buffered 'codex-hook-attribution-probe|hook_client_identity|hook_client_hint'
+set -e
+
+finish
