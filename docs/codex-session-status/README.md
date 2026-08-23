@@ -51,9 +51,12 @@ specific:
 2. **The tree is visible.** Reference renderers show a root row followed by
    indented child rows. Compact renderers may put the same detail in a tooltip,
    but must consume the same graph.
-3. **Codex app-server is primary truth.** The implementation uses the supported
-   proxy command rather than reading the control socket directly. It snapshots
-   existing descendants and then consumes live notifications.
+3. **Codex app-server is primary structural truth.** The implementation uses
+   the supported proxy command rather than reading the control socket directly.
+   It snapshots existing descendants and then consumes live notifications. The
+   standard-CLI `request_user_input` wait is independently owned by exact
+   lifecycle hooks because that launch path does not expose the app-server item
+   edge.
 4. **Do not guess root identity by CWD.** Prefer `CODEX_THREAD_ID` from the root
    process environment on Linux, then an exact lifecycle-hook association.
    `SessionStart` normally establishes it; a later hook self-heals a discovery
@@ -62,8 +65,10 @@ specific:
 5. **Status has separate axes.** Runtime activity, attention reason, and child
    lifecycle are represented independently and collapsed only by a shared
    reducer.
-6. **Approval and user input stay distinct.** Both make the root attention-red;
-   the child row says which kind of response is required.
+6. **Only confirmed human attention is red.** Approval and user input stay
+   distinct, and both make the root red only while an exact unresolved request
+   requires the user. Codex wait flags are mechanical gates; automatic review
+   stays green and unknown ownership stays gray.
 7. **Existing wire keys remain compatible.** `claude`, `codex`, and their legacy
    summary statuses remain readable. The agent graph is additive.
 8. **Provider-specific inference stays in provider adapters.** Claude's pending

@@ -6,9 +6,12 @@
 > command. Requiring `switchboard-codex`, a private per-TUI app-server, a shell
 > alias, or another launcher is not an acceptable solution.
 >
-> Status: the item-based app-server change is not a fix for the reported
-> standard-Codex symptom. It is experimental code for a launch mode outside the
-> product requirement and must not be presented or deployed as the solution.
+> Status (updated 2026-08-22): the item-based app-server change is not a fix for
+> the reported standard-Codex symptom. The standard path is fixed separately
+> with content-free Codex hooks: `request_user_input` opens on `PreToolUse` and
+> resolves by exact `tool_use_id` on `PostToolUse` (or by the turn's `Stop`). No
+> alternate launcher or private endpoint is part of the implementation. Restart
+> recovery for an already-open hook-only interview remains unknown.
 
 ## Reported symptom
 
@@ -150,11 +153,13 @@ The key questions are:
 5. Are those hooks still owned by the interactive TUI when no shared app-server
    daemon is enabled?
 
-If the answers provide exact onset and resolution edges, the workable design is
-a hook-owned pending-input latch for plain Codex. The current mapping of every
-`PreToolUse` event to generic active/green would need a narrow user-input case,
-and clear events would need the same conservative ownership rules used for
-Claude pending prompts.
+The verified hook contract provides the required onset and resolution edges.
+The implemented design is a hook-owned pending-input latch for plain Codex:
+`request_user_input` is the narrow exception to generic `PreToolUse` activity,
+and opaque `tool_use_id` correlation prevents another call's completion from
+clearing the wait. Turn `Stop` handles interruption, conversation rotation
+retires the old identity, and generic app-server snapshots cannot override the
+still-pending hook evidence.
 
 ### Gate 2 — find a recovery source
 

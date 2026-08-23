@@ -56,6 +56,16 @@ the root chip red because both require action; the row/tooltip retains the exact
 reason. If both kinds exist at once, compact summary `attention` chooses
 `approval`, while `approval_nodes` and `user_input_nodes` preserve both counts.
 
+Provider adapters may emit those attention values only for a confirmed,
+unresolved human-owned request. In particular, Codex's
+`waitingOnApproval`/`waitingOnUserInput` active flags describe mechanical
+app-server gates, not who must resolve them. The Codex adapter correlates the
+gate with reviewer settings, exact server-request IDs and resolutions,
+blocking/auto-resolution metadata, auto-review events, and guardian source
+evidence before publishing a neutral graph. An unowned gate is gray/unknown,
+never red. This ownership rule is enforced before graph history is written, so
+an automated review creates no synthetic `permission` interval.
+
 The reducer ignores provider/source names and uses only a valid graph plus its
 half-open freshness interval (`observed_at <= now < fresh_until`). It evaluates
 the following table top to bottom:
@@ -71,6 +81,10 @@ the following table top to bottom:
 | yes | none | `idle` | none | `idle` | orange |
 | yes | none | `not_loaded`/`unknown` | none | `""` (unknown) | gray |
 
+The table assumes attention has already passed the provider ownership check;
+the shared reducer intentionally has no Codex-specific debounce or reviewer
+logic.
+
 A child lifecycle is terminal at `completed`, `interrupted`, `errored`,
 `shutdown`, or `not_found`. Terminal children remain available as bounded
 display/history evidence but do not count as live work or waiting attention;
@@ -81,8 +95,11 @@ Freshness is authority, not decoration. A disconnected observer can leave the
 last graph structure visible until/after its deadline, but once expired the
 summary becomes unknown and renderers grey child detail as stale. A restored
 last-known graph obeys the same deadline. A newer, fresh high-authority source
-(`codex_app_server` or `claude_transcript`) outranks hook/rollout/restored
-fallbacks in daemon orchestration; the reducer itself stays source-neutral.
+(`codex_app_server` or `claude_transcript`) outranks ordinary
+hook/rollout/restored fallbacks in daemon orchestration. The exception is
+Codex's exact, hook-owned `request_user_input` transition: generic app-server
+snapshots cannot resolve a standard-CLI question. The reducer itself stays
+source-neutral.
 
 Only root `Session` rows are switchable. Child rows have colors and labels for
 visibility but never add Waybar slots, focus selectors, picker entries, or cycle

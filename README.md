@@ -314,7 +314,45 @@ Switchboard uses the locally verified `codex app-server proxy --sock` bridge to
 talk JSONL to each Unix endpoint and rejects older or unparseable CLI versions.
 
 Hooks provide immediate identity/status edges and app-server polling corrects
-missed or delayed hooks. This valid
+missed or delayed hooks. The transport used here is `codex app-server proxy`: a disposable stdio child
+that connects to the already-running app-server control socket. That proxy
+subcommand was verified locally in Codex CLI **0.149.0** and Switchboard rejects
+older or unparseable versions. The current public app-server page does not
+document the proxy subcommand, so this is a locally verified capability—not a
+general OpenAI protocol guarantee.
+
+The proxy transport expects the local app-server control daemon, but there is a
+known Codex 0.149 integration incompatibility: enabling the shared daemon moved
+new threads under the background process and broke Switchboard's exact
+hook-to-visible-TUI attribution. New roots then stayed `unknown` even though the
+hooks were configured and trusted. Do **not** start the shared daemon solely for
+Switchboard until that binding gap is fixed; use the hook fallback instead. See
+the [incident report](docs/codex-app-server-hook-attribution-incident.md).
+
+Root binding is exact and never uses cwd, rollout recency, or timestamp
+correlation:
+
+1. `CODEX_THREAD_ID` from the discovered root process environment on Linux,
+   before a hook identity has arrived.
+2. The `session_id` delivered by that root's trusted lifecycle hooks, which
+   supersedes the immutable environment identity after `/clear`.
+
+`SessionStart` is normally the first hook identity edge. If it races the
+one-second process-discovery scan, any later lifecycle hook with the same exact
+`session_id` self-heals the binding. A persisted exact identity is restored for
+the same `(pid, started_at)` process lifetime after a Switchboard restart.
+Because `/clear` changes the conversation without changing the TUI process, a
+new lifecycle-hook identity supersedes the immutable process-start environment
+value. Retired hook identities are fenced for that process lifetime, so a late
+pre-clear event cannot rotate the chip backwards.
+
+`CODEX_SESSION_ID` is intentionally ignored because captured 0.149 process
+evidence showed it can name an ancestor rather than the current thread. A PID is
+always paired with Switchboard's process-lifetime `started_at`, so PID reuse
+cannot inherit a binding.
+
+Hooks are therefore optional identity and fallback enrichment, not the primary
+Codex status source. If process-environment access is unavailable, this valid
 `~/.codex/hooks.json` shape supplies exact hook identity and a bounded partial
 root status while app-server reconnects:
 
@@ -336,12 +374,22 @@ This three-level event → matcher group → handler shape follows the
 [official OpenAI hooks documentation](https://learn.chatgpt.com/docs/hooks).
 Codex requires non-managed command hooks to be reviewed and trusted; use
 `/hooks` after adding or changing the file. The fallback maps
-`UserPromptSubmit`/`PreToolUse`/`PostToolUse` to active, `PermissionRequest` to
-an approval wait (`AskUserQuestion` to user input), and `Stop`/`SessionStart` to
-idle. It is partial and root-only. Active evidence remains fresh for 10 minutes,
-approval or user-input waits for 24 hours, and idle edges for 7 days. Every
-later hook replaces and refreshes that evidence; the finite deadlines bound the
-effect of a missed resolution edge.
+`UserPromptSubmit` and ordinary `PreToolUse`/`PostToolUse` to active,
+`PermissionRequest` to an approval wait, and `Stop` to idle. A
+`request_user_input` `PreToolUse` instead opens a user-input wait keyed by its
+opaque `tool_use_id`; only the matching `PostToolUse`, its turn's `Stop`, or a
+new conversation clears that wait. Unrelated tool hooks and generic app-server
+snapshots cannot repaint it green. `SessionStart(clear|startup|resume)` is held
+for 250 ms so an immediate same-thread continuation replaces the provisional
+idle edge, while a standalone `/clear` still settles idle.
+`SessionStart(compact)` remains active because Codex continues the model
+immediately after compaction. Only content-free lifecycle metadata is used to
+correlate the wait; its question, answer, and raw tool input stay out of the
+daemon. The hook fallback is partial and root-only. Active evidence remains
+fresh for 10 minutes, approval or user-input waits for 24 hours, and idle edges
+for 7 days. A daemon restart during an already-open hook-only interview cannot
+reconstruct that wait and therefore remains unknown rather than confidently
+green.
 
 Automatic degradation is fail-open for the root and fail-closed for status:
 
@@ -350,10 +398,8 @@ Automatic degradation is fail-open for the root and fail-closed for status:
   deadline, then its summary becomes unknown/stale rather than freezing a
   confident color;
 - the observer reconnects with bounded exponential backoff and resnapshots;
-- Codex processes not started through `switchboard-codex` remain on hook-only
-  observation until they exit; no running TUI is forcibly restarted. The
-  app-server item detector therefore does **not** solve interview waits for
-  standard `codex`; see the
+- The standard `codex` launch path owns interview waits through the exact hook
+  latch above; it does not depend on a launcher or private endpoint. See the
   [standard-CLI retrospective](docs/codex-standard-cli-interview-retrospective.md);
 - `-codex-observer off` never constructs the proxy. Codex hooks can still supply
   the partial root view; without them the root remains visible with unknown

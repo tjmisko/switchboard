@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -35,8 +34,11 @@ func TestSchemaFixturesMapNestedRuntimeLifecycleAndAttention(t *testing.T) {
 		t.Fatalf("idle root with active children = %#v", summary)
 	}
 
-	applyFixture(t, observer, "child-waiting-approval.jsonl", 1)
-	applyFixture(t, observer, "child-waiting-user-input.jsonl", 1)
+	observer.applyNotificationLocked(rpcNotification{Generation: 1, Method: "thread/settings/updated", Params: mustJSON(t, map[string]any{
+		"threadId": fixtureAtlas, "threadSettings": map[string]any{"approvalsReviewer": "user"},
+	})})
+	applyFixture(t, observer, "child-waiting-approval.jsonl", 2)
+	applyFixture(t, observer, "child-waiting-user-input.jsonl", 2)
 	observation = observer.roots[key].observation
 	assertNodeAttention(t, observation, fixtureAtlas, agentgraph.AttentionApproval)
 	assertNodeAttention(t, observation, fixtureNova, agentgraph.AttentionUserInput)
@@ -114,114 +116,10 @@ func TestRootThreadNameSnapshotAndUpdateRemainExplicitAndDisplayOnly(t *testing.
 	}
 }
 
-func TestInProgressRequestUserInputItemSuppliesMissingAttentionFlag(t *testing.T) {
-	root := rpcThread{
-		ID: fixtureRoot, Status: rpcStatus{Type: "active", ActiveFlags: []string{}},
-		Turns: []rpcTurn{{
-			ID: "turn-interview", Status: "inProgress",
-			Items: []rpcItem{{
-				ID: "item-interview", Type: "dynamicToolCall", Tool: "request_user_input", Status: "inProgress",
-			}},
-		}},
-	}
-	state := newGraphState(root, nil, 32)
-	observation, err := state.observation(fixtureNow, time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertNodeAttention(t, observation, fixtureRoot, agentgraph.AttentionUserInput)
-	if summary := agentgraph.Reduce(observation, agentgraph.Summary{}, fixtureNow); summary.LegacyStatus != agentgraph.LegacyPermission || summary.UserInputNodes != 1 {
-		t.Fatalf("in-progress interview summary = %#v", summary)
-	}
-
-	state.applyStatus(state.nodes[fixtureRoot], rpcStatus{Type: "active", ActiveFlags: []string{}})
-	assertGraphNodeAttention(t, state, fixtureRoot, agentgraph.AttentionUserInput)
-
-	state.applyItem(fixtureRoot, "turn-interview", rpcItem{
-		ID: "item-interview", Type: "dynamicToolCall", Tool: "request_user_input", Status: "completed",
-	})
-	assertGraphNodeAttention(t, state, fixtureRoot, agentgraph.AttentionNone)
-}
-
-func TestRequestUserInputItemFallbackIsNarrowAndTurnCompletionClearsIt(t *testing.T) {
-	state := newGraphState(rpcThread{ID: fixtureRoot, Status: rpcStatus{Type: "active"}}, nil, 32)
-	for _, tool := range []string{"request_user_inputs", "vendor.request_user_input", "AskUserQuestion"} {
-		state.applyItem(fixtureRoot, "turn-1", rpcItem{ID: tool, Type: "dynamicToolCall", Tool: tool, Status: "inProgress"})
-	}
-	assertGraphNodeAttention(t, state, fixtureRoot, agentgraph.AttentionNone)
-
-	state.applyItem(fixtureRoot, "turn-1", rpcItem{
-		ID: "interview", Type: "dynamicToolCall", Tool: "functions.request_user_input", Status: "inProgress",
-	})
-	assertGraphNodeAttention(t, state, fixtureRoot, agentgraph.AttentionUserInput)
-
-	state.completeTurn(fixtureRoot, "turn-1")
-	assertGraphNodeAttention(t, state, fixtureRoot, agentgraph.AttentionNone)
-}
-
-func TestRequestUserInputItemNotificationsLatchUntilCompletion(t *testing.T) {
-	observer, key := fixtureObserver(t)
-	item := map[string]any{
-		"id": "interview", "type": "dynamicToolCall", "tool": "request_user_input", "status": "inProgress",
-	}
-	changed, _ := observer.applyNotificationLocked(rpcNotification{
-		Generation: 1, Method: "item/started",
-		Params: mustJSON(t, map[string]any{"threadId": fixtureRoot, "turnId": "turn-interview", "item": item}),
-	})
-	if len(changed) != 1 || changed[0] != key {
-		t.Fatalf("item start changed keys = %#v", changed)
-	}
-	assertNodeAttention(t, observer.roots[key].observation, fixtureRoot, agentgraph.AttentionUserInput)
-
-	observer.applyNotificationLocked(rpcNotification{
-		Generation: 1, Method: "thread/status/changed",
-		Params: mustJSON(t, map[string]any{
-			"threadId": fixtureRoot, "status": map[string]any{"type": "active", "activeFlags": []string{}},
-		}),
-	})
-	assertNodeAttention(t, observer.roots[key].observation, fixtureRoot, agentgraph.AttentionUserInput)
-
-	item["status"] = "completed"
-	observer.applyNotificationLocked(rpcNotification{
-		Generation: 1, Method: "item/completed",
-		Params: mustJSON(t, map[string]any{"threadId": fixtureRoot, "turnId": "turn-interview", "item": item}),
-	})
-	assertNodeAttention(t, observer.roots[key].observation, fixtureRoot, agentgraph.AttentionNone)
-}
-
-func TestRequestUserInputServerRequestSuppliesImmediateAttentionEdge(t *testing.T) {
-	observer, key := fixtureObserver(t)
-	observer.applyNotificationLocked(rpcNotification{
-		Generation: 1, Method: "item/tool/requestUserInput", RequestID: `"request-1"`,
-		Params: mustJSON(t, map[string]any{
-			"threadId": fixtureRoot, "turnId": "turn-interview", "itemId": "interview",
-		}),
-	})
-	assertNodeAttention(t, observer.roots[key].observation, fixtureRoot, agentgraph.AttentionUserInput)
-
-	observer.applyNotificationLocked(rpcNotification{
-		Generation: 1, Method: "serverRequest/resolved",
-		Params: mustJSON(t, map[string]any{
-			"threadId": fixtureRoot, "requestId": "request-1",
-		}),
-	})
-	assertNodeAttention(t, observer.roots[key].observation, fixtureRoot, agentgraph.AttentionNone)
-}
-
-func TestApprovalFlagKeepsPriorityOverRequestUserInputItem(t *testing.T) {
-	state := newGraphState(rpcThread{
-		ID: fixtureRoot, Status: rpcStatus{Type: "active", ActiveFlags: []string{"waitingOnApproval"}},
-		Turns: []rpcTurn{{ID: "turn-1", Items: []rpcItem{{
-			ID: "interview", Type: "dynamicToolCall", Tool: "requestUserInput", Status: "inProgress",
-		}}}},
-	}, nil, 32)
-	assertGraphNodeAttention(t, state, fixtureRoot, agentgraph.AttentionApproval)
-}
-
 func TestThreadNameUpdatedNotificationRefreshesRootMetadata(t *testing.T) {
 	observer, key := fixtureObserver(t)
 
-	changed, unknown := observer.applyNotificationLocked(rpcNotification{
+	changed, unknown, _ := observer.applyNotificationLocked(rpcNotification{
 		Generation: 1,
 		Method:     "thread/name/updated",
 		Params: mustJSON(t, map[string]any{
@@ -235,7 +133,7 @@ func TestThreadNameUpdatedNotificationRefreshesRootMetadata(t *testing.T) {
 		t.Fatalf("name update observation root = %#v", got)
 	}
 
-	changed, _ = observer.applyNotificationLocked(rpcNotification{
+	changed, _, _ = observer.applyNotificationLocked(rpcNotification{
 		Generation: 1,
 		Method:     "thread/name/updated",
 		Params: mustJSON(t, map[string]any{
@@ -303,8 +201,14 @@ func TestStatusBeforeMetadataIsGenerationScopedAndAppliedAfterParentage(t *testi
 	observer.applyNotificationLocked(rpcNotification{Generation: 1, Method: "thread/status/changed", Params: mustJSON(t, map[string]any{
 		"threadId": "late-child", "status": map[string]any{"type": "active", "activeFlags": []string{"waitingOnUserInput"}},
 	})})
+	observer.applyNotificationLocked(rpcNotification{Generation: 1, ID: mustJSON(t, "late-input"), Method: "item/tool/requestUserInput", Params: mustJSON(t, map[string]any{
+		"threadId": "late-child", "turnId": "turn", "itemId": "item", "isBlocking": true, "autoResolutionMs": nil,
+	})})
 	if len(observer.pendingStatuses) != 1 {
 		t.Fatalf("pre-metadata status was not retained: %#v", observer.pendingStatuses)
+	}
+	if len(observer.pendingWaits["late-child"]) != 1 {
+		t.Fatalf("pre-metadata request was not retained: %#v", observer.pendingWaits)
 	}
 	observer.applyNotificationLocked(rpcNotification{Generation: 1, Method: "thread/started", Params: mustJSON(t, map[string]any{
 		"thread": map[string]any{"id": "late-child", "parentThreadId": fixtureRoot, "agentNickname": "Late"},
@@ -313,6 +217,9 @@ func TestStatusBeforeMetadataIsGenerationScopedAndAppliedAfterParentage(t *testi
 	assertNode(t, observation, "late-child", fixtureRoot, "Late", "", agentgraph.RuntimeActive, agentgraph.AttentionUserInput, agentgraph.LifecycleUnknown)
 	if len(observer.pendingStatuses) != 0 {
 		t.Fatalf("applied pending status was retained: %#v", observer.pendingStatuses)
+	}
+	if len(observer.pendingWaits) != 0 {
+		t.Fatalf("applied pending request was retained: %#v", observer.pendingWaits)
 	}
 }
 
@@ -420,6 +327,15 @@ func fixtureObserver(t *testing.T) (*Observer, provider.RootKey) {
 		},
 		generation: 1, connected: true, pendingStatuses: make(map[string]rpcStatus),
 	}
+	t.Cleanup(func() {
+		observer.mu.Lock()
+		for _, record := range observer.roots {
+			if record.graph != nil {
+				record.graph.stopClassifications()
+			}
+		}
+		observer.mu.Unlock()
+	})
 	return observer, key
 }
 
@@ -440,10 +356,7 @@ func applyFixture(t *testing.T, observer *Observer, name string, limit int) {
 		if envelope.Method == "" || envelope.Method == "thread/read" || envelope.Method == "thread/list" || envelope.Method == "initialize" {
 			continue
 		}
-		observer.applyNotificationLocked(rpcNotification{
-			Generation: 1, Method: envelope.Method,
-			RequestID: strings.TrimSpace(string(envelope.ID)), Params: envelope.Params,
-		})
+		observer.applyNotificationLocked(rpcNotification{Generation: 1, ID: envelope.ID, Method: envelope.Method, Params: envelope.Params})
 		count++
 		if limit >= 0 && count >= limit {
 			break
@@ -469,14 +382,6 @@ func assertNodeAttention(t *testing.T, observation agentgraph.Observation, id st
 	t.Helper()
 	if node := findNode(observation, id); node == nil || node.Attention != want {
 		t.Fatalf("node %s attention = %#v, want %s", id, node, want)
-	}
-}
-
-func assertGraphNodeAttention(t *testing.T, state *graphState, id string, want agentgraph.AttentionState) {
-	t.Helper()
-	node := state.nodes[id]
-	if node == nil || node.node.Attention != want {
-		t.Fatalf("graph node %s attention = %#v, want %s", id, node, want)
 	}
 }
 

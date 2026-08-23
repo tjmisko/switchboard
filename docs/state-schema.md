@@ -190,25 +190,32 @@ is present.
 #### Legacy hook fallback mapping
 
 Claude compatibility still consumes its hook/transcript state machine. Codex
-uses app-server as primary truth; only its lower-authority partial fallback
-maps hook events directly. Active evidence expires after 10 minutes, approval
-or user-input waits after 24 hours, and idle edges after 7 days. Each later hook
-replaces and refreshes that evidence. The event mapping is:
+uses app-server as primary structural truth, plus a standard-CLI hook-owned
+`request_user_input` latch that app-server snapshots cannot resolve. Other
+Codex hook evidence remains a lower-authority partial fallback. Active evidence
+expires after 10 minutes, approval or user-input waits after 24 hours, and idle
+edges after 7 days. The event mapping is:
 
 | Hook event | `claude` status | `codex` status |
 |------------|-----------------|----------------|
 | `UserPromptSubmit` | `working` | `working` |
-| `PreToolUse` | (unmapped) | `working` |
-| `PostToolUse` | `working` | `working` |
+| ordinary `PreToolUse` | (unmapped) | `working` |
+| `request_user_input` `PreToolUse` | (unmapped) | `permission` (`user_input`) |
+| ordinary/unmatched `PostToolUse` | `working` | `working`, without clearing a pending question |
+| matching `request_user_input` `PostToolUse` | `working` | `working`, and clears that exact question |
 | `PermissionRequest` | `permission` | `permission` |
-| `Stop`, `SessionStart` | `idle` | `idle` |
+| `Stop` | `idle` | `idle`, and clears an interrupted question for that turn |
+| `SessionStart(startup|resume|clear)` | `idle` | provisional `idle`, coalesced for 250 ms with an immediate continuation |
+| `SessionStart(compact)` | `idle` | `working` |
 | (any other / unknown) | unchanged | unchanged |
 
 For Codex, `PermissionRequest` with tool `AskUserQuestion` becomes structured
 attention `user_input`; other permission requests become `approval`. Either
-reduces to legacy `permission`. A fresh app-server graph outranks the hook
-fallback, so missed hook edges cannot overwrite a current complete snapshot.
-Rollout files alone still cannot recover approval state, but app-server can.
+reduces to legacy `permission`. `request_user_input` is correlated only by its
+opaque `tool_use_id`; question and answer content are not persisted. A fresh
+app-server graph outranks ordinary hook fallback, but cannot clear this
+independently owned standard-CLI latch. Rollout files alone still cannot recover
+approval state, but app-server can.
 
 ##### `permission` self-heal (reconciler)
 

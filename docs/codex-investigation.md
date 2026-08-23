@@ -16,10 +16,11 @@
 > daemon solely for Switchboard until that exact-binding gap is fixed. See the
 > [incident report](codex-app-server-hook-attribution-incident.md).
 
-> **Standard-CLI requirement (2026-08-21):** requiring the
-> `switchboard-codex` private-endpoint launcher is not an acceptable solution.
-> The item-based interview detector is unreachable on the hook-only plain
-> `codex` path and must not be presented as fixing that case. See the
+> **Standard-CLI requirement (updated 2026-08-22):** requiring a private
+> endpoint launcher is not an acceptable solution. Plain `codex` now detects
+> interactive questions through an exact, content-free
+> `PreToolUse`/`PostToolUse` latch. The app-server item detector is not evidence
+> for the standard path. See the
 > [interview-detection retrospective](codex-standard-cli-interview-retrospective.md).
 
 This document preserves the useful findings from the original investigation,
@@ -61,13 +62,15 @@ terminal target. See the
 ## Exact root binding
 
 A correct graph is useless if attached to the wrong TUI. Binding therefore
-accepts only exact identity sources, in this order:
+accepts only exact identity sources:
 
 1. `CODEX_THREAD_ID` read from the discovered root process environment on
-   Linux.
+   Linux, before a hook identity has arrived.
 2. The root lifecycle hooks' common `session_id`, registered against the same
    `(pid, started_at)` process lifetime. `SessionStart` normally establishes it;
-   a later hook self-heals when startup delivery races process discovery.
+   a later hook self-heals when startup delivery races process discovery. Once
+   registered, hook identity wins because it can rotate on `/clear` while the
+   process-start environment is immutable.
 
 Switchboard also restores a persisted exact identity for the same process
 lifetime after its own daemon restarts. It never carries that binding across a
@@ -122,29 +125,56 @@ and configured Codex hook fallback remain active.
 
 ## Attention and lifecycle fidelity
 
-App-server status is mapped onto independent neutral axes:
+App-server status is mapped onto independent neutral axes, but raw wait flags
+are classified before they reach the graph:
 
 - runtime: `notLoaded`, `idle`, `active`, `systemError` → `not_loaded`, `idle`,
   `active`, `system_error`;
-- attention flags: `waitingOnApproval` → `approval`,
-  `waitingOnUserInput` → `user_input`;
+- mechanical gates: `waitingOnApproval` and `waitingOnUserInput` are retained
+  internally but do not by themselves produce attention;
 - collaborative lifecycle: `pendingInit`, `running`, `completed`,
   `interrupted`, `errored`, `shutdown`, `notFound` → the corresponding neutral
   snake-case values.
 
-Approval and user input deliberately remain distinct. Either makes the root's
-legacy summary `permission` (red), but child rows show `approval` versus `user
-input` (`question` in the compact Waybar tooltip). Terminal nodes no longer
-count as live work or waiting attention even if a partial provider payload
-still carries an old runtime/attention value.
+An unresolved server request becomes `approval` only when it is routed to the
+user, or when no auto-review evidence arrives during the bounded 500 ms
+classification window. A blocking `item/tool/requestUserInput` request with no
+auto-resolution becomes `user_input` immediately. Nonblocking and
+auto-resolving input remains non-attention. `thread/settings/updated`
+`approvalsReviewer`, `item/autoApprovalReview/*`, and an active
+`source.subAgent.other = guardian` thread classify automatic ownership; the
+auto-review notifications are supplementary because their generated schema is
+explicitly unstable. Exact JSON-RPC request IDs and
+`serverRequest/resolved.requestId` bound human attention, including concurrent
+string and integer IDs.
 
-Hooks are lower-authority, partial observations. `SessionStart`/`Stop` map the
-root to idle; `UserPromptSubmit`/`PreToolUse`/`PostToolUse` map it active; and
-`PermissionRequest` maps approval, except `AskUserQuestion`, which maps user
-input. The fallback is root-only and incomplete. Active evidence remains fresh
-for 10 minutes, approval or user-input waits for 24 hours, and idle edges for 7
-days. Each later hook replaces and refreshes it, and a fresh app-server
-observation outranks it.
+Publication is held only while an ambiguous wait is classified. Auto evidence
+cancels that timer without creating a transient graph or history edge. A
+mechanical gate whose owner remains unknown projects runtime `unknown` with no
+attention, so uncertainty is gray rather than red. Request state is discarded
+on exact resolution, turn/thread completion, deletion, authoritative snapshot
+omission, or reconnect generation replacement. Classification diagnostics
+contain only a finite source label, duration, and suppressed-false-red boolean.
+
+Confirmed approval and user input deliberately remain distinct. Either makes
+the root's legacy summary `permission` (red), but child rows show `approval`
+versus `user input` (`question` in the compact Waybar tooltip). Terminal nodes
+no longer count as live work or waiting attention even if a partial provider
+payload still carries an old runtime/attention value.
+
+Hooks are partial observations, with one independently owned attention latch.
+`Stop` maps the root to idle; `UserPromptSubmit` and ordinary
+`PreToolUse`/`PostToolUse` map it active; and `PermissionRequest` maps approval.
+`request_user_input` is the narrow exception: its `PreToolUse` opens a
+user-input wait keyed by `tool_use_id`, and only the matching `PostToolUse`, the
+turn's `Stop`, or conversation rotation clears it. Generic app-server snapshots
+cannot clear this standard-CLI wait. `SessionStart(clear|startup|resume)` is
+briefly coalesced with a same-thread continuation so `/clear` followed by an
+accepted plan does not create a synthetic idle interval; a standalone `/clear`
+still settles idle. `SessionStart(compact)` stays active because the documented
+lifecycle continues the model immediately. The fallback is root-only and
+incomplete. Active evidence remains fresh for 10 minutes, approval or user-input
+waits for 24 hours, and idle edges for 7 days.
 
 ## Terminal titles, spinners, and session names
 

@@ -264,7 +264,22 @@ func hydrateAgentGraph(sess *Session, now time.Time) {
 		return
 	}
 	provider := agentgraph.ProviderKind(sess.Agent)
-	projection, err := ProjectAgentGraph(sess.AgentGraph.observation(provider), sess.AgentGraph, now)
+	observation := sess.AgentGraph.observation(provider)
+	// request_user_input is an edge-owned, in-memory hook latch on the standard
+	// Codex path. After a daemon restart there is no exact pending tool_use_id to
+	// resolve, so a persisted red must fail unknown instead of pretending the
+	// question is still open for the remainder of its freshness window.
+	if provider == agentgraph.ProviderCodex && observation.Source == agentgraph.SourceHook {
+		for i := range observation.Nodes {
+			if observation.Nodes[i].ID == observation.RootID && observation.Nodes[i].Attention == agentgraph.AttentionUserInput {
+				observation.Nodes[i].Runtime = agentgraph.RuntimeUnknown
+				observation.Nodes[i].Attention = agentgraph.AttentionNone
+				observation.FreshUntil = now
+				break
+			}
+		}
+	}
+	projection, err := ProjectAgentGraph(observation, sess.AgentGraph, now)
 	if err != nil {
 		sess.AgentGraph = nil
 		return

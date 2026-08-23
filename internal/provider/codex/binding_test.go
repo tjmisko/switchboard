@@ -15,6 +15,17 @@ type fakeEnvironment struct {
 	calls  []provider.RootKey
 }
 
+type blockingEnvironment struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (f *blockingEnvironment) Environ(context.Context, provider.RootKey) ([]byte, error) {
+	close(f.started)
+	<-f.release
+	return []byte("CODEX_THREAD_ID=environment-thread\x00"), nil
+}
+
 func (f *fakeEnvironment) Environ(_ context.Context, key provider.RootKey) ([]byte, error) {
 	f.calls = append(f.calls, key)
 	return f.values[key], f.errors[key]
@@ -27,12 +38,16 @@ func TestBindingPrecedenceAndPIDStartIdentity(t *testing.T) {
 		key: []byte("CODEX_SESSION_ID=session-parent\x00CODEX_THREAD_ID=environment-thread\x00"),
 	}}
 	registry := newBindingRegistry(environment)
+	got, _ := registry.resolve(context.Background(), provider.RootRef{PID: key.PID, StartedAt: key.StartedAt, CWD: "/same"})
+	if got.ThreadID != "environment-thread" || got.Source != BindingProcessEnvironment {
+		t.Fatalf("environment binding = %#v", got)
+	}
 	if _, err := registry.RegisterHook(key, "hook-thread"); err != nil {
 		t.Fatal(err)
 	}
-	got, _ := registry.resolve(context.Background(), provider.RootRef{PID: key.PID, StartedAt: key.StartedAt, CWD: "/same"})
+	got, _ = registry.resolve(context.Background(), provider.RootRef{PID: key.PID, StartedAt: key.StartedAt, CWD: "/same"})
 	if got.ThreadID != "hook-thread" || got.Source != BindingHook {
-		t.Fatalf("environment precedence = %#v", got)
+		t.Fatalf("rotatable hook precedence = %#v", got)
 	}
 
 	// PID reuse must not inherit the previous lifetime's environment or hook.
@@ -41,8 +56,8 @@ func TestBindingPrecedenceAndPIDStartIdentity(t *testing.T) {
 	if got.ThreadID != "" || diagnostic == "" {
 		t.Fatalf("reused PID binding = %#v, diagnostic %q", got, diagnostic)
 	}
-	if len(environment.calls) != 1 || environment.calls[0] != reused.Key() {
-		t.Fatalf("only the unbound reused lifetime should read its environment: %#v", environment.calls)
+	if len(environment.calls) != 2 || environment.calls[0] != key || environment.calls[1] != reused.Key() {
+		t.Fatalf("each process lifetime should read its own environment once: %#v", environment.calls)
 	}
 }
 
@@ -99,5 +114,24 @@ func TestRegisterHookRotatesAndRejectsRetiredThread(t *testing.T) {
 	}
 	if !stale.Stale || stale.Generation != 2 {
 		t.Fatalf("retired binding = %+v", stale)
+	}
+}
+
+func TestHookBindingWinsWhenItArrivesDuringEnvironmentRead(t *testing.T) {
+	environment := &blockingEnvironment{started: make(chan struct{}), release: make(chan struct{})}
+	registry := newBindingRegistry(environment)
+	key := provider.RootKey{PID: 1, StartedAt: time.Unix(1, 0)}
+	result := make(chan Binding, 1)
+	go func() {
+		binding, _ := registry.resolve(context.Background(), provider.RootRef{PID: key.PID, StartedAt: key.StartedAt})
+		result <- binding
+	}()
+	<-environment.started
+	if _, err := registry.RegisterHook(key, "hook-thread"); err != nil {
+		t.Fatal(err)
+	}
+	close(environment.release)
+	if got := <-result; got.ThreadID != "hook-thread" || got.Source != BindingHook {
+		t.Fatalf("concurrent binding = %#v, want hook identity", got)
 	}
 }

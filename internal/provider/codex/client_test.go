@@ -38,7 +38,7 @@ func TestRPCMethodAllowlistRejectsEveryMutation(t *testing.T) {
 	}
 }
 
-func TestRPCGenerationTagsNotificationsAndCloseReleasesWaiter(t *testing.T) {
+func TestRPCGenerationPreservesServerRequestIDAndCloseReleasesWaiter(t *testing.T) {
 	clientSide, serverSide := net.Pipe()
 	notes := make(chan rpcNotification, 1)
 	client := newRPCClient(clientSide, 7, func(note rpcNotification) { notes <- note })
@@ -47,7 +47,7 @@ func TestRPCGenerationTagsNotificationsAndCloseReleasesWaiter(t *testing.T) {
 		decoder := json.NewDecoder(serverSide)
 		var request map[string]any
 		_ = decoder.Decode(&request)
-		_, _ = serverSide.Write([]byte(`{"id":"request-1","method":"thread/status/changed","params":{"threadId":"x","status":{"type":"idle"}}}` + "\n"))
+		_, _ = serverSide.Write([]byte(`{"id":"approval-42","method":"item/commandExecution/requestApproval","params":{"threadId":"x","turnId":"t","itemId":"i"}}` + "\n"))
 	}()
 	errCh := make(chan error, 1)
 	go func() {
@@ -58,8 +58,8 @@ func TestRPCGenerationTagsNotificationsAndCloseReleasesWaiter(t *testing.T) {
 		if note.Generation != 7 {
 			t.Fatalf("notification generation = %d", note.Generation)
 		}
-		if note.RequestID != `"request-1"` {
-			t.Fatalf("server request id = %q, want quoted JSON id", note.RequestID)
+		if string(note.ID) != `"approval-42"` {
+			t.Fatalf("server-request id = %s, want preserved string id", note.ID)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("notification not delivered")

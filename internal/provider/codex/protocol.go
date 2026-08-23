@@ -3,6 +3,7 @@ package codex
 import (
 	"encoding/json"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,15 +29,16 @@ type threadLoadedListResult struct {
 }
 
 type rpcThread struct {
-	ID             string    `json:"id"`
-	ParentThreadID string    `json:"parentThreadId"`
-	Name           string    `json:"name"`
-	AgentNickname  string    `json:"agentNickname"`
-	AgentRole      string    `json:"agentRole"`
-	CreatedAt      int64     `json:"createdAt"`
-	UpdatedAt      int64     `json:"updatedAt"`
-	Status         rpcStatus `json:"status"`
-	Turns          []rpcTurn `json:"turns"`
+	ID             string          `json:"id"`
+	ParentThreadID string          `json:"parentThreadId"`
+	Name           string          `json:"name"`
+	AgentNickname  string          `json:"agentNickname"`
+	AgentRole      string          `json:"agentRole"`
+	CreatedAt      int64           `json:"createdAt"`
+	UpdatedAt      int64           `json:"updatedAt"`
+	Status         rpcStatus       `json:"status"`
+	Source         json.RawMessage `json:"source"`
+	Turns          []rpcTurn       `json:"turns"`
 }
 
 type rpcStatus struct {
@@ -66,31 +68,64 @@ type rpcAgentState struct {
 	Status string `json:"status"`
 }
 
-type nodeState struct {
-	node            agentgraph.Node
-	statusAttention agentgraph.AttentionState
-	cohort          string
+type reviewerRoute uint8
+
+const (
+	reviewerUnknown reviewerRoute = iota
+	reviewerUser
+	reviewerAuto
+)
+
+type requestOwner uint8
+
+const (
+	requestPending requestOwner = iota
+	requestHuman
+	requestAutomatic
+	requestIgnored
+)
+
+type rpcRequestID string
+
+type requestEvidence struct {
+	reason agentgraph.AttentionState
+	owner  requestOwner
+	turnID string
+	itemID string
 }
 
-type pendingUserInput struct {
-	threadID  string
-	turnID    string
-	requestID string
+type waitOwnershipState struct {
+	rawApproval      bool
+	rawUserInput     bool
+	reviewer         reviewerRoute
+	autoReviewSeen   bool
+	activeAutoReview map[string]struct{}
+	requests         map[rpcRequestID]requestEvidence
+
+	classificationPending bool
+	classifiedUnknown     bool
+	classificationStarted time.Time
+	classificationToken   uint64
+	classificationTimer   *time.Timer
+}
+
+type nodeState struct {
+	node        agentgraph.Node
+	baseRuntime agentgraph.RuntimeState
+	cohort      string
+	guardian    bool
+	wait        waitOwnershipState
 }
 
 type graphState struct {
-	rootID           string
-	rootTurnID       string
-	nodes            map[string]*nodeState
-	pendingUserInput map[string]pendingUserInput
-	unknownEnum      bool
+	rootID      string
+	rootTurnID  string
+	nodes       map[string]*nodeState
+	unknownEnum bool
 }
 
 func newGraphState(root rpcThread, descendants []rpcThread, terminalLimit int) *graphState {
-	state := &graphState{
-		rootID: root.ID, nodes: make(map[string]*nodeState, len(descendants)+1),
-		pendingUserInput: make(map[string]pendingUserInput),
-	}
+	state := &graphState{rootID: root.ID, nodes: make(map[string]*nodeState, len(descendants)+1)}
 	state.upsertThread(root, true)
 	for _, thread := range descendants {
 		state.upsertThread(thread, false)
@@ -98,13 +133,13 @@ func newGraphState(root rpcThread, descendants []rpcThread, terminalLimit int) *
 	for _, turn := range root.Turns {
 		state.rootTurnID = turn.ID
 		for _, item := range turn.Items {
-			state.applyItem(root.ID, turn.ID, item)
+			state.applyCollaboration(turn.ID, item)
 		}
 	}
 	for _, thread := range descendants {
 		for _, turn := range thread.Turns {
 			for _, item := range turn.Items {
-				state.applyItem(thread.ID, turn.ID, item)
+				state.applyCollaboration(turn.ID, item)
 			}
 		}
 	}
@@ -115,16 +150,17 @@ func newGraphState(root rpcThread, descendants []rpcThread, terminalLimit int) *
 func (s *graphState) clone() *graphState {
 	out := &graphState{
 		rootID: s.rootID, rootTurnID: s.rootTurnID,
-		nodes:            make(map[string]*nodeState, len(s.nodes)),
-		pendingUserInput: make(map[string]pendingUserInput, len(s.pendingUserInput)),
-		unknownEnum:      s.unknownEnum,
+		nodes:       make(map[string]*nodeState, len(s.nodes)),
+		unknownEnum: s.unknownEnum,
 	}
 	for id, state := range s.nodes {
 		copy := *state
+		copy.wait.classificationTimer = nil
+		copy.wait.classificationPending = false
+		copy.wait.classificationStarted = time.Time{}
+		copy.wait.activeAutoReview = cloneSet(state.wait.activeAutoReview)
+		copy.wait.requests = cloneRequests(state.wait.requests)
 		out.nodes[id] = &copy
-	}
-	for itemID, pending := range s.pendingUserInput {
-		out.pendingUserInput[itemID] = pending
 	}
 	return out
 }
@@ -144,6 +180,9 @@ func (s *graphState) upsertThread(thread rpcThread, root bool) {
 		state.node.Nickname = strings.TrimSpace(thread.Name)
 	}
 	state.node.Role = thread.AgentRole
+	if len(thread.Source) > 0 {
+		state.guardian = isGuardianSource(thread.Source)
+	}
 	if startedAt := unixSeconds(thread.CreatedAt); !startedAt.IsZero() {
 		state.node.StartedAt = startedAt
 	}
@@ -153,6 +192,7 @@ func (s *graphState) upsertThread(thread rpcThread, root bool) {
 	if thread.Status.Type != "" || thread.Status.ActiveFlags != nil {
 		s.applyStatus(state, thread.Status)
 	}
+	s.deriveAll()
 }
 
 // setThreadName applies Codex's thread/name/updated notification without
@@ -175,8 +215,8 @@ func (s *graphState) ensureNode(id, parentID string) *nodeState {
 	state := s.nodes[id]
 	if state == nil {
 		state = &nodeState{
-			node:            agentgraph.Node{ID: id, ParentID: parentID, Runtime: agentgraph.RuntimeUnknown, Attention: agentgraph.AttentionNone, Lifecycle: agentgraph.LifecycleUnknown},
-			statusAttention: agentgraph.AttentionNone,
+			node:        agentgraph.Node{ID: id, ParentID: parentID, Runtime: agentgraph.RuntimeUnknown, Attention: agentgraph.AttentionNone, Lifecycle: agentgraph.LifecycleUnknown},
+			baseRuntime: agentgraph.RuntimeUnknown,
 		}
 		s.nodes[id] = state
 	} else if state.node.ParentID == "" && id != s.rootID && parentID != "" {
@@ -186,109 +226,32 @@ func (s *graphState) ensureNode(id, parentID string) *nodeState {
 }
 
 func (s *graphState) applyStatus(state *nodeState, status rpcStatus) {
-	state.node.Runtime = mapRuntime(status.Type)
-	if status.Type != "" && state.node.Runtime == agentgraph.RuntimeUnknown && status.Type != "unknown" {
+	if status.Type != "" {
+		state.baseRuntime = mapRuntime(status.Type)
+	}
+	if status.Type != "" && state.baseRuntime == agentgraph.RuntimeUnknown && status.Type != "unknown" {
 		s.unknownEnum = true
 	}
-	state.statusAttention = agentgraph.AttentionNone
+	wasWaiting := state.wait.rawApproval || state.wait.rawUserInput
+	state.wait.rawApproval = false
+	state.wait.rawUserInput = false
 	for _, flag := range status.ActiveFlags {
 		switch flag {
 		case "waitingOnApproval":
-			state.statusAttention = agentgraph.AttentionApproval
+			state.wait.rawApproval = true
 		case "waitingOnUserInput":
-			if state.statusAttention != agentgraph.AttentionApproval {
-				state.statusAttention = agentgraph.AttentionUserInput
-			}
+			state.wait.rawUserInput = true
 		default:
 			s.unknownEnum = true
 		}
 	}
-	s.refreshAttention(state.node.ID)
-}
-
-// applyItem supplements Thread.activeFlags with the durable turn-item shape.
-// Codex 0.149 can leave activeFlags empty while the TUI is displaying a Plan
-// mode interview, but thread/read still reports the built-in
-// request_user_input dynamic tool call as inProgress. Deriving the same
-// attention edge from both representations makes notification loss harmless:
-// the next active poll rebuilds this map from the authoritative turn snapshot.
-func (s *graphState) applyItem(threadID, turnID string, item rpcItem) {
-	s.applyCollaboration(turnID, item)
-	if item.ID == "" {
-		return
+	isWaiting := state.wait.rawApproval || state.wait.rawUserInput
+	if !isWaiting {
+		state.clearTransientWait()
+	} else if !wasWaiting {
+		state.wait.classifiedUnknown = false
 	}
-	requestID := ""
-	if previous, ok := s.pendingUserInput[item.ID]; ok {
-		requestID = previous.requestID
-		delete(s.pendingUserInput, item.ID)
-		s.refreshAttention(previous.threadID)
-	}
-	if item.Type != "dynamicToolCall" || item.Status != "inProgress" || !isUserInputTool(item.Tool) {
-		return
-	}
-	s.beginUserInputRequest(threadID, turnID, item.ID, requestID)
-}
-
-func (s *graphState) beginUserInputRequest(threadID, turnID, itemID, requestID string) {
-	if s.nodes[threadID] == nil || itemID == "" {
-		return
-	}
-	s.pendingUserInput[itemID] = pendingUserInput{threadID: threadID, turnID: turnID, requestID: requestID}
-	s.refreshAttention(threadID)
-}
-
-func (s *graphState) resolveUserInputRequest(threadID, requestID string) {
-	if requestID == "" {
-		return
-	}
-	changed := false
-	for itemID, pending := range s.pendingUserInput {
-		if pending.threadID == threadID && pending.requestID == requestID {
-			delete(s.pendingUserInput, itemID)
-			changed = true
-		}
-	}
-	if changed {
-		s.refreshAttention(threadID)
-	}
-}
-
-func (s *graphState) completeTurn(threadID, turnID string) {
-	changed := false
-	for itemID, pending := range s.pendingUserInput {
-		if pending.threadID == threadID && (turnID == "" || pending.turnID == turnID) {
-			delete(s.pendingUserInput, itemID)
-			changed = true
-		}
-	}
-	if changed {
-		s.refreshAttention(threadID)
-	}
-}
-
-func (s *graphState) refreshAttention(threadID string) {
-	state := s.nodes[threadID]
-	if state == nil {
-		return
-	}
-	state.node.Attention = state.statusAttention
-	if state.node.Attention == agentgraph.AttentionApproval {
-		return
-	}
-	for _, pending := range s.pendingUserInput {
-		if pending.threadID == threadID {
-			state.node.Attention = agentgraph.AttentionUserInput
-			return
-		}
-	}
-}
-
-func isUserInputTool(tool string) bool {
-	tool = strings.TrimSpace(tool)
-	if namespace, name, ok := strings.Cut(tool, "."); ok && namespace == "functions" {
-		tool = name
-	}
-	return tool == "request_user_input" || tool == "requestUserInput"
+	s.deriveAll()
 }
 
 func (s *graphState) applyCollaboration(turnID string, item rpcItem) {
@@ -310,11 +273,13 @@ func (s *graphState) applyCollaboration(turnID string, item rpcItem) {
 		}
 		if state.node.Lifecycle.Terminal() {
 			state.node.CompletedAt = state.node.UpdatedAt
+			state.clearAllWait()
 		}
 		if turnID != "" && parentID == s.rootID {
 			state.cohort = turnID
 		}
 	}
+	s.deriveAll()
 }
 
 func (s *graphState) beginRootTurn(turnID string) {
@@ -358,12 +323,380 @@ func (s *graphState) deleteThread(id string) {
 }
 
 func (s *graphState) deleteNode(id string) {
+	if state := s.nodes[id]; state != nil {
+		state.clearAllWait()
+	}
 	delete(s.nodes, id)
-	for itemID, pending := range s.pendingUserInput {
-		if pending.threadID == id {
-			delete(s.pendingUserInput, itemID)
+	s.deriveAll()
+}
+
+func (s *graphState) deriveAll() {
+	for id := range s.nodes {
+		s.deriveNode(id)
+	}
+}
+
+func (s *graphState) deriveNode(id string) {
+	state := s.nodes[id]
+	if state == nil {
+		return
+	}
+	state.node.Runtime = state.baseRuntime
+	state.node.Attention = agentgraph.AttentionNone
+	for _, request := range state.wait.requests {
+		if request.owner != requestHuman {
+			continue
+		}
+		if request.reason == agentgraph.AttentionApproval {
+			state.node.Attention = agentgraph.AttentionApproval
+			return
+		}
+		state.node.Attention = agentgraph.AttentionUserInput
+	}
+	if state.node.Attention != agentgraph.AttentionNone || (!state.wait.rawApproval && !state.wait.rawUserInput) {
+		return
+	}
+	if s.mechanicalWaitCovered(id) {
+		return
+	}
+	// A mechanical app-server gate with no confirmed owner is deliberately
+	// unknown. Runtime "active" is not enough to turn uncertainty green, and the
+	// raw waiting flag is not enough to turn it red.
+	state.node.Runtime = agentgraph.RuntimeUnknown
+}
+
+func (s *graphState) effectiveReviewer(id string) reviewerRoute {
+	for current := s.nodes[id]; current != nil; current = s.nodes[current.node.ParentID] {
+		if current.wait.reviewer != reviewerUnknown {
+			return current.wait.reviewer
+		}
+		if current.node.ParentID == "" {
+			break
 		}
 	}
+	return reviewerUnknown
+}
+
+func (s *graphState) hasAutoEvidence(id string) bool {
+	state := s.nodes[id]
+	if state == nil {
+		return false
+	}
+	if s.effectiveReviewer(id) == reviewerAuto || state.wait.autoReviewSeen || len(state.wait.activeAutoReview) > 0 || state.guardian {
+		return true
+	}
+	for _, candidate := range s.nodes {
+		if candidate.node.ParentID == id && candidate.guardian && candidate.baseRuntime == agentgraph.RuntimeActive && !candidate.node.Lifecycle.Terminal() {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *graphState) mechanicalWaitCovered(id string) bool {
+	state := s.nodes[id]
+	if state == nil {
+		return false
+	}
+	if s.hasAutoEvidence(id) {
+		return true
+	}
+	approvalCovered := !state.wait.rawApproval
+	inputCovered := !state.wait.rawUserInput
+	for _, request := range state.wait.requests {
+		switch request.reason {
+		case agentgraph.AttentionApproval:
+			approvalCovered = approvalCovered || request.owner == requestAutomatic
+		case agentgraph.AttentionUserInput:
+			inputCovered = inputCovered || request.owner == requestAutomatic || request.owner == requestIgnored
+		}
+	}
+	return approvalCovered && inputCovered
+}
+
+func (s *graphState) setReviewer(id, value string) bool {
+	state := s.nodes[id]
+	if state == nil {
+		return false
+	}
+	switch value {
+	case "user":
+		state.wait.reviewer = reviewerUser
+		state.wait.autoReviewSeen = false
+		state.wait.activeAutoReview = nil
+	case "auto_review", "guardian_subagent":
+		state.wait.reviewer = reviewerAuto
+	default:
+		state.wait.reviewer = reviewerUnknown
+		s.unknownEnum = true
+	}
+	for candidateID := range s.nodes {
+		switch s.effectiveReviewer(candidateID) {
+		case reviewerUser:
+			s.classifyPendingRequests(candidateID, requestHuman)
+		case reviewerAuto:
+			s.classifyPendingRequests(candidateID, requestAutomatic)
+		}
+	}
+	s.deriveAll()
+	return true
+}
+
+func (s *graphState) addAutoReview(id, reviewID, targetItemID string, completed bool) bool {
+	state := s.nodes[id]
+	if state == nil {
+		return false
+	}
+	state.wait.autoReviewSeen = true
+	if state.wait.activeAutoReview == nil {
+		state.wait.activeAutoReview = make(map[string]struct{})
+	}
+	if reviewID != "" {
+		if completed {
+			delete(state.wait.activeAutoReview, reviewID)
+		} else {
+			state.wait.activeAutoReview[reviewID] = struct{}{}
+		}
+	}
+	matched := false
+	for requestID, request := range state.wait.requests {
+		if request.owner != requestPending || request.reason != agentgraph.AttentionApproval {
+			continue
+		}
+		if targetItemID != "" && request.itemID != targetItemID {
+			continue
+		}
+		request.owner = requestAutomatic
+		state.wait.requests[requestID] = request
+		matched = true
+	}
+	if !matched && targetItemID != "" {
+		// The request and unstable review events can arrive in either order. The
+		// durable auto-review evidence still classifies the mechanical gate.
+		state.wait.autoReviewSeen = true
+	}
+	s.deriveAll()
+	return true
+}
+
+func (s *graphState) addRequest(id string, requestID rpcRequestID, reason agentgraph.AttentionState, turnID, itemID string, human bool, ignored bool) bool {
+	state := s.nodes[id]
+	if state == nil || requestID == "" {
+		return false
+	}
+	state.ensureWaitMaps()
+	owner := requestPending
+	switch {
+	case ignored:
+		owner = requestIgnored
+	case human:
+		owner = requestHuman
+	case s.hasAutoEvidence(id):
+		owner = requestAutomatic
+	case s.effectiveReviewer(id) == reviewerUser:
+		owner = requestHuman
+	}
+	state.wait.requests[requestID] = requestEvidence{reason: reason, owner: owner, turnID: turnID, itemID: itemID}
+	if owner == requestPending {
+		state.wait.classifiedUnknown = false
+	}
+	s.deriveAll()
+	return true
+}
+
+func (s *graphState) resolveRequest(id string, requestID rpcRequestID) bool {
+	state := s.nodes[id]
+	if state == nil || requestID == "" {
+		return false
+	}
+	if _, ok := state.wait.requests[requestID]; !ok {
+		return false
+	}
+	delete(state.wait.requests, requestID)
+	if state.wait.rawApproval || state.wait.rawUserInput {
+		state.wait.classifiedUnknown = true
+	}
+	s.deriveAll()
+	return true
+}
+
+func (s *graphState) classifyPendingRequests(id string, owner requestOwner) int {
+	state := s.nodes[id]
+	if state == nil {
+		return 0
+	}
+	count := 0
+	for requestID, request := range state.wait.requests {
+		if request.owner != requestPending {
+			continue
+		}
+		request.owner = owner
+		state.wait.requests[requestID] = request
+		count++
+	}
+	return count
+}
+
+func (s *graphState) expireClassification(id string) bool {
+	state := s.nodes[id]
+	if state == nil {
+		return false
+	}
+	becameHuman := s.classifyPendingRequests(id, requestHuman) > 0
+	state.wait.classificationPending = false
+	state.wait.classificationTimer = nil
+	state.wait.classifiedUnknown = !becameHuman
+	s.deriveAll()
+	return becameHuman
+}
+
+func (s *graphState) needsClassification(id string) bool {
+	state := s.nodes[id]
+	if state == nil || s.hasAutoEvidence(id) {
+		return false
+	}
+	hasPending := false
+	hasHuman := false
+	for _, request := range state.wait.requests {
+		if request.owner == requestPending {
+			hasPending = true
+		}
+		if request.owner == requestHuman {
+			hasHuman = true
+		}
+	}
+	if hasPending {
+		return true
+	}
+	if hasHuman {
+		return false
+	}
+	return (state.wait.rawApproval || state.wait.rawUserInput) && !s.mechanicalWaitCovered(id) && !state.wait.classifiedUnknown
+}
+
+func (s *graphState) hasPendingClassification() bool {
+	for _, state := range s.nodes {
+		if state.wait.classificationPending {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *graphState) hasHumanAttention() bool {
+	for _, state := range s.nodes {
+		if state.node.Attention == agentgraph.AttentionApproval || state.node.Attention == agentgraph.AttentionUserInput {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *graphState) clearThreadWait(id string) bool {
+	state := s.nodes[id]
+	if state == nil {
+		return false
+	}
+	state.clearAllWait()
+	s.deriveAll()
+	return true
+}
+
+func (state *nodeState) ensureWaitMaps() {
+	if state.wait.requests == nil {
+		state.wait.requests = make(map[rpcRequestID]requestEvidence)
+	}
+}
+
+func (state *nodeState) clearTransientWait() {
+	state.stopClassification()
+	state.wait.rawApproval = false
+	state.wait.rawUserInput = false
+	state.wait.autoReviewSeen = false
+	state.wait.activeAutoReview = nil
+	state.wait.requests = nil
+	state.wait.classifiedUnknown = false
+}
+
+func (state *nodeState) clearAllWait() {
+	state.clearTransientWait()
+	state.node.Attention = agentgraph.AttentionNone
+}
+
+func (state *nodeState) stopClassification() {
+	state.wait.classificationToken++
+	if state.wait.classificationTimer != nil {
+		state.wait.classificationTimer.Stop()
+	}
+	state.wait.classificationTimer = nil
+	state.wait.classificationPending = false
+	state.wait.classificationStarted = time.Time{}
+}
+
+func (s *graphState) stopClassifications() {
+	for _, state := range s.nodes {
+		state.stopClassification()
+	}
+}
+
+func (s *graphState) resetWaitOwnership() {
+	for _, state := range s.nodes {
+		state.stopClassification()
+		state.wait = waitOwnershipState{}
+	}
+	s.deriveAll()
+}
+
+func parseRequestID(raw json.RawMessage) (rpcRequestID, bool) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", false
+	}
+	var text string
+	if raw[0] == '"' {
+		if err := json.Unmarshal(raw, &text); err != nil || text == "" {
+			return "", false
+		}
+		return rpcRequestID("s:" + text), true
+	}
+	var number int64
+	if err := json.Unmarshal(raw, &number); err != nil {
+		return "", false
+	}
+	return rpcRequestID("n:" + strconv.FormatInt(number, 10)), true
+}
+
+func isGuardianSource(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var source struct {
+		SubAgent struct {
+			Other string `json:"other"`
+		} `json:"subAgent"`
+	}
+	return json.Unmarshal(raw, &source) == nil && source.SubAgent.Other == "guardian"
+}
+
+func cloneSet(input map[string]struct{}) map[string]struct{} {
+	if input == nil {
+		return nil
+	}
+	out := make(map[string]struct{}, len(input))
+	for key := range input {
+		out[key] = struct{}{}
+	}
+	return out
+}
+
+func cloneRequests(input map[rpcRequestID]requestEvidence) map[rpcRequestID]requestEvidence {
+	if input == nil {
+		return nil
+	}
+	out := make(map[rpcRequestID]requestEvidence, len(input))
+	for key, value := range input {
+		out[key] = value
+	}
+	return out
 }
 
 func (s *graphState) boundTerminals(limit int) {

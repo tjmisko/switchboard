@@ -71,8 +71,14 @@ func TestObserverReconnectFreshnessGenerationAndCoalescing(t *testing.T) {
 		t.Fatalf("caller mutated cached observation: %#v", node)
 	}
 
+	proxy.Notify(rpcEnvelope{Method: "thread/settings/updated", Params: mustJSON(t, map[string]any{
+		"threadId": "child", "threadSettings": map[string]any{"approvalsReviewer": "user"},
+	})})
 	proxy.Notify(rpcEnvelope{Method: "thread/status/changed", Params: mustJSON(t, map[string]any{
 		"threadId": "child", "status": map[string]any{"type": "active", "activeFlags": []string{"waitingOnApproval"}},
+	})})
+	proxy.Notify(rpcEnvelope{ID: mustJSON(t, "approval-1"), Method: "item/commandExecution/requestApproval", Params: mustJSON(t, map[string]any{
+		"threadId": "child", "turnId": "turn", "itemId": "item",
 	})})
 	waiting := waitUpdateObservation(t, observer, ref, time.Second, func(observation agentgraph.Observation) bool {
 		node := findNode(observation, "child")
@@ -83,7 +89,7 @@ func TestObserverReconnectFreshnessGenerationAndCoalescing(t *testing.T) {
 	// Unrelated roots never invalidate this root.
 	drainUpdates(observer.Updates())
 	observer.mu.Lock()
-	unrelatedKeys, _ := observer.applyNotificationLocked(rpcNotification{Generation: observer.generation, Method: "thread/status/changed", Params: mustJSON(t, map[string]any{
+	unrelatedKeys, _, _ := observer.applyNotificationLocked(rpcNotification{Generation: observer.generation, Method: "thread/status/changed", Params: mustJSON(t, map[string]any{
 		"threadId": "unrelated", "status": map[string]any{"type": "active"},
 	})})
 	observer.mu.Unlock()
@@ -176,23 +182,34 @@ func TestNotificationSignalExposesMutation(t *testing.T) {
 	})
 	done := make(chan struct{})
 	go func() {
+		observer.handleNotification(rpcNotification{Generation: 1, Method: "thread/settings/updated", Params: mustJSON(t, map[string]any{
+			"threadId": fixtureRoot, "threadSettings": map[string]any{"approvalsReviewer": "user"},
+		})})
 		observer.handleNotification(rpcNotification{
 			Generation: 1,
 			Method:     "thread/status/changed",
 			Params:     params,
 		})
+		observer.handleNotification(rpcNotification{
+			Generation: 1,
+			ID:         mustJSON(t, "approval-root"),
+			Method:     "item/commandExecution/requestApproval",
+			Params: mustJSON(t, map[string]any{
+				"threadId": fixtureRoot, "turnId": "turn", "itemId": "item",
+			}),
+		})
 		close(done)
 	}()
 	waitUpdate(t, observer.Updates(), time.Second)
-	observer.mu.Lock()
-	observation := observer.roots[key].observation.Clone()
-	observer.mu.Unlock()
-	assertNodeAttention(t, observation, fixtureRoot, agentgraph.AttentionApproval)
 	select {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("notification handler did not return after signaling")
 	}
+	observer.mu.Lock()
+	observation := observer.roots[key].observation.Clone()
+	observer.mu.Unlock()
+	assertNodeAttention(t, observation, fixtureRoot, agentgraph.AttentionApproval)
 }
 
 func TestObserverHookBindingAndRootIDVerification(t *testing.T) {

@@ -395,11 +395,15 @@ func cmdHook(c *rpc.Client, event, agent string) {
 	agentID := ""
 	agentType := ""
 	prompt := ""
+	hookSource := ""
+	turnID := ""
+	toolUseID := ""
+	permissionMode := ""
 	if body, err := io.ReadAll(os.Stdin); err == nil && len(body) > 0 {
 		var payload struct {
 			SessionID      string `json:"session_id"`
 			TranscriptPath string `json:"transcript_path"`
-			// tool_name is present on PermissionRequest/PostToolUse payloads. It
+			// tool_name is present on PreToolUse/PermissionRequest/PostToolUse payloads. It
 			// lets the daemon clear a red chip at hook speed when the approved tool
 			// itself completes (see rpc.clearsPermission); absent on other events,
 			// which just disables that fast path.
@@ -414,11 +418,15 @@ func cmdHook(c *rpc.Client, event, agent string) {
 			// snake_case (verified against the 2.1.195 binary); the camelCase
 			// fallbacks tolerate a build that reuses the dir-style key. Best-effort —
 			// the daemon only uses them to TRIGGER a dir re-scan, keyed off agent_id.
-			AgentID      string `json:"agent_id"`
-			AgentType    string `json:"agent_type"`
-			AgentIDAlt   string `json:"agentId"`
-			AgentTypeAlt string `json:"agentType"`
-			Prompt       string `json:"prompt"`
+			AgentID        string `json:"agent_id"`
+			AgentType      string `json:"agent_type"`
+			AgentIDAlt     string `json:"agentId"`
+			AgentTypeAlt   string `json:"agentType"`
+			Prompt         string `json:"prompt"`
+			Source         string `json:"source"`
+			TurnID         string `json:"turn_id"`
+			ToolUseID      string `json:"tool_use_id"`
+			PermissionMode string `json:"permission_mode"`
 		}
 		if json.Unmarshal(body, &payload) == nil {
 			sessionID = payload.SessionID
@@ -430,22 +438,30 @@ func cmdHook(c *rpc.Client, event, agent string) {
 			if agent == state.AgentKindCodex && event == "UserPromptSubmit" {
 				prompt = truncatePrompt(payload.Prompt, 1000)
 			}
+			hookSource = payload.Source
+			turnID = payload.TurnID
+			toolUseID = payload.ToolUseID
+			permissionMode = payload.PermissionMode
 		}
 	}
 	_ = c.Send(rpc.Request{
-		Cmd:           "hook",
-		Event:         event,
-		PID:           pid,
-		SessionID:     sessionID,
-		Transcript:    transcript,
-		ToolName:      toolName,
-		ToolInputHash: toolInputHash,
-		AgentID:       agentID,
-		AgentType:     agentType,
-		Agent:         agent,
-		SlotID:        strings.TrimSpace(os.Getenv("SWITCHBOARD_SLOT_ID")),
-		Prompt:        prompt,
-		ObservedAt:    time.Now().UTC(),
+		Cmd:            "hook",
+		Event:          event,
+		PID:            pid,
+		SessionID:      sessionID,
+		Transcript:     transcript,
+		ObservedAt:     time.Now().UTC(),
+		HookSource:     hookSource,
+		TurnID:         turnID,
+		ToolUseID:      toolUseID,
+		PermissionMode: permissionMode,
+		ToolName:       toolName,
+		ToolInputHash:  toolInputHash,
+		AgentID:        agentID,
+		AgentType:      agentType,
+		Agent:          agent,
+		SlotID:         strings.TrimSpace(os.Getenv("SWITCHBOARD_SLOT_ID")),
+		Prompt:         prompt,
 	})
 	var resp rpc.Response
 	_ = c.Recv(&resp)

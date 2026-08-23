@@ -47,8 +47,11 @@ type bindingRecord struct {
 }
 
 // BindingRegistry combines process-environment and hook identities. The
-// environment supplies a startup fallback; an exact hook wins after arrival
-// because /clear changes the thread without replacing the process.
+// process environment seeds identity before hooks arrive; a registered hook
+// wins afterwards because it can observe /clear under the stable process while
+// the process-start environment cannot change. CODEX_SESSION_ID is not used:
+// 0.149 evidence shows that it can identify a parent rather than the current
+// thread.
 type BindingRegistry struct {
 	env EnvironmentReader
 
@@ -68,7 +71,9 @@ func newBindingRegistry(env EnvironmentReader) *BindingRegistry {
 }
 
 // RegisterHook records an exact hook-supplied thread ID for one process
-// lifetime. A different non-retired ID is a /clear rotation, never a conflict.
+// lifetime. It is safe to repeat with the same ID. A different trusted hook ID
+// advances the binding for /clear under the same TUI process and retires the
+// previous ID; a retired ID can never rotate the process backwards.
 func (r *BindingRegistry) RegisterHook(key provider.RootKey, threadID string) (BindingUpdate, error) {
 	threadID = strings.TrimSpace(threadID)
 	if key.PID <= 0 || key.StartedAt.IsZero() || threadID == "" {
@@ -106,6 +111,9 @@ func (r *BindingRegistry) Forget(key provider.RootKey) {
 
 func (r *BindingRegistry) resolve(ctx context.Context, ref provider.RootRef) (Binding, string) {
 	key := ref.Key()
+	// A lifecycle hook can rotate the conversation under a stable TUI PID. Once
+	// present it is newer than the process-start environment, whose value cannot
+	// change after /clear.
 	r.mu.RLock()
 	if hook := r.hooks[key]; hook != nil && hook.threadID != "" {
 		binding := Binding{ThreadID: hook.threadID, Source: BindingHook, Generation: hook.generation}
@@ -118,6 +126,12 @@ func (r *BindingRegistry) resolve(ctx context.Context, ref provider.RootRef) (Bi
 		if err == nil {
 			if id := environmentValue(body, "CODEX_THREAD_ID"); id != "" {
 				r.mu.Lock()
+				// A hook may have arrived while the environment read was in
+				// flight. Preserve its newer, rotatable identity.
+				if hook := r.hooks[key]; hook != nil && hook.threadID != "" {
+					r.mu.Unlock()
+					return Binding{ThreadID: hook.threadID, Source: BindingHook, Generation: hook.generation}, ""
+				}
 				r.environment[key] = id
 				r.mu.Unlock()
 				return Binding{ThreadID: id, Source: BindingProcessEnvironment, Generation: 1}, ""
