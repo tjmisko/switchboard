@@ -15,7 +15,7 @@ require_command() {
 	fi
 }
 
-for command in git go systemctl journalctl jq rg tee; do
+for command in date git go systemctl journalctl jq rg tee; do
 	require_command "$command"
 done
 
@@ -33,6 +33,7 @@ mkdir -p "$go_bin" "$go_cache"
 )
 
 echo "Restarting Switchboard only (the Codex daemon is untouched)"
+journal_since=$(date '+%Y-%m-%d %H:%M:%S')
 systemctl --user restart switchboard.service
 systemctl --user --no-pager --full status switchboard.service
 
@@ -78,7 +79,7 @@ finish() {
 trap finish INT TERM
 
 set +e
-journalctl --user -u switchboard.service -f -o cat \
+journalctl --user -u switchboard.service --since "$journal_since" -f -o cat \
 	| rg --line-buffered 'codex-hook-attribution-probe|hook_client_identity|hook_client_hint|snapshot_.*(error|invalid|mismatch)'
 set -e
 
