@@ -5,6 +5,7 @@ probe_commit=c3dfe25c462bd7ddcff430262021a8f8ea5a86a7
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_dir=$(cd -- "$script_dir/.." && pwd)
 go_bin=/home/tjmisko/go/bin
+daemon_bin=/home/tjmisko/.config/switchboard/bin/switchboard
 go_cache=/tmp/switchboard-no-wrapper-go-cache
 ctl=$go_bin/switchboard-ctl
 
@@ -15,7 +16,7 @@ require_command() {
 	fi
 }
 
-for command in date git go systemctl journalctl jq rg tee; do
+for command in date dirname git go systemctl journalctl jq rg tee; do
 	require_command "$command"
 done
 
@@ -25,12 +26,14 @@ if ! git -C "$repo_dir" merge-base --is-ancestor "$probe_commit" HEAD; then
 fi
 
 echo "Installing the no-wrapper probe from $(git -C "$repo_dir" rev-parse --short HEAD)"
-mkdir -p "$go_bin" "$go_cache"
+mkdir -p "$go_bin" "$(dirname -- "$daemon_bin")" "$go_cache"
 (
 	cd "$repo_dir"
-	env GOCACHE="$go_cache" GOBIN="$go_bin" \
-		go install ./cmd/switchboard ./cmd/switchboard-ctl
+	env GOCACHE="$go_cache" go build -o "$daemon_bin" ./cmd/switchboard
+	env GOCACHE="$go_cache" GOBIN="$go_bin" go install ./cmd/switchboard-ctl
 )
+echo "Installed daemon: $daemon_bin"
+echo "Installed hook CLI: $ctl"
 
 echo "Restarting Switchboard only (the Codex daemon is untouched)"
 journal_since=$(date '+%Y-%m-%d %H:%M:%S')
