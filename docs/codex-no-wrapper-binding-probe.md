@@ -127,3 +127,24 @@ remaining blocker was the observation transport: both graphs stayed
 therefore emits bounded snapshot-stage categories for `thread/read`,
 `thread/list`, root mismatch, and graph validation. Raw protocol errors, thread
 IDs, and payloads remain excluded from diagnostics.
+
+## Standalone stdio transport experiment — 2026-08-23
+
+The corrected live probe showed that `codex app-server proxy` repeatedly opened
+its subprocess pipes but failed the first `initialize` request. The installed
+CLI describes that command as a byte proxy to an already-running app-server
+control socket; no usable socket was present.
+
+The spike now launches `codex app-server --stdio` instead. This is an official
+standalone transport exposed by the unmodified Codex binary. It does not require
+a wrapper, alias, replacement launcher, private per-TUI endpoint, or any change
+to the shared Codex daemon. The experiment must establish both halves of the
+feature before promotion:
+
+1. the standalone server can read the hook-bound root thread and its descendants;
+2. its snapshots or notifications remain sufficiently live to retain every
+   child lifecycle transition required by history fanout.
+
+Successful initialization alone is transport progress, not proof of either
+invariant. `observer_initialized` must be followed by snapshot target/read/list
+success and complete app-server-sourced graphs.

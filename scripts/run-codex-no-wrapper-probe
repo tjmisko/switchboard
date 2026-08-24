@@ -34,6 +34,7 @@ mkdir -p "$go_bin" "$(dirname -- "$daemon_bin")" "$go_cache"
 )
 echo "Installed daemon: $daemon_bin"
 echo "Installed hook CLI: $ctl"
+echo "Codex observer transport: standalone app-server over stdio"
 
 echo "Restarting Switchboard only (the Codex daemon is untouched)"
 journal_since=$(date '+%Y-%m-%d %H:%M:%S')

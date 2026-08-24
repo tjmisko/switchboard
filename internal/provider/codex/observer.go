@@ -1,5 +1,5 @@
-// Package codex observes Codex app-server state through the read-only
-// `codex app-server proxy` surface and projects it onto the neutral agent graph.
+// Package codex observes Codex app-server state through a disposable standalone
+// `codex app-server --stdio` process and projects it onto the neutral agent graph.
 package codex
 
 import (
@@ -405,7 +405,7 @@ func checkAppServerVersion(userAgent string) error {
 	if userAgent == "" {
 		return errors.New("codex app-server did not report a version")
 	}
-	return checkProxyVersion(strings.ReplaceAll(userAgent, "/", " "))
+	return checkAppServerCLIVersion(strings.ReplaceAll(userAgent, "/", " "))
 }
 
 func (o *Observer) resnapshotAll(client *rpcClient, generation uint64) {
