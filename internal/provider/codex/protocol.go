@@ -23,6 +23,12 @@ type threadListResult struct {
 	NextCursor *string     `json:"nextCursor"`
 }
 
+type threadTurnsListResult struct {
+	Data            []rpcTurn `json:"data"`
+	NextCursor      *string   `json:"nextCursor"`
+	BackwardsCursor *string   `json:"backwardsCursor"`
+}
+
 type rpcThread struct {
 	ID             string          `json:"id"`
 	ParentThreadID string          `json:"parentThreadId"`

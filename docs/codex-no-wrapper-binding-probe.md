@@ -191,3 +191,28 @@ will reach durable `agent_state` history.
 | Bounded exact-hook root status survives later not-loaded snapshots | Pass |
 | Live child runtime/lifecycle transitions and durable fanout | Unproved; blocks #83 |
 | `/clear` then implement-plan red/rotation/green sequence | Unproved; blocks #86 |
+
+## Child-lifecycle probe — iteration 1
+
+The next #83 experiment separates three possible no-wrapper lifecycle channels:
+
+1. lifecycle-relevant notifications received by the standalone app-server;
+2. persisted `collabAgentToolCall.agentsStates` returned by either
+   `thread/read(includeTurns=true)` or the explicit full-item
+   `thread/turns/list`; and
+3. standard `SubagentStart`/`SubagentStop` hooks whose `agent_id` exactly matches
+   a child already present in app-server topology.
+
+[`scripts/run-codex-child-lifecycle-probe`](../scripts/run-codex-child-lifecycle-probe)
+installs a diagnostic build, adds the two standard hook handlers, and watches a
+single deliberately long-lived child from start through completion. It emits
+only finite evidence categories, opaque root/child IDs, neutral state axes, and
+canonical child-history fields. Prompts, messages, tool input, commands, cwd,
+nicknames, roles, and raw provider payloads are excluded.
+
+The hook events are diagnostic-only in this iteration. A start/stop hook cannot
+mutate lifecycle until live evidence proves that its child ID joins the
+structural graph exactly. Likewise, `thread/turns/list` is supplemental evidence
+and does not yet replace the existing `thread/read` reducer. This keeps all
+three candidate routes fail-closed while identifying which one can safely
+supply the missing lifecycle axis.

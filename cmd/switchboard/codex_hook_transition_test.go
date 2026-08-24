@@ -303,3 +303,30 @@ func TestCodexCompactSessionStartRemainsWorking(t *testing.T) {
 		t.Fatalf("compact SessionStart created an idle edge: %#v", graph.Summary)
 	}
 }
+
+func TestCodexSubagentHookDiagnosticsRequireExactTopologyID(t *testing.T) {
+	graph := &state.AgentGraph{RootID: "root", Nodes: []state.AgentNode{
+		{ID: "root"},
+		{ID: "child", ParentID: "root"},
+	}}
+	tests := []struct {
+		name  string
+		req   rpc.Request
+		graph *state.AgentGraph
+		want  string
+	}{
+		{name: "unrelated event", req: rpc.Request{Event: "PreToolUse", AgentID: "child"}, graph: graph, want: ""},
+		{name: "start missing id", req: rpc.Request{Event: "SubagentStart"}, graph: graph, want: "subagent_hook_start_id_absent"},
+		{name: "start before topology", req: rpc.Request{Event: "SubagentStart", AgentID: "child"}, want: "subagent_hook_start_graph_absent"},
+		{name: "start exact match", req: rpc.Request{Event: "SubagentStart", AgentID: "child"}, graph: graph, want: "subagent_hook_start_graph_match"},
+		{name: "stop exact mismatch", req: rpc.Request{Event: "SubagentStop", AgentID: "other"}, graph: graph, want: "subagent_hook_stop_graph_unmatched"},
+		{name: "root is not child", req: rpc.Request{Event: "SubagentStop", AgentID: "root"}, graph: graph, want: "subagent_hook_stop_graph_unmatched"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := codexSubagentHookDiagnostic(test.req, test.graph); got != test.want {
+				t.Fatalf("diagnostic = %q, want %q", got, test.want)
+			}
+		})
+	}
+}

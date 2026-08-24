@@ -234,18 +234,20 @@ func TestMissingParentIsRejectedAndUnknownDiagnosticIsRateLimited(t *testing.T) 
 	}
 
 	observer, _ := fixtureObserver(t)
-	diagnostics := 0
+	unknownDiagnostics := 0
 	observer.config.Diagnostic = func(message string) {
 		if message == "" {
 			t.Fatal("empty diagnostic")
 		}
-		diagnostics++
+		if message == DiagnosticUnknownProtocolEnum {
+			unknownDiagnostics++
+		}
 	}
 	params := mustJSON(t, map[string]any{"threadId": fixtureRoot, "status": map[string]any{"type": "futureRuntime"}})
 	observer.handleNotification(rpcNotification{Generation: 1, Method: "thread/status/changed", Params: params})
 	observer.handleNotification(rpcNotification{Generation: 1, Method: "thread/status/changed", Params: params})
-	if diagnostics != 1 {
-		t.Fatalf("unknown enum diagnostics = %d, want one per rate-limit window", diagnostics)
+	if unknownDiagnostics != 1 {
+		t.Fatalf("unknown enum diagnostics = %d, want one per rate-limit window", unknownDiagnostics)
 	}
 }
 

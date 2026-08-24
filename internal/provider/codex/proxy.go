@@ -14,8 +14,8 @@ import (
 
 const minimumAppServerVersion = "0.149.0"
 
-// CommandConnector supervises a disposable standalone app-server over its
-// official stdio transport. It never opens a private control socket and never
+// CommandConnector supervises a disposable standalone app-server over the
+// installed CLI's stdio transport. It never opens a private control socket and never
 // starts, stops, or reconfigures the shared app-server daemon. The installed
 // capability was established for Codex 0.149.0, so a version preflight rejects
 // older or unparseable CLIs.

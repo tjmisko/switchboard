@@ -15,9 +15,10 @@ var (
 )
 
 var allowedRequests = map[string]struct{}{
-	"initialize":  {},
-	"thread/read": {},
-	"thread/list": {},
+	"initialize":        {},
+	"thread/read":       {},
+	"thread/list":       {},
+	"thread/turns/list": {},
 }
 
 var allowedNotifications = map[string]struct{}{

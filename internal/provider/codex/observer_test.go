@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -53,6 +54,60 @@ func TestSnapshotDiagnosticsAreFiniteStageLabelsAndRateLimitedPerStage(t *testin
 	}
 }
 
+func TestChildLifecycleProbeCategoriesAreFiniteAndContentFree(t *testing.T) {
+	turns := []rpcTurn{{ID: "must-not-cross", Items: []rpcItem{{
+		ID: "secret-item", Type: "collabAgentToolCall", Tool: "spawnAgent", Status: "inProgress",
+		SenderThreadID: "secret-root", ReceiverThreadIDs: []string{"secret-child"},
+		AgentsStates: map[string]rpcAgentState{
+			"secret-child": {Status: "running"},
+			"other-child":  {Status: "future-provider-value"},
+		},
+	}}}}
+	categories := snapshotTurnEvidenceCategories("thread_read", turns)
+	want := map[string]bool{
+		"snapshot_thread_read_turns_present":            false,
+		"snapshot_thread_read_collab_items_present":     false,
+		"snapshot_thread_read_collab_receivers_present": false,
+		"snapshot_thread_read_collab_states_present":    false,
+		"snapshot_thread_read_collab_tool_spawn_agent":  false,
+		"snapshot_thread_read_collab_call_in_progress":  false,
+		"snapshot_thread_read_collab_state_running":     false,
+		"snapshot_thread_read_collab_state_unknown":     false,
+	}
+	for _, category := range categories {
+		if len(category) > 64 {
+			t.Fatalf("diagnostic category too long: %q", category)
+		}
+		for _, r := range category {
+			if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' {
+				t.Fatalf("diagnostic category is not finite-label safe: %q", category)
+			}
+		}
+		if strings.Contains(category, "secret") || strings.Contains(category, "future_provider") {
+			t.Fatalf("provider identity/value crossed diagnostic boundary: %q", category)
+		}
+		if _, expected := want[category]; expected {
+			want[category] = true
+		}
+	}
+	for category, seen := range want {
+		if !seen {
+			t.Errorf("missing diagnostic %q in %v", category, categories)
+		}
+	}
+
+	if got := snapshotTurnEvidenceCategories("turns_list", nil); !reflect.DeepEqual(got, []string{"snapshot_turns_list_turns_absent"}) {
+		t.Fatalf("absent turns diagnostics = %v", got)
+	}
+	collab := mustJSON(t, map[string]any{"item": map[string]any{"type": "collabAgentToolCall"}})
+	if got := notificationEvidenceCategory(rpcNotification{Method: "item/started", Params: collab}); got != "notification_collab_item_started" {
+		t.Fatalf("collab notification category = %q", got)
+	}
+	if got := notificationEvidenceCategory(rpcNotification{Method: "agentMessage/delta", Params: mustJSON(t, map[string]any{"text": "secret"})}); got != "" {
+		t.Fatalf("content-bearing notification received a diagnostic category: %q", got)
+	}
+}
+
 func TestObserverReconnectFreshnessGenerationAndCoalescing(t *testing.T) {
 	proxy := newFakeProxy()
 	started := time.Unix(100, 0)
@@ -79,7 +134,7 @@ func TestObserverReconnectFreshnessGenerationAndCoalescing(t *testing.T) {
 	assertNode(t, complete, "child", "root", "First", "worker", agentgraph.RuntimeActive, agentgraph.AttentionNone, agentgraph.LifecycleRunning)
 
 	methods := proxy.Methods()
-	assertMethodOrder(t, methods, []string{"initialize", "initialized", "thread/read", "thread/list"})
+	assertMethodOrder(t, methods, []string{"initialize", "initialized", "thread/read", "thread/turns/list", "thread/list"})
 	for _, method := range methods {
 		if _, request := allowedRequests[method]; request {
 			continue
@@ -471,6 +526,8 @@ func (p *fakeProxy) serve(connection net.Conn) {
 			result = initializeResult{UserAgent: "codex_app_server/0.149.0"}
 		case "thread/read":
 			result = threadReadResult{Thread: root}
+		case "thread/turns/list":
+			result = threadTurnsListResult{Data: append([]rpcTurn(nil), root.Turns...)}
 		case "thread/list":
 			var request fakeListRequest
 			_ = json.Unmarshal(envelope.Params, &request)

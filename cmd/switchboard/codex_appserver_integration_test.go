@@ -71,8 +71,9 @@ func (c *integrationCodexConnection) close() {
 }
 
 // integrationCodexAppServer is a JSONL peer behind the observer's public
-// Connector seam. It implements only the allowlisted initialize/read/list
-// surface and never invokes an installed Codex binary or a live user service.
+// Connector seam. It implements only the allowlisted initialize/read/list and
+// turns-list surface and never invokes an installed Codex binary or a live user
+// service.
 type integrationCodexAppServer struct {
 	mu sync.Mutex
 
@@ -138,6 +139,15 @@ func (s *integrationCodexAppServer) serve(connection *integrationCodexConnection
 			root := append(json.RawMessage(nil), s.root...)
 			s.mu.Unlock()
 			result = integrationMustJSON(map[string]json.RawMessage{"thread": root})
+		case "thread/turns/list":
+			s.mu.Lock()
+			rootBody := append(json.RawMessage(nil), s.root...)
+			s.mu.Unlock()
+			var root integrationCodexThread
+			_ = json.Unmarshal(rootBody, &root)
+			result = integrationMustJSON(struct {
+				Data []integrationCodexTurn `json:"data"`
+			}{Data: root.Turns})
 		case "thread/list":
 			var params struct {
 				AncestorThreadID string `json:"ancestorThreadId"`

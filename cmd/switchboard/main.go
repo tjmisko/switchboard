@@ -144,8 +144,9 @@ func main() {
 
 	// Provider observation is process-wide and graph-authoritative. Both periodic
 	// and app-server/hook invalidations land through agentRuntime's generation
-	// fence; observer I/O never runs under Store.Apply. The Codex proxy is a
-	// disposable read-only child and is closed exactly once with the daemon.
+	// fence; observer I/O never runs under Store.Apply. The standalone Codex
+	// app-server is a disposable read-only child and is closed exactly once with
+	// the daemon.
 	claudeObs := claudeprovider.NewObserver(sink.Dir(), claudeprovider.WithTuning(tun))
 	codexObs := codexObserverForMode(codexMode, func() codexObserver {
 		observer := codexprovider.NewObserver(codexprovider.Config{Diagnostic: func(category string) {

@@ -146,6 +146,11 @@ func (c *agentCoordinator) handleCodexHookNow(ref provider.RootRef, req rpc.Requ
 	commitCodexHookSession(rootState, rootID, now)
 	pendingAttention, hookOwnsTransition := reduceCodexPendingInput(rootState, req)
 	c.codexHookMu.Unlock()
+	if req.Event == "SubagentStart" || req.Event == "SubagentStop" {
+		if category := codexSubagentHookDiagnostic(req, currentCodexGraph(c.store.Snapshot(), ref.Key())); category != "" {
+			c.recordDiagnostic(ref.Provider, category, now)
+		}
+	}
 
 	ref.ProviderSessionID = rootID
 	observation, mapped := codexHookObservation(rootID, req, ref.StartedAt, now)
@@ -162,6 +167,41 @@ func (c *agentCoordinator) handleCodexHookNow(ref provider.RootRef, req rpc.Requ
 	if c.codex != nil {
 		c.Request(ref.Key())
 	}
+}
+
+func currentCodexGraph(snapshot state.Snapshot, key provider.RootKey) *state.AgentGraph {
+	session, ok := sessionForKey(snapshot, key)
+	if !ok || session.Agent != state.AgentKindCodex {
+		return nil
+	}
+	return session.AgentGraph
+}
+
+// codexSubagentHookDiagnostic records whether a standard Codex lifecycle hook
+// supplies an exact child ID that already exists in app-server topology. It
+// returns only a finite category and never the ID, type, prompt, or payload.
+func codexSubagentHookDiagnostic(req rpc.Request, graph *state.AgentGraph) string {
+	base := ""
+	switch req.Event {
+	case "SubagentStart":
+		base = "subagent_hook_start"
+	case "SubagentStop":
+		base = "subagent_hook_stop"
+	default:
+		return ""
+	}
+	if req.AgentID == "" {
+		return base + "_id_absent"
+	}
+	if graph == nil {
+		return base + "_graph_absent"
+	}
+	for _, node := range graph.Nodes {
+		if node.ID == req.AgentID && node.ParentID != "" {
+			return base + "_graph_match"
+		}
+	}
+	return base + "_graph_unmatched"
 }
 
 func codexHookSessionAllowed(state *codexHookRootState, rootID string, req rpc.Request, now time.Time, introduced bool) bool {

@@ -27,6 +27,7 @@ const (
 
 	DiagnosticUnknownProtocolEnum     = "unknown_protocol_enum"
 	DiagnosticSnapshotThreadRead      = "snapshot_thread_read_error"
+	DiagnosticSnapshotTurnsList       = "snapshot_turns_list_error"
 	DiagnosticSnapshotRootMismatch    = "snapshot_root_mismatch"
 	DiagnosticSnapshotThreadList      = "snapshot_thread_list_error"
 	DiagnosticSnapshotGraphInvalid    = "snapshot_graph_invalid"
@@ -98,9 +99,9 @@ type rootRecord struct {
 	expiry      *time.Timer
 }
 
-// Observer is a supervised provider.Observer. NewObserver starts its proxy
-// supervisor immediately; callers should register exact hook bindings before
-// their first Observe when process-environment binding is unavailable.
+// Observer is a supervised provider.Observer. NewObserver starts its standalone
+// app-server supervisor immediately; callers should register exact hook bindings
+// before their first Observe when process-environment binding is unavailable.
 type Observer struct {
 	config   Config
 	bindings *BindingRegistry
@@ -271,7 +272,7 @@ func (o *Observer) Forget(key provider.RootKey) {
 	o.mu.Unlock()
 }
 
-// Close is idempotent. It cancels the proxy child, releases request waiters,
+// Close is idempotent. It cancels the standalone app-server child, releases request waiters,
 // stops retry/freshness timers, and waits for the supervisor goroutine.
 func (o *Observer) Close() error {
 	o.once.Do(func() {
@@ -467,6 +468,18 @@ func (o *Observer) snapshot(client *rpcClient, rootID string) (*graphState, erro
 	if rootResult.Thread.ID != rootID {
 		return nil, newSnapshotDiagnosticError(DiagnosticSnapshotRootMismatch, errors.New("codex app-server returned a different root thread"))
 	}
+	o.emitSnapshotTurnEvidence("thread_read", rootResult.Thread.Turns)
+	var turnResult threadTurnsListResult
+	if err := client.request(ctx, "thread/turns/list", map[string]any{
+		"threadId": rootID, "limit": 100, "sortDirection": "desc", "itemsView": "full",
+	}, &turnResult); err != nil {
+		// This request is supplemental characterization evidence. The already
+		// successful thread/read plus descendant list remain a valid structural
+		// snapshot when an installed CLI lacks or rejects the method.
+		o.emitDiagnostic(DiagnosticSnapshotTurnsList)
+	} else {
+		o.emitSnapshotTurnEvidence("turns_list", turnResult.Data)
+	}
 	var descendants []rpcThread
 	var cursor string
 	for {
@@ -528,9 +541,119 @@ func (o *Observer) installSnapshot(generation uint64, key provider.RootKey, thre
 		if len(observation.Nodes) > 1 {
 			o.emitDiagnostic(DiagnosticSnapshotChildrenPresent)
 		}
+		o.emitSnapshotChildEvidence(observation)
 	}
 	o.emitClassificationDiagnostics(diagnostics)
 	o.emitUnknownDiagnostic(state)
+}
+
+// emitSnapshotTurnEvidence reports only finite structural/lifecycle classes.
+// It deliberately excludes root/thread/item IDs, prompts, messages, tool input,
+// and every raw provider value. The two source labels are internal constants.
+func (o *Observer) emitSnapshotTurnEvidence(source string, turns []rpcTurn) {
+	for _, category := range snapshotTurnEvidenceCategories(source, turns) {
+		o.emitDiagnostic(category)
+	}
+}
+
+func snapshotTurnEvidenceCategories(source string, turns []rpcTurn) []string {
+	prefix := "snapshot_" + source
+	if len(turns) == 0 {
+		return []string{prefix + "_turns_absent"}
+	}
+	categories := []string{prefix + "_turns_present"}
+	collabItems, collabStates, receivers := false, false, false
+	for _, turn := range turns {
+		for _, item := range turn.Items {
+			if item.Type != "collabAgentToolCall" {
+				continue
+			}
+			collabItems = true
+			if len(item.ReceiverThreadIDs) > 0 {
+				receivers = true
+			}
+			categories = appendUniqueDiagnostic(categories,
+				prefix+"_collab_tool_"+collabToolDiagnosticSuffix(item.Tool),
+				prefix+"_collab_call_"+collabCallDiagnosticSuffix(item.Status),
+			)
+			for _, state := range item.AgentsStates {
+				collabStates = true
+				lifecycle := mapLifecycle(state.Status)
+				categories = appendUniqueDiagnostic(categories, prefix+"_collab_state_"+string(lifecycle))
+			}
+		}
+	}
+	if !collabItems {
+		return append(categories, prefix+"_collab_items_absent")
+	}
+	categories = append(categories, prefix+"_collab_items_present")
+	if receivers {
+		categories = append(categories, prefix+"_collab_receivers_present")
+	} else {
+		categories = append(categories, prefix+"_collab_receivers_absent")
+	}
+	if collabStates {
+		categories = append(categories, prefix+"_collab_states_present")
+	} else {
+		categories = append(categories, prefix+"_collab_states_absent")
+	}
+	return categories
+}
+
+func collabToolDiagnosticSuffix(value string) string {
+	switch value {
+	case "spawnAgent":
+		return "spawn_agent"
+	case "sendInput":
+		return "send_input"
+	case "resumeAgent":
+		return "resume_agent"
+	case "wait":
+		return "wait"
+	case "closeAgent":
+		return "close_agent"
+	default:
+		return "unknown"
+	}
+}
+
+func collabCallDiagnosticSuffix(value string) string {
+	switch value {
+	case "inProgress":
+		return "in_progress"
+	case "completed":
+		return "completed"
+	case "failed":
+		return "failed"
+	default:
+		return "unknown"
+	}
+}
+
+func appendUniqueDiagnostic(categories []string, candidates ...string) []string {
+	for _, candidate := range candidates {
+		found := false
+		for _, category := range categories {
+			if category == candidate {
+				found = true
+				break
+			}
+		}
+		if !found {
+			categories = append(categories, candidate)
+		}
+	}
+	return categories
+}
+
+func (o *Observer) emitSnapshotChildEvidence(observation agentgraph.Observation) {
+	for _, node := range observation.Nodes {
+		if node.ID == observation.RootID {
+			continue
+		}
+		o.emitDiagnostic("snapshot_child_runtime_" + string(node.Runtime))
+		o.emitDiagnostic("snapshot_child_lifecycle_" + string(node.Lifecycle))
+	}
 }
 
 func (o *Observer) beginSync(generation uint64) {
@@ -582,9 +705,13 @@ func (o *Observer) disconnect(generation uint64) {
 }
 
 func (o *Observer) handleNotification(notification rpcNotification) {
+	evidenceCategory := notificationEvidenceCategory(notification)
 	o.mu.Lock()
 	if notification.Generation != o.generation || !o.connected {
 		o.mu.Unlock()
+		if evidenceCategory != "" {
+			o.emitDiagnostic(evidenceCategory + "_stale")
+		}
 		return
 	}
 	if o.syncing {
@@ -592,10 +719,20 @@ func (o *Observer) handleNotification(notification rpcNotification) {
 		notification.Params = append(json.RawMessage(nil), notification.Params...)
 		o.queued = append(o.queued, notification)
 		o.mu.Unlock()
+		if evidenceCategory != "" {
+			o.emitDiagnostic(evidenceCategory + "_queued")
+		}
 		return
 	}
 	keys, unknown, diagnostics := o.applyNotificationLocked(notification)
 	o.mu.Unlock()
+	if evidenceCategory != "" {
+		if len(keys) > 0 {
+			o.emitDiagnostic(evidenceCategory + "_matched")
+		} else {
+			o.emitDiagnostic(evidenceCategory + "_unmatched")
+		}
+	}
 	for _, key := range keys {
 		o.queue.Signal(key)
 	}
@@ -603,6 +740,39 @@ func (o *Observer) handleNotification(notification rpcNotification) {
 		o.emitUnknownDiagnostic(&graphState{unknownEnum: true})
 	}
 	o.emitClassificationDiagnostics(diagnostics)
+}
+
+// notificationEvidenceCategory recognizes only lifecycle-relevant method and
+// item classes. It never incorporates an arbitrary provider method or payload
+// value into logs.
+func notificationEvidenceCategory(notification rpcNotification) string {
+	switch notification.Method {
+	case "thread/started":
+		return "notification_thread_started"
+	case "thread/updated":
+		return "notification_thread_updated"
+	case "thread/status/changed":
+		return "notification_thread_status"
+	case "turn/started":
+		return "notification_turn_started"
+	case "turn/completed":
+		return "notification_turn_completed"
+	case "thread/archived":
+		return "notification_thread_archived"
+	case "thread/deleted":
+		return "notification_thread_deleted"
+	case "item/started", "item/completed":
+		params, ok := decodeParams[notificationParams](notification.Params)
+		if !ok || params.Item.Type != "collabAgentToolCall" {
+			return ""
+		}
+		if notification.Method == "item/started" {
+			return "notification_collab_item_started"
+		}
+		return "notification_collab_item_completed"
+	default:
+		return ""
+	}
 }
 
 type notificationParams struct {
