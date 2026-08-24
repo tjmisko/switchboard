@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repo_dir=$(cd -- "$script_dir/.." && pwd)
+go_bin=/home/tjmisko/go/bin
+daemon_bin=/home/tjmisko/.config/switchboard/bin/switchboard
+go_cache=/tmp/switchboard-child-lifecycle-go-cache
+go_tmp=/tmp/switchboard-child-lifecycle-go-tmp
+ctl=$go_bin/switchboard-ctl
+hooks_file=/home/tjmisko/.codex/hooks.json
+hooks_tmp=/tmp/switchboard-child-hooks.json
+history_tmp=/tmp/switchboard-child-history.jsonl
+
+require_command() {
+	if ! command -v "$1" >/dev/null 2>&1; then
+		echo "missing required command: $1" >&2
+		exit 1
+	fi
+}
+
+for command in date dirname git go install systemctl journalctl jq rg tee sleep kill sort uniq; do
+	require_command "$command"
+done
+
+if ! rg -q 'thread/turns/list' "$repo_dir/internal/provider/codex/observer.go"; then
+	echo "this checkout does not contain the Codex child-lifecycle probe" >&2
+	exit 1
+fi
+if [[ ! -f "$hooks_file" ]]; then
+	echo "missing Codex hooks file: $hooks_file" >&2
+	exit 1
+fi
+
+echo "Installing the child-lifecycle probe from $(git -C "$repo_dir" rev-parse --short HEAD)"
+mkdir -p "$go_bin" "$(dirname -- "$daemon_bin")" "$go_cache" "$go_tmp"
+(
+	cd "$repo_dir"
+	env GOCACHE="$go_cache" GOTMPDIR="$go_tmp" go build -o "$daemon_bin" ./cmd/switchboard
+	env GOCACHE="$go_cache" GOTMPDIR="$go_tmp" GOBIN="$go_bin" go install ./cmd/switchboard-ctl
+)
+
+# Add the two standard Codex lifecycle events without retaining a backup. The
+# handlers forward only the existing content-free hook fields. Production
+# applies them only after an exact app-server topology match.
+jq --arg ctl "$ctl" '
+  def handler($event):
+    [{hooks: [{type: "command", command: ($ctl + " codex-hook " + $event), timeout: 2}]}];
+  .hooks.SubagentStart = handler("SubagentStart") |
+  .hooks.SubagentStop = handler("SubagentStop")
+' "$hooks_file" > "$hooks_tmp"
+install -m 0644 "$hooks_tmp" "$hooks_file"
+
+echo "Installed daemon: $daemon_bin"
+echo "Installed hook CLI: $ctl"
+echo "Added production SubagentStart/SubagentStop handlers to $hooks_file"
+echo "Restarting Switchboard only; the Codex daemon remains untouched"
+journal_since=$(date '+%Y-%m-%d %H:%M:%S')
+systemctl --user restart switchboard.service
+systemctl --user --no-pager --full status switchboard.service
+
+codex_state() {
+	"$ctl" --json list | jq -c '[
+    .sessions[]
+    | select(.agent == "codex")
+    | (.agent_graph.root_id // "") as $root
+    | {
+        pid,
+        root_id: (if $root == "" then null else $root end),
+        root_status: (.codex.status // null),
+        live_children: (.agent_graph.summary.live_children // 0),
+        children: [
+          (.agent_graph.nodes // [])[]
+          | select(.id != $root)
+          | {
+              thread_id: .id,
+              parent_thread_id: (.parent_id // null),
+              runtime,
+              attention,
+              lifecycle
+            }
+        ]
+      }
+  ]'
+}
+
+print_timeline() {
+	if ! "$ctl" timeline --json 2>/dev/null \
+		| jq '{
+        roots: [
+          (.agent_timeline.roots // [])[]
+          | {
+              session_id,
+              pid,
+              provider,
+              nodes: [
+                .nodes[]
+                | {
+                    thread_id,
+                    parent_thread_id,
+                    depth,
+                    runtime,
+                    attention_state,
+                    lifecycle,
+                    activity
+                  }
+              ]
+            }
+        ],
+        summary: (.agent_timeline.summary // {})
+      }'; then
+		echo '{}  (timeline is disabled or no canonical child lane exists)'
+	fi
+}
+
+print_transition_checks() {
+	if ! jq -s '{
+      saw_running: any(.[]; .type == "agent_state" and .agent == "codex" and .to_runtime == "active" and .to_lifecycle == "running"),
+      saw_completed: any(.[]; .type == "agent_state" and .agent == "codex" and .to_runtime == "idle" and .to_lifecycle == "completed"),
+      saw_nested_parent: any(.[]; .type == "agent_state" and .agent == "codex" and (.parent_thread_id // "") != "" and .parent_thread_id != .session_id),
+      saw_reactivation: (
+        [.[] | select(.type == "agent_state" and .agent == "codex" and .to_lifecycle == "running")]
+        | group_by([.session_id, .thread_id])
+        | any(.[]; length >= 2)
+      )
+    }' "$history_tmp" 2>/dev/null; then
+		echo '{}  (history is disabled or no readable history file exists)'
+	fi
+}
+
+print_history() {
+	"$ctl" history tail --json -n 2000 > "$history_tmp" 2>/dev/null || true
+	if ! jq -sc '[
+      .[]
+      | select(.type == "agent_state" and .agent == "codex" and (.parent_thread_id // "") != "")
+      | {
+          ts,
+          session_id,
+          thread_id,
+          parent_thread_id,
+          from_runtime,
+          to_runtime,
+          from_attention,
+          to_attention,
+          from_lifecycle,
+          to_lifecycle,
+          source
+        }
+    ]' "$history_tmp" 2>/dev/null; then
+		echo "[]  (history is disabled or no readable history file exists)"
+	fi
+}
+
+print_probe_journal_summary() {
+	journalctl --user -u switchboard.service --since "$journal_since" -o cat --no-pager \
+		| rg -o 'category=(snapshot_(thread_read|turns_list|child_)[a-z0-9_]*|notification_(thread|turn|collab)[a-z0-9_]*|subagent_hook_[a-z0-9_]*)' \
+		| sort \
+		| uniq -c \
+		|| true
+}
+
+print_snapshot() {
+	echo
+	echo "Agent diagnostics:"
+	"$ctl" --json agent-diagnostics \
+		| tee /tmp/switchboard-child-lifecycle-diagnostics.json
+	echo
+	echo "Content-free Codex graph state:"
+	codex_state
+	echo
+	echo "Durable Codex child agent_state events today:"
+	print_history
+	echo
+	echo "Canonical child timeline lanes today:"
+	print_timeline
+	echo
+	echo "Lifecycle acceptance checks today:"
+	print_transition_checks
+	echo
+	echo "Probe journal category counts since restart:"
+	print_probe_journal_summary
+}
+
+watch_state() {
+	previous=""
+	while sleep 2; do
+		current=$(codex_state 2>/dev/null || true)
+		if [[ -n "$current" && "$current" != "$previous" ]]; then
+			date '+state-change %Y-%m-%d %H:%M:%S'
+			printf '%s\n' "$current"
+			previous=$current
+		fi
+	done
+}
+
+print_snapshot
+
+cat <<'EOF'
+
+The #83 child-lifecycle probe is ready.
+
+1. In one existing plain Codex TUI, run /hooks and approve the newly added
+   SubagentStart and SubagentStop handlers if Codex requests trust.
+2. In that same TUI submit:
+
+   Spawn exactly one child agent. Tell that child to spawn one nested child
+   which runs `sleep 45` and returns NESTED_DONE. Wait for both children to
+   finish before replying CHILD_DONE.
+
+3. After CHILD_DONE, ask Codex to reactivate the same completed child and have
+   it return REACTIVATED. If Codex cannot emit a follow-up start for the same
+   child, record that exact limitation; do not substitute a new child.
+
+4. Leave this script running through child start, completion, and the follow-up.
+   The expected live count is `0 -> 1 (or 2 while nested) -> 0`, followed by a
+   new running edge if Codex emits reactivation. The script reports only:
+   - whether thread/read or thread/turns/list contains collaboration state;
+   - whether the standalone app-server receives lifecycle notifications;
+   - whether SubagentStart/Stop carries an ID exactly matching graph topology;
+   - root/child IDs and neutral state axes; and
+   - canonical child agent_state fields and sanitized timeline lanes.
+
+No prompts, messages, tool input, commands, cwd, nicknames, roles, or raw
+provider payloads are logged. Press Ctrl-C after REACTIVATED (or after Codex
+reports that reactivation is unavailable) to print the final counters, graph,
+history, timeline, and acceptance checks.
+EOF
+
+watch_state &
+watcher_pid=$!
+
+finish() {
+	trap - INT TERM
+	if kill -0 "$watcher_pid" 2>/dev/null; then
+		kill "$watcher_pid" 2>/dev/null || true
+	fi
+	print_snapshot
+	exit 0
+}
+trap finish INT TERM
+
+set +e
+journalctl --user -u switchboard.service --since "$journal_since" -f -o cat \
+	| rg --line-buffered 'snapshot_(thread_read|turns_list|child_)|notification_(thread|turn|collab)|subagent_hook_'
+set -e
+
+finish

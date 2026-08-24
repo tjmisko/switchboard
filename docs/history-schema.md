@@ -231,7 +231,7 @@ Example at the default minimal privacy tier:
 | `from_runtime`, `to_runtime` | explicit projector values | Runtime before/after the event: `unknown`, `not_loaded`, `idle`, `active`, `system_error`, or a future value. |
 | `from_attention`, `to_attention` | explicit projector values | Attention before/after: `none`, `approval`, `user_input`, or a future value. |
 | `from_lifecycle`, `to_lifecycle` | explicit projector values | Lifecycle before/after: `unknown`, `pending`, `running`, `completed`, `interrupted`, `errored`, `shutdown`, `not_found`, or a future value. |
-| `source` | omitted when unknown | Observation source (`codex_app_server`, `hook`, `claude_transcript`, `codex_rollout`, or `restored_last_known`). |
+| `source` | omitted when unknown | Structural observation source (`codex_app_server`, `hook`, `claude_transcript`, `codex_rollout`, or `restored_last_known`). A Codex child edge filled by an exact hook after topology validation remains `codex_app_server`; overlay provenance is diagnostic-only. |
 | `dur_prev_ms` | omitted when zero | How long the prior **combined three-axis state** was held. It is clamped to zero when timing would go backward. |
 
 An event is emitted when any of the three axes changes. All three before/after
@@ -256,6 +256,11 @@ later legitimate return to the same value. The lane is forgotten when the root
 process lifetime ends or the provider root id rotates. Partial observations do
 not manufacture removal events; only a complete observation can transition an
 omitted prior node to `not_found`.
+
+For standard-CLI Codex child state, exact `SubagentStart`/`SubagentStop` edges
+enter this same projector only after a fresh app-server graph matches the child
+id. The hook does not create the node or parent and adds no history field. See
+[`codex-no-wrapper-child-lifecycle.md`](codex-no-wrapper-child-lifecycle.md).
 
 At `minimal` detail, opaque root/thread/parent ids, provider, source, state axes,
 timing, and project abbreviation remain because they are required to build the

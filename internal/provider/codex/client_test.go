@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -76,7 +77,7 @@ func TestRPCGenerationPreservesServerRequestIDAndCloseReleasesWaiter(t *testing.
 	}
 }
 
-func TestProxyVersionCapabilityChecks(t *testing.T) {
+func TestAppServerVersionCapabilityChecks(t *testing.T) {
 	for _, test := range []struct {
 		value string
 		ok    bool
@@ -87,9 +88,17 @@ func TestProxyVersionCapabilityChecks(t *testing.T) {
 		{"codex-cli 0.148.9", false},
 		{"unknown", false},
 	} {
-		err := checkProxyVersion(test.value)
+		err := checkAppServerCLIVersion(test.value)
 		if (err == nil) != test.ok {
-			t.Errorf("checkProxyVersion(%q) = %v", test.value, err)
+			t.Errorf("checkAppServerCLIVersion(%q) = %v", test.value, err)
 		}
+	}
+}
+
+func TestCommandConnectorUsesStandaloneStdioTransport(t *testing.T) {
+	command := standaloneAppServerCommand(context.Background(), "codex-test")
+	want := []string{"codex-test", "app-server", "--stdio"}
+	if !reflect.DeepEqual(command.Args, want) {
+		t.Fatalf("command args = %q, want %q", command.Args, want)
 	}
 }

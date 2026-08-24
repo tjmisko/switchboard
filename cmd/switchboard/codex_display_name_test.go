@@ -113,7 +113,7 @@ func waitForNamerCalls(t *testing.T, namer *scriptedDisplayNamer, want int) {
 	t.Fatalf("naming calls = %d, want %d", len(inputs), want)
 }
 
-func diagnosticCount(coordinator *agentCoordinator, category string) uint64 {
+func displayDiagnosticCount(coordinator *agentCoordinator, category string) uint64 {
 	for _, diagnostic := range coordinator.Diagnostics() {
 		if diagnostic.Provider == state.AgentKindCodex && diagnostic.Category == category {
 			return diagnostic.Count
@@ -169,7 +169,7 @@ func TestCodexDisplayNameStartsAfterMatchingCompletedTurnExactlyOnce(t *testing.
 		LastAssistantMessage: "out of order", ObservedAt: base.Add(-time.Millisecond),
 	})
 	waitForNamerCalls(t, namer, 1)
-	if got := diagnosticCount(coordinator, "generated"); got != 1 {
+	if got := displayDiagnosticCount(coordinator, "generated"); got != 1 {
 		t.Fatalf("generated diagnostics = %d, want 1", got)
 	}
 }
@@ -235,7 +235,7 @@ func TestCodexDisplayNameDiscardsEmptyStopAndReplacesIncompletePrompt(t *testing
 	if len(inputs) != 1 || inputs[0].UserPrompt != "New prompt replaces it" || inputs[0].AssistantResponse != "new completion" {
 		t.Fatalf("replacement context = %+v", inputs)
 	}
-	if got := diagnosticCount(coordinator, "canceled"); got == 0 {
+	if got := displayDiagnosticCount(coordinator, "canceled"); got == 0 {
 		t.Fatal("empty completion did not emit a content-free canceled diagnostic")
 	}
 }
@@ -260,7 +260,7 @@ func TestCodexDisplayNameRetriesThenUsesDeterministicFallback(t *testing.T) {
 		t.Fatalf("origin = %q, want fallback", record.Origin)
 	}
 	waitForNamerCalls(t, namer, 2)
-	if got := diagnosticCount(coordinator, "fallback"); got != 1 {
+	if got := displayDiagnosticCount(coordinator, "fallback"); got != 1 {
 		t.Fatalf("fallback diagnostics = %d, want 1", got)
 	}
 }
@@ -318,7 +318,7 @@ func TestCodexDisplayNameNewerCompletedAttemptCancelsOlderWork(t *testing.T) {
 	if got := store.Snapshot().Sessions[0].DisplayName.Value; got != "newer-completed-turn" {
 		t.Fatalf("stale result replaced newer name: %q", got)
 	}
-	if got := diagnosticCount(coordinator, "canceled"); got == 0 {
+	if got := displayDiagnosticCount(coordinator, "canceled"); got == 0 {
 		t.Fatal("superseded attempt did not emit canceled diagnostic")
 	}
 }
@@ -346,13 +346,13 @@ func TestCodexDisplayNameRejectsStaleResultWithoutReplacingCommittedRecord(t *te
 	})
 	close(release)
 	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) && diagnosticCount(coordinator, "stale-result") == 0 {
+	for time.Now().Before(deadline) && displayDiagnosticCount(coordinator, "stale-result") == 0 {
 		time.Sleep(time.Millisecond)
 	}
 	if got := store.Snapshot().Sessions[0].DisplayName.Value; got != "already-committed-name" {
 		t.Fatalf("stale result replaced committed name: %q", got)
 	}
-	if got := diagnosticCount(coordinator, "stale-result"); got != 1 {
+	if got := displayDiagnosticCount(coordinator, "stale-result"); got != 1 {
 		t.Fatalf("stale-result diagnostics = %d, want 1", got)
 	}
 }
@@ -569,7 +569,7 @@ func TestCodexDisplayNameNativeBaselineAndRenamePrecedence(t *testing.T) {
 		t.Fatal("native rename observation was not applied")
 	}
 	waitForNoDisplayName(t, store)
-	if got := diagnosticCount(coordinator, "native-override"); got != 1 {
+	if got := displayDiagnosticCount(coordinator, "native-override"); got != 1 {
 		t.Fatalf("native-override diagnostics = %d, want 1", got)
 	}
 }

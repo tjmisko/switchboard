@@ -159,12 +159,12 @@ The daemon integration should expose an operational mode with at least:
 
 - `auto` (default): use app-server when capability is available, degrade safely;
 - `off`: retain root discovery/navigation and hook-only legacy Codex behavior;
-- a test-only proxy command/transport injection, not a user-facing arbitrary
+- a test-only connector/transport injection, not a user-facing arbitrary
   shell string.
 
-Absence of `codex`, absence of `app-server proxy`, version mismatch, denied
-process-environment access, or proxy failure must not prevent daemon startup or
-root navigation in `auto` mode.
+Absence of `codex`, absence of standalone app-server capability, version
+mismatch, or connection failure must not prevent daemon startup or root
+navigation in `auto` mode.
 
 Useful content-free startup/runtime logs:
 

@@ -282,6 +282,55 @@ func TestCmdHookForwardsBoundedCodexNamingContextOnlyOnItsLifecycleEdges(t *test
 	}
 }
 
+func TestCmdHookShouldForwardExactCodexSubagentIdentity(t *testing.T) {
+	req := hookRequestForEventPayload(t, "SubagentStart", "codex", `{
+		"session_id": "root-thread",
+		"hook_event_name": "SubagentStart",
+		"agent_id": "child-thread",
+		"agent_type": "worker",
+		"turn_id": "turn-7"
+	}`)
+	if req.Agent != "codex" || req.Event != "SubagentStart" || req.SessionID != "root-thread" ||
+		req.AgentID != "child-thread" || req.AgentType != "worker" || req.TurnID != "turn-7" || req.ObservedAt.IsZero() {
+		t.Fatalf("Codex child identity was not forwarded exactly: %+v", req)
+	}
+}
+
+func TestHookClientHintsShouldUseOnlyBoundedTerminalIdentityAllowlist(t *testing.T) {
+	environment := map[string]string{
+		"SSH_TTY":         "/dev/pts/7",
+		"WEZTERM_PANE":    "12",
+		"TMUX_PANE":       "%3",
+		"TERM_SESSION_ID": "must-not-cross-the-hook-socket",
+	}
+	hints := hookClientHintsFrom("/dev/pts/7", func(key string) string { return environment[key] })
+	want := []rpc.HookClientHint{
+		{Kind: rpc.HookClientHintTTY, Value: "/dev/pts/7"},
+		{Kind: rpc.HookClientHintWeztermPane, Value: "12"},
+		{Kind: rpc.HookClientHintTmuxPane, Value: "%3"},
+	}
+	if len(hints) != len(want) {
+		t.Fatalf("hints = %+v, want %+v", hints, want)
+	}
+	for i := range want {
+		if hints[i] != want[i] {
+			t.Fatalf("hint[%d] = %+v, want %+v", i, hints[i], want[i])
+		}
+	}
+	body, err := json.Marshal(hints)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contains(string(body), environment["TERM_SESSION_ID"]) {
+		t.Fatalf("non-allowlisted environment value crossed the hook socket: %s", body)
+	}
+
+	overlong := strings.Repeat("x", maxHookClientHintLen+1)
+	if got := hookClientHintsFrom("", func(string) string { return overlong }); len(got) != 0 {
+		t.Fatalf("overlong hook identity was forwarded: %+v", got)
+	}
+}
+
 func TestCmdHookShouldForwardToolInputHashWhenPayloadCarriesToolInput(t *testing.T) {
 	req := hookRequestForPayload(t, `{
 		"session_id": "sess-1",

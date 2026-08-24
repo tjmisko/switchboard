@@ -19,6 +19,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/tjmisko/switchboard/internal/agentgraph"
 	"github.com/tjmisko/switchboard/internal/detect"
 	"github.com/tjmisko/switchboard/internal/discovery"
 	"github.com/tjmisko/switchboard/internal/fanout"
@@ -144,18 +145,21 @@ func main() {
 
 	// Provider observation is process-wide and graph-authoritative. Both periodic
 	// and app-server/hook invalidations land through agentRuntime's generation
-	// fence; observer I/O never runs under Store.Apply. The Codex proxy is a
-	// disposable read-only child and is closed exactly once with the daemon.
+	// fence; observer I/O never runs under Store.Apply. The standalone Codex
+	// app-server is a disposable read-only child and is closed exactly once with
+	// the daemon.
 	claudeObs := claudeprovider.NewObserver(sink.Dir(), claudeprovider.WithTuning(tun))
 	codexObs := codexObserverForMode(codexMode, func() codexObserver {
-		return codexprovider.NewObserver(codexprovider.Config{Diagnostic: func(string) {
+		observer := codexprovider.NewObserver(codexprovider.Config{Diagnostic: func(category string) {
 			// The adapter guarantees this callback contains only a finite, content-free
 			// protocol category. Keep the log equally content-free.
-			log.Printf("agent-observer: provider=codex category=unknown_protocol_enum count=1")
+			log.Printf("agent-observer: provider=codex category=%s count=1", category)
 		}, WaitDiagnostic: func(diagnostic codexprovider.WaitClassificationDiagnostic) {
 			log.Printf("agent-observer: provider=codex category=wait_classification source=%s duration_ms=%d suppressed_false_red=%t count=1",
 				diagnostic.Source, diagnostic.Duration.Milliseconds(), diagnostic.SuppressedFalseRed)
 		}})
+		log.Printf("agent-observer: provider=codex category=observer_constructed count=1")
+		return observer
 	})
 	log.Printf("agent-observer: provider=codex category=%s count=1", codexObserverModeCategory(codexMode))
 	agentRuntime := newAgentCoordinator(store, sink, claudeObs, codexObs)
@@ -230,6 +234,13 @@ func main() {
 	server.SetHistory(sink)
 	server.SetAgentHookHandler(agentRuntime.HandleHook)
 	server.SetAgentDiagnosticSource(agentRuntime.Diagnostics)
+	server.SetHookAttributionDiagnostic(func(diagnostic rpc.HookAttributionDiagnostic) {
+		agentRuntime.recordDiagnostic(agentgraph.ProviderCodex, diagnostic.Category, time.Now())
+		if diagnostic.MatchedPID != 0 {
+			log.Printf("codex-hook-attribution-probe: category=%s matched_pid=%d",
+				diagnostic.Category, diagnostic.MatchedPID)
+		}
+	})
 	if err := os.MkdirAll(filepath.Dir(*socketPath), 0o755); err != nil {
 		log.Fatalf("mkdir socket dir: %v", err)
 	}

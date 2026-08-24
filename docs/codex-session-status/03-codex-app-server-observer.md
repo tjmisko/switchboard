@@ -1,5 +1,13 @@
 # Phase 3 — Codex app-server observer
 
+> **Historical plan; transport superseded 2026-08-23.** The implementation now
+> launches disposable `codex app-server --stdio`, not `app-server proxy`, and
+> does not depend on the shared daemon. Live testing proves exact structural
+> snapshots, while recovered child runtime/lifecycle remains unknown. Treat the
+> notification and child-transition requirements below as unfinished acceptance
+> gates; see the
+> [canonical no-wrapper result](../codex-no-wrapper-binding-probe.md).
+
 ## Mission
 
 Implement a supervised, read-only Codex provider observer whose primary truth is
@@ -205,16 +213,16 @@ relationships.
   loss.
 - Observer returns deep copies; cache mutation cannot race reducers/renderers.
 - Update sends never block the protocol reader.
-- `Close` is idempotent, terminates the proxy, releases waiters, and stops retry
+- `Close` is idempotent, terminates the standalone app-server, releases waiters, and stops retry
   timers without leaking goroutines.
 - No method waits on the app-server while holding a cache mutex.
 
 ## Tests
 
-All tests use E0 fixtures or a fake proxy process/transport. They must cover:
+All tests use E0 fixtures or a fake standalone app-server transport. They must cover:
 
 - initialization and allowed-method enforcement;
-- exact process-environment and hook binding precedence;
+- exact hook binding, conversation rotation, and retired-identity fencing;
 - same-CWD roots never cross-bind;
 - nested descendants and stable parentage;
 - spawn-before-thread and status-before-metadata ordering;

@@ -256,10 +256,10 @@ Rollout verification:
 - Default mode is `auto`; accepted modes are exactly `auto` and `off`.
 - `off` does not construct the app-server observer and retains Codex hook
   fallback, root discovery/navigation, and Claude graphs.
-- `auto` construction is non-blocking with respect to later proxy retry; proxy
+- `auto` construction is non-blocking with respect to later app-server retry;
   version parsing accepts `>=0.149.0` and rejects older/unparseable versions.
-- Environment read denial falls back only to an exact hook binding; an unbound
-  root remains visible and unknown rather than using CWD.
+- Conversation binding comes only from an exact trusted hook; an unbound root
+  remains visible and unknown rather than using environment, CWD, or recency.
 - `go run ./cmd/switchboard -h` exited 0 and advertised
   `-codex-observer auto|off` with default `auto`.
 - `go run ./cmd/switchboard -codex-observer=invalid` exited 1 before daemon

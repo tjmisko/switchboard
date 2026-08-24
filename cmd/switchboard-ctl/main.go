@@ -98,6 +98,8 @@ func main() {
 		cmdCycle(c, direction)
 	case "attention":
 		cmdAttention(c)
+	case "agent-diagnostics":
+		cmdAgentDiagnostics(c, *jsonOut)
 	case "hook":
 		if len(args) < 2 {
 			fail("hook requires an event name")
@@ -143,6 +145,41 @@ func cmdList(c *rpc.Client, jsonOut bool) {
 		if s.Hyprland != nil {
 			fmt.Printf("       hypr:    addr=%s workspace=%s\n", s.Hyprland.Address, s.Hyprland.Workspace)
 		}
+	}
+}
+
+func cmdAgentDiagnostics(c *rpc.Client, jsonOut bool) {
+	if err := c.Send(rpc.Request{Cmd: "agent-diagnostics"}); err != nil {
+		fail("send: %v", err)
+	}
+	var resp rpc.Response
+	if err := c.Recv(&resp); err != nil {
+		fail("recv: %v", err)
+	}
+	if resp.Error != "" {
+		fail("%s", resp.Error)
+	}
+	if jsonOut {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(resp.Diagnostics)
+		return
+	}
+	renderAgentDiagnostics(os.Stdout, resp.Diagnostics)
+}
+
+func renderAgentDiagnostics(w io.Writer, diagnostics []rpc.AgentDiagnostic) {
+	if len(diagnostics) == 0 {
+		fmt.Fprintln(w, "no agent diagnostics")
+		return
+	}
+	for _, diagnostic := range diagnostics {
+		lastAt := "-"
+		if !diagnostic.LastAt.IsZero() {
+			lastAt = diagnostic.LastAt.UTC().Format(time.RFC3339)
+		}
+		fmt.Fprintf(w, "%s %s count=%d last_at=%s\n",
+			diagnostic.Provider, diagnostic.Category, diagnostic.Count, lastAt)
 	}
 }
 
@@ -385,6 +422,9 @@ func cmdHook(c *rpc.Client, event, agent string) {
 	req := parseHookPayload(body, event, agent)
 	req.PID = os.Getppid()
 	req.ObservedAt = time.Now().UTC()
+	if agent == state.AgentKindCodex {
+		req.HookClientHints = hookClientHints()
+	}
 	_ = c.Send(req)
 	var resp rpc.Response
 	_ = c.Recv(&resp)
@@ -450,6 +490,50 @@ func truncatePrompt(prompt string, limit int) string {
 		runes = runes[:limit]
 	}
 	return string(runes)
+}
+
+const maxHookClientHintLen = 128
+
+// hookClientHints captures only bounded terminal identity metadata that
+// Switchboard can independently compare with a discovered TUI. These hints do
+// not authorize attribution and are never logged or persisted.
+func hookClientHints() []rpc.HookClientHint {
+	return hookClientHintsFrom(currentHookTTY(), os.Getenv)
+}
+
+func hookClientHintsFrom(tty string, getenv func(string) string) []rpc.HookClientHint {
+	var hints []rpc.HookClientHint
+	seen := make(map[rpc.HookClientHint]struct{})
+	add := func(kind, value string) {
+		value = strings.TrimSpace(value)
+		if value == "" || len(value) > maxHookClientHintLen {
+			return
+		}
+		hint := rpc.HookClientHint{Kind: kind, Value: value}
+		if _, duplicate := seen[hint]; duplicate {
+			return
+		}
+		seen[hint] = struct{}{}
+		hints = append(hints, hint)
+	}
+	add(rpc.HookClientHintTTY, tty)
+	add(rpc.HookClientHintTTY, getenv("SSH_TTY"))
+	add(rpc.HookClientHintWeztermPane, getenv("WEZTERM_PANE"))
+	add(rpc.HookClientHintTmuxPane, getenv("TMUX_PANE"))
+	return hints
+}
+
+func currentHookTTY() string {
+	for _, fd := range []uintptr{os.Stdin.Fd(), os.Stdout.Fd(), os.Stderr.Fd()} {
+		path, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
+		if err != nil {
+			continue
+		}
+		if strings.HasPrefix(path, "/dev/pts/") || strings.HasPrefix(path, "/dev/tty") {
+			return path
+		}
+	}
+	return ""
 }
 
 // toolInputHashLen is how much of the sha256 hex digest is forwarded. 16 hex
@@ -622,6 +706,8 @@ commands:
                             else — only if all are green — working sessions;
                             repeated presses visit each member in turn;
                             no-op if any session is unknown (grey)
+  agent-diagnostics       show bounded provider diagnostic counters; --json
+                            emits the raw content-free array
   name <sub>              project names: resolve --cwd --name, abbrev --cwd,
                             full --cwd, set <dir> <abbrev>, or
                             set-full --cwd --name <full> (pretty display name)
@@ -648,7 +734,7 @@ commands:
 
 flags:
   --socket <path>         daemon socket (default: $XDG_RUNTIME_DIR/switchboard.sock)
-  --json                  json output for list
+  --json                  json output for list or agent-diagnostics
 `))
 }
 

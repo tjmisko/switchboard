@@ -272,7 +272,9 @@ and the bounded context used for display naming. Configure
     "PreToolUse": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook PreToolUse", "timeout": 2}]}],
     "PostToolUse": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook PostToolUse", "timeout": 2}]}],
     "PermissionRequest": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook PermissionRequest", "timeout": 2}]}],
-    "Stop": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook Stop", "timeout": 2}]}]
+    "Stop": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook Stop", "timeout": 2}]}],
+    "SubagentStart": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook SubagentStart", "timeout": 2}]}],
+    "SubagentStop": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook SubagentStop", "timeout": 2}]}]
   }
 }
 ```
@@ -294,11 +296,15 @@ idle edge, while a standalone `/clear` still settles idle.
 `SessionStart(compact)` remains active because Codex continues the model
 immediately after compaction. Only content-free lifecycle metadata is used to
 correlate the wait; its question, answer, and raw tool input stay out of the
-daemon. The hook fallback is partial and root-only. Active evidence remains
-fresh for 10 minutes, approval or user-input waits for 24 hours, and idle edges
+daemon. The root-status hook fallback is partial and root-only. Active evidence
+remains fresh for 10 minutes, approval or user-input waits for 24 hours, and idle edges
 for 7 days. A daemon restart during an already-open hook-only interview cannot
 reconstruct that wait and therefore remains unknown rather than confidently
-green.
+green. The two child hooks are required for live child state on the tested
+standard-CLI path, but not for discovery or topology. Matched running child
+edges expire after 10 minutes without a later edge; matched completions persist
+within the exact root lifetime and can be reopened by a later start. See the
+[no-wrapper child-lifecycle decision](docs/codex-no-wrapper-child-lifecycle.md).
 
 After the first usable prompt/`Stop` pair in a conversation, Switchboard asks
 an isolated ephemeral naming turn for a 2–5-word lowercase kebab-case label (at
@@ -324,14 +330,15 @@ authoritative name observation next becomes available.
 
 Automatic degradation is fail-open for the root and fail-closed for status:
 
-- observer/proxy/version failure leaves discovery and navigation working;
+- app-server capability/start/connection failure leaves discovery and navigation working;
 - the last complete graph remains visible only until its explicit freshness
   deadline, then its summary becomes unknown/stale rather than freezing a
   confident color;
 - the observer reconnects with bounded exponential backoff and resnapshots;
-- `-codex-observer off` never constructs the proxy. Codex hooks can still
-  supply the partial root view; without them the root remains visible with
-  unknown status and no child graph.
+- `-codex-observer off` never constructs the standalone app-server. Codex hooks
+  can still supply the partial root view, but child hooks cannot synthesize
+  topology; without hooks the root remains visible with unknown status and no
+  proven live children.
 
 Use `switchboard-ctl diagnose --observer` to inspect content-free binding,
 snapshot freshness, completeness, node counts, observer mode, display-name
@@ -342,8 +349,8 @@ labels, prompts, assistant content, commands, or raw provider payloads.
 
 - **Observe:** Linux with `pidfd_open(2)` (kernel 5.3+). Go 1.25 to build.
 - **Codex graph observer:** a locally verified Codex CLI 0.149.0+ installation
-  exposing `codex app-server proxy`; otherwise use `-codex-observer off` or the
-  automatic degraded root-only behavior above.
+  exposing `codex app-server --stdio`; otherwise use `-codex-observer off` or
+  the automatic degraded root-only behavior above.
 - **Navigate:** a supported WM (Hyprland / sway / i3 / X11) **and** terminal
   (wezterm / tmux) on `PATH`.
 - macOS support (Observe tier) is planned (see the plan).

@@ -1,10 +1,8 @@
 # Codex session status and agent-tree integration
 
-> **Status: APPROVED FOR IMPLEMENTATION PLANNING.** The product decisions in
-> this document are locked: child agents are nested under their root session,
-> Codex app-server is the primary Codex truth source, and approval/user-input
-> waits remain distinct on child rows while either makes the root need
-> attention.
+> **Status: historical implementation-planning packet.** The neutral graph and
+> child-nesting decisions remain useful, but the no-wrapper live update below
+> supersedes this packet's proxy, shared-daemon, and primary-status assumptions.
 
 > **Post-rollout finding (2026-08-21):** shared app-server ownership invalidates
 > the implemented hook-parent-to-visible-TUI binding for newly created threads.
@@ -12,6 +10,16 @@
 > assumption is not operationally safe until an exact client/thread association
 > exists. See the
 > [incident report](../codex-app-server-hook-attribution-incident.md).
+
+> **No-wrapper live update (2026-08-23):** this packet is design history where
+> it assumes `codex app-server proxy` or live shared-daemon notifications. The
+> current spike launches disposable `codex app-server --stdio`, exactly binds
+> plain Codex roots through standard lifecycle hooks, and composes bounded hook
+> root status with app-server topology. Structural descendants are recovered;
+> exact matched `SubagentStart`/`SubagentStop` hooks now provide their bounded
+> live intervals when app-server returns `not_loaded`/`unknown`. The canonical
+> decision and rollout gate are in the
+> [child-lifecycle record](../codex-no-wrapper-child-lifecycle.md).
 
 This directory is an implementation-ready planning packet for adding accurate
 Codex status and fanout visibility to the Go daemon without forcing Codex
@@ -39,9 +47,9 @@ specific:
 
 - Claude: hooks plus transcript/subagent-directory observation and existing
   per-writer recovery logic.
-- Codex: the shared app-server protocol through `codex app-server proxy`, with
-  hooks for exact identity where needed and rollout/SQLite data used only as a
-  degraded fallback.
+- Codex: standalone `codex app-server --stdio` for structural topology, with
+  hooks for exact identity and bounded unavailable-root status; rollout/SQLite
+  data remains degraded evidence only.
 
 ## Locked product and architecture decisions
 
@@ -91,11 +99,16 @@ The reducer derives the legacy root-chip summary in this priority order:
 
 1. Any live node with `approval` or `user_input` -> `permission`.
 2. Root runtime `active` -> `working`.
-3. Root idle/not-loaded and any live descendant active/pending/running ->
+3. Root idle/not-loaded and any positively live descendant
+   active/pending/running ->
    `delegating`.
 4. No active/waiting live node and root idle -> `idle`.
 5. No fresh authoritative observation -> empty legacy status (`unknown` to
    renderers).
+
+Positive child liveness requires pending/running lifecycle, active/idle
+runtime, or actionable attention. A structural child that is
+`not_loaded`/`unknown` on both live axes contributes zero.
 
 `system_error` remains explicit on the node. The first version folds a root
 system error to unknown rather than silently equating an error with a user

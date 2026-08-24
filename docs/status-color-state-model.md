@@ -85,6 +85,12 @@ The table assumes attention has already passed the provider ownership check;
 the shared reducer intentionally has no Codex-specific debounce or reviewer
 logic.
 
+Likewise, a descendant counts as live only with positive evidence: lifecycle
+`pending`/`running`, runtime `active`/`idle`, or actionable attention. Mere
+topology with runtime `unknown`/`not_loaded` and lifecycle `unknown` contributes
+zero. This prevents a retained structural Codex child from fabricating a
+delegating chip.
+
 A child lifecycle is terminal at `completed`, `interrupted`, `errored`,
 `shutdown`, or `not_found`. Terminal children remain available as bounded
 display/history evidence but do not count as live work or waiting attention;

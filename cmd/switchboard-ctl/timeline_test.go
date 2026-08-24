@@ -535,6 +535,65 @@ func TestBuildAgentTimelineOldHistoryStaysAbsent(t *testing.T) {
 	}
 }
 
+func TestTimelineJSONConsumesCodexHookFusedCanonicalHistory(t *testing.T) {
+	dir := t.TempDir()
+	day := "2026-06-26"
+	startAt, stopAt := atSec(2), atSec(12)
+	restartAt, finalStopAt := atSec(14), atSec(18)
+	start := history.Event{
+		Ts: startAt, Type: history.EventAgentState, SessionID: "root", PID: 7, Agent: "codex",
+		ThreadID: "nested", ParentThreadID: "parent", Source: agentgraph.SourceCodexAppServer,
+		FromRuntime: agentgraph.RuntimeNotLoaded, ToRuntime: agentgraph.RuntimeActive,
+		FromLifecycle: agentgraph.LifecycleUnknown, ToLifecycle: agentgraph.LifecycleRunning,
+	}
+	stop := history.Event{
+		Ts: stopAt, Type: history.EventAgentState, SessionID: "root", PID: 7, Agent: "codex",
+		ThreadID: "nested", ParentThreadID: "parent", Source: agentgraph.SourceCodexAppServer,
+		FromRuntime: agentgraph.RuntimeActive, ToRuntime: agentgraph.RuntimeIdle,
+		FromLifecycle: agentgraph.LifecycleRunning, ToLifecycle: agentgraph.LifecycleCompleted,
+	}
+	restart := history.Event{
+		Ts: restartAt, Type: history.EventAgentState, SessionID: "root", PID: 7, Agent: "codex",
+		ThreadID: "nested", ParentThreadID: "parent", Source: agentgraph.SourceCodexAppServer,
+		FromRuntime: agentgraph.RuntimeIdle, ToRuntime: agentgraph.RuntimeActive,
+		FromLifecycle: agentgraph.LifecycleCompleted, ToLifecycle: agentgraph.LifecycleRunning,
+	}
+	finalStop := history.Event{
+		Ts: finalStopAt, Type: history.EventAgentState, SessionID: "root", PID: 7, Agent: "codex",
+		ThreadID: "nested", ParentThreadID: "parent", Source: agentgraph.SourceCodexAppServer,
+		FromRuntime: agentgraph.RuntimeActive, ToRuntime: agentgraph.RuntimeIdle,
+		FromLifecycle: agentgraph.LifecycleRunning, ToLifecycle: agentgraph.LifecycleCompleted,
+	}
+	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: dir})
+	// The repeated stop models reconnect/reconcile delivery. The canonical
+	// timeline must remain idempotent while preserving the later reactivation.
+	for _, event := range []history.Event{start, stop, stop, restart, finalStop} {
+		sink.Record(event)
+	}
+	sink.Close()
+
+	out := captureStdout(t, func() { cmdTimeline([]string{"--dir", dir, "--day", day, "--json"}) })
+	var envelope struct {
+		Agents *agentTimeline `json:"agent_timeline"`
+	}
+	if err := json.Unmarshal([]byte(out), &envelope); err != nil {
+		t.Fatalf("unmarshal timeline: %v\n%s", err, out)
+	}
+	if envelope.Agents == nil || len(envelope.Agents.Roots) != 1 || len(envelope.Agents.Roots[0].Nodes) != 1 {
+		t.Fatalf("Codex agent timeline is empty: %s", out)
+	}
+	node := envelope.Agents.Roots[0].Nodes[0]
+	if node.ThreadID != "nested" || node.ParentThreadID != "parent" || node.Depth != 1 ||
+		node.Runtime != agentgraph.RuntimeIdle || node.Lifecycle != agentgraph.LifecycleCompleted {
+		t.Fatalf("Codex timeline node = %+v", node)
+	}
+	if len(node.Activity) != 2 || !node.Activity[0].Start.Equal(startAt) || !node.Activity[0].End.Equal(stopAt) ||
+		!node.Activity[1].Start.Equal(restartAt) || !node.Activity[1].End.Equal(finalStopAt) ||
+		envelope.Agents.Summary.AgentActivity != 14*time.Second {
+		t.Fatalf("Codex timeline activity = %+v summary=%+v", node.Activity, envelope.Agents.Summary)
+	}
+}
+
 func TestBuildAgentTimelinePreservesUnknownForwardValues(t *testing.T) {
 	events := []history.Event{{
 		Ts: atSec(0), Type: history.EventAgentState, SessionID: "root", ThreadID: "child", ParentThreadID: "root",

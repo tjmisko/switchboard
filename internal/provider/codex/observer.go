@@ -1,5 +1,5 @@
-// Package codex observes Codex app-server state through the read-only
-// `codex app-server proxy` surface and projects it onto the neutral agent graph.
+// Package codex observes Codex app-server state through a disposable standalone
+// `codex app-server --stdio` process and projects it onto the neutral agent graph.
 package codex
 
 import (
@@ -25,6 +25,28 @@ const (
 	DefaultReconnectMaximum   = 5 * time.Second
 	DefaultTerminalLimit      = 32
 	DefaultWaitClassification = 500 * time.Millisecond
+
+	DiagnosticUnknownProtocolEnum     = "unknown_protocol_enum"
+	DiagnosticSnapshotThreadRead      = "snapshot_thread_read_error"
+	DiagnosticSnapshotTurnsList       = "snapshot_turns_list_error"
+	DiagnosticSnapshotRootMismatch    = "snapshot_root_mismatch"
+	DiagnosticSnapshotThreadList      = "snapshot_thread_list_error"
+	DiagnosticSnapshotGraphInvalid    = "snapshot_graph_invalid"
+	DiagnosticSnapshotUnknownFailure  = "snapshot_unknown_error"
+	DiagnosticObserverConnect         = "observer_connect_error"
+	DiagnosticObserverConnectAttempt  = "observer_connect_attempt"
+	DiagnosticObserverSupervisorStart = "observer_supervisor_started"
+	DiagnosticObserverConnected       = "observer_connected"
+	DiagnosticInitializeRequest       = "observer_initialize_request_error"
+	DiagnosticInitializeVersion       = "observer_initialize_version_error"
+	DiagnosticInitializedNotify       = "observer_initialized_notify_error"
+	DiagnosticObserverInitialized     = "observer_initialized"
+	DiagnosticConnectionLost          = "observer_connection_lost"
+	DiagnosticSnapshotNoTargets       = "snapshot_no_targets"
+	DiagnosticSnapshotTargetsPresent  = "snapshot_targets_present"
+	DiagnosticSnapshotInstalled       = "snapshot_installed"
+	DiagnosticSnapshotRootNotLoaded   = "snapshot_root_not_loaded"
+	DiagnosticSnapshotChildrenPresent = "snapshot_children_present"
 )
 
 // descendantSourceKinds is explicit because thread/list otherwise defaults to
@@ -40,7 +62,7 @@ var descendantSourceKinds = []string{
 
 // Config controls observer I/O and bounded retention. Zero durations receive
 // production defaults. Connector is injectable so tests never touch an
-// installed Codex binary or live app-server proxy.
+// installed Codex binary or live app-server process.
 type Config struct {
 	Connector           Connector
 	Freshness           time.Duration
@@ -55,8 +77,10 @@ type Config struct {
 	WaitClassification  time.Duration
 	Now                 func() time.Time
 	Jitter              func(time.Duration) time.Duration
-	Diagnostic          func(string)
-	WaitDiagnostic      func(WaitClassificationDiagnostic)
+	// Diagnostic receives finite categories only; raw protocol errors and
+	// payloads never cross this callback.
+	Diagnostic     func(string)
+	WaitDiagnostic func(WaitClassificationDiagnostic)
 }
 
 // WaitClassificationDiagnostic contains finite-label, content-free evidence
@@ -77,9 +101,9 @@ type rootRecord struct {
 	expiry      *time.Timer
 }
 
-// Observer is a supervised provider.Observer. NewObserver starts its proxy
-// supervisor immediately; callers should register exact hook bindings before
-// their first Observe.
+// Observer is a supervised provider.Observer. NewObserver starts its standalone
+// app-server supervisor immediately; callers register exact hook bindings before
+// their first Observe. It performs no environment or loaded-thread attribution.
 type Observer struct {
 	config   Config
 	bindings *BindingRegistry
@@ -99,8 +123,7 @@ type Observer struct {
 	pendingStatuses map[string]rpcStatus
 	pendingWaits    map[string][]rpcNotification
 	closed          bool
-	lastDiagnostic  time.Time
-	lastError       string
+	lastDiagnostics map[string]time.Time
 
 	refresh chan struct{}
 	cadence chan struct{}
@@ -116,8 +139,10 @@ func NewObserver(config Config) *Observer {
 		config: config, bindings: newBindingRegistry(),
 		queue: provider.NewInvalidationQueue(config.UpdateBuffer), ctx: ctx, cancel: cancel,
 		roots: make(map[provider.RootKey]*rootRecord), pendingStatuses: make(map[string]rpcStatus),
-		pendingWaits: make(map[string][]rpcNotification),
-		refresh:      make(chan struct{}, 1), cadence: make(chan struct{}, 1),
+		pendingWaits:    make(map[string][]rpcNotification),
+		lastDiagnostics: make(map[string]time.Time),
+		refresh:         make(chan struct{}, 1),
+		cadence:         make(chan struct{}, 1),
 	}
 	observer.wg.Add(1)
 	go observer.run()
@@ -265,7 +290,7 @@ func (o *Observer) Forget(key provider.RootKey) {
 	o.mu.Unlock()
 }
 
-// Close is idempotent. It cancels the proxy child, releases request waiters,
+// Close is idempotent. It cancels the standalone app-server child, releases request waiters,
 // stops retry/freshness timers, and waits for the supervisor goroutine.
 func (o *Observer) Close() error {
 	o.once.Do(func() {
@@ -288,20 +313,23 @@ func (o *Observer) Close() error {
 
 func (o *Observer) run() {
 	defer o.wg.Done()
+	o.emitDiagnostic(DiagnosticObserverSupervisorStart)
 	backoff := o.config.ReconnectMinimum
 	for {
 		if o.ctx.Err() != nil {
 			return
 		}
+		o.emitDiagnostic(DiagnosticObserverConnectAttempt)
 		connection, err := o.config.Connector.Connect(o.ctx)
 		if err != nil {
-			o.recordError("endpoint_connect_error")
+			o.emitDiagnostic(DiagnosticObserverConnect)
 			if !o.waitBackoff(backoff) {
 				return
 			}
 			backoff = min(backoff*2, o.config.ReconnectMaximum)
 			continue
 		}
+		o.emitDiagnostic(DiagnosticObserverConnected)
 		o.mu.Lock()
 		o.generation++
 		generation := o.generation
@@ -319,7 +347,6 @@ func (o *Observer) run() {
 
 		client := newRPCClient(connection, generation, o.handleNotification)
 		if err := o.initialize(client); err != nil {
-			o.recordError("endpoint_initialize_error")
 			_ = client.Close()
 			o.disconnect(generation)
 			if !o.waitBackoff(backoff) {
@@ -328,6 +355,7 @@ func (o *Observer) run() {
 			backoff = min(backoff*2, o.config.ReconnectMaximum)
 			continue
 		}
+		o.emitDiagnostic(DiagnosticObserverInitialized)
 		o.resnapshotAll(client, generation)
 		o.finishSync(generation)
 
@@ -349,6 +377,9 @@ func (o *Observer) run() {
 				stableTimer.Stop()
 				_ = client.Close()
 				o.disconnect(generation)
+				if o.ctx.Err() == nil {
+					o.emitDiagnostic(DiagnosticConnectionLost)
+				}
 				if !o.waitBackoff(backoff) {
 					return
 				}
@@ -382,19 +413,25 @@ func (o *Observer) initialize(client *rpcClient) error {
 		"clientInfo":   map[string]string{"name": "switchboard", "title": "Switchboard", "version": "1"},
 		"capabilities": map[string]bool{"experimentalApi": true},
 	}, &result); err != nil {
+		o.emitDiagnostic(DiagnosticInitializeRequest)
 		return err
 	}
 	if err := checkAppServerVersion(result.UserAgent); err != nil {
+		o.emitDiagnostic(DiagnosticInitializeVersion)
 		return err
 	}
-	return client.notify("initialized", map[string]any{})
+	if err := client.notify("initialized", map[string]any{}); err != nil {
+		o.emitDiagnostic(DiagnosticInitializedNotify)
+		return err
+	}
+	return nil
 }
 
 func checkAppServerVersion(userAgent string) error {
 	if userAgent == "" {
 		return errors.New("codex app-server did not report a version")
 	}
-	return checkProxyVersion(strings.ReplaceAll(userAgent, "/", " "))
+	return checkAppServerCLIVersion(strings.ReplaceAll(userAgent, "/", " "))
 }
 
 func (o *Observer) resnapshotAll(client *rpcClient, generation uint64) {
@@ -408,23 +445,42 @@ func (o *Observer) resnapshotAll(client *rpcClient, generation uint64) {
 		targets = append(targets, target{key: key, id: record.threadID})
 	}
 	o.mu.Unlock()
+	if len(targets) == 0 {
+		o.emitDiagnostic(DiagnosticSnapshotNoTargets)
+	} else {
+		o.emitDiagnostic(DiagnosticSnapshotTargetsPresent)
+	}
 	for _, target := range targets {
 		if target.id == "" {
 			continue
 		}
 		state, err := o.snapshot(client, target.id)
 		if err != nil {
-			o.recordError("thread_snapshot_error")
+			o.emitDiagnostic(snapshotDiagnosticCategory(err))
 			continue
 		}
 		o.installSnapshot(generation, target.key, target.id, state)
 	}
 }
 
-func (o *Observer) recordError(category string) {
-	o.mu.Lock()
-	o.lastError = category
-	o.mu.Unlock()
+type snapshotDiagnosticError struct {
+	category string
+	err      error
+}
+
+func newSnapshotDiagnosticError(category string, err error) error {
+	return &snapshotDiagnosticError{category: category, err: err}
+}
+
+func (e *snapshotDiagnosticError) Error() string { return e.err.Error() }
+func (e *snapshotDiagnosticError) Unwrap() error { return e.err }
+
+func snapshotDiagnosticCategory(err error) string {
+	var diagnostic *snapshotDiagnosticError
+	if errors.As(err, &diagnostic) {
+		return diagnostic.category
+	}
+	return DiagnosticSnapshotUnknownFailure
 }
 
 func (o *Observer) snapshot(client *rpcClient, rootID string) (*graphState, error) {
@@ -432,10 +488,22 @@ func (o *Observer) snapshot(client *rpcClient, rootID string) (*graphState, erro
 	defer cancel()
 	var rootResult threadReadResult
 	if err := client.request(ctx, "thread/read", map[string]any{"threadId": rootID, "includeTurns": true}, &rootResult); err != nil {
-		return nil, err
+		return nil, newSnapshotDiagnosticError(DiagnosticSnapshotThreadRead, err)
 	}
 	if rootResult.Thread.ID != rootID {
-		return nil, errors.New("codex app-server returned a different root thread")
+		return nil, newSnapshotDiagnosticError(DiagnosticSnapshotRootMismatch, errors.New("codex app-server returned a different root thread"))
+	}
+	o.emitSnapshotTurnEvidence("thread_read", rootResult.Thread.Turns)
+	var turnResult threadTurnsListResult
+	if err := client.request(ctx, "thread/turns/list", map[string]any{
+		"threadId": rootID, "limit": 100, "sortDirection": "desc", "itemsView": "full",
+	}, &turnResult); err != nil {
+		// This request is supplemental characterization evidence. The already
+		// successful thread/read plus descendant list remain a valid structural
+		// snapshot when an installed CLI lacks or rejects the method.
+		o.emitDiagnostic(DiagnosticSnapshotTurnsList)
+	} else {
+		o.emitSnapshotTurnEvidence("turns_list", turnResult.Data)
 	}
 	var descendants []rpcThread
 	var cursor string
@@ -450,7 +518,7 @@ func (o *Observer) snapshot(client *rpcClient, rootID string) (*graphState, erro
 		}
 		var result threadListResult
 		if err := client.request(ctx, "thread/list", params, &result); err != nil {
-			return nil, err
+			return nil, newSnapshotDiagnosticError(DiagnosticSnapshotThreadList, err)
 		}
 		descendants = append(descendants, result.Data...)
 		if result.NextCursor == nil || *result.NextCursor == "" {
@@ -460,7 +528,7 @@ func (o *Observer) snapshot(client *rpcClient, rootID string) (*graphState, erro
 	}
 	state := newGraphState(rootResult.Thread, descendants, o.config.RecentTerminalLimit)
 	if _, err := state.observation(o.config.Now(), o.config.Freshness); err != nil {
-		return nil, err
+		return nil, newSnapshotDiagnosticError(DiagnosticSnapshotGraphInvalid, err)
 	}
 	return state, nil
 }
@@ -491,9 +559,126 @@ func (o *Observer) installSnapshot(generation uint64, key provider.RootKey, thre
 	o.mu.Unlock()
 	if publish {
 		o.queue.Signal(key)
+		o.emitDiagnostic(DiagnosticSnapshotInstalled)
+		if len(observation.Nodes) > 0 && observation.Nodes[0].Runtime == agentgraph.RuntimeNotLoaded {
+			o.emitDiagnostic(DiagnosticSnapshotRootNotLoaded)
+		}
+		if len(observation.Nodes) > 1 {
+			o.emitDiagnostic(DiagnosticSnapshotChildrenPresent)
+		}
+		o.emitSnapshotChildEvidence(observation)
 	}
 	o.emitClassificationDiagnostics(diagnostics)
 	o.emitUnknownDiagnostic(state)
+}
+
+// emitSnapshotTurnEvidence reports only finite structural/lifecycle classes.
+// It deliberately excludes root/thread/item IDs, prompts, messages, tool input,
+// and every raw provider value. The two source labels are internal constants.
+func (o *Observer) emitSnapshotTurnEvidence(source string, turns []rpcTurn) {
+	for _, category := range snapshotTurnEvidenceCategories(source, turns) {
+		o.emitDiagnostic(category)
+	}
+}
+
+func snapshotTurnEvidenceCategories(source string, turns []rpcTurn) []string {
+	prefix := "snapshot_" + source
+	if len(turns) == 0 {
+		return []string{prefix + "_turns_absent"}
+	}
+	categories := []string{prefix + "_turns_present"}
+	collabItems, collabStates, receivers := false, false, false
+	for _, turn := range turns {
+		for _, item := range turn.Items {
+			if item.Type != "collabAgentToolCall" {
+				continue
+			}
+			collabItems = true
+			if len(item.ReceiverThreadIDs) > 0 {
+				receivers = true
+			}
+			categories = appendUniqueDiagnostic(categories,
+				prefix+"_collab_tool_"+collabToolDiagnosticSuffix(item.Tool),
+				prefix+"_collab_call_"+collabCallDiagnosticSuffix(item.Status),
+			)
+			for _, state := range item.AgentsStates {
+				collabStates = true
+				lifecycle := mapLifecycle(state.Status)
+				categories = appendUniqueDiagnostic(categories, prefix+"_collab_state_"+string(lifecycle))
+			}
+		}
+	}
+	if !collabItems {
+		return append(categories, prefix+"_collab_items_absent")
+	}
+	categories = append(categories, prefix+"_collab_items_present")
+	if receivers {
+		categories = append(categories, prefix+"_collab_receivers_present")
+	} else {
+		categories = append(categories, prefix+"_collab_receivers_absent")
+	}
+	if collabStates {
+		categories = append(categories, prefix+"_collab_states_present")
+	} else {
+		categories = append(categories, prefix+"_collab_states_absent")
+	}
+	return categories
+}
+
+func collabToolDiagnosticSuffix(value string) string {
+	switch value {
+	case "spawnAgent":
+		return "spawn_agent"
+	case "sendInput":
+		return "send_input"
+	case "resumeAgent":
+		return "resume_agent"
+	case "wait":
+		return "wait"
+	case "closeAgent":
+		return "close_agent"
+	default:
+		return "unknown"
+	}
+}
+
+func collabCallDiagnosticSuffix(value string) string {
+	switch value {
+	case "inProgress":
+		return "in_progress"
+	case "completed":
+		return "completed"
+	case "failed":
+		return "failed"
+	default:
+		return "unknown"
+	}
+}
+
+func appendUniqueDiagnostic(categories []string, candidates ...string) []string {
+	for _, candidate := range candidates {
+		found := false
+		for _, category := range categories {
+			if category == candidate {
+				found = true
+				break
+			}
+		}
+		if !found {
+			categories = append(categories, candidate)
+		}
+	}
+	return categories
+}
+
+func (o *Observer) emitSnapshotChildEvidence(observation agentgraph.Observation) {
+	for _, node := range observation.Nodes {
+		if node.ID == observation.RootID {
+			continue
+		}
+		o.emitDiagnostic("snapshot_child_runtime_" + string(node.Runtime))
+		o.emitDiagnostic("snapshot_child_lifecycle_" + string(node.Lifecycle))
+	}
 }
 
 func (o *Observer) beginSync(generation uint64) {
@@ -545,9 +730,13 @@ func (o *Observer) disconnect(generation uint64) {
 }
 
 func (o *Observer) handleNotification(notification rpcNotification) {
+	evidenceCategory := notificationEvidenceCategory(notification)
 	o.mu.Lock()
 	if notification.Generation != o.generation || !o.connected {
 		o.mu.Unlock()
+		if evidenceCategory != "" {
+			o.emitDiagnostic(evidenceCategory + "_stale")
+		}
 		return
 	}
 	if o.syncing {
@@ -555,10 +744,20 @@ func (o *Observer) handleNotification(notification rpcNotification) {
 		notification.Params = append(json.RawMessage(nil), notification.Params...)
 		o.queued = append(o.queued, notification)
 		o.mu.Unlock()
+		if evidenceCategory != "" {
+			o.emitDiagnostic(evidenceCategory + "_queued")
+		}
 		return
 	}
 	keys, unknown, diagnostics := o.applyNotificationLocked(notification)
 	o.mu.Unlock()
+	if evidenceCategory != "" {
+		if len(keys) > 0 {
+			o.emitDiagnostic(evidenceCategory + "_matched")
+		} else {
+			o.emitDiagnostic(evidenceCategory + "_unmatched")
+		}
+	}
 	for _, key := range keys {
 		o.queue.Signal(key)
 	}
@@ -572,6 +771,9 @@ func (o *Observer) handleNotification(notification rpcNotification) {
 	o.emitClassificationDiagnostics(diagnostics)
 }
 
+// notificationEvidenceCategory recognizes only lifecycle-relevant method and
+// item classes. It never incorporates an arbitrary provider method or payload
+// value into logs.
 func (o *Observer) pollInterval() time.Duration {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -583,6 +785,36 @@ func (o *Observer) pollInterval() time.Duration {
 		}
 	}
 	return o.config.IdlePollInterval
+}
+
+func notificationEvidenceCategory(notification rpcNotification) string {
+	switch notification.Method {
+	case "thread/started":
+		return "notification_thread_started"
+	case "thread/updated":
+		return "notification_thread_updated"
+	case "thread/status/changed":
+		return "notification_thread_status"
+	case "turn/started":
+		return "notification_turn_started"
+	case "turn/completed":
+		return "notification_turn_completed"
+	case "thread/archived":
+		return "notification_thread_archived"
+	case "thread/deleted":
+		return "notification_thread_deleted"
+	case "item/started", "item/completed":
+		params, ok := decodeParams[notificationParams](notification.Params)
+		if !ok || params.Item.Type != "collabAgentToolCall" {
+			return ""
+		}
+		if notification.Method == "item/started" {
+			return "notification_collab_item_started"
+		}
+		return "notification_collab_item_completed"
+	default:
+		return ""
+	}
 }
 
 type notificationParams struct {
@@ -970,18 +1202,28 @@ func (o *Observer) scheduleExpiryLocked(key provider.RootKey, record *rootRecord
 }
 
 func (o *Observer) emitUnknownDiagnostic(state *graphState) {
-	if !state.unknownEnum || o.config.Diagnostic == nil {
+	if !state.unknownEnum {
+		return
+	}
+	o.emitDiagnostic(DiagnosticUnknownProtocolEnum)
+}
+
+func (o *Observer) emitDiagnostic(category string) {
+	if o.config.Diagnostic == nil {
 		return
 	}
 	o.mu.Lock()
 	now := o.config.Now()
-	if !o.lastDiagnostic.IsZero() && now.Sub(o.lastDiagnostic) < time.Minute {
+	if o.lastDiagnostics == nil {
+		o.lastDiagnostics = make(map[string]time.Time)
+	}
+	if last := o.lastDiagnostics[category]; !last.IsZero() && now.Sub(last) < time.Minute {
 		o.mu.Unlock()
 		return
 	}
-	o.lastDiagnostic = now
+	o.lastDiagnostics[category] = now
 	o.mu.Unlock()
-	o.config.Diagnostic("codex observer received an unknown protocol enum")
+	o.config.Diagnostic(category)
 }
 
 func (o *Observer) signalRefresh() {

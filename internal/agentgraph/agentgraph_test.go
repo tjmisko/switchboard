@@ -47,6 +47,20 @@ func TestReduceTruthTable(t *testing.T) {
 			wantRuntime: RuntimeNotLoaded, wantAttention: AttentionNone,
 		},
 		{
+			name:        "unknown topology child is not live",
+			root:        Node{Runtime: RuntimeIdle},
+			children:    []Node{{ID: "child", Runtime: RuntimeUnknown, Lifecycle: LifecycleUnknown}},
+			wantRuntime: RuntimeIdle, wantAttention: AttentionNone,
+			wantLegacy: LegacyIdle,
+		},
+		{
+			name:        "not loaded topology child is not live",
+			root:        Node{Runtime: RuntimeIdle},
+			children:    []Node{{ID: "child", Runtime: RuntimeNotLoaded, Lifecycle: LifecycleUnknown}},
+			wantRuntime: RuntimeIdle, wantAttention: AttentionNone,
+			wantLegacy: LegacyIdle,
+		},
+		{
 			name:        "idle root plus running child delegates",
 			root:        Node{Runtime: RuntimeIdle},
 			children:    []Node{{ID: "child", Lifecycle: LifecycleRunning}},
@@ -66,6 +80,20 @@ func TestReduceTruthTable(t *testing.T) {
 			children:    []Node{{ID: "child", Runtime: RuntimeActive}},
 			wantRuntime: RuntimeIdle, wantAttention: AttentionNone,
 			wantLegacy: LegacyDelegating, wantLiveChildren: 1,
+		},
+		{
+			name:        "idle child is live but not working",
+			root:        Node{Runtime: RuntimeIdle},
+			children:    []Node{{ID: "child", Runtime: RuntimeIdle, Lifecycle: LifecycleUnknown}},
+			wantRuntime: RuntimeIdle, wantAttention: AttentionNone,
+			wantLegacy: LegacyIdle, wantLiveChildren: 1,
+		},
+		{
+			name:        "actionable unknown child is live",
+			root:        Node{Runtime: RuntimeIdle},
+			children:    []Node{{ID: "child", Runtime: RuntimeUnknown, Attention: AttentionApproval, Lifecycle: LifecycleUnknown}},
+			wantRuntime: RuntimeIdle, wantAttention: AttentionApproval,
+			wantLegacy: LegacyPermission, wantLiveChildren: 1, wantWaiting: 1, wantApprovals: 1,
 		},
 		{
 			name:        "completed child does not delegate",

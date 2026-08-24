@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +14,99 @@ import (
 	"github.com/tjmisko/switchboard/internal/agentgraph"
 	"github.com/tjmisko/switchboard/internal/provider"
 )
+
+func TestSnapshotDiagnosticsAreFiniteStageLabelsAndRateLimitedPerStage(t *testing.T) {
+	tests := []struct {
+		category string
+		err      error
+	}{
+		{DiagnosticSnapshotThreadRead, newSnapshotDiagnosticError(DiagnosticSnapshotThreadRead, errors.New("raw read detail"))},
+		{DiagnosticSnapshotRootMismatch, newSnapshotDiagnosticError(DiagnosticSnapshotRootMismatch, errors.New("raw root detail"))},
+		{DiagnosticSnapshotThreadList, newSnapshotDiagnosticError(DiagnosticSnapshotThreadList, errors.New("raw list detail"))},
+		{DiagnosticSnapshotGraphInvalid, newSnapshotDiagnosticError(DiagnosticSnapshotGraphInvalid, errors.New("raw graph detail"))},
+		{DiagnosticSnapshotUnknownFailure, errors.New("unclassified raw detail")},
+	}
+
+	var diagnostics []string
+	observer := &Observer{config: Config{
+		Now: func() time.Time { return time.Unix(100, 0) },
+		Diagnostic: func(category string) {
+			diagnostics = append(diagnostics, category)
+		},
+	}}
+	for _, test := range tests {
+		if got := snapshotDiagnosticCategory(test.err); got != test.category {
+			t.Fatalf("category = %q, want %q", got, test.category)
+		}
+		observer.emitDiagnostic(test.category)
+		observer.emitDiagnostic(test.category)
+	}
+	if len(diagnostics) != len(tests) {
+		t.Fatalf("diagnostics = %v, want one per stage", diagnostics)
+	}
+	for i, test := range tests {
+		if diagnostics[i] != test.category {
+			t.Fatalf("diagnostic[%d] = %q, want %q", i, diagnostics[i], test.category)
+		}
+		if diagnostics[i] == test.err.Error() {
+			t.Fatalf("raw error crossed diagnostic callback: %q", diagnostics[i])
+		}
+	}
+}
+
+func TestChildLifecycleProbeCategoriesAreFiniteAndContentFree(t *testing.T) {
+	turns := []rpcTurn{{ID: "must-not-cross", Items: []rpcItem{{
+		ID: "secret-item", Type: "collabAgentToolCall", Tool: "spawnAgent", Status: "inProgress",
+		SenderThreadID: "secret-root", ReceiverThreadIDs: []string{"secret-child"},
+		AgentsStates: map[string]rpcAgentState{
+			"secret-child": {Status: "running"},
+			"other-child":  {Status: "future-provider-value"},
+		},
+	}}}}
+	categories := snapshotTurnEvidenceCategories("thread_read", turns)
+	want := map[string]bool{
+		"snapshot_thread_read_turns_present":            false,
+		"snapshot_thread_read_collab_items_present":     false,
+		"snapshot_thread_read_collab_receivers_present": false,
+		"snapshot_thread_read_collab_states_present":    false,
+		"snapshot_thread_read_collab_tool_spawn_agent":  false,
+		"snapshot_thread_read_collab_call_in_progress":  false,
+		"snapshot_thread_read_collab_state_running":     false,
+		"snapshot_thread_read_collab_state_unknown":     false,
+	}
+	for _, category := range categories {
+		if len(category) > 64 {
+			t.Fatalf("diagnostic category too long: %q", category)
+		}
+		for _, r := range category {
+			if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' {
+				t.Fatalf("diagnostic category is not finite-label safe: %q", category)
+			}
+		}
+		if strings.Contains(category, "secret") || strings.Contains(category, "future_provider") {
+			t.Fatalf("provider identity/value crossed diagnostic boundary: %q", category)
+		}
+		if _, expected := want[category]; expected {
+			want[category] = true
+		}
+	}
+	for category, seen := range want {
+		if !seen {
+			t.Errorf("missing diagnostic %q in %v", category, categories)
+		}
+	}
+
+	if got := snapshotTurnEvidenceCategories("turns_list", nil); !reflect.DeepEqual(got, []string{"snapshot_turns_list_turns_absent"}) {
+		t.Fatalf("absent turns diagnostics = %v", got)
+	}
+	collab := mustJSON(t, map[string]any{"item": map[string]any{"type": "collabAgentToolCall"}})
+	if got := notificationEvidenceCategory(rpcNotification{Method: "item/started", Params: collab}); got != "notification_collab_item_started" {
+		t.Fatalf("collab notification category = %q", got)
+	}
+	if got := notificationEvidenceCategory(rpcNotification{Method: "agentMessage/delta", Params: mustJSON(t, map[string]any{"text": "secret"})}); got != "" {
+		t.Fatalf("content-bearing notification received a diagnostic category: %q", got)
+	}
+}
 
 func TestObserverReconnectFreshnessGenerationAndCoalescing(t *testing.T) {
 	proxy := newFakeProxy()
@@ -42,7 +136,7 @@ func TestObserverReconnectFreshnessGenerationAndCoalescing(t *testing.T) {
 	assertNode(t, complete, "child", "root", "First", "worker", agentgraph.RuntimeActive, agentgraph.AttentionNone, agentgraph.LifecycleRunning)
 
 	methods := proxy.Methods()
-	assertMethodOrder(t, methods, []string{"initialize", "initialized", "thread/read", "thread/list"})
+	assertMethodOrder(t, methods, []string{"initialize", "initialized", "thread/read", "thread/turns/list", "thread/list"})
 	for _, method := range methods {
 		if _, request := allowedRequests[method]; request {
 			continue
@@ -310,10 +404,14 @@ func TestObserverDisconnectDuringDescendantListKeepsLastCompleteSnapshot(t *test
 func TestObserverCloseInterruptsReconnectBackoff(t *testing.T) {
 	connector := &rejectingConnector{called: make(chan struct{})}
 	backoffStarted := make(chan struct{})
+	diagnostics := make(chan string, 3)
 	var backoffOnce sync.Once
 	observer := NewObserver(Config{
 		Connector:        connector,
 		ReconnectMinimum: time.Hour, ReconnectMaximum: time.Hour,
+		Diagnostic: func(category string) {
+			diagnostics <- category
+		},
 		Jitter: func(time.Duration) time.Duration {
 			backoffOnce.Do(func() { close(backoffStarted) })
 			return 0
@@ -323,6 +421,17 @@ func TestObserverCloseInterruptsReconnectBackoff(t *testing.T) {
 	case <-connector.called:
 	case <-time.After(time.Second):
 		t.Fatal("observer never attempted connection")
+	}
+	wantDiagnostics := []string{DiagnosticObserverSupervisorStart, DiagnosticObserverConnectAttempt, DiagnosticObserverConnect}
+	for i, want := range wantDiagnostics {
+		select {
+		case category := <-diagnostics:
+			if category != want {
+				t.Fatalf("diagnostic[%d] = %q, want %q", i, category, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("connection failure emitted only %d of %d bounded diagnostics", i, len(wantDiagnostics))
+		}
 	}
 	select {
 	case <-backoffStarted:
@@ -420,6 +529,8 @@ func (p *fakeProxy) serve(connection net.Conn) {
 			result = initializeResult{UserAgent: "codex_app_server/0.149.0"}
 		case "thread/read":
 			result = threadReadResult{Thread: root}
+		case "thread/turns/list":
+			result = threadTurnsListResult{Data: append([]rpcTurn(nil), root.Turns...)}
 		case "thread/list":
 			var request fakeListRequest
 			_ = json.Unmarshal(envelope.Params, &request)
