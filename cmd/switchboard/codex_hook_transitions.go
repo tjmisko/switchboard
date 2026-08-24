@@ -9,6 +9,7 @@ import (
 	"github.com/tjmisko/switchboard/internal/provider"
 	claudeprovider "github.com/tjmisko/switchboard/internal/provider/claude"
 	"github.com/tjmisko/switchboard/internal/rpc"
+	"github.com/tjmisko/switchboard/internal/state"
 )
 
 const codexHookStartSettle = 250 * time.Millisecond
@@ -22,6 +23,14 @@ type codexHookRootState struct {
 	latestAt  time.Time
 	retired   map[string]struct{}
 	pending   map[string]codexPendingInput
+
+	// Standalone app-server snapshots retain topology but report interactive
+	// TUI roots as notLoaded. Preserve the last exact hook-owned root state under
+	// its original bounded freshness deadline so those structural snapshots do
+	// not erase useful status or extend hook evidence indefinitely.
+	rootNode       agentgraph.Node
+	rootObservedAt time.Time
+	rootFreshUntil time.Time
 }
 
 type pendingCodexStart struct {
@@ -142,7 +151,9 @@ func (c *agentCoordinator) handleCodexHookNow(ref provider.RootRef, req rpc.Requ
 	observation, mapped := codexHookObservation(rootID, req, ref.StartedAt, now)
 	if mapped {
 		observation = applyCodexPendingAttention(observation, pendingAttention, now)
+		c.rememberCodexHookRootObservation(ref.Key(), observation)
 		if current, ok := sessionForKey(c.store.Snapshot(), ref.Key()); ok {
+			hookOwnsTransition = hookOwnsTransition || codexAppServerRootUnavailable(current.AgentGraph)
 			observation = overlayCodexHookObservation(observation, current.AgentGraph)
 		}
 		generation := c.begin(ref.Key())
@@ -172,11 +183,91 @@ func commitCodexHookSession(state *codexHookRootState, rootID string, now time.T
 	if state.sessionID != "" && state.sessionID != rootID {
 		state.retired[state.sessionID] = struct{}{}
 		clear(state.pending)
+		state.rootNode = agentgraph.Node{}
+		state.rootObservedAt = time.Time{}
+		state.rootFreshUntil = time.Time{}
 	}
 	state.sessionID = rootID
 	if now.After(state.latestAt) {
 		state.latestAt = now
 	}
+}
+
+func (c *agentCoordinator) rememberCodexHookRootObservation(key provider.RootKey, observation agentgraph.Observation) {
+	var root agentgraph.Node
+	for _, node := range observation.Nodes {
+		if node.ID == observation.RootID {
+			root = node
+			break
+		}
+	}
+	if root.ID == "" {
+		return
+	}
+	c.codexHookMu.Lock()
+	defer c.codexHookMu.Unlock()
+	state := c.codexHookRoots[key]
+	if state == nil || state.sessionID != observation.RootID ||
+		(!state.rootObservedAt.IsZero() && observation.ObservedAt.Before(state.rootObservedAt)) {
+		return
+	}
+	state.rootNode = root
+	state.rootObservedAt = observation.ObservedAt
+	state.rootFreshUntil = observation.FreshUntil
+}
+
+// overlayCodexHookRootObservation composes exact hook-owned root status with a
+// structurally complete standalone app-server graph. It applies only when the
+// app-server explicitly lacks a live runtime and never survives the hook's
+// original freshness deadline.
+func (c *agentCoordinator) overlayCodexHookRootObservation(key provider.RootKey, observation agentgraph.Observation, now time.Time) agentgraph.Observation {
+	if observation.Source != agentgraph.SourceCodexAppServer || observation.RootID == "" {
+		return observation
+	}
+	c.codexHookMu.Lock()
+	state := c.codexHookRoots[key]
+	if state == nil || state.sessionID != observation.RootID || state.rootNode.ID != observation.RootID ||
+		state.rootFreshUntil.IsZero() || !now.Before(state.rootFreshUntil) {
+		c.codexHookMu.Unlock()
+		return observation
+	}
+	root, freshUntil := state.rootNode, state.rootFreshUntil
+	c.codexHookMu.Unlock()
+
+	for i := range observation.Nodes {
+		if observation.Nodes[i].ID != observation.RootID {
+			continue
+		}
+		if !codexRootStateUnavailable(observation.Nodes[i].Runtime, observation.Nodes[i].Attention) {
+			return observation
+		}
+		observation.Nodes[i].Runtime = root.Runtime
+		observation.Nodes[i].Attention = root.Attention
+		observation.Nodes[i].Lifecycle = root.Lifecycle
+		observation.Nodes[i].UpdatedAt = root.UpdatedAt
+		if observation.FreshUntil.IsZero() || freshUntil.Before(observation.FreshUntil) {
+			observation.FreshUntil = freshUntil
+		}
+		return observation
+	}
+	return observation
+}
+
+func codexAppServerRootUnavailable(graph *state.AgentGraph) bool {
+	if graph == nil || graph.Source != agentgraph.SourceCodexAppServer {
+		return false
+	}
+	for _, node := range graph.Nodes {
+		if node.ID == graph.RootID {
+			return codexRootStateUnavailable(node.Runtime, node.Attention)
+		}
+	}
+	return false
+}
+
+func codexRootStateUnavailable(runtime agentgraph.RuntimeState, attention agentgraph.AttentionState) bool {
+	return attention == agentgraph.AttentionNone &&
+		(runtime == agentgraph.RuntimeUnknown || runtime == agentgraph.RuntimeNotLoaded)
 }
 
 func reduceCodexPendingInput(state *codexHookRootState, req rpc.Request) (agentgraph.AttentionState, bool) {

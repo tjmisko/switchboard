@@ -42,6 +42,9 @@ const (
 	DiagnosticConnectionLost          = "observer_connection_lost"
 	DiagnosticSnapshotNoTargets       = "snapshot_no_targets"
 	DiagnosticSnapshotTargetsPresent  = "snapshot_targets_present"
+	DiagnosticSnapshotInstalled       = "snapshot_installed"
+	DiagnosticSnapshotRootNotLoaded   = "snapshot_root_not_loaded"
+	DiagnosticSnapshotChildrenPresent = "snapshot_children_present"
 )
 
 // descendantSourceKinds is explicit because thread/list otherwise defaults to
@@ -518,6 +521,13 @@ func (o *Observer) installSnapshot(generation uint64, key provider.RootKey, thre
 	o.mu.Unlock()
 	if publish {
 		o.queue.Signal(key)
+		o.emitDiagnostic(DiagnosticSnapshotInstalled)
+		if len(observation.Nodes) > 0 && observation.Nodes[0].Runtime == agentgraph.RuntimeNotLoaded {
+			o.emitDiagnostic(DiagnosticSnapshotRootNotLoaded)
+		}
+		if len(observation.Nodes) > 1 {
+			o.emitDiagnostic(DiagnosticSnapshotChildrenPresent)
+		}
 	}
 	o.emitClassificationDiagnostics(diagnostics)
 	o.emitUnknownDiagnostic(state)

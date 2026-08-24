@@ -391,6 +391,7 @@ func (c *agentCoordinator) applyObservation(ref provider.RootRef, generation uin
 
 func (c *agentCoordinator) applyObservationWithHookOwnership(ref provider.RootRef, generation uint64, observation agentgraph.Observation, compat claudeprovider.Compatibility, now time.Time, hookOwnsTransition bool) bool {
 	if ref.Provider == agentgraph.ProviderCodex {
+		observation = c.overlayCodexHookRootObservation(ref.Key(), observation, now)
 		observation = c.overlayCodexPendingObservation(ref.Key(), observation, now)
 	}
 	c.mu.Lock()

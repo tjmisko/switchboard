@@ -336,6 +336,73 @@ func TestFreshCodexAppServerGraphOutranksHookFallback(t *testing.T) {
 	}
 }
 
+func TestCodexNotLoadedAppServerSnapshotRetainsBoundedHookRootStatusAndTopology(t *testing.T) {
+	startedAt := time.Date(2026, 8, 23, 16, 0, 0, 0, time.UTC)
+	store := state.New("")
+	ref := seedCoordinatorSession(store, 4104, startedAt, state.AgentKindCodex, "root", "/same")
+	fake := newFakeCodexCoordinatorObserver()
+	coordinator := newAgentCoordinator(store, nil, nil, fake)
+	coordinator.refreshTrackedRoots()
+	defer coordinator.Close()
+
+	initialAt := startedAt.Add(time.Hour)
+	initial := testCodexObservation(ref, "root", initialAt, agentgraph.RuntimeNotLoaded, agentgraph.AttentionNone)
+	initial.Nodes[0].Lifecycle = agentgraph.LifecycleUnknown
+	if !coordinator.applyObservation(ref, coordinator.begin(ref.Key()), initial, claudeprovider.Compatibility{}, initialAt) {
+		t.Fatal("initial notLoaded app-server observation was not applied")
+	}
+	if got := store.Snapshot().Sessions[0].AgentGraph.Summary.Status; got != "" {
+		t.Fatalf("notLoaded app-server status = %q, want unknown", got)
+	}
+
+	hookAt := initialAt.Add(time.Second)
+	coordinator.HandleHook(rpc.Request{
+		Agent: state.AgentKindCodex, Event: "UserPromptSubmit", SessionID: "root", ObservedAt: hookAt,
+	}, store.Snapshot().Sessions[0])
+	hookGraph := store.Snapshot().Sessions[0].AgentGraph
+	if hookGraph.Source != agentgraph.SourceHook || hookGraph.Summary.Status != state.StatusWorking {
+		t.Fatalf("exact hook did not fill unavailable app-server root: %#v", hookGraph)
+	}
+
+	snapshotAt := hookAt.Add(time.Second)
+	snapshot := testCodexObservation(ref, "root", snapshotAt, agentgraph.RuntimeNotLoaded, agentgraph.AttentionNone)
+	snapshot.FreshUntil = hookAt.Add(24 * time.Hour)
+	snapshot.Nodes[0].Lifecycle = agentgraph.LifecycleUnknown
+	snapshot.Nodes = append(snapshot.Nodes, agentgraph.Node{
+		ID: "child", ParentID: "root", Nickname: "Topology", Runtime: agentgraph.RuntimeNotLoaded,
+		Attention: agentgraph.AttentionNone, Lifecycle: agentgraph.LifecycleUnknown,
+	})
+	if !coordinator.applyObservation(ref, coordinator.begin(ref.Key()), snapshot, claudeprovider.Compatibility{}, snapshotAt) {
+		t.Fatal("composed app-server observation was not applied")
+	}
+	composed := store.Snapshot().Sessions[0].AgentGraph
+	if composed.Source != agentgraph.SourceCodexAppServer || !composed.Complete ||
+		composed.Summary.Status != state.StatusWorking || len(composed.Nodes) != 2 ||
+		composed.Nodes[1].Nickname != "Topology" {
+		t.Fatalf("composed hook status and app-server topology = %#v", composed)
+	}
+	wantDeadline := hookAt.Add(codexHookActiveFreshness)
+	if !composed.FreshUntil.Equal(wantDeadline) {
+		t.Fatalf("composed freshness = %v, want hook deadline %v", composed.FreshUntil, wantDeadline)
+	}
+
+	expiredAt := wantDeadline
+	expired := snapshot.Clone()
+	expired.ObservedAt = expiredAt
+	expired.FreshUntil = expiredAt.Add(time.Minute)
+	expired.Nodes[0].Runtime = agentgraph.RuntimeNotLoaded
+	expired.Nodes[0].Attention = agentgraph.AttentionNone
+	expired.Nodes[0].Lifecycle = agentgraph.LifecycleUnknown
+	expired.Nodes[0].UpdatedAt = expiredAt
+	if !coordinator.applyObservation(ref, coordinator.begin(ref.Key()), expired, claudeprovider.Compatibility{}, expiredAt) {
+		t.Fatal("post-hook-deadline app-server observation was not applied")
+	}
+	postExpiry := store.Snapshot().Sessions[0].AgentGraph
+	if postExpiry.Summary.Status != "" || postExpiry.Nodes[0].Runtime != agentgraph.RuntimeNotLoaded {
+		t.Fatalf("expired hook evidence remained authoritative: %#v", postExpiry)
+	}
+}
+
 func TestExpiredObservationClearsAuthorityWithoutDroppingRoot(t *testing.T) {
 	startedAt := time.Now().Add(-time.Hour)
 	store := state.New("")

@@ -148,3 +148,18 @@ feature before promotion:
 Successful initialization alone is transport progress, not proof of either
 invariant. `observer_initialized` must be followed by snapshot target/read/list
 success and complete app-server-sourced graphs.
+
+### First live stdio result
+
+The standalone transport initialized and repeatedly installed valid snapshots
+for all four hook-bound roots. It also recovered descendant thread IDs,
+parentage, and nicknames. However, the standalone server reported every
+interactive root and recovered child as `notLoaded` with unknown lifecycle.
+That structural snapshot erased the previously useful hook-derived root status
+and cannot yet prove child lifecycle transitions.
+
+The spike therefore composes authorities by field: app-server snapshots retain
+topology, while the last exact root hook retains working/idle/attention only
+until its original state-specific freshness deadline. A later app-server value
+other than `unknown`/`notLoaded` wins immediately. Unknown child lifecycle stays
+unknown; the spike does not infer liveness from topology alone.
