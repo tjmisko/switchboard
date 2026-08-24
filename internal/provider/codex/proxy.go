@@ -12,12 +12,13 @@ import (
 	"sync"
 )
 
-const minimumProxyVersion = "0.149.0"
+const minimumAppServerVersion = "0.149.0"
 
-// CommandConnector supervises only the disposable stdio proxy child. It never
-// opens the private socket directly and never starts or stops the shared
-// app-server. The installed capability was established for Codex 0.149.0, so a
-// version preflight rejects older or unparseable CLIs.
+// CommandConnector supervises a disposable standalone app-server over the
+// installed CLI's stdio transport. It never opens a private control socket and never
+// starts, stops, or reconfigures the shared app-server daemon. The installed
+// capability was established for Codex 0.149.0, so a version preflight rejects
+// older or unparseable CLIs.
 type CommandConnector struct {
 	Binary string
 }
@@ -30,13 +31,13 @@ func (c CommandConnector) Connect(ctx context.Context) (Connection, error) {
 	versionCmd := exec.CommandContext(ctx, binary, "--version")
 	versionOutput, err := versionCmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("codex proxy capability check: %w", err)
+		return nil, fmt.Errorf("codex app-server capability check: %w", err)
 	}
-	if err := checkProxyVersion(string(versionOutput)); err != nil {
+	if err := checkAppServerCLIVersion(string(versionOutput)); err != nil {
 		return nil, err
 	}
 
-	cmd := exec.CommandContext(ctx, binary, "app-server", "proxy")
+	cmd := standaloneAppServerCommand(ctx, binary)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -53,20 +54,24 @@ func (c CommandConnector) Connect(ctx context.Context) (Connection, error) {
 	}
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
-		return nil, fmt.Errorf("start codex app-server proxy: %w", err)
+		return nil, fmt.Errorf("start standalone codex app-server: %w", err)
 	}
 	// stderr is never mixed with protocol stdout and raw payloads are never
-	// logged. Draining it prevents a noisy proxy from blocking.
+	// logged. Draining it prevents a noisy app-server from blocking.
 	go func() { _, _ = io.Copy(io.Discard, stderr) }()
 	return &commandConnection{reader: stdout, writer: stdin, cmd: cmd}, nil
 }
 
+func standaloneAppServerCommand(ctx context.Context, binary string) *exec.Cmd {
+	return exec.CommandContext(ctx, binary, "app-server", "--stdio")
+}
+
 var versionPattern = regexp.MustCompile(`(?:^|[\s/])(\d+)\.(\d+)\.(\d+)(?:\s|$)`)
 
-func checkProxyVersion(output string) error {
+func checkAppServerCLIVersion(output string) error {
 	match := versionPattern.FindStringSubmatch(strings.TrimSpace(output))
 	if len(match) != 4 {
-		return errors.New("codex proxy capability check: unrecognized CLI version")
+		return errors.New("codex app-server capability check: unrecognized CLI version")
 	}
 	got := [3]int{}
 	for i := range got {
@@ -78,7 +83,7 @@ func checkProxyVersion(output string) error {
 			return nil
 		}
 		if got[i] < minimum[i] {
-			return fmt.Errorf("codex app-server proxy requires CLI >= %s", minimumProxyVersion)
+			return fmt.Errorf("codex app-server requires CLI >= %s", minimumAppServerVersion)
 		}
 	}
 	return nil

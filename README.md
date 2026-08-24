@@ -251,7 +251,7 @@ reduce the latency on the `delegating` chip and the "N agents" count. The hook i
 a pure trigger; the daemon's Observer remains the single source of truth, so a
 duplicated or dropped subagent hook can never miscount.
 
-## Codex app-server observer and optional hooks
+## Codex app-server observer and lifecycle hooks
 
 Switchboard discovers interactive **OpenAI Codex** TUI roots while excluding
 wrappers and non-interactive subcommands such as `exec`, `mcp`, and
@@ -259,14 +259,25 @@ wrappers and non-interactive subcommands such as `exec`, `mcp`, and
 Codex child agents are app-server threads nested beneath that root; they never
 become focus/cycle/pick targets of their own.
 
-In the default `-codex-observer auto` mode, Switchboard uses Codex app-server as
-the primary status source. It reads the bound root with `thread/read`, snapshots
-spawned descendants with `thread/list`, and consumes live thread/turn/item
-notifications. This preserves distinct `approval` and `user_input` waits: both
-make the root chip red, while the child row says `approval` or `user input`
-(`question` in the compact Waybar tooltip). The public app-server documentation
-defines the JSON-RPC/JSONL protocol, thread reads/listing, descendant filters,
-runtime status, approvals, and streamed events. See the
+In the default `-codex-observer auto` mode, Switchboard launches a disposable
+standalone Codex app-server and reads the exact bound root with `thread/read`
+plus its descendants with `thread/list`. Live testing with the installed Codex
+0.149.0 CLI proves that this path recovers thread IDs, immediate parentage, and
+nicknames for plain `codex` TUIs. That standalone server currently reports the
+tested recovered children as `notLoaded` with unknown lifecycle, so structural
+presence alone is not counted as live work.
+
+Authority is therefore composed by field. App-server owns structural topology.
+When its root runtime is `unknown` or `notLoaded`, the last exact lifecycle hook
+may retain bounded root runtime/attention until that hook's original freshness
+deadline; snapshots never extend the deadline. Any available app-server root
+runtime wins immediately. Trusted `SubagentStart`/`SubagentStop` hooks supply a
+child runtime/lifecycle edge only after their exact `agent_id` matches a
+non-root node in a fresh app-server graph. Missing or unmatched hooks never
+create children, change parentage, or infer completion. The protocol reducer
+preserves distinct `approval` and `user_input` waits when those events are available:
+both make the root chip red, while the child row says `approval` or `user input`
+(`question` in the compact Waybar tooltip). See the
 [official OpenAI app-server documentation](https://learn.chatgpt.com/docs/app-server)
 and [Codex subagent documentation](https://learn.chatgpt.com/docs/agent-configuration/subagents).
 
@@ -276,44 +287,51 @@ its stable thread ID; after project prefixing that renders as, for example,
 `sb-01`. An explicit rename replaces that fallback (`sb-my-short-name`). Codex
 terminal titles are deliberately excluded from label fallback: their
 configurable spinner/run-state, branch, and model items do not belong in the
-session label. Colors continue to come only from structured app-server
-runtime/attention state; names do not affect status.
+session label. Colors come only from the composed structured app-server/hook
+authorities described below; names do not affect status.
 
-The transport used here is `codex app-server proxy`: a disposable stdio child
-that connects to the already-running app-server control socket. That proxy
-subcommand was verified locally in Codex CLI **0.149.0** and Switchboard rejects
-older or unparseable versions. The current public app-server page does not
-document the proxy subcommand, so this is a locally verified capability—not a
-general OpenAI protocol guarantee.
+The transport is `codex app-server --stdio`: a disposable standalone child from
+the unmodified Codex binary. It does not open a private per-TUI endpoint or
+start, stop, reconfigure, or depend on the shared app-server daemon. The
+installed CLI help and the 2026-08-23 live run establish this behavior for
+Codex CLI **0.149.0**; it is empirical compatibility evidence, not a general
+OpenAI protocol guarantee. Switchboard rejects older or unparseable versions.
 
-The proxy transport expects the local app-server control daemon, but there is a
-known Codex 0.149 integration incompatibility: enabling the shared daemon moved
-new threads under the background process and broke Switchboard's exact
-hook-to-visible-TUI attribution. New roots then stayed `unknown` even though the
-hooks were configured and trusted. Do **not** start the shared daemon solely for
-Switchboard until that binding gap is fixed; use the hook fallback instead. See
-the [incident report](docs/codex-app-server-hook-attribution-incident.md).
+The earlier `codex app-server proxy` experiment required a usable shared-daemon
+control socket and failed its first `initialize` request. Enabling that daemon
+also moved new threads under the background process and broke exact
+hook-to-visible-TUI attribution. The standalone stdio path avoids that
+ownership problem entirely. Do **not** start the shared daemon solely for
+Switchboard. See the
+[incident report](docs/codex-app-server-hook-attribution-incident.md).
 
 Root binding is exact and never uses cwd, rollout recency, or timestamp
 correlation:
 
-1. `CODEX_THREAD_ID` from the discovered root process environment on Linux.
-2. The `session_id` delivered by that root's trusted lifecycle hooks.
+1. `CODEX_THREAD_ID` from the discovered root process environment on Linux,
+   before a hook identity has arrived.
+2. The `session_id` delivered by that root's trusted lifecycle hooks, which
+   supersedes the immutable environment identity after `/clear`.
 
 `SessionStart` is normally the first hook identity edge. If it races the
 one-second process-discovery scan, any later lifecycle hook with the same exact
 `session_id` self-heals the binding. A persisted exact identity is restored for
 the same `(pid, started_at)` process lifetime after a Switchboard restart.
+Because `/clear` changes the conversation without changing the TUI process, a
+new lifecycle-hook identity supersedes the immutable process-start environment
+value. Retired hook identities are fenced for that process lifetime, so a late
+pre-clear event cannot rotate the chip backwards.
 
 `CODEX_SESSION_ID` is intentionally ignored because captured 0.149 process
 evidence showed it can name an ancestor rather than the current thread. A PID is
 always paired with Switchboard's process-lifetime `started_at`, so PID reuse
 cannot inherit a binding.
 
-Hooks are therefore optional identity and fallback enrichment, not the primary
-Codex status source. If process-environment access is unavailable, this valid
-`~/.codex/hooks.json` shape supplies exact hook identity and a bounded partial
-root status while app-server reconnects:
+Hooks therefore provide exact identity and bounded root runtime/attention,
+while app-server supplies structural topology. If process-environment access is
+unavailable, this valid `~/.codex/hooks.json` shape still binds the root and
+supplies a bounded partial root status while app-server reconnects or reports
+the root as not loaded:
 
 ```json
 {
@@ -324,7 +342,9 @@ root status while app-server reconnects:
     "PreToolUse": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook PreToolUse", "timeout": 2}]}],
     "PostToolUse": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook PostToolUse", "timeout": 2}]}],
     "PermissionRequest": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook PermissionRequest", "timeout": 2}]}],
-    "Stop": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook Stop", "timeout": 2}]}]
+    "Stop": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook Stop", "timeout": 2}]}],
+    "SubagentStart": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook SubagentStart", "timeout": 2}]}],
+    "SubagentStop": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook SubagentStop", "timeout": 2}]}]
   }
 }
 ```
@@ -333,23 +353,42 @@ This three-level event → matcher group → handler shape follows the
 [official OpenAI hooks documentation](https://learn.chatgpt.com/docs/hooks).
 Codex requires non-managed command hooks to be reviewed and trusted; use
 `/hooks` after adding or changing the file. The fallback maps
-`UserPromptSubmit`/`PreToolUse`/`PostToolUse` to active, `PermissionRequest` to
-an approval wait (`AskUserQuestion` to user input), and `Stop`/`SessionStart` to
-idle. It is partial and root-only. Active evidence remains fresh for 10 minutes,
-approval or user-input waits for 24 hours, and idle edges for 7 days. Every
-later hook replaces and refreshes that evidence; the finite deadlines bound the
-effect of a missed resolution edge.
+`UserPromptSubmit` and ordinary `PreToolUse`/`PostToolUse` to active,
+`PermissionRequest` to an approval wait, and `Stop` to idle. A
+`request_user_input` `PreToolUse` instead opens a user-input wait keyed by its
+opaque `tool_use_id`; only the matching `PostToolUse`, its turn's `Stop`, or a
+new conversation clears that wait. Unrelated tool hooks and generic app-server
+snapshots cannot repaint it green. `SessionStart(clear|startup|resume)` is held
+for 250 ms so an immediate same-thread continuation replaces the provisional
+idle edge, while a standalone `/clear` still settles idle.
+`SessionStart(compact)` remains active because Codex continues the model
+immediately after compaction. Only content-free lifecycle metadata is used to
+correlate the wait; its question, answer, and raw tool input stay out of the
+daemon. The root-status hook fallback is partial and root-only. Active evidence remains
+fresh for 10 minutes, approval or user-input waits for 24 hours, and idle edges
+for 7 days. A daemon restart during an already-open hook-only interview cannot
+reconstruct that wait and therefore remains unknown rather than confidently
+green. The two child hooks are required for live child state on the tested
+standard-CLI path, but not for discovery or topology. Matched running child
+edges expire after 10 minutes without a later edge; matched completions persist
+within the exact root lifetime and can be reopened by a later start. See the
+[no-wrapper child-lifecycle decision](docs/codex-no-wrapper-child-lifecycle.md).
 
 Automatic degradation is fail-open for the root and fail-closed for status:
 
-- proxy/version/connection failure leaves discovery and navigation working;
+- app-server capability/start/connection failure leaves discovery and
+  navigation working;
 - the last complete graph remains visible only until its explicit freshness
   deadline, then its summary becomes unknown/stale rather than freezing a
   confident color;
 - the observer reconnects with bounded exponential backoff and resnapshots;
-- `-codex-observer off` never constructs the proxy. Codex hooks can still supply
-  the partial root view; without them the root remains visible with unknown
-  status and no child graph.
+- The standard `codex` launch path owns interview waits through the exact hook
+  latch above; it does not depend on a launcher or private endpoint. See the
+  [standard-CLI retrospective](docs/codex-standard-cli-interview-retrospective.md);
+- `-codex-observer off` never constructs the standalone app-server. Codex hooks
+  can still supply the partial root view, but child hooks cannot synthesize
+  topology; without hooks the root remains visible with unknown status and no
+  proven live children.
 
 Use `switchboard-ctl diagnose --observer` to inspect content-free binding,
 source, freshness, completeness, node counts, observer mode, and finite error
@@ -360,8 +399,8 @@ transcripts, thread labels, prompts, commands, or raw provider payloads.
 
 - **Observe:** Linux with `pidfd_open(2)` (kernel 5.3+). Go 1.25 to build.
 - **Codex graph observer:** a locally verified Codex CLI 0.149.0+ installation
-  exposing `codex app-server proxy`; otherwise use `-codex-observer off` or the
-  automatic degraded root-only behavior above.
+  exposing `codex app-server --stdio`; otherwise use `-codex-observer off` or
+  the automatic degraded root-only behavior above.
 - **Navigate:** a supported WM (Hyprland / sway / i3 / X11) **and** terminal
   (wezterm / tmux) on `PATH`.
 - macOS support (Observe tier) is planned (see the plan).

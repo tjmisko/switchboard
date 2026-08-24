@@ -48,16 +48,29 @@ type Request struct {
 	Selector string `json:"selector,omitempty"`
 
 	// hook fields — set when Cmd == "hook"
-	Event      string `json:"event,omitempty"`
-	PID        int    `json:"pid,omitempty"`
-	SessionID  string `json:"session_id,omitempty"`
-	Transcript string `json:"transcript,omitempty"`
+	Event      string    `json:"event,omitempty"`
+	PID        int       `json:"pid,omitempty"`
+	SessionID  string    `json:"session_id,omitempty"`
+	Transcript string    `json:"transcript,omitempty"`
+	ObservedAt time.Time `json:"observed_at,omitzero"`
+	// HookSource is Codex SessionStart.source (startup, resume, clear, compact).
+	// It is lifecycle metadata, not provider content, and lets the daemon avoid
+	// treating an immediate post-/clear continuation as a real idle interval.
+	HookSource string `json:"hook_source,omitempty"`
+	// TurnID and ToolUseID are opaque Codex hook correlation IDs. In particular,
+	// tool_use_id joins request_user_input's PreToolUse and PostToolUse edges so
+	// an unrelated tool completion cannot clear a waiting-for-user state.
+	TurnID    string `json:"turn_id,omitempty"`
+	ToolUseID string `json:"tool_use_id,omitempty"`
+	// PermissionMode records the content-free Codex turn mode (default, plan,
+	// and so on) at lifecycle boundaries.
+	PermissionMode string `json:"permission_mode,omitempty"`
 	// Agent names which coding agent fired the hook: "claude" (default when
 	// empty) or "codex". It routes the enrichment to the right block and selects
 	// the event→status mapping.
 	Agent string `json:"agent,omitempty"`
-	// ToolName is the hook's tool_name when the event carries one (PermissionRequest,
-	// PostToolUse). It is stashed at red-onset (state.PendingPrompt.Tool, under the
+	// ToolName is the hook's tool_name when the event carries one (PreToolUse,
+	// PermissionRequest, PostToolUse). It is stashed at red-onset (state.PendingPrompt.Tool, under the
 	// writer that raised the prompt) and matched on a later
 	// PostToolUse to clear red at hook speed when the approved tool completes —
 	// while a non-matching/Task PostToolUse keeps the chip red. Empty for events
@@ -97,12 +110,34 @@ type Request struct {
 	AgentID   string `json:"agent_id,omitempty"`
 	AgentType string `json:"agent_type,omitempty"`
 
+	// HookClientHints are bounded terminal identity candidates
+	// observed by the hook subprocess. They are diagnostic-only: the daemon may
+	// compare them with already-discovered Codex roots, but they never authorize
+	// hook delivery or bind a provider thread. This probe determines whether
+	// daemon-owned standard-Codex hooks retain an exact per-TUI identity.
+	HookClientHints []HookClientHint `json:"hook_client_hints,omitempty"`
+
 	// Activity carries the global user-activity edge — set when Cmd == "activity".
 	// It is session-less: "idle" when an idle daemon (e.g. hypridle) sees no input
 	// for its timeout, "active" when input resumes. Exactly those two values are
 	// valid; handleActivity rejects anything else.
 	Activity string `json:"activity,omitempty"`
 }
+
+// HookClientHint is an opaque terminal identity candidate. Values come only
+// from a small allowlist at the ctl edge and are never logged or persisted.
+type HookClientHint struct {
+	Kind  string `json:"kind"`
+	Value string `json:"value"`
+}
+
+const (
+	HookClientHintTTY         = "tty"
+	HookClientHintWeztermPane = "wezterm_pane"
+	HookClientHintTmuxPane    = "tmux_pane"
+	maxHookClientHints        = 4
+	maxHookClientHintValueLen = 128
+)
 
 type Response struct {
 	Snapshot    *state.Snapshot   `json:"snapshot,omitempty"`
@@ -135,6 +170,14 @@ type AgentDiagnostic struct {
 	LastAt   time.Time `json:"last_at"`
 }
 
+// HookAttributionDiagnostic is the bounded result of the no-wrapper identity
+// probe. MatchedPID is populated only when exactly one visible Codex root
+// matches; no raw hint value crosses the callback.
+type HookAttributionDiagnostic struct {
+	Category   string
+	MatchedPID int
+}
+
 // AgentHookHandler receives an already-attributed hook and a detached snapshot
 // of its root session. The handler owns provider-specific interpretation. It is
 // invoked without the state-store lock held, including while walking /proc to
@@ -154,6 +197,11 @@ type Server struct {
 	fanout      *fanout.Observer
 	agentHook   AgentHookHandler
 	diagnostics AgentDiagnosticSource
+	// hookAttributionDiagnostic receives finite labels and, for a unique match,
+	// the already-discovered root PID. It observes whether an otherwise-
+	// unattributable plain-Codex hook carried a terminal identity matching zero,
+	// one, or several visible roots; it never causes delivery.
+	hookAttributionDiagnostic func(HookAttributionDiagnostic)
 	// readProc is the seam findTrackedAncestor walks the ppid chain through.
 	// Production is proc.Read; tests substitute a synthetic chain so hook
 	// attribution can be exercised against process shapes (a nested `claude -p`,
@@ -188,6 +236,13 @@ func (s *Server) SetAgentHookHandler(handler AgentHookHandler) { s.agentHook = h
 
 // SetAgentDiagnosticSource installs the additive, content-free diagnostics RPC.
 func (s *Server) SetAgentDiagnosticSource(source AgentDiagnosticSource) { s.diagnostics = source }
+
+// SetHookAttributionDiagnostic installs the diagnostic-only no-wrapper probe.
+// The callback receives finite implementation labels, an optional discovered
+// root PID, and no hint values.
+func (s *Server) SetHookAttributionDiagnostic(handler func(HookAttributionDiagnostic)) {
+	s.hookAttributionDiagnostic = handler
+}
 
 // Serve listens on the socket path and accepts connections until ctx is done.
 // The socket file is removed on startup (in case of unclean shutdown) and on
@@ -743,9 +798,96 @@ func (s *Server) dispatchAgentHook(req Request) {
 	}
 	pid := findTrackedAncestor(tracked, req.PID, s.readProc)
 	if pid == 0 {
+		s.reportHookAttributionProbe(req, snap.Sessions)
 		return
 	}
 	s.agentHook(req, *tracked[pid])
+}
+
+func (s *Server) reportHookAttributionProbe(req Request, sessions []state.Session) {
+	if req.Agent != state.AgentKindCodex || s.hookAttributionDiagnostic == nil {
+		return
+	}
+	present := make(map[string]struct{})
+	for i, hint := range req.HookClientHints {
+		if i >= maxHookClientHints {
+			break
+		}
+		if len(hint.Value) > maxHookClientHintValueLen {
+			continue
+		}
+		switch hint.Kind {
+		case HookClientHintTTY, HookClientHintWeztermPane, HookClientHintTmuxPane:
+			if strings.TrimSpace(hint.Value) != "" {
+				present[hint.Kind] = struct{}{}
+			}
+		}
+	}
+	for _, kind := range []string{HookClientHintTTY, HookClientHintWeztermPane, HookClientHintTmuxPane} {
+		if _, ok := present[kind]; ok {
+			s.hookAttributionDiagnostic(HookAttributionDiagnostic{Category: "hook_client_hint_" + kind + "_present"})
+		}
+	}
+
+	category := "hook_client_identity_unmatched"
+	matchedPID := 0
+	if len(present) == 0 {
+		category = "hook_client_identity_absent"
+	} else {
+		matches, pid := hookClientHintMatches(sessions, req.HookClientHints)
+		switch matches {
+		case 1:
+			category = "hook_client_identity_unique"
+			matchedPID = pid
+		case 2:
+			category = "hook_client_identity_ambiguous"
+		}
+	}
+	s.hookAttributionDiagnostic(HookAttributionDiagnostic{Category: category, MatchedPID: matchedPID})
+}
+
+// hookClientHintMatches returns a count of 0, 1, or 2 (two-or-more), plus the
+// matching PID only when the count is exactly one. Even a unique result leaves
+// the hook dropped until live evidence and a separate exactness review promote
+// a client identity source into the binding contract.
+func hookClientHintMatches(sessions []state.Session, hints []HookClientHint) (int, int) {
+	matches := 0
+	matchedPID := 0
+	for _, session := range sessions {
+		if session.Agent != state.AgentKindCodex {
+			continue
+		}
+		matched := false
+		for i, hint := range hints {
+			if i >= maxHookClientHints {
+				break
+			}
+			if len(hint.Value) > maxHookClientHintValueLen {
+				continue
+			}
+			value := strings.TrimSpace(hint.Value)
+			if value == "" {
+				continue
+			}
+			switch hint.Kind {
+			case HookClientHintTTY:
+				matched = session.TTY != "" && value == session.TTY
+			case HookClientHintWeztermPane:
+				matched = session.Wezterm != nil && value == strconv.Itoa(session.Wezterm.PaneID)
+			}
+			if matched {
+				break
+			}
+		}
+		if matched {
+			matches++
+			matchedPID = session.PID
+			if matches > 1 {
+				return 2, 0
+			}
+		}
+	}
+	return matches, matchedPID
 }
 
 // agentIDPrefix is the "agent-" that brackets a subagent id in its on-disk file

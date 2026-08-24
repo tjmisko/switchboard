@@ -150,25 +150,39 @@ is present.
 #### Legacy hook fallback mapping
 
 Claude compatibility still consumes its hook/transcript state machine. Codex
-uses app-server as primary truth; only its lower-authority partial fallback
-maps hook events directly. Active evidence expires after 10 minutes, approval
-or user-input waits after 24 hours, and idle edges after 7 days. Each later hook
-replaces and refreshes that evidence. The event mapping is:
+uses app-server as primary structural truth, plus a standard-CLI hook-owned
+`request_user_input` latch that app-server snapshots cannot resolve. Other
+Codex hook evidence remains a lower-authority partial fallback. Active evidence
+expires after 10 minutes, approval or user-input waits after 24 hours, and idle
+edges after 7 days. The event mapping is:
 
 | Hook event | `claude` status | `codex` status |
 |------------|-----------------|----------------|
 | `UserPromptSubmit` | `working` | `working` |
-| `PreToolUse` | (unmapped) | `working` |
-| `PostToolUse` | `working` | `working` |
+| ordinary `PreToolUse` | (unmapped) | `working` |
+| `request_user_input` `PreToolUse` | (unmapped) | `permission` (`user_input`) |
+| ordinary/unmatched `PostToolUse` | `working` | `working`, without clearing a pending question |
+| matching `request_user_input` `PostToolUse` | `working` | `working`, and clears that exact question |
 | `PermissionRequest` | `permission` | `permission` |
-| `Stop`, `SessionStart` | `idle` | `idle` |
+| `Stop` | `idle` | `idle`, and clears an interrupted question for that turn |
+| `SessionStart(startup|resume|clear)` | `idle` | provisional `idle`, coalesced for 250 ms with an immediate continuation |
+| `SessionStart(compact)` | `idle` | `working` |
 | (any other / unknown) | unchanged | unchanged |
 
 For Codex, `PermissionRequest` with tool `AskUserQuestion` becomes structured
 attention `user_input`; other permission requests become `approval`. Either
-reduces to legacy `permission`. A fresh app-server graph outranks the hook
-fallback, so missed hook edges cannot overwrite a current complete snapshot.
-Rollout files alone still cannot recover approval state, but app-server can.
+reduces to legacy `permission`. `request_user_input` is correlated only by its
+opaque `tool_use_id`; question and answer content are not persisted. A fresh
+app-server graph outranks ordinary hook fallback, but cannot clear this
+independently owned standard-CLI latch. Rollout files alone still cannot recover
+approval state, but app-server can.
+
+Codex `SubagentStart`/`SubagentStop` do not use this root-status mapping. They
+are required for live child state on the tested standard-CLI path and apply only
+after their exact `agent_id` matches a non-root node in a fresh app-server graph
+for the same `(pid, started_at, root session_id)` lifetime. They cannot create
+nodes, modify attention, or change parentage. See the
+[no-wrapper child-lifecycle decision](codex-no-wrapper-child-lifecycle.md).
 
 ##### `permission` self-heal (reconciler)
 
@@ -294,7 +308,7 @@ metadata.
 | Field | JSON type | Presence | Meaning |
 |-------|-----------|----------|---------|
 | `root_id` | string | always | Stable provider id of the root node. Exactly one element of `nodes` has this id and that node has no `parent_id`. |
-| `source` | string | omitted when empty | Evidence source: `codex_app_server`, `hook`, `claude_transcript`, `codex_rollout`, `restored_last_known`, or absent/unknown. Source precedence is daemon policy, not a confidence score consumers should recompute. |
+| `source` | string | omitted when empty | Structural graph authority: `codex_app_server`, `hook`, `claude_transcript`, `codex_rollout`, `restored_last_known`, or absent/unknown. A Codex graph whose child runtime/lifecycle was filled by an exact hook remains `codex_app_server`; bounded diagnostics expose overlay provenance without adding a wire field. Source precedence is daemon policy, not a confidence score consumers should recompute. |
 | `observed_at` | RFC 3339 timestamp | omitted when unknown | Start of the observation's authority interval. |
 | `fresh_until` | RFC 3339 timestamp | omitted when unknown | Exclusive end of the authority interval. A graph is fresh only when `observed_at <= now < fresh_until`. |
 | `complete` | boolean | always | `true` means omission is authoritative for that observation; `false` means a partial view. Completeness does not imply freshness and freshness does not imply completeness. |
@@ -311,7 +325,7 @@ unrecognized value and should still use the explicit freshness timestamps.
 | `runtime` | string | yes | Root runtime: `unknown`, `not_loaded`, `idle`, `active`, or `system_error`. Becomes `unknown` when the observation is not fresh or invalid. |
 | `attention` | string | yes | Folded wait reason: `none`, `approval`, or `user_input`. If both wait kinds exist, `approval` wins only in this compact field; the two counts below preserve both. |
 | `status` | string | yes | Legacy root-chip value: `working`, `idle`, `permission`, `delegating`, or `""` when no fresh rule produces a confident status. |
-| `live_children` | integer | yes | Non-terminal descendants. Terminal means lifecycle `completed`, `interrupted`, `errored`, `shutdown`, or `not_found`. |
+| `live_children` | integer | yes | Descendants with positive liveness: pending/running lifecycle, active/idle runtime, or actionable approval/user-input attention. Terminal lifecycle always excludes a child. `runtime=unknown|not_loaded` plus `lifecycle=unknown` is visible topology but contributes zero. |
 | `waiting_nodes` | integer | yes | Live root/descendant nodes waiting for either approval or user input. Equals `approval_nodes + user_input_nodes`. |
 | `approval_nodes` | integer | yes | Live nodes whose attention is `approval`. |
 | `user_input_nodes` | integer | yes | Live nodes whose attention is `user_input`. |

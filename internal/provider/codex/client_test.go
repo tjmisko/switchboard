@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -38,7 +39,7 @@ func TestRPCMethodAllowlistRejectsEveryMutation(t *testing.T) {
 	}
 }
 
-func TestRPCGenerationTagsNotificationsAndCloseReleasesWaiter(t *testing.T) {
+func TestRPCGenerationPreservesServerRequestIDAndCloseReleasesWaiter(t *testing.T) {
 	clientSide, serverSide := net.Pipe()
 	notes := make(chan rpcNotification, 1)
 	client := newRPCClient(clientSide, 7, func(note rpcNotification) { notes <- note })
@@ -47,7 +48,7 @@ func TestRPCGenerationTagsNotificationsAndCloseReleasesWaiter(t *testing.T) {
 		decoder := json.NewDecoder(serverSide)
 		var request map[string]any
 		_ = decoder.Decode(&request)
-		_, _ = serverSide.Write([]byte(`{"method":"thread/status/changed","params":{"threadId":"x","status":{"type":"idle"}}}` + "\n"))
+		_, _ = serverSide.Write([]byte(`{"id":"approval-42","method":"item/commandExecution/requestApproval","params":{"threadId":"x","turnId":"t","itemId":"i"}}` + "\n"))
 	}()
 	errCh := make(chan error, 1)
 	go func() {
@@ -57,6 +58,9 @@ func TestRPCGenerationTagsNotificationsAndCloseReleasesWaiter(t *testing.T) {
 	case note := <-notes:
 		if note.Generation != 7 {
 			t.Fatalf("notification generation = %d", note.Generation)
+		}
+		if string(note.ID) != `"approval-42"` {
+			t.Fatalf("server-request id = %s, want preserved string id", note.ID)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("notification not delivered")
@@ -73,7 +77,7 @@ func TestRPCGenerationTagsNotificationsAndCloseReleasesWaiter(t *testing.T) {
 	}
 }
 
-func TestProxyVersionCapabilityChecks(t *testing.T) {
+func TestAppServerVersionCapabilityChecks(t *testing.T) {
 	for _, test := range []struct {
 		value string
 		ok    bool
@@ -84,9 +88,17 @@ func TestProxyVersionCapabilityChecks(t *testing.T) {
 		{"codex-cli 0.148.9", false},
 		{"unknown", false},
 	} {
-		err := checkProxyVersion(test.value)
+		err := checkAppServerCLIVersion(test.value)
 		if (err == nil) != test.ok {
-			t.Errorf("checkProxyVersion(%q) = %v", test.value, err)
+			t.Errorf("checkAppServerCLIVersion(%q) = %v", test.value, err)
 		}
+	}
+}
+
+func TestCommandConnectorUsesStandaloneStdioTransport(t *testing.T) {
+	command := standaloneAppServerCommand(context.Background(), "codex-test")
+	want := []string{"codex-test", "app-server", "--stdio"}
+	if !reflect.DeepEqual(command.Args, want) {
+		t.Fatalf("command args = %q, want %q", command.Args, want)
 	}
 }

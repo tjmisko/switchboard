@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	sblabel "github.com/tjmisko/switchboard/internal/label"
 	"github.com/tjmisko/switchboard/internal/projectname"
@@ -97,6 +98,8 @@ func main() {
 		cmdCycle(c, direction)
 	case "attention":
 		cmdAttention(c)
+	case "agent-diagnostics":
+		cmdAgentDiagnostics(c, *jsonOut)
 	case "hook":
 		if len(args) < 2 {
 			fail("hook requires an event name")
@@ -142,6 +145,41 @@ func cmdList(c *rpc.Client, jsonOut bool) {
 		if s.Hyprland != nil {
 			fmt.Printf("       hypr:    addr=%s workspace=%s\n", s.Hyprland.Address, s.Hyprland.Workspace)
 		}
+	}
+}
+
+func cmdAgentDiagnostics(c *rpc.Client, jsonOut bool) {
+	if err := c.Send(rpc.Request{Cmd: "agent-diagnostics"}); err != nil {
+		fail("send: %v", err)
+	}
+	var resp rpc.Response
+	if err := c.Recv(&resp); err != nil {
+		fail("recv: %v", err)
+	}
+	if resp.Error != "" {
+		fail("%s", resp.Error)
+	}
+	if jsonOut {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(resp.Diagnostics)
+		return
+	}
+	renderAgentDiagnostics(os.Stdout, resp.Diagnostics)
+}
+
+func renderAgentDiagnostics(w io.Writer, diagnostics []rpc.AgentDiagnostic) {
+	if len(diagnostics) == 0 {
+		fmt.Fprintln(w, "no agent diagnostics")
+		return
+	}
+	for _, diagnostic := range diagnostics {
+		lastAt := "-"
+		if !diagnostic.LastAt.IsZero() {
+			lastAt = diagnostic.LastAt.UTC().Format(time.RFC3339)
+		}
+		fmt.Fprintf(w, "%s %s count=%d last_at=%s\n",
+			diagnostic.Provider, diagnostic.Category, diagnostic.Count, lastAt)
 	}
 }
 
@@ -387,11 +425,15 @@ func cmdHook(c *rpc.Client, event, agent string) {
 	toolInputHash := ""
 	agentID := ""
 	agentType := ""
+	hookSource := ""
+	turnID := ""
+	toolUseID := ""
+	permissionMode := ""
 	if body, err := io.ReadAll(os.Stdin); err == nil && len(body) > 0 {
 		var payload struct {
 			SessionID      string `json:"session_id"`
 			TranscriptPath string `json:"transcript_path"`
-			// tool_name is present on PermissionRequest/PostToolUse payloads. It
+			// tool_name is present on PreToolUse/PermissionRequest/PostToolUse payloads. It
 			// lets the daemon clear a red chip at hook speed when the approved tool
 			// itself completes (see rpc.clearsPermission); absent on other events,
 			// which just disables that fast path.
@@ -403,13 +445,17 @@ func cmdHook(c *rpc.Client, event, agent string) {
 			// hashToolInput can reduce it; the raw bytes never leave this function.
 			ToolInput json.RawMessage `json:"tool_input"`
 			// SubagentStart/Stop carry the subagent's identity. The wire form is
-			// snake_case (verified against the 2.1.195 binary); the camelCase
-			// fallbacks tolerate a build that reuses the dir-style key. Best-effort —
-			// the daemon only uses them to TRIGGER a dir re-scan, keyed off agent_id.
-			AgentID      string `json:"agent_id"`
-			AgentType    string `json:"agent_type"`
-			AgentIDAlt   string `json:"agentId"`
-			AgentTypeAlt string `json:"agentType"`
+			// snake_case; the camelCase fallbacks tolerate providers that reuse the
+			// directory-style key. The daemon accepts child lifecycle only after this
+			// exact agent_id joins provider-owned topology.
+			AgentID        string `json:"agent_id"`
+			AgentType      string `json:"agent_type"`
+			AgentIDAlt     string `json:"agentId"`
+			AgentTypeAlt   string `json:"agentType"`
+			Source         string `json:"source"`
+			TurnID         string `json:"turn_id"`
+			ToolUseID      string `json:"tool_use_id"`
+			PermissionMode string `json:"permission_mode"`
 		}
 		if json.Unmarshal(body, &payload) == nil {
 			sessionID = payload.SessionID
@@ -418,22 +464,85 @@ func cmdHook(c *rpc.Client, event, agent string) {
 			toolInputHash = hashToolInput(payload.ToolInput)
 			agentID = firstNonEmpty(payload.AgentID, payload.AgentIDAlt)
 			agentType = firstNonEmpty(payload.AgentType, payload.AgentTypeAlt)
+			hookSource = payload.Source
+			turnID = payload.TurnID
+			toolUseID = payload.ToolUseID
+			permissionMode = payload.PermissionMode
 		}
 	}
+	var clientHints []rpc.HookClientHint
+	if agent == state.AgentKindCodex {
+		clientHints = hookClientHints()
+	}
 	_ = c.Send(rpc.Request{
-		Cmd:           "hook",
-		Event:         event,
-		PID:           pid,
-		SessionID:     sessionID,
-		Transcript:    transcript,
-		ToolName:      toolName,
-		ToolInputHash: toolInputHash,
-		AgentID:       agentID,
-		AgentType:     agentType,
-		Agent:         agent,
+		Cmd:             "hook",
+		Event:           event,
+		PID:             pid,
+		SessionID:       sessionID,
+		Transcript:      transcript,
+		ObservedAt:      time.Now().UTC(),
+		HookSource:      hookSource,
+		TurnID:          turnID,
+		ToolUseID:       toolUseID,
+		PermissionMode:  permissionMode,
+		ToolName:        toolName,
+		ToolInputHash:   toolInputHash,
+		AgentID:         agentID,
+		AgentType:       agentType,
+		Agent:           agent,
+		HookClientHints: clientHints,
 	})
 	var resp rpc.Response
 	_ = c.Recv(&resp)
+}
+
+const maxHookClientHintLen = 128
+
+// hookClientHints captures only terminal identity metadata that Switchboard can
+// independently derive for a discovered TUI. The values cross the local daemon
+// socket for diagnostic comparison but are never logged or persisted. They do
+// not authorize attribution; the daemon still drops a hook whose process
+// ancestry cannot identify a tracked root.
+func hookClientHints() []rpc.HookClientHint {
+	return hookClientHintsFrom(currentHookTTY(), os.Getenv)
+}
+
+func hookClientHintsFrom(tty string, getenv func(string) string) []rpc.HookClientHint {
+	var hints []rpc.HookClientHint
+	seen := make(map[rpc.HookClientHint]struct{})
+	add := func(kind, value string) {
+		value = strings.TrimSpace(value)
+		if value == "" || len(value) > maxHookClientHintLen {
+			return
+		}
+		hint := rpc.HookClientHint{Kind: kind, Value: value}
+		if _, duplicate := seen[hint]; duplicate {
+			return
+		}
+		seen[hint] = struct{}{}
+		hints = append(hints, hint)
+	}
+	add(rpc.HookClientHintTTY, tty)
+	add(rpc.HookClientHintTTY, getenv("SSH_TTY"))
+	add(rpc.HookClientHintWeztermPane, getenv("WEZTERM_PANE"))
+	add(rpc.HookClientHintTmuxPane, getenv("TMUX_PANE"))
+	return hints
+}
+
+// currentHookTTY checks the hook process itself rather than its parent. Under
+// the shared-daemon failure mode the parent belongs to the daemon; the open
+// stdio descriptors are the remaining place a client-specific TTY may survive.
+func currentHookTTY() string {
+	for _, fd := range []uintptr{os.Stdin.Fd(), os.Stdout.Fd(), os.Stderr.Fd()} {
+		path, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
+		if err != nil {
+			continue
+		}
+		if strings.HasPrefix(path, "/dev/pts/") || strings.HasPrefix(path, "/dev/tty") {
+			return path
+		}
+	}
+	return ""
 }
 
 // toolInputHashLen is how much of the sha256 hex digest is forwarded. 16 hex
@@ -606,6 +715,8 @@ commands:
                             else — only if all are green — working sessions;
                             repeated presses visit each member in turn;
                             no-op if any session is unknown (grey)
+  agent-diagnostics       show bounded provider diagnostic counters; --json
+                            emits the raw content-free array
   name <sub>              project names: resolve --cwd --name, abbrev --cwd,
                             full --cwd, set <dir> <abbrev>, or
                             set-full --cwd --name <full> (pretty display name)
@@ -632,7 +743,7 @@ commands:
 
 flags:
   --socket <path>         daemon socket (default: $XDG_RUNTIME_DIR/switchboard.sock)
-  --json                  json output for list
+  --json                  json output for list or agent-diagnostics
 `))
 }
 

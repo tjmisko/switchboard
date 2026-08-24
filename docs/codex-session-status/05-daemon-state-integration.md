@@ -202,9 +202,11 @@ For Codex:
 5. Restored last-known graph until its freshness expiry.
 6. Unknown.
 
-A lower source cannot overwrite a fresher higher source. In particular,
-`PostToolUse` cannot clear an app-server-reported child approval or user-input
-wait.
+A lower source cannot overwrite a fresher higher source. The narrow exception
+is a standard-CLI `request_user_input` transition owned by exact
+`PreToolUse`/`PostToolUse` correlation; a generic app-server snapshot cannot
+clear that independently owned wait. An unrelated `PostToolUse` still cannot
+clear an app-server-reported child approval or user-input wait.
 
 For Claude, the Claude adapter owns source fusion. Daemon code applies its
 observation and shared reducer output without interpreting transcript details.
@@ -214,8 +216,9 @@ observation and shared reducer output without interpreting transcript details.
 - Keep the shared external hook RPC envelope backward compatible.
 - Route Claude hook payloads into the Claude adapter's hook API.
 - Route Codex `SessionStart` session ID into the Codex exact-binding registry.
-- Treat Codex hook status as fallback only when no fresh app-server graph is
-  authoritative.
+- Treat ordinary Codex hook status as fallback only when no fresh app-server
+  graph is authoritative. Preserve the exact hook-owned `request_user_input`
+  latch until its matching `PostToolUse`, turn `Stop`, or conversation rotation.
 - Do not apply Claude's assumption that `agent_id` exists on every child tool
   hook to Codex.
 - `SubagentStart`/`SubagentStop` may trigger an immediate resnapshot, but the

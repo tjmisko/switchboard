@@ -4,8 +4,16 @@
 >
 > Affected environment: Linux, Codex CLI 0.149.0
 >
-> Status: root cause understood; operational workaround available; permanent
-> binding fix not implemented
+> Status: root cause understood. The no-wrapper production direction now avoids
+> the shared daemon with disposable `codex app-server --stdio`; the daemon-owned
+> attribution gap remains if that daemon is enabled.
+
+> Follow-up (2026-08-23): two simultaneous plain `codex` TUIs were exactly
+> hook-bound, and a standalone stdio app-server recovered their structural
+> graphs without taking thread ownership. Bounded hook root status now survives
+> not-loaded snapshots. This removes the shared daemon and custom launcher from
+> Switchboard's required path; it does not yet prove live child lifecycle. See
+> the [no-wrapper probe](codex-no-wrapper-binding-probe.md).
 
 ## Summary
 
@@ -189,9 +197,11 @@ switchboard-ctl diagnose --observer
 switchboard-ctl --json list
 ```
 
-For each relaunched session, expect a non-empty graph root, `source=hook`, and a
-fresh partial observation after a lifecycle event. Waybar should then emit
-`working`, `permission`, or `idle` rather than `unknown`.
+For each relaunched session, expect a non-empty graph root and exact hook
+binding. With the standalone observer enabled, structural snapshots use
+`source=codex_app_server` while bounded hook edges may supply root
+`working`/`permission`/`idle`; with `-codex-observer off`, expect the older
+partial `source=hook` graph after a lifecycle event.
 
 ## Things that do not solve it
 
@@ -209,15 +219,19 @@ fresh partial observation after a lifecycle event. Waybar should then emit
 
 ## Permanent-fix requirements
 
-Any code fix must preserve exactness under multiple simultaneous TUIs in the
-same repository. Acceptable directions include:
+Any code fix for users who independently enable the shared daemon must preserve
+exactness under multiple simultaneous TUIs in the same repository. Acceptable
+directions include:
 
 1. a supported Codex identity exposed directly on each visible client process;
 2. a supported app-server association between a thread and its attached TUI
    client/terminal;
-3. an explicit launcher-provided token shared by the TUI and hook command;
-4. detecting shared-daemon ownership and reporting a dedicated incompatible
+3. detecting shared-daemon ownership and reporting a dedicated incompatible
    binding diagnostic instead of generic `exact_binding_unavailable`.
+
+A launcher-provided token, wrapper, alias, private per-TUI endpoint, or manual
+registration is explicitly rejected as a product dependency or acceptance
+mechanism. The standard `codex` command must remain sufficient.
 
 The implementation should also record content-free hook receipt outcomes such
 as `accepted`, `no_tracked_ancestor`, and `binding_conflict`. That preserves the

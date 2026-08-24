@@ -33,15 +33,18 @@ type Binding struct {
 	Source   BindingSource
 }
 
-// BindingRegistry combines process-environment and hook identities. Process
-// environment wins when CODEX_THREAD_ID is present. CODEX_SESSION_ID is not
-// used: 0.149 evidence shows that it can identify a parent rather than the
-// current thread.
+// BindingRegistry combines process-environment and hook identities. The
+// process environment seeds identity before hooks arrive; a registered hook
+// wins afterwards because it can observe /clear under the stable process while
+// the process-start environment cannot change. CODEX_SESSION_ID is not used:
+// 0.149 evidence shows that it can identify a parent rather than the current
+// thread.
 type BindingRegistry struct {
 	env EnvironmentReader
 
 	mu          sync.RWMutex
 	hooks       map[provider.RootKey]string
+	retired     map[provider.RootKey]map[string]struct{}
 	environment map[provider.RootKey]string
 }
 
@@ -50,14 +53,15 @@ func newBindingRegistry(env EnvironmentReader) *BindingRegistry {
 		env = defaultEnvironmentReader()
 	}
 	return &BindingRegistry{
-		env: env, hooks: make(map[provider.RootKey]string),
+		env: env, hooks: make(map[provider.RootKey]string), retired: make(map[provider.RootKey]map[string]struct{}),
 		environment: make(map[provider.RootKey]string),
 	}
 }
 
 // RegisterHook records an exact hook-supplied thread ID for one process
-// lifetime. It is safe to repeat with the same ID; conflicting exact IDs are
-// rejected instead of being silently replaced.
+// lifetime. It is safe to repeat with the same ID. A different trusted hook ID
+// advances the binding for /clear under the same TUI process and retires the
+// previous ID; a retired ID can never rotate the process backwards.
 func (r *BindingRegistry) RegisterHook(key provider.RootKey, threadID string) error {
 	threadID = strings.TrimSpace(threadID)
 	if key.PID <= 0 || key.StartedAt.IsZero() || threadID == "" {
@@ -65,8 +69,14 @@ func (r *BindingRegistry) RegisterHook(key provider.RootKey, threadID string) er
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if _, stale := r.retired[key][threadID]; stale {
+		return fmt.Errorf("codex: retired hook binding for process lifetime")
+	}
 	if prior := r.hooks[key]; prior != "" && prior != threadID {
-		return fmt.Errorf("codex: conflicting hook binding for process lifetime")
+		if r.retired[key] == nil {
+			r.retired[key] = make(map[string]struct{})
+		}
+		r.retired[key][prior] = struct{}{}
 	}
 	r.hooks[key] = threadID
 	return nil
@@ -76,17 +86,33 @@ func (r *BindingRegistry) RegisterHook(key provider.RootKey, threadID string) er
 func (r *BindingRegistry) Forget(key provider.RootKey) {
 	r.mu.Lock()
 	delete(r.hooks, key)
+	delete(r.retired, key)
 	delete(r.environment, key)
 	r.mu.Unlock()
 }
 
 func (r *BindingRegistry) resolve(ctx context.Context, ref provider.RootRef) (Binding, string) {
 	key := ref.Key()
+	// A lifecycle hook can rotate the conversation under a stable TUI PID. Once
+	// present it is newer than the process-start environment, whose value cannot
+	// change after /clear.
+	r.mu.RLock()
+	if id := r.hooks[key]; id != "" {
+		r.mu.RUnlock()
+		return Binding{ThreadID: id, Source: BindingHook}, ""
+	}
+	r.mu.RUnlock()
 	if r.env != nil {
 		body, err := r.env.Environ(ctx, key)
 		if err == nil {
 			if id := environmentValue(body, "CODEX_THREAD_ID"); id != "" {
 				r.mu.Lock()
+				// A hook may have arrived while the environment read was in
+				// flight. Preserve its newer, rotatable identity.
+				if hookID := r.hooks[key]; hookID != "" {
+					r.mu.Unlock()
+					return Binding{ThreadID: hookID, Source: BindingHook}, ""
+				}
 				r.environment[key] = id
 				r.mu.Unlock()
 				return Binding{ThreadID: id, Source: BindingProcessEnvironment}, ""
@@ -103,11 +129,7 @@ func (r *BindingRegistry) resolve(ctx context.Context, ref provider.RootRef) (Bi
 		r.mu.RUnlock()
 		return Binding{ThreadID: id, Source: BindingProcessEnvironment}, ""
 	}
-	id := r.hooks[key]
 	r.mu.RUnlock()
-	if id != "" {
-		return Binding{ThreadID: id, Source: BindingHook}, ""
-	}
 	return Binding{}, "exact Codex thread binding unavailable"
 }
 

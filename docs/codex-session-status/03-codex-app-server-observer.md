@@ -1,5 +1,13 @@
 # Phase 3 — Codex app-server observer
 
+> **Historical plan; transport superseded 2026-08-23.** The implementation now
+> launches disposable `codex app-server --stdio`, not `app-server proxy`, and
+> does not depend on the shared daemon. Live testing proves exact structural
+> snapshots, while recovered child runtime/lifecycle remains unknown. Treat the
+> notification and child-transition requirements below as unfinished acceptance
+> gates; see the
+> [canonical no-wrapper result](../codex-no-wrapper-binding-probe.md).
+
 ## Mission
 
 Implement a supervised, read-only Codex provider observer whose primary truth is
@@ -155,10 +163,21 @@ Thread runtime:
 - `active` -> `active`
 - `systemError` -> `system_error`
 
-Active flags:
+Active flags are mechanical gates, not attention ownership:
 
-- `waitingOnApproval` -> `approval`
-- `waitingOnUserInput` -> `user_input`
+- `waitingOnApproval` starts or refreshes approval classification;
+- `waitingOnUserInput` starts or refreshes input classification;
+- neither flag alone maps to `approval` or `user_input`.
+
+The adapter preserves inbound JSON-RPC request IDs and correlates them with
+`serverRequest/resolved`. A user-routed approval request becomes `approval`; a
+blocking, non-auto-resolving input request becomes `user_input`. Reviewer mode
+`auto_review`/`guardian_subagent`, auto-review events, or an active guardian
+source keeps runtime active with no attention. Ambiguous approval ownership is
+held for at most 500 ms: a request with no auto evidence then becomes human,
+while a flag with no request becomes runtime `unknown`/gray. The delay is before
+publication, not a renderer debounce, so automated reviews create no red graph
+or history transition.
 
 Collaborative-agent status:
 
@@ -215,6 +234,11 @@ All tests use E0 fixtures or a fake proxy process/transport. They must cover:
 - spawn-before-thread and status-before-metadata ordering;
 - root idle while child active;
 - child approval and child user-input waits;
+- both wait-before-auto-review and auto-review-before-wait ordering;
+- auto-review allow, deny, timeout, and abort with zero attention edges;
+- exact string/integer request resolution and mixed automatic/human waits;
+- nonblocking and auto-resolving user input remaining non-attention;
+- reconnect guardian evidence and unknown-owner timer expiry;
 - simultaneous waiting children;
 - completion/drain;
 - a new root turn pruning older terminal children without losing live ones;

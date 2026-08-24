@@ -15,24 +15,26 @@ var (
 )
 
 var allowedRequests = map[string]struct{}{
-	"initialize":  {},
-	"thread/read": {},
-	"thread/list": {},
+	"initialize":        {},
+	"thread/read":       {},
+	"thread/list":       {},
+	"thread/turns/list": {},
 }
 
 var allowedNotifications = map[string]struct{}{
 	"initialized": {},
 }
 
-// Connection is one stdio-compatible app-server proxy connection.
+// Connection is one stdio-compatible app-server connection.
 type Connection interface {
 	io.Reader
 	io.Writer
 	io.Closer
 }
 
-// Connector creates a connection to `codex app-server proxy`. Production uses
-// CommandConnector; tests should inject a fake and must not invoke Codex.
+// Connector creates a connection to a disposable standalone app-server.
+// Production uses CommandConnector; tests should inject a fake and must not
+// invoke Codex.
 type Connector interface {
 	Connect(context.Context) (Connection, error)
 }
@@ -56,6 +58,7 @@ type rpcResponse struct {
 
 type rpcNotification struct {
 	Generation uint64
+	ID         json.RawMessage
 	Method     string
 	Params     json.RawMessage
 }
@@ -180,7 +183,12 @@ func (c *rpcClient) readLoop() {
 		}
 		if envelope.Method != "" {
 			if c.onNote != nil {
-				c.onNote(rpcNotification{Generation: c.generation, Method: envelope.Method, Params: append(json.RawMessage(nil), envelope.Params...)})
+				c.onNote(rpcNotification{
+					Generation: c.generation,
+					ID:         append(json.RawMessage(nil), envelope.ID...),
+					Method:     envelope.Method,
+					Params:     append(json.RawMessage(nil), envelope.Params...),
+				})
 			}
 			continue
 		}

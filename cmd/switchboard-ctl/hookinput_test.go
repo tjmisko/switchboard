@@ -179,6 +179,10 @@ func TestHashToolInputShouldNotLeakRawInputWhenInputIsSensitive(t *testing.T) {
 // hookRequestForPayload runs cmdHook against a real socket with the given hook
 // payload on stdin, and returns the rpc.Request the daemon side received.
 func hookRequestForPayload(t *testing.T, payload string) rpc.Request {
+	return hookRequestForEventPayload(t, "PermissionRequest", "claude", payload)
+}
+
+func hookRequestForEventPayload(t *testing.T, event, agent, payload string) rpc.Request {
 	t.Helper()
 
 	socket := filepath.Join(t.TempDir(), "s")
@@ -222,7 +226,7 @@ func hookRequestForPayload(t *testing.T, payload string) rpc.Request {
 	}
 	defer client.Close()
 
-	cmdHook(client, "PermissionRequest", "claude")
+	cmdHook(client, event, agent)
 
 	select {
 	case req := <-received:
@@ -230,6 +234,78 @@ func hookRequestForPayload(t *testing.T, payload string) rpc.Request {
 	case <-time.After(5 * time.Second):
 		t.Fatal("daemon side never received the hook request")
 		return rpc.Request{}
+	}
+}
+
+func TestCmdHookShouldForwardContentFreeStandardCodexLifecycleMetadata(t *testing.T) {
+	req := hookRequestForEventPayload(t, "PreToolUse", "codex", `{
+		"session_id": "thread-new",
+		"hook_event_name": "PreToolUse",
+		"source": "clear",
+		"turn_id": "turn-7",
+		"tool_use_id": "call-9",
+		"permission_mode": "plan",
+		"tool_name": "request_user_input"
+	}`)
+
+	if req.HookSource != "clear" || req.TurnID != "turn-7" || req.ToolUseID != "call-9" || req.PermissionMode != "plan" {
+		t.Fatalf("Codex lifecycle metadata was not forwarded: %+v", req)
+	}
+	if req.ToolName != "request_user_input" || req.Agent != "codex" || req.ObservedAt.IsZero() {
+		t.Fatalf("standard Codex hook routing fields were disturbed: %+v", req)
+	}
+}
+
+func TestCmdHookShouldForwardExactCodexSubagentIdentity(t *testing.T) {
+	req := hookRequestForEventPayload(t, "SubagentStart", "codex", `{
+		"session_id": "root-thread",
+		"hook_event_name": "SubagentStart",
+		"agent_id": "child-thread",
+		"agent_type": "worker",
+		"turn_id": "turn-7"
+	}`)
+
+	if req.Agent != "codex" || req.Event != "SubagentStart" || req.SessionID != "root-thread" ||
+		req.AgentID != "child-thread" || req.AgentType != "worker" || req.TurnID != "turn-7" || req.ObservedAt.IsZero() {
+		t.Fatalf("Codex child identity was not forwarded exactly: %+v", req)
+	}
+}
+
+func TestHookClientHintsShouldUseOnlyBoundedTerminalIdentityAllowlist(t *testing.T) {
+	environment := map[string]string{
+		"SSH_TTY":         "/dev/pts/7", // duplicate of the direct fd-derived tty
+		"WEZTERM_PANE":    "12",
+		"TMUX_PANE":       "%3",
+		"TERM_SESSION_ID": "must-not-cross-the-hook-socket",
+	}
+	hints := hookClientHintsFrom("/dev/pts/7", func(key string) string { return environment[key] })
+	want := []rpc.HookClientHint{
+		{Kind: rpc.HookClientHintTTY, Value: "/dev/pts/7"},
+		{Kind: rpc.HookClientHintWeztermPane, Value: "12"},
+		{Kind: rpc.HookClientHintTmuxPane, Value: "%3"},
+	}
+	if len(hints) != len(want) {
+		t.Fatalf("hints = %+v, want %+v", hints, want)
+	}
+	for i := range want {
+		if hints[i] != want[i] {
+			t.Fatalf("hint[%d] = %+v, want %+v", i, hints[i], want[i])
+		}
+	}
+	body, err := json.Marshal(hints)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contains(string(body), environment["TERM_SESSION_ID"]) {
+		t.Fatalf("non-allowlisted environment value crossed the hook socket: %s", body)
+	}
+
+	overlong := ""
+	for range maxHookClientHintLen + 1 {
+		overlong += "x"
+	}
+	if got := hookClientHintsFrom("", func(string) string { return overlong }); len(got) != 0 {
+		t.Fatalf("overlong hook identity was forwarded: %+v", got)
 	}
 }
 

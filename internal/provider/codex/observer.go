@@ -1,5 +1,5 @@
-// Package codex observes Codex app-server state through the read-only
-// `codex app-server proxy` surface and projects it onto the neutral agent graph.
+// Package codex observes Codex app-server state through a disposable standalone
+// `codex app-server --stdio` process and projects it onto the neutral agent graph.
 package codex
 
 import (
@@ -17,12 +17,35 @@ import (
 )
 
 const (
-	DefaultFreshness        = 15 * time.Second
-	DefaultResnapshot       = 10 * time.Second
-	DefaultRequestTimeout   = 5 * time.Second
-	DefaultReconnectMinimum = 100 * time.Millisecond
-	DefaultReconnectMaximum = 5 * time.Second
-	DefaultTerminalLimit    = 32
+	DefaultFreshness          = 15 * time.Second
+	DefaultResnapshot         = 10 * time.Second
+	DefaultRequestTimeout     = 5 * time.Second
+	DefaultReconnectMinimum   = 100 * time.Millisecond
+	DefaultReconnectMaximum   = 5 * time.Second
+	DefaultTerminalLimit      = 32
+	DefaultWaitClassification = 500 * time.Millisecond
+
+	DiagnosticUnknownProtocolEnum     = "unknown_protocol_enum"
+	DiagnosticSnapshotThreadRead      = "snapshot_thread_read_error"
+	DiagnosticSnapshotTurnsList       = "snapshot_turns_list_error"
+	DiagnosticSnapshotRootMismatch    = "snapshot_root_mismatch"
+	DiagnosticSnapshotThreadList      = "snapshot_thread_list_error"
+	DiagnosticSnapshotGraphInvalid    = "snapshot_graph_invalid"
+	DiagnosticSnapshotUnknownFailure  = "snapshot_unknown_error"
+	DiagnosticObserverConnect         = "observer_connect_error"
+	DiagnosticObserverConnectAttempt  = "observer_connect_attempt"
+	DiagnosticObserverSupervisorStart = "observer_supervisor_started"
+	DiagnosticObserverConnected       = "observer_connected"
+	DiagnosticInitializeRequest       = "observer_initialize_request_error"
+	DiagnosticInitializeVersion       = "observer_initialize_version_error"
+	DiagnosticInitializedNotify       = "observer_initialized_notify_error"
+	DiagnosticObserverInitialized     = "observer_initialized"
+	DiagnosticConnectionLost          = "observer_connection_lost"
+	DiagnosticSnapshotNoTargets       = "snapshot_no_targets"
+	DiagnosticSnapshotTargetsPresent  = "snapshot_targets_present"
+	DiagnosticSnapshotInstalled       = "snapshot_installed"
+	DiagnosticSnapshotRootNotLoaded   = "snapshot_root_not_loaded"
+	DiagnosticSnapshotChildrenPresent = "snapshot_children_present"
 )
 
 // descendantSourceKinds is explicit because thread/list otherwise defaults to
@@ -49,9 +72,22 @@ type Config struct {
 	ReconnectMaximum    time.Duration
 	UpdateBuffer        int
 	RecentTerminalLimit int
+	WaitClassification  time.Duration
 	Now                 func() time.Time
 	Jitter              func(time.Duration) time.Duration
-	Diagnostic          func(string)
+	// Diagnostic receives finite categories only; raw protocol errors and
+	// payloads never cross this callback.
+	Diagnostic     func(string)
+	WaitDiagnostic func(WaitClassificationDiagnostic)
+}
+
+// WaitClassificationDiagnostic contains finite-label, content-free evidence
+// about one ownership decision. It never contains thread/request IDs, prompts,
+// commands, reasons, or auto-review rationale.
+type WaitClassificationDiagnostic struct {
+	Source             string
+	Duration           time.Duration
+	SuppressedFalseRed bool
 }
 
 type rootRecord struct {
@@ -63,9 +99,9 @@ type rootRecord struct {
 	expiry      *time.Timer
 }
 
-// Observer is a supervised provider.Observer. NewObserver starts its proxy
-// supervisor immediately; callers should register exact hook bindings before
-// their first Observe when process-environment binding is unavailable.
+// Observer is a supervised provider.Observer. NewObserver starts its standalone
+// app-server supervisor immediately; callers should register exact hook bindings
+// before their first Observe when process-environment binding is unavailable.
 type Observer struct {
 	config   Config
 	bindings *BindingRegistry
@@ -83,8 +119,9 @@ type Observer struct {
 	syncing         bool
 	queued          []rpcNotification
 	pendingStatuses map[string]rpcStatus
+	pendingWaits    map[string][]rpcNotification
 	closed          bool
-	lastDiagnostic  time.Time
+	lastDiagnostics map[string]time.Time
 
 	refresh chan struct{}
 }
@@ -99,7 +136,9 @@ func NewObserver(config Config) *Observer {
 		config: config, bindings: newBindingRegistry(config.Environment),
 		queue: provider.NewInvalidationQueue(config.UpdateBuffer), ctx: ctx, cancel: cancel,
 		roots: make(map[provider.RootKey]*rootRecord), pendingStatuses: make(map[string]rpcStatus),
-		refresh: make(chan struct{}, 1),
+		pendingWaits:    make(map[string][]rpcNotification),
+		lastDiagnostics: make(map[string]time.Time),
+		refresh:         make(chan struct{}, 1),
 	}
 	observer.wg.Add(1)
 	go observer.run()
@@ -134,6 +173,9 @@ func withDefaults(config Config) Config {
 	if config.RecentTerminalLimit == 0 {
 		config.RecentTerminalLimit = DefaultTerminalLimit
 	}
+	if config.WaitClassification <= 0 {
+		config.WaitClassification = DefaultWaitClassification
+	}
 	if config.Now == nil {
 		config.Now = time.Now
 	}
@@ -148,9 +190,10 @@ func withDefaults(config Config) Config {
 	return config
 }
 
-// RegisterHookBinding records a daemon-verified exact thread ID. Environment
-// CODEX_THREAD_ID still has precedence. Registration triggers a resnapshot and
-// is safe to call before or after the first Observe.
+// RegisterHookBinding records a daemon-verified exact thread ID. It supersedes
+// the immutable process-start CODEX_THREAD_ID so /clear can rotate the thread
+// under a stable TUI process. Registration triggers a resnapshot and is safe to
+// call before or after the first Observe.
 func (o *Observer) RegisterHookBinding(key provider.RootKey, threadID string) error {
 	if err := o.bindings.RegisterHook(key, threadID); err != nil {
 		return err
@@ -217,14 +260,19 @@ func (o *Observer) Updates() <-chan provider.RootKey { return o.queue.Updates() 
 func (o *Observer) Forget(key provider.RootKey) {
 	o.bindings.Forget(key)
 	o.mu.Lock()
-	if record := o.roots[key]; record != nil && record.expiry != nil {
-		record.expiry.Stop()
+	if record := o.roots[key]; record != nil {
+		if record.expiry != nil {
+			record.expiry.Stop()
+		}
+		if record.graph != nil {
+			record.graph.stopClassifications()
+		}
 	}
 	delete(o.roots, key)
 	o.mu.Unlock()
 }
 
-// Close is idempotent. It cancels the proxy child, releases request waiters,
+// Close is idempotent. It cancels the standalone app-server child, releases request waiters,
 // stops retry/freshness timers, and waits for the supervisor goroutine.
 func (o *Observer) Close() error {
 	o.once.Do(func() {
@@ -236,6 +284,9 @@ func (o *Observer) Close() error {
 			if record.expiry != nil {
 				record.expiry.Stop()
 			}
+			if record.graph != nil {
+				record.graph.stopClassifications()
+			}
 		}
 		o.mu.Unlock()
 	})
@@ -244,19 +295,23 @@ func (o *Observer) Close() error {
 
 func (o *Observer) run() {
 	defer o.wg.Done()
+	o.emitDiagnostic(DiagnosticObserverSupervisorStart)
 	backoff := o.config.ReconnectMinimum
 	for {
 		if o.ctx.Err() != nil {
 			return
 		}
+		o.emitDiagnostic(DiagnosticObserverConnectAttempt)
 		connection, err := o.config.Connector.Connect(o.ctx)
 		if err != nil {
+			o.emitDiagnostic(DiagnosticObserverConnect)
 			if !o.waitBackoff(backoff) {
 				return
 			}
 			backoff = min(backoff*2, o.config.ReconnectMaximum)
 			continue
 		}
+		o.emitDiagnostic(DiagnosticObserverConnected)
 		o.mu.Lock()
 		o.generation++
 		generation := o.generation
@@ -264,6 +319,12 @@ func (o *Observer) run() {
 		o.syncing = true
 		o.queued = nil
 		o.pendingStatuses = make(map[string]rpcStatus)
+		o.pendingWaits = make(map[string][]rpcNotification)
+		for _, record := range o.roots {
+			if record.graph != nil {
+				record.graph.resetWaitOwnership()
+			}
+		}
 		o.mu.Unlock()
 
 		client := newRPCClient(connection, generation, o.handleNotification)
@@ -276,6 +337,7 @@ func (o *Observer) run() {
 			backoff = min(backoff*2, o.config.ReconnectMaximum)
 			continue
 		}
+		o.emitDiagnostic(DiagnosticObserverInitialized)
 		o.resnapshotAll(client, generation)
 		o.finishSync(generation)
 
@@ -297,6 +359,9 @@ func (o *Observer) run() {
 				stableTimer.Stop()
 				_ = client.Close()
 				o.disconnect(generation)
+				if o.ctx.Err() == nil {
+					o.emitDiagnostic(DiagnosticConnectionLost)
+				}
 				if !o.waitBackoff(backoff) {
 					return
 				}
@@ -326,19 +391,25 @@ func (o *Observer) initialize(client *rpcClient) error {
 		"clientInfo":   map[string]string{"name": "switchboard", "title": "Switchboard", "version": "1"},
 		"capabilities": map[string]bool{"experimentalApi": true},
 	}, &result); err != nil {
+		o.emitDiagnostic(DiagnosticInitializeRequest)
 		return err
 	}
 	if err := checkAppServerVersion(result.UserAgent); err != nil {
+		o.emitDiagnostic(DiagnosticInitializeVersion)
 		return err
 	}
-	return client.notify("initialized", map[string]any{})
+	if err := client.notify("initialized", map[string]any{}); err != nil {
+		o.emitDiagnostic(DiagnosticInitializedNotify)
+		return err
+	}
+	return nil
 }
 
 func checkAppServerVersion(userAgent string) error {
 	if userAgent == "" {
 		return errors.New("codex app-server did not report a version")
 	}
-	return checkProxyVersion(strings.ReplaceAll(userAgent, "/", " "))
+	return checkAppServerCLIVersion(strings.ReplaceAll(userAgent, "/", " "))
 }
 
 func (o *Observer) resnapshotAll(client *rpcClient, generation uint64) {
@@ -352,13 +423,39 @@ func (o *Observer) resnapshotAll(client *rpcClient, generation uint64) {
 		targets = append(targets, target{key: key, id: record.threadID})
 	}
 	o.mu.Unlock()
+	if len(targets) == 0 {
+		o.emitDiagnostic(DiagnosticSnapshotNoTargets)
+	} else {
+		o.emitDiagnostic(DiagnosticSnapshotTargetsPresent)
+	}
 	for _, target := range targets {
 		state, err := o.snapshot(client, target.id)
 		if err != nil {
+			o.emitDiagnostic(snapshotDiagnosticCategory(err))
 			continue
 		}
 		o.installSnapshot(generation, target.key, target.id, state)
 	}
+}
+
+type snapshotDiagnosticError struct {
+	category string
+	err      error
+}
+
+func newSnapshotDiagnosticError(category string, err error) error {
+	return &snapshotDiagnosticError{category: category, err: err}
+}
+
+func (e *snapshotDiagnosticError) Error() string { return e.err.Error() }
+func (e *snapshotDiagnosticError) Unwrap() error { return e.err }
+
+func snapshotDiagnosticCategory(err error) string {
+	var diagnostic *snapshotDiagnosticError
+	if errors.As(err, &diagnostic) {
+		return diagnostic.category
+	}
+	return DiagnosticSnapshotUnknownFailure
 }
 
 func (o *Observer) snapshot(client *rpcClient, rootID string) (*graphState, error) {
@@ -366,10 +463,22 @@ func (o *Observer) snapshot(client *rpcClient, rootID string) (*graphState, erro
 	defer cancel()
 	var rootResult threadReadResult
 	if err := client.request(ctx, "thread/read", map[string]any{"threadId": rootID, "includeTurns": true}, &rootResult); err != nil {
-		return nil, err
+		return nil, newSnapshotDiagnosticError(DiagnosticSnapshotThreadRead, err)
 	}
 	if rootResult.Thread.ID != rootID {
-		return nil, errors.New("codex app-server returned a different root thread")
+		return nil, newSnapshotDiagnosticError(DiagnosticSnapshotRootMismatch, errors.New("codex app-server returned a different root thread"))
+	}
+	o.emitSnapshotTurnEvidence("thread_read", rootResult.Thread.Turns)
+	var turnResult threadTurnsListResult
+	if err := client.request(ctx, "thread/turns/list", map[string]any{
+		"threadId": rootID, "limit": 100, "sortDirection": "desc", "itemsView": "full",
+	}, &turnResult); err != nil {
+		// This request is supplemental characterization evidence. The already
+		// successful thread/read plus descendant list remain a valid structural
+		// snapshot when an installed CLI lacks or rejects the method.
+		o.emitDiagnostic(DiagnosticSnapshotTurnsList)
+	} else {
+		o.emitSnapshotTurnEvidence("turns_list", turnResult.Data)
 	}
 	var descendants []rpcThread
 	var cursor string
@@ -384,7 +493,7 @@ func (o *Observer) snapshot(client *rpcClient, rootID string) (*graphState, erro
 		}
 		var result threadListResult
 		if err := client.request(ctx, "thread/list", params, &result); err != nil {
-			return nil, err
+			return nil, newSnapshotDiagnosticError(DiagnosticSnapshotThreadList, err)
 		}
 		descendants = append(descendants, result.Data...)
 		if result.NextCursor == nil || *result.NextCursor == "" {
@@ -394,7 +503,7 @@ func (o *Observer) snapshot(client *rpcClient, rootID string) (*graphState, erro
 	}
 	state := newGraphState(rootResult.Thread, descendants, o.config.RecentTerminalLimit)
 	if _, err := state.observation(o.config.Now(), o.config.Freshness); err != nil {
-		return nil, err
+		return nil, newSnapshotDiagnosticError(DiagnosticSnapshotGraphInvalid, err)
 	}
 	return state, nil
 }
@@ -411,13 +520,140 @@ func (o *Observer) installSnapshot(generation uint64, key provider.RootKey, thre
 		o.mu.Unlock()
 		return
 	}
+	if record.graph != nil {
+		record.graph.stopClassifications()
+	}
 	record.graph = state
-	record.observation = observation
 	record.generation = generation
-	o.scheduleExpiryLocked(key, record)
+	diagnostics := o.reconcileClassificationsLocked(key, record, "snapshot")
+	publish := !state.hasPendingClassification() || state.hasHumanAttention()
+	if publish {
+		record.observation = observation
+		o.scheduleExpiryLocked(key, record)
+	}
 	o.mu.Unlock()
-	o.queue.Signal(key)
+	if publish {
+		o.queue.Signal(key)
+		o.emitDiagnostic(DiagnosticSnapshotInstalled)
+		if len(observation.Nodes) > 0 && observation.Nodes[0].Runtime == agentgraph.RuntimeNotLoaded {
+			o.emitDiagnostic(DiagnosticSnapshotRootNotLoaded)
+		}
+		if len(observation.Nodes) > 1 {
+			o.emitDiagnostic(DiagnosticSnapshotChildrenPresent)
+		}
+		o.emitSnapshotChildEvidence(observation)
+	}
+	o.emitClassificationDiagnostics(diagnostics)
 	o.emitUnknownDiagnostic(state)
+}
+
+// emitSnapshotTurnEvidence reports only finite structural/lifecycle classes.
+// It deliberately excludes root/thread/item IDs, prompts, messages, tool input,
+// and every raw provider value. The two source labels are internal constants.
+func (o *Observer) emitSnapshotTurnEvidence(source string, turns []rpcTurn) {
+	for _, category := range snapshotTurnEvidenceCategories(source, turns) {
+		o.emitDiagnostic(category)
+	}
+}
+
+func snapshotTurnEvidenceCategories(source string, turns []rpcTurn) []string {
+	prefix := "snapshot_" + source
+	if len(turns) == 0 {
+		return []string{prefix + "_turns_absent"}
+	}
+	categories := []string{prefix + "_turns_present"}
+	collabItems, collabStates, receivers := false, false, false
+	for _, turn := range turns {
+		for _, item := range turn.Items {
+			if item.Type != "collabAgentToolCall" {
+				continue
+			}
+			collabItems = true
+			if len(item.ReceiverThreadIDs) > 0 {
+				receivers = true
+			}
+			categories = appendUniqueDiagnostic(categories,
+				prefix+"_collab_tool_"+collabToolDiagnosticSuffix(item.Tool),
+				prefix+"_collab_call_"+collabCallDiagnosticSuffix(item.Status),
+			)
+			for _, state := range item.AgentsStates {
+				collabStates = true
+				lifecycle := mapLifecycle(state.Status)
+				categories = appendUniqueDiagnostic(categories, prefix+"_collab_state_"+string(lifecycle))
+			}
+		}
+	}
+	if !collabItems {
+		return append(categories, prefix+"_collab_items_absent")
+	}
+	categories = append(categories, prefix+"_collab_items_present")
+	if receivers {
+		categories = append(categories, prefix+"_collab_receivers_present")
+	} else {
+		categories = append(categories, prefix+"_collab_receivers_absent")
+	}
+	if collabStates {
+		categories = append(categories, prefix+"_collab_states_present")
+	} else {
+		categories = append(categories, prefix+"_collab_states_absent")
+	}
+	return categories
+}
+
+func collabToolDiagnosticSuffix(value string) string {
+	switch value {
+	case "spawnAgent":
+		return "spawn_agent"
+	case "sendInput":
+		return "send_input"
+	case "resumeAgent":
+		return "resume_agent"
+	case "wait":
+		return "wait"
+	case "closeAgent":
+		return "close_agent"
+	default:
+		return "unknown"
+	}
+}
+
+func collabCallDiagnosticSuffix(value string) string {
+	switch value {
+	case "inProgress":
+		return "in_progress"
+	case "completed":
+		return "completed"
+	case "failed":
+		return "failed"
+	default:
+		return "unknown"
+	}
+}
+
+func appendUniqueDiagnostic(categories []string, candidates ...string) []string {
+	for _, candidate := range candidates {
+		found := false
+		for _, category := range categories {
+			if category == candidate {
+				found = true
+				break
+			}
+		}
+		if !found {
+			categories = append(categories, candidate)
+		}
+	}
+	return categories
+}
+
+func (o *Observer) emitSnapshotChildEvidence(observation agentgraph.Observation) {
+	for _, node := range observation.Nodes {
+		if node.ID == observation.RootID {
+			continue
+		}
+		o.emitDiagnostic("snapshot_child_runtime_" + string(node.Runtime))
+		o.emitDiagnostic("snapshot_child_lifecycle_" + string(node.Lifecycle))
+	}
 }
 
 func (o *Observer) beginSync(generation uint64) {
@@ -454,8 +690,12 @@ func (o *Observer) disconnect(generation uint64) {
 	o.syncing = false
 	o.queued = nil
 	o.pendingStatuses = make(map[string]rpcStatus)
+	o.pendingWaits = make(map[string][]rpcNotification)
 	keys := make([]provider.RootKey, 0, len(o.roots))
-	for key := range o.roots {
+	for key, record := range o.roots {
+		if record.graph != nil {
+			record.graph.stopClassifications()
+		}
 		keys = append(keys, key)
 	}
 	o.mu.Unlock()
@@ -465,50 +705,117 @@ func (o *Observer) disconnect(generation uint64) {
 }
 
 func (o *Observer) handleNotification(notification rpcNotification) {
+	evidenceCategory := notificationEvidenceCategory(notification)
 	o.mu.Lock()
 	if notification.Generation != o.generation || !o.connected {
 		o.mu.Unlock()
+		if evidenceCategory != "" {
+			o.emitDiagnostic(evidenceCategory + "_stale")
+		}
 		return
 	}
 	if o.syncing {
+		notification.ID = append(json.RawMessage(nil), notification.ID...)
 		notification.Params = append(json.RawMessage(nil), notification.Params...)
 		o.queued = append(o.queued, notification)
 		o.mu.Unlock()
+		if evidenceCategory != "" {
+			o.emitDiagnostic(evidenceCategory + "_queued")
+		}
 		return
 	}
-	keys, unknown := o.applyNotificationLocked(notification)
+	keys, unknown, diagnostics := o.applyNotificationLocked(notification)
 	o.mu.Unlock()
+	if evidenceCategory != "" {
+		if len(keys) > 0 {
+			o.emitDiagnostic(evidenceCategory + "_matched")
+		} else {
+			o.emitDiagnostic(evidenceCategory + "_unmatched")
+		}
+	}
 	for _, key := range keys {
 		o.queue.Signal(key)
 	}
 	if unknown {
 		o.emitUnknownDiagnostic(&graphState{unknownEnum: true})
 	}
+	o.emitClassificationDiagnostics(diagnostics)
 }
 
-func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]provider.RootKey, bool) {
-	type threadParams struct {
-		ThreadID   string    `json:"threadId"`
-		ThreadName *string   `json:"threadName"`
-		TurnID     string    `json:"turnId"`
-		Thread     rpcThread `json:"thread"`
-		Status     rpcStatus `json:"status"`
-		Turn       rpcTurn   `json:"turn"`
-		Item       rpcItem   `json:"item"`
+// notificationEvidenceCategory recognizes only lifecycle-relevant method and
+// item classes. It never incorporates an arbitrary provider method or payload
+// value into logs.
+func notificationEvidenceCategory(notification rpcNotification) string {
+	switch notification.Method {
+	case "thread/started":
+		return "notification_thread_started"
+	case "thread/updated":
+		return "notification_thread_updated"
+	case "thread/status/changed":
+		return "notification_thread_status"
+	case "turn/started":
+		return "notification_turn_started"
+	case "turn/completed":
+		return "notification_turn_completed"
+	case "thread/archived":
+		return "notification_thread_archived"
+	case "thread/deleted":
+		return "notification_thread_deleted"
+	case "item/started", "item/completed":
+		params, ok := decodeParams[notificationParams](notification.Params)
+		if !ok || params.Item.Type != "collabAgentToolCall" {
+			return ""
+		}
+		if notification.Method == "item/started" {
+			return "notification_collab_item_started"
+		}
+		return "notification_collab_item_completed"
+	default:
+		return ""
 	}
-	params, ok := decodeParams[threadParams](notification.Params)
+}
+
+type notificationParams struct {
+	ThreadID       string            `json:"threadId"`
+	ConversationID string            `json:"conversationId"`
+	ThreadName     *string           `json:"threadName"`
+	TurnID         string            `json:"turnId"`
+	ItemID         string            `json:"itemId"`
+	CallID         string            `json:"callId"`
+	ReviewID       string            `json:"reviewId"`
+	TargetItemID   string            `json:"targetItemId"`
+	RequestID      json.RawMessage   `json:"requestId"`
+	IsBlocking     bool              `json:"isBlocking"`
+	AutoResolution *uint64           `json:"autoResolutionMs"`
+	Thread         rpcThread         `json:"thread"`
+	Status         rpcStatus         `json:"status"`
+	Turn           rpcTurn           `json:"turn"`
+	Item           rpcItem           `json:"item"`
+	ThreadSettings rpcThreadSettings `json:"threadSettings"`
+}
+
+type rpcThreadSettings struct {
+	ApprovalsReviewer string `json:"approvalsReviewer"`
+}
+
+func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]provider.RootKey, bool, []WaitClassificationDiagnostic) {
+	params, ok := decodeParams[notificationParams](notification.Params)
 	if !ok {
-		return nil, false
+		return nil, false, nil
 	}
 	var changed []provider.RootKey
+	var diagnostics []WaitClassificationDiagnostic
 	unknown := false
 	statusMatched := false
+	eventMatched := false
 	for key, record := range o.roots {
 		if record.graph == nil || record.generation != notification.Generation {
 			continue
 		}
 		state := record.graph
 		touches := false
+		forcePublish := false
+		classificationSource := "protocol_event"
 		switch notification.Method {
 		case "thread/started", "thread/updated":
 			thread := params.Thread
@@ -520,6 +827,9 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 				if pending, exists := o.pendingStatuses[thread.ID]; exists {
 					state.applyStatus(state.nodes[thread.ID], pending)
 					delete(o.pendingStatuses, thread.ID)
+				}
+				if isGuardianSource(thread.Source) {
+					classificationSource = "guardian_source"
 				}
 				touches = true
 			}
@@ -544,11 +854,12 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 				if params.ThreadID == state.rootID {
 					state.beginRootTurn(params.Turn.ID)
 				}
-				node.node.Runtime = agentgraph.RuntimeActive
+				node.baseRuntime = agentgraph.RuntimeActive
 				touches = true
 			}
 		case "turn/completed":
-			if state.nodes[params.ThreadID] != nil {
+			if state.clearThreadWait(params.ThreadID) {
+				classificationSource = "turn_completed"
 				touches = true
 			}
 		case "item/started", "item/completed":
@@ -565,12 +876,74 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 				touches = true
 			}
 		case "thread/archived", "thread/deleted":
-			if state.nodes[params.ThreadID] != nil && params.ThreadID != state.rootID {
+			if params.ThreadID == state.rootID && state.clearThreadWait(params.ThreadID) {
+				classificationSource = "thread_completed"
+				touches = true
+			} else if state.nodes[params.ThreadID] != nil {
 				state.deleteThread(params.ThreadID)
+				classificationSource = "thread_completed"
+				touches = true
+			}
+		case "thread/settings/updated":
+			if state.setReviewer(params.ThreadID, params.ThreadSettings.ApprovalsReviewer) {
+				if state.effectiveReviewer(params.ThreadID) == reviewerAuto {
+					classificationSource = "reviewer_auto"
+				} else if state.effectiveReviewer(params.ThreadID) == reviewerUser {
+					classificationSource = "reviewer_user"
+					forcePublish = state.hasHumanAttention()
+				} else {
+					classificationSource = "reviewer_unknown"
+				}
+				touches = true
+			}
+		case "item/autoApprovalReview/started", "item/autoApprovalReview/completed":
+			if state.addAutoReview(params.ThreadID, params.ReviewID, params.TargetItemID, notification.Method == "item/autoApprovalReview/completed") {
+				classificationSource = "auto_review_event"
+				touches = true
+			}
+		case "item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval":
+			requestID, valid := parseRequestID(notification.ID)
+			if valid && state.addRequest(params.ThreadID, requestID, agentgraph.AttentionApproval, params.TurnID, params.ItemID, false, false) {
+				classificationSource = "approval_request"
+				forcePublish = state.hasHumanAttention()
+				touches = true
+			}
+		case "applyPatchApproval", "execCommandApproval":
+			requestID, valid := parseRequestID(notification.ID)
+			if valid && state.addRequest(params.ConversationID, requestID, agentgraph.AttentionApproval, "", params.CallID, false, false) {
+				classificationSource = "approval_request"
+				forcePublish = state.hasHumanAttention()
+				touches = true
+			}
+		case "item/tool/requestUserInput":
+			requestID, valid := parseRequestID(notification.ID)
+			autoResolving := params.AutoResolution != nil
+			if valid && state.addRequest(params.ThreadID, requestID, agentgraph.AttentionUserInput, params.TurnID, params.ItemID, params.IsBlocking && !autoResolving, !params.IsBlocking || autoResolving) {
+				classificationSource = "user_input_request"
+				forcePublish = state.hasHumanAttention()
+				touches = true
+			}
+		case "mcpServer/elicitation/request":
+			requestID, valid := parseRequestID(notification.ID)
+			if valid && state.addRequest(params.ThreadID, requestID, agentgraph.AttentionUserInput, params.TurnID, params.ItemID, true, false) {
+				classificationSource = "user_input_request"
+				forcePublish = true
+				touches = true
+			}
+		case "serverRequest/resolved":
+			requestID, valid := parseRequestID(params.RequestID)
+			if valid && state.resolveRequest(params.ThreadID, requestID) {
+				classificationSource = "request_resolved"
 				touches = true
 			}
 		}
 		if !touches {
+			continue
+		}
+		eventMatched = true
+		diagnostics = append(diagnostics, o.reconcileClassificationsLocked(key, record, classificationSource)...)
+		if state.hasPendingClassification() && !forcePublish {
+			unknown = unknown || state.unknownEnum
 			continue
 		}
 		now := o.config.Now()
@@ -592,7 +965,178 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 		}
 		o.pendingStatuses[params.ThreadID] = params.Status
 	}
-	return changed, unknown
+	if (notification.Method == "turn/completed" || notification.Method == "thread/archived" || notification.Method == "thread/deleted") && params.ThreadID != "" {
+		delete(o.pendingWaits, params.ThreadID)
+		if notification.Method != "turn/completed" {
+			delete(o.pendingStatuses, params.ThreadID)
+		}
+	}
+	if !eventMatched {
+		if threadID := pendingWaitThread(notification.Method, params); threadID != "" {
+			o.retainPendingWaitLocked(threadID, notification)
+		}
+	}
+	if (notification.Method == "thread/started" || notification.Method == "thread/updated") && params.Thread.ID != "" {
+		pending := o.pendingWaits[params.Thread.ID]
+		delete(o.pendingWaits, params.Thread.ID)
+		for _, retained := range pending {
+			retainedChanged, retainedUnknown, retainedDiagnostics := o.applyNotificationLocked(retained)
+			for _, key := range retainedChanged {
+				changed = appendUniqueRootKey(changed, key)
+			}
+			unknown = unknown || retainedUnknown
+			diagnostics = append(diagnostics, retainedDiagnostics...)
+		}
+	}
+	return changed, unknown, diagnostics
+}
+
+func pendingWaitThread(method string, params notificationParams) string {
+	switch method {
+	case "thread/settings/updated", "item/autoApprovalReview/started", "item/autoApprovalReview/completed",
+		"item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval",
+		"item/tool/requestUserInput", "mcpServer/elicitation/request", "serverRequest/resolved":
+		return params.ThreadID
+	case "applyPatchApproval", "execCommandApproval":
+		return params.ConversationID
+	default:
+		return ""
+	}
+}
+
+func (o *Observer) retainPendingWaitLocked(threadID string, notification rpcNotification) {
+	if o.pendingWaits == nil {
+		o.pendingWaits = make(map[string][]rpcNotification)
+	}
+	count := 0
+	for _, pending := range o.pendingWaits {
+		count += len(pending)
+	}
+	if count >= 256 {
+		for id, pending := range o.pendingWaits {
+			if len(pending) <= 1 {
+				delete(o.pendingWaits, id)
+			} else {
+				o.pendingWaits[id] = pending[1:]
+			}
+			break
+		}
+	}
+	notification.ID = append(json.RawMessage(nil), notification.ID...)
+	notification.Params = append(json.RawMessage(nil), notification.Params...)
+	o.pendingWaits[threadID] = append(o.pendingWaits[threadID], notification)
+}
+
+func appendUniqueRootKey(keys []provider.RootKey, candidate provider.RootKey) []provider.RootKey {
+	for _, key := range keys {
+		if key == candidate {
+			return keys
+		}
+	}
+	return append(keys, candidate)
+}
+
+func (o *Observer) reconcileClassificationsLocked(key provider.RootKey, record *rootRecord, source string) []WaitClassificationDiagnostic {
+	if record == nil || record.graph == nil {
+		return nil
+	}
+	state := record.graph
+	state.deriveAll()
+	var diagnostics []WaitClassificationDiagnostic
+	for id, node := range state.nodes {
+		needs := state.needsClassification(id)
+		switch {
+		case needs && !node.wait.classificationPending:
+			o.startClassificationLocked(key, record, id, node)
+		case !needs && node.wait.classificationPending:
+			started := node.wait.classificationStarted
+			node.stopClassification()
+			diagnostics = append(diagnostics, classificationDiagnostic(
+				source, elapsedSince(started, o.config.Now()), suppressesFalseRed(source),
+			))
+		}
+	}
+	state.deriveAll()
+	return diagnostics
+}
+
+func (o *Observer) startClassificationLocked(key provider.RootKey, record *rootRecord, threadID string, node *nodeState) {
+	delay := o.config.WaitClassification
+	if delay <= 0 {
+		delay = DefaultWaitClassification
+	}
+	node.wait.classificationToken++
+	token := node.wait.classificationToken
+	node.wait.classificationPending = true
+	node.wait.classificationStarted = o.config.Now()
+	graph := record.graph
+	generation := record.generation
+	node.wait.classificationTimer = time.AfterFunc(delay, func() {
+		o.mu.Lock()
+		current := o.roots[key]
+		if o.closed || current != record || current.graph != graph || current.generation != generation {
+			o.mu.Unlock()
+			return
+		}
+		currentNode := graph.nodes[threadID]
+		if currentNode == nil || !currentNode.wait.classificationPending || currentNode.wait.classificationToken != token {
+			o.mu.Unlock()
+			return
+		}
+		started := currentNode.wait.classificationStarted
+		becameHuman := graph.expireClassification(threadID)
+		publish := !graph.hasPendingClassification() || graph.hasHumanAttention()
+		if publish {
+			now := o.config.Now()
+			observation, err := graph.observation(now, o.config.Freshness)
+			if err == nil {
+				current.observation = observation
+				o.scheduleExpiryLocked(key, current)
+			} else {
+				publish = false
+			}
+		}
+		o.mu.Unlock()
+		if publish {
+			o.queue.Signal(key)
+		}
+		source := "unknown_timeout"
+		if becameHuman {
+			source = "request_timeout"
+		}
+		o.emitClassificationDiagnostics([]WaitClassificationDiagnostic{
+			classificationDiagnostic(source, elapsedSince(started, o.config.Now()), false),
+		})
+	})
+}
+
+func elapsedSince(started, now time.Time) time.Duration {
+	if started.IsZero() || now.Before(started) {
+		return 0
+	}
+	return now.Sub(started)
+}
+
+func suppressesFalseRed(source string) bool {
+	switch source {
+	case "reviewer_auto", "auto_review_event", "guardian_source":
+		return true
+	default:
+		return false
+	}
+}
+
+func classificationDiagnostic(source string, duration time.Duration, suppressed bool) WaitClassificationDiagnostic {
+	return WaitClassificationDiagnostic{Source: source, Duration: duration, SuppressedFalseRed: suppressed}
+}
+
+func (o *Observer) emitClassificationDiagnostics(diagnostics []WaitClassificationDiagnostic) {
+	if o.config.WaitDiagnostic == nil {
+		return
+	}
+	for _, diagnostic := range diagnostics {
+		o.config.WaitDiagnostic(diagnostic)
+	}
 }
 
 func (o *Observer) scheduleExpiryLocked(key provider.RootKey, record *rootRecord) {
@@ -616,18 +1160,28 @@ func (o *Observer) scheduleExpiryLocked(key provider.RootKey, record *rootRecord
 }
 
 func (o *Observer) emitUnknownDiagnostic(state *graphState) {
-	if !state.unknownEnum || o.config.Diagnostic == nil {
+	if !state.unknownEnum {
+		return
+	}
+	o.emitDiagnostic(DiagnosticUnknownProtocolEnum)
+}
+
+func (o *Observer) emitDiagnostic(category string) {
+	if o.config.Diagnostic == nil {
 		return
 	}
 	o.mu.Lock()
 	now := o.config.Now()
-	if !o.lastDiagnostic.IsZero() && now.Sub(o.lastDiagnostic) < time.Minute {
+	if o.lastDiagnostics == nil {
+		o.lastDiagnostics = make(map[string]time.Time)
+	}
+	if last := o.lastDiagnostics[category]; !last.IsZero() && now.Sub(last) < time.Minute {
 		o.mu.Unlock()
 		return
 	}
-	o.lastDiagnostic = now
+	o.lastDiagnostics[category] = now
 	o.mu.Unlock()
-	o.config.Diagnostic("codex observer received an unknown protocol enum")
+	o.config.Diagnostic(category)
 }
 
 func (o *Observer) signalRefresh() {

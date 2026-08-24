@@ -71,8 +71,9 @@ func (c *integrationCodexConnection) close() {
 }
 
 // integrationCodexAppServer is a JSONL peer behind the observer's public
-// Connector seam. It implements only the allowlisted initialize/read/list
-// surface and never invokes an installed Codex binary or a live user service.
+// Connector seam. It implements only the allowlisted initialize/read/list and
+// turns-list surface and never invokes an installed Codex binary or a live user
+// service.
 type integrationCodexAppServer struct {
 	mu sync.Mutex
 
@@ -138,6 +139,15 @@ func (s *integrationCodexAppServer) serve(connection *integrationCodexConnection
 			root := append(json.RawMessage(nil), s.root...)
 			s.mu.Unlock()
 			result = integrationMustJSON(map[string]json.RawMessage{"thread": root})
+		case "thread/turns/list":
+			s.mu.Lock()
+			rootBody := append(json.RawMessage(nil), s.root...)
+			s.mu.Unlock()
+			var root integrationCodexThread
+			_ = json.Unmarshal(rootBody, &root)
+			result = integrationMustJSON(struct {
+				Data []integrationCodexTurn `json:"data"`
+			}{Data: root.Turns})
 		case "thread/list":
 			var params struct {
 				AncestorThreadID string `json:"ancestorThreadId"`
@@ -166,6 +176,14 @@ func (s *integrationCodexAppServer) serve(connection *integrationCodexConnection
 }
 
 func (s *integrationCodexAppServer) notify(method string, params any) bool {
+	return s.send(json.RawMessage(nil), method, params)
+}
+
+func (s *integrationCodexAppServer) request(id json.RawMessage, method string, params any) bool {
+	return s.send(id, method, params)
+}
+
+func (s *integrationCodexAppServer) send(id json.RawMessage, method string, params any) bool {
 	s.mu.Lock()
 	connection := s.active
 	s.mu.Unlock()
@@ -173,9 +191,10 @@ func (s *integrationCodexAppServer) notify(method string, params any) bool {
 		return false
 	}
 	return connection.write(struct {
+		ID     json.RawMessage `json:"id,omitempty"`
 		Method string          `json:"method"`
 		Params json.RawMessage `json:"params"`
-	}{Method: method, Params: integrationMustJSON(params)}) == nil
+	}{ID: id, Method: method, Params: integrationMustJSON(params)}) == nil
 }
 
 func (s *integrationCodexAppServer) disconnect() {
@@ -271,7 +290,7 @@ func TestCodexAppServerObserverThroughCoordinatorStateAndHistory(t *testing.T) {
 	descendants := []integrationCodexThread{
 		{
 			ID: "child-approval", ParentThreadID: rootID, AgentNickname: "Reviewer", AgentRole: "reviewer",
-			Status: integrationCodexStatus{Type: "active", ActiveFlags: []string{"waitingOnApproval"}},
+			Status: integrationCodexStatus{Type: "active"},
 		},
 		{
 			ID: "child-worker", ParentThreadID: rootID, AgentNickname: "Builder", AgentRole: "worker",
@@ -307,28 +326,97 @@ func TestCodexAppServerObserverThroughCoordinatorStateAndHistory(t *testing.T) {
 	coordinator.HandleHook(rpc.Request{
 		Agent: state.AgentKindCodex, Event: "SessionStart", SessionID: rootID,
 	}, session)
-	permission := waitForIntegrationCodexGraph(t, store, ref.Key(), func(graph *state.AgentGraph) bool {
+	delegating := waitForIntegrationCodexGraph(t, store, ref.Key(), func(graph *state.AgentGraph) bool {
 		return graph != nil && graph.Source == agentgraph.SourceCodexAppServer && graph.Complete &&
-			len(graph.Nodes) == 3 && graph.Summary.Status == state.StatusPermission
+			len(graph.Nodes) == 3 && graph.Summary.Status == state.StatusDelegating
 	})
-	if permission.RootID != rootID || permission.Summary.LiveChildren != 2 ||
-		permission.Summary.ApprovalNodes != 1 || permission.Summary.Attention != agentgraph.AttentionApproval {
-		t.Fatalf("initial app-server projection = %#v", permission)
+	if delegating.RootID != rootID || delegating.Summary.LiveChildren != 2 || delegating.Summary.WaitingNodes != 0 {
+		t.Fatalf("initial app-server projection = %#v", delegating)
 	}
 
+	// Reproduce the false-red escalation: the mechanical wait and server request
+	// arrive before auto-review evidence. Publication is held until ownership is
+	// known, then stays green through every automated review edge.
 	if !appServer.notify("thread/status/changed", map[string]any{
 		"threadId": "child-approval",
-		"status":   map[string]any{"type": "active", "activeFlags": []string{}},
+		"status":   map[string]any{"type": "active", "activeFlags": []string{"waitingOnApproval"}},
 	}) {
 		t.Fatal("fake app-server had no live JSONL connection")
 	}
-	delegating := waitForIntegrationCodexGraph(t, store, ref.Key(), func(graph *state.AgentGraph) bool {
+	if !appServer.request(json.RawMessage(`"auto-request-1"`), "item/commandExecution/requestApproval", map[string]any{
+		"threadId": "child-approval", "turnId": "child-turn", "itemId": "auto-item-1",
+	}) || !appServer.notify("item/autoApprovalReview/started", map[string]any{
+		"threadId": "child-approval", "turnId": "child-turn", "reviewId": "review-1", "targetItemId": "auto-item-1",
+		"review": map[string]any{"status": "inProgress"},
+	}) {
+		t.Fatal("fake app-server could not emit wait-first auto review")
+	}
+	automatic := waitForIntegrationCodexGraph(t, store, ref.Key(), func(graph *state.AgentGraph) bool {
 		return graph != nil && graph.Source == agentgraph.SourceCodexAppServer &&
 			graph.Summary.Status == state.StatusDelegating && graph.Summary.WaitingNodes == 0
 	})
-	if delegating.Summary.LiveChildren != 2 {
-		t.Fatalf("delegating graph live children = %d, want 2", delegating.Summary.LiveChildren)
+	if automatic.Summary.LiveChildren != 2 {
+		t.Fatalf("automatic-review graph live children = %d, want 2", automatic.Summary.LiveChildren)
 	}
+	if !appServer.notify("item/autoApprovalReview/completed", map[string]any{
+		"threadId": "child-approval", "turnId": "child-turn", "reviewId": "review-1", "targetItemId": "auto-item-1",
+		"review": map[string]any{"status": "denied"},
+	}) || !appServer.notify("serverRequest/resolved", map[string]any{
+		"threadId": "child-approval", "requestId": "auto-request-1",
+	}) || !appServer.notify("thread/status/changed", map[string]any{
+		"threadId": "child-approval", "status": map[string]any{"type": "active", "activeFlags": []string{}},
+	}) {
+		t.Fatal("fake app-server could not complete wait-first auto review")
+	}
+
+	// Exercise the inverse event order as well.
+	if !appServer.notify("item/autoApprovalReview/started", map[string]any{
+		"threadId": "child-approval", "turnId": "child-turn", "reviewId": "review-2", "targetItemId": "auto-item-2",
+		"review": map[string]any{"status": "inProgress"},
+	}) || !appServer.request(json.RawMessage(`"auto-request-2"`), "item/commandExecution/requestApproval", map[string]any{
+		"threadId": "child-approval", "turnId": "child-turn", "itemId": "auto-item-2",
+	}) || !appServer.notify("thread/status/changed", map[string]any{
+		"threadId": "child-approval", "status": map[string]any{"type": "active", "activeFlags": []string{"waitingOnApproval"}},
+	}) || !appServer.notify("item/autoApprovalReview/completed", map[string]any{
+		"threadId": "child-approval", "turnId": "child-turn", "reviewId": "review-2", "targetItemId": "auto-item-2",
+		"review": map[string]any{"status": "allowed"},
+	}) || !appServer.notify("serverRequest/resolved", map[string]any{
+		"threadId": "child-approval", "requestId": "auto-request-2",
+	}) || !appServer.notify("thread/status/changed", map[string]any{
+		"threadId": "child-approval", "status": map[string]any{"type": "active", "activeFlags": []string{}},
+	}) {
+		t.Fatal("fake app-server could not emit review-first auto review")
+	}
+	waitForIntegrationCodexGraph(t, store, ref.Key(), func(graph *state.AgentGraph) bool {
+		return graph != nil && graph.Summary.Status == state.StatusDelegating && graph.Summary.WaitingNodes == 0
+	})
+
+	// A positively identified user-routed request is the only red edge.
+	if !appServer.notify("thread/settings/updated", map[string]any{
+		"threadId": "child-approval", "threadSettings": map[string]any{"approvalsReviewer": "user"},
+	}) || !appServer.notify("thread/status/changed", map[string]any{
+		"threadId": "child-approval", "status": map[string]any{"type": "active", "activeFlags": []string{"waitingOnApproval"}},
+	}) || !appServer.request(json.RawMessage(`"human-request"`), "item/commandExecution/requestApproval", map[string]any{
+		"threadId": "child-approval", "turnId": "child-turn", "itemId": "human-item",
+	}) {
+		t.Fatal("fake app-server could not emit human approval")
+	}
+	permission := waitForIntegrationCodexGraph(t, store, ref.Key(), func(graph *state.AgentGraph) bool {
+		return graph != nil && graph.Summary.Status == state.StatusPermission && graph.Summary.ApprovalNodes == 1
+	})
+	if permission.Summary.Attention != agentgraph.AttentionApproval {
+		t.Fatalf("human approval projection = %#v", permission)
+	}
+	if !appServer.notify("serverRequest/resolved", map[string]any{
+		"threadId": "child-approval", "requestId": "human-request",
+	}) || !appServer.notify("thread/status/changed", map[string]any{
+		"threadId": "child-approval", "status": map[string]any{"type": "active", "activeFlags": []string{}},
+	}) {
+		t.Fatal("fake app-server could not resolve human approval")
+	}
+	waitForIntegrationCodexGraph(t, store, ref.Key(), func(graph *state.AgentGraph) bool {
+		return graph != nil && graph.Summary.Status == state.StatusDelegating && graph.Summary.WaitingNodes == 0
+	})
 
 	// Disconnect preserves the last snapshot only through its exact freshness
 	// boundary. The coordinator must then project unknown instead of freezing a
@@ -372,18 +460,138 @@ func TestCodexAppServerObserverThroughCoordinatorStateAndHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var sawApproval, sawApprovalClear, sawNotFound bool
+	var approvalStarts, approvalClears int
+	var sawNotFound bool
 	for _, event := range events {
 		if event.Type != history.EventAgentState || event.ThreadID != "child-approval" {
 			continue
 		}
-		sawApproval = sawApproval || event.ToAttention == agentgraph.AttentionApproval
-		sawApprovalClear = sawApprovalClear ||
-			(event.FromAttention == agentgraph.AttentionApproval && event.ToAttention == agentgraph.AttentionNone)
+		if event.ToAttention == agentgraph.AttentionApproval {
+			approvalStarts++
+		}
+		if event.FromAttention == agentgraph.AttentionApproval && event.ToAttention == agentgraph.AttentionNone {
+			approvalClears++
+		}
 		sawNotFound = sawNotFound || event.ToLifecycle == agentgraph.LifecycleNotFound
 	}
-	if !sawApproval || !sawApprovalClear || !sawNotFound {
-		t.Fatalf("canonical history missing approval/clear/not_found edges: approval=%t clear=%t not_found=%t events=%+v",
-			sawApproval, sawApprovalClear, sawNotFound, events)
+	if approvalStarts != 1 || approvalClears != 1 || !sawNotFound {
+		t.Fatalf("canonical history approval intervals=%d/%d not_found=%t; automated reviews must create none: events=%+v",
+			approvalStarts, approvalClears, sawNotFound, events)
+	}
+}
+
+func TestCodexChildHooksThroughAppServerCoordinatorAndHistory(t *testing.T) {
+	const rootID = "root-child-hooks"
+	root := integrationCodexThread{ID: rootID, Status: integrationCodexStatus{Type: "idle"}}
+	descendants := []integrationCodexThread{
+		{
+			ID: "structural-parent", ParentThreadID: rootID, AgentNickname: "Parent", AgentRole: "worker",
+			Status: integrationCodexStatus{Type: "notLoaded"},
+		},
+		{
+			ID: "nested-child", ParentThreadID: "structural-parent", AgentNickname: "Nested", AgentRole: "worker",
+			Status: integrationCodexStatus{Type: "notLoaded"},
+		},
+	}
+	appServer := newIntegrationCodexAppServer(t, root, descendants)
+	historyDir := t.TempDir()
+	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: historyDir})
+	observer := codexprovider.NewObserver(codexprovider.Config{
+		Connector: appServer, Environment: integrationCodexEnvironment{},
+		Freshness: 2 * time.Second, ResnapshotInterval: time.Hour,
+		RequestTimeout: time.Second, ReconnectMinimum: 5 * time.Millisecond,
+		ReconnectMaximum: 10 * time.Millisecond, Jitter: func(time.Duration) time.Duration { return 0 },
+	})
+	store := state.New("")
+	ref := seedCoordinatorSession(store, 4802, time.Now().Add(-time.Hour), state.AgentKindCodex, rootID, "/project")
+	coordinator := newAgentCoordinator(store, sink, nil, observer)
+	coordinator.Start(context.Background(), time.Hour)
+	closed := false
+	t.Cleanup(func() {
+		coordinator.Close()
+		if !closed {
+			sink.Close()
+		}
+		appServer.disconnect()
+	})
+
+	initial := waitForIntegrationCodexGraph(t, store, ref.Key(), func(graph *state.AgentGraph) bool {
+		return graph != nil && graph.Source == agentgraph.SourceCodexAppServer && graph.Complete && len(graph.Nodes) == 3
+	})
+	if initial.Summary.LiveChildren != 0 {
+		t.Fatalf("topology-only live children = %d, want 0: %#v", initial.Summary.LiveChildren, initial)
+	}
+
+	send := func(event string, at time.Time) {
+		session, ok := sessionForKey(store.Snapshot(), ref.Key())
+		if !ok {
+			t.Fatal("Codex root disappeared")
+		}
+		coordinator.HandleHook(rpc.Request{
+			Agent: state.AgentKindCodex, Event: event, SessionID: rootID,
+			AgentID: "nested-child", ObservedAt: at,
+		}, session)
+	}
+	startAt := time.Now().UTC()
+	send("SubagentStart", startAt)
+	started := waitForIntegrationCodexGraph(t, store, ref.Key(), func(graph *state.AgentGraph) bool {
+		if graph == nil || graph.Summary.LiveChildren != 1 {
+			return false
+		}
+		node := childNode(t, graph, "nested-child")
+		return node.Runtime == agentgraph.RuntimeActive && node.Lifecycle == agentgraph.LifecycleRunning
+	})
+	if node := childNode(t, started, "nested-child"); node.ParentID != "structural-parent" {
+		t.Fatalf("nested immediate parent = %q, want structural-parent", node.ParentID)
+	}
+
+	stopAt := startAt.Add(time.Second)
+	send("SubagentStop", stopAt)
+	waitForIntegrationCodexGraph(t, store, ref.Key(), func(graph *state.AgentGraph) bool {
+		if graph == nil || graph.Summary.LiveChildren != 0 {
+			return false
+		}
+		node := childNode(t, graph, "nested-child")
+		return node.Runtime == agentgraph.RuntimeIdle && node.Lifecycle == agentgraph.LifecycleCompleted && node.CompletedAt.Equal(stopAt)
+	})
+	// Exact replay must not create another canonical history edge.
+	send("SubagentStop", stopAt)
+
+	restartAt := stopAt.Add(time.Second)
+	send("SubagentStart", restartAt)
+	waitForIntegrationCodexGraph(t, store, ref.Key(), func(graph *state.AgentGraph) bool {
+		return graph != nil && graph.Summary.LiveChildren == 1 &&
+			childNode(t, graph, "nested-child").Lifecycle == agentgraph.LifecycleRunning
+	})
+	finalStopAt := restartAt.Add(time.Second)
+	send("SubagentStop", finalStopAt)
+	waitForIntegrationCodexGraph(t, store, ref.Key(), func(graph *state.AgentGraph) bool {
+		return graph != nil && graph.Summary.LiveChildren == 0 &&
+			childNode(t, graph, "nested-child").Lifecycle == agentgraph.LifecycleCompleted
+	})
+
+	coordinator.Close()
+	sink.Close()
+	closed = true
+	events, err := history.ReadRange(historyDir, time.Time{}, time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var childEvents []history.Event
+	for _, event := range events {
+		if event.Type == history.EventAgentState && event.ThreadID == "nested-child" &&
+			event.FromLifecycle != event.ToLifecycle {
+			childEvents = append(childEvents, event)
+		}
+	}
+	wantTimes := []time.Time{startAt, stopAt, restartAt, finalStopAt}
+	if len(childEvents) != len(wantTimes) {
+		t.Fatalf("canonical child events = %d, want %d: %+v", len(childEvents), len(wantTimes), childEvents)
+	}
+	for i, event := range childEvents {
+		if !event.Ts.Equal(wantTimes[i]) || event.ParentThreadID != "structural-parent" ||
+			event.Source != agentgraph.SourceCodexAppServer {
+			t.Fatalf("child event[%d] = %+v", i, event)
+		}
 	}
 }
