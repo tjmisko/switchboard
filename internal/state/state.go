@@ -35,9 +35,9 @@ type Session struct {
 	// selects which enrichment block (claude/codex) hooks write and how a
 	// renderer reads status. Omitted only when the kind is not yet known.
 	Agent string `json:"agent,omitempty"`
-	// SlotID links a visible Codex TUI session to its stable launcher-created
-	// slot. It remains unchanged across /clear conversation rotations.
-	SlotID string `json:"slot_id,omitempty"`
+	// DisplayName is Switchboard-owned Codex display metadata. It is valid only
+	// for its exact conversation_id and never changes Codex's native thread name.
+	DisplayName *DisplayName `json:"display_name,omitempty"`
 
 	// MemAgentBytes is the live resident cost of the agent process alone:
 	// Pss + SwapPss from /proc/<pid>/smaps_rollup, refreshed each reconcile tick.
@@ -423,7 +423,6 @@ type ClaudeInfo = AgentInfo
 type Snapshot struct {
 	SchemaVersion int           `json:"schema_version,omitempty"`
 	Sessions      []Session     `json:"sessions"`
-	Slots         []CodexSlot   `json:"slots,omitempty"`
 	UpdatedAt     time.Time     `json:"updated_at"`
 	Capabilities  *Capabilities `json:"capabilities,omitempty"`
 }
@@ -471,7 +470,6 @@ type Store struct {
 	path        string
 	mu          sync.RWMutex
 	sessions    map[int]*Session
-	slots       map[string]*CodexSlot
 	subscribers map[chan Broadcast]struct{}
 	caps        *Capabilities
 	// publishedKey is snapshotChangeKey of the last snapshot Apply decided to
@@ -490,7 +488,6 @@ func New(statePath string) *Store {
 	return &Store{
 		path:        statePath,
 		sessions:    make(map[int]*Session),
-		slots:       make(map[string]*CodexSlot),
 		subscribers: make(map[chan Broadcast]struct{}),
 	}
 }
@@ -531,31 +528,12 @@ var lockHoldWarn = func() time.Duration {
 // machine sitting idle overnight was waking ten waybar processes and rewriting
 // state.json on every tick, forever, to republish byte-identical state.
 func (s *Store) Apply(fn func(map[int]*Session)) {
-	s.ApplyState(func(sessions map[int]*Session, _ map[string]*CodexSlot) { fn(sessions) })
-}
-
-// ApplyState atomically mutates terminal sessions and Codex slot bindings.
-// Existing callers use Apply; slot-aware code uses this wider clean-v2 seam.
-func (s *Store) ApplyState(fn func(map[int]*Session, map[string]*CodexSlot)) {
 	s.mu.Lock()
 	var heldFrom time.Time
 	if lockHoldWarn > 0 {
 		heldFrom = time.Now()
 	}
-	fn(s.sessions, s.slots)
-	// A slot is exactly one visible TUI lifetime. Normal unregister removes it
-	// explicitly; this invariant is the crash/death backstop so a stale endpoint
-	// can never survive after the corresponding process session is gone.
-	for slotID, slot := range s.slots {
-		if slot == nil {
-			delete(s.slots, slotID)
-			continue
-		}
-		sess := s.sessions[slot.PID]
-		if sess == nil || sess.SlotID != slotID || sess.Agent != AgentKindCodex || !sess.StartedAt.Equal(slot.StartedAt) {
-			delete(s.slots, slotID)
-		}
-	}
+	fn(s.sessions)
 	snap := s.snapshotLocked()
 	gen, changed := s.adoptPublishedLocked(snap)
 	if lockHoldWarn > 0 {
@@ -681,9 +659,8 @@ func snapshotChangeKey(snap Snapshot) []byte {
 	key, err := json.Marshal(struct {
 		SchemaVersion int           `json:"schema_version"`
 		Sessions      []Session     `json:"sessions"`
-		Slots         []CodexSlot   `json:"slots,omitempty"`
 		Capabilities  *Capabilities `json:"capabilities,omitempty"`
-	}{SchemaVersion: snap.SchemaVersion, Sessions: snap.Sessions, Slots: snap.Slots, Capabilities: snap.Capabilities})
+	}{SchemaVersion: snap.SchemaVersion, Sessions: snap.Sessions, Capabilities: snap.Capabilities})
 	if err != nil {
 		// Not reachable today (Snapshot holds no unencodable field), but fail OPEN:
 		// a nil key compares unequal to everything, so a broken encode republishes
@@ -713,6 +690,7 @@ func (s *Store) snapshotLocked() Snapshot {
 		cp.Claude = enrichForWire(sess.Claude)
 		cp.Codex = enrichForWire(sess.Codex)
 		cp.AgentGraph = sess.AgentGraph.Clone()
+		cp.DisplayName = cloneDisplayName(sess.DisplayName)
 		sessions = append(sessions, cp)
 	}
 	// Sort into chip order (lessChipOrder), which carries a PID tie-break for
@@ -722,12 +700,7 @@ func (s *Store) snapshotLocked() Snapshot {
 	sort.Slice(sessions, func(i, j int) bool {
 		return lessChipOrder(sessions[i], sessions[j])
 	})
-	slots := make([]CodexSlot, 0, len(s.slots))
-	for _, slot := range s.slots {
-		slots = append(slots, *cloneCodexSlot(slot))
-	}
-	sort.Slice(slots, func(i, j int) bool { return slots[i].SlotID < slots[j].SlotID })
-	return Snapshot{SchemaVersion: CurrentSchemaVersion, Sessions: sessions, Slots: slots, UpdatedAt: time.Now(), Capabilities: s.caps}
+	return Snapshot{SchemaVersion: CurrentSchemaVersion, Sessions: sessions, UpdatedAt: time.Now(), Capabilities: s.caps}
 }
 
 // enrichForWire returns a wire-ready copy of an enrichment block: a value copy
@@ -907,8 +880,8 @@ func (s *Store) Load() error {
 		return err
 	}
 	if snap.SchemaVersion != 0 && snap.SchemaVersion != CurrentSchemaVersion {
-		// Clean break: old process-bound mirrors are not migrated into the slot
-		// model. Live discovery and slot registration rebuild the store.
+		// Clean break: incompatible mirrors are not migrated. Live discovery and
+		// hooks rebuild the store, including intentionally ignoring schema v2.
 		return nil
 	}
 	if snap.SchemaVersion == 0 {
@@ -926,13 +899,6 @@ func (s *Store) Load() error {
 		hydratePendingWriters(sess.Codex)
 		hydrateAgentGraph(&sess, hydratedAt)
 		s.sessions[sess.PID] = &sess
-	}
-	for i := range snap.Slots {
-		slot := snap.Slots[i]
-		sess := s.sessions[slot.PID]
-		if slot.SlotID != "" && sess != nil && sess.Agent == AgentKindCodex && sess.SlotID == slot.SlotID && sess.StartedAt.Equal(slot.StartedAt) {
-			s.slots[slot.SlotID] = cloneCodexSlot(&slot)
-		}
 	}
 	s.mu.Unlock()
 	return nil

@@ -57,11 +57,10 @@ specific:
    standard-CLI `request_user_input` wait is independently owned by exact
    lifecycle hooks because that launch path does not expose the app-server item
    edge.
-4. **Do not guess root identity by CWD.** Prefer `CODEX_THREAD_ID` from the root
-   process environment on Linux, then an exact lifecycle-hook association.
-   `SessionStart` normally establishes it; a later hook self-heals a discovery
-   race. Same-CWD/time correlation may be diagnostic evidence but never a
-   binding.
+4. **Do not guess root identity by CWD.** Use only the exact trusted
+   lifecycle-hook association. `SessionStart` normally establishes it; a later
+   hook self-heals a discovery race. Same-CWD/time correlation may be
+   diagnostic evidence but never a binding.
 5. **Status has separate axes.** Runtime activity, attention reason, and child
    lifecycle are represented independently and collapsed only by a shared
    reducer.
@@ -75,8 +74,8 @@ specific:
    writer map, workflow artifacts, and transcript self-heals do not enter the
    Codex adapter or the neutral graph package.
 9. **No I/O under `Store.Apply`.** App-server calls, transcript reads, rollout
-   reads, process-environment reads, and observer reconciliation happen before
-   the state-store write lock is acquired.
+   reads, and observer reconciliation happen before the state-store write lock
+   is acquired.
 
 ## Canonical status reduction
 
@@ -270,8 +269,8 @@ These rules are part of the plan, not suggestions:
 Suggested per-agent environment (replace the suffix):
 
 ```bash
-export GOCACHE=/tmp/switchboard-codex-c3-gocache
-export GOTMPDIR=/tmp/switchboard-codex-c3-tmp
+export GOCACHE=/tmp/switchboard-c3-gocache
+export GOTMPDIR=/tmp/switchboard-c3-tmp
 mkdir -p "$GOCACHE" "$GOTMPDIR"
 ```
 

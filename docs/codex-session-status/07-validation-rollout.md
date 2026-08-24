@@ -24,8 +24,8 @@ wire/behavior freeze.
 Use a dedicated worktree and unique resources:
 
 ```bash
-export GOCACHE=/tmp/switchboard-codex-v7-gocache
-export GOTMPDIR=/tmp/switchboard-codex-v7-tmp
+export GOCACHE=/tmp/switchboard-v7-gocache
+export GOTMPDIR=/tmp/switchboard-v7-tmp
 mkdir -p "$GOCACHE" "$GOTMPDIR"
 ```
 

@@ -163,7 +163,6 @@ next tick). A session that can't be mapped stays in the Observe tier.
 ```
 cmd/
   switchboard/        daemon — fans the signal sources into one store
-  switchboard-codex/  per-TUI Codex launcher — stable slot + private app-server
   switchboard-ctl/    CLI — list / focus / cycle / pick / hook / bottombar
   claude-tui/         reference TUI renderer (subscribe → live list)
   switchboard-waybar/ waybar exec module — one process per slot (Hyprland extra)
@@ -252,113 +251,21 @@ reduce the latency on the `delegating` chip and the "N agents" count. The hook i
 a pure trigger; the daemon's Observer remains the single source of truth, so a
 duplicated or dropped subagent hook can never miscount.
 
-## Codex app-server observer and optional hooks
+## Codex hooks, display names, and read-only observation
 
-Switchboard discovers interactive **OpenAI Codex** TUI roots while excluding
-wrappers and non-interactive subcommands such as `exec`, `mcp`, and
-`app-server`. Navigation remains rooted in the OS process and controlling tty.
-Codex child agents are app-server threads nested beneath that root; they never
-become focus/cycle/pick targets of their own.
+Switchboard discovers ordinary interactive **OpenAI Codex** TUI processes while
+excluding non-interactive subcommands such as `exec`, `mcp`, and
+`app-server`. Run Codex normally with `codex`; navigation remains rooted in
+the OS process and its controlling tty. Codex child agents are nested graph
+nodes and never become focus/cycle/pick targets of their own.
 
-Launch new visible Codex sessions through the wrapper:
-
-```bash
-switchboard-codex [normal codex arguments...]
-```
-
-The wrapper creates a random stable slot ID and a private app-server socket
-under `$XDG_RUNTIME_DIR/switchboard/codex/<slot-id>/`, starts
-`codex app-server --listen unix://...`, then starts the visible TUI with
-`codex --remote unix://...`. It exports `SWITCHBOARD_SLOT_ID` to the TUI and
-registers the slot, endpoint, TUI pid, and process-lifetime timestamp with the
-daemon. The socket is supervised and removed when either child exits. Newly
-launched TUIs therefore never share the old control daemon: one endpoint belongs
-to exactly one visible terminal slot.
-
-The slot is the thing Switchboard navigates; its current Codex thread is a
-replaceable conversation binding. `/clear` keeps the same chip and terminal but
-increments the binding generation, retires the old thread, clears its status,
-attention, children, and name, then applies the first new-thread observation.
-Late events for a retired thread or generation are rejected. Every exact hook
-and every app-server poll can discover a rotation, so missed `SessionStart`
-events and app-server restarts self-heal without cwd or timestamp correlation.
-
-In the default `-codex-observer auto` mode, the daemon runs one read-mostly
-observer per registered endpoint. It reconciles `thread/loaded/list`, reads the
-bound root and descendants, and consumes thread/turn/item notifications as
-invalidation hints. Polling remains the missed-event backstop: every second
-while active and every ten seconds while idle, with capped reconnect backoff.
-Structured approval and user-input waits take precedence over runtime, active
-state renders green, and idle state renders orange. User-input detection uses
-both `waitingOnUserInput` and an in-progress built-in `request_user_input`
-turn item. The second signal covers Plan-mode interviews where Codex leaves the
-thread active without setting the waiting flag; item or turn completion clears
-it.
-
-The app-server thread name is authoritative. `/rename foo` reaches the chip on
-the next notification or poll, and an explicit non-empty name is never replaced
-by automatic naming. On the first substantive prompt of an unnamed generation,
-Switchboard asks an isolated ephemeral Codex naming server for a lowercase
-2–5-word kebab-case title, validates it, and sends `thread/name/set` to the
-visible endpoint. The default model is `gpt-5.6-luna`; override it with
-`-codex-autoname-model`. One transient retry is followed by a deterministic
-prompt-derived fallback. `switchboard-ctl autoname [slot-id]` is only a manual
-retry; prompts are bounded to 1,000 characters and are never persisted or
-logged.
-
-The public protocol documents `thread/loaded/list`, `thread/read`,
-`thread/name/set`, and `thread/name/updated`; see the
-[official OpenAI app-server documentation](https://learn.chatgpt.com/docs/app-server)
-and [Codex subagent documentation](https://learn.chatgpt.com/docs/agent-configuration/subagents).
-Switchboard uses the locally verified `codex app-server proxy --sock` bridge to
-talk JSONL to each Unix endpoint and rejects older or unparseable CLI versions.
-
-Hooks provide immediate identity/status edges and app-server polling corrects
-missed or delayed hooks. The transport used here is `codex app-server proxy`: a disposable stdio child
-that connects to the already-running app-server control socket. That proxy
-subcommand was verified locally in Codex CLI **0.149.0** and Switchboard rejects
-older or unparseable versions. The current public app-server page does not
-document the proxy subcommand, so this is a locally verified capability—not a
-general OpenAI protocol guarantee.
-
-The proxy transport expects the local app-server control daemon, but there is a
-known Codex 0.149 integration incompatibility: enabling the shared daemon moved
-new threads under the background process and broke Switchboard's exact
-hook-to-visible-TUI attribution. New roots then stayed `unknown` even though the
-hooks were configured and trusted. Do **not** start the shared daemon solely for
-Switchboard until that binding gap is fixed; use the hook fallback instead. See
-the [incident report](docs/codex-app-server-hook-attribution-incident.md).
-
-Root binding is exact and never uses cwd, rollout recency, or timestamp
-correlation:
-
-1. `CODEX_THREAD_ID` from the discovered root process environment on Linux,
-   before a hook identity has arrived.
-2. The `session_id` delivered by that root's trusted lifecycle hooks, which
-   supersedes the immutable environment identity after `/clear`.
-
-`SessionStart` is normally the first hook identity edge. If it races the
-one-second process-discovery scan, any later lifecycle hook with the same exact
-`session_id` self-heals the binding. A persisted exact identity is restored for
-the same `(pid, started_at)` process lifetime after a Switchboard restart.
-Because `/clear` changes the conversation without changing the TUI process, a
-new lifecycle-hook identity supersedes the immutable process-start environment
-value. Retired hook identities are fenced for that process lifetime, so a late
-pre-clear event cannot rotate the chip backwards.
-
-`CODEX_SESSION_ID` is intentionally ignored because captured 0.149 process
-evidence showed it can name an ancestor rather than the current thread. A PID is
-always paired with Switchboard's process-lifetime `started_at`, so PID reuse
-cannot inherit a binding.
-
-Hooks are therefore optional identity and fallback enrichment, not the primary
-Codex status source. If process-environment access is unavailable, this valid
-`~/.codex/hooks.json` shape supplies exact hook identity and a bounded partial
-root status while app-server reconnects:
+Trusted Codex hooks provide the exact conversation ID, immediate root status,
+and the bounded context used for display naming. Configure
+`~/.codex/hooks.json` with the standard command:
 
 ```json
 {
-  "description": "Switchboard Codex identity and fallback status",
+  "description": "Switchboard Codex identity, naming, and fallback status",
   "hooks": {
     "SessionStart": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook SessionStart", "timeout": 2}]}],
     "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook UserPromptSubmit", "timeout": 2}]}],
@@ -373,7 +280,9 @@ root status while app-server reconnects:
 This three-level event → matcher group → handler shape follows the
 [official OpenAI hooks documentation](https://learn.chatgpt.com/docs/hooks).
 Codex requires non-managed command hooks to be reviewed and trusted; use
-`/hooks` after adding or changing the file. The fallback maps
+`/hooks` after adding or changing the file. A PID is always paired with its
+process-lifetime `started_at`, and hook identities retired by `/clear` cannot
+rotate a chip back to an older conversation. The fallback maps
 `UserPromptSubmit` and ordinary `PreToolUse`/`PostToolUse` to active,
 `PermissionRequest` to an approval wait, and `Stop` to idle. A
 `request_user_input` `PreToolUse` instead opens a user-input wait keyed by its
@@ -391,25 +300,43 @@ for 7 days. A daemon restart during an already-open hook-only interview cannot
 reconstruct that wait and therefore remains unknown rather than confidently
 green.
 
+After the first usable prompt/`Stop` pair in a conversation, Switchboard asks
+an isolated ephemeral naming turn for a 2–5-word lowercase kebab-case label (at
+most 40 characters). Both the prompt and final assistant message are trimmed to
+1,000 Unicode characters, used only in memory, and never written to state,
+history, diagnostics, or logs. The default model is `gpt-5.6-luna`; select a
+different one with `-codex-autoname-model`. Invalid or failed output is retried
+once, then replaced by a deterministic fallback.
+
+Only the resulting `display_name` record is persisted. It is bound to the
+exact Codex conversation and shown before the native graph nickname.
+Switchboard never changes Codex's native thread name. When a later
+authoritative app-server observation reports a native name different from the
+baseline captured for the display record, the generated record is cleared, so
+`/rename` wins.
+
+In `-codex-observer auto` mode, the generic observer binds exclusively from an
+exact hook-supplied thread ID. It may read that thread and its descendants and
+consume native-name notifications, but exposes no visible-thread write path. If
+observation is disabled or temporarily unavailable, hooks still drive status
+and display-name generation; native-rename precedence takes effect when an
+authoritative name observation next becomes available.
+
 Automatic degradation is fail-open for the root and fail-closed for status:
 
-- endpoint/proxy/version failure leaves discovery and navigation working;
+- observer/proxy/version failure leaves discovery and navigation working;
 - the last complete graph remains visible only until its explicit freshness
   deadline, then its summary becomes unknown/stale rather than freezing a
   confident color;
 - the observer reconnects with bounded exponential backoff and resnapshots;
-- The standard `codex` launch path owns interview waits through the exact hook
-  latch above; it does not depend on a launcher or private endpoint. See the
-  [standard-CLI retrospective](docs/codex-standard-cli-interview-retrospective.md);
-- `-codex-observer off` never constructs the proxy. Codex hooks can still supply
-  the partial root view; without them the root remains visible with unknown
-  status and no child graph.
+- `-codex-observer off` never constructs the proxy. Codex hooks can still
+  supply the partial root view; without them the root remains visible with
+  unknown status and no child graph.
 
-Use `switchboard-ctl diagnose --observer` to inspect content-free slot identity,
-endpoint connectivity, bound generation, snapshot age, autoname state,
-freshness, completeness, node counts, observer mode, and finite error categories
-from `state.json` and the daemon journal. It never prints cwd,
-transcripts, thread labels, prompts, commands, or raw provider payloads.
+Use `switchboard-ctl diagnose --observer` to inspect content-free binding,
+snapshot freshness, completeness, node counts, observer mode, display-name
+origin, and finite error categories. It never prints cwd, transcripts, thread
+labels, prompts, assistant content, commands, or raw provider payloads.
 
 ## Requirements
 

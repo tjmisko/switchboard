@@ -77,23 +77,17 @@ do not log raw notification payloads.
 
 ## Exact root binding
 
-Binding precedence:
-
-1. Linux root-process environment `CODEX_THREAD_ID`.
-2. `CODEX_SESSION_ID` when evidence proves its equivalence/meaning.
-3. Exact hook-supplied session/thread ID registered by daemon integration.
-4. Unbound: return no authoritative graph and a diagnostic.
+Binding has one source: an exact trusted hook-supplied conversation ID,
+registered against the `(pid, started_at)` process lifetime. Without that
+identity the observer returns no authoritative graph and a content-free
+diagnostic.
 
 Never bind by CWD, title, nearest creation time, most recent rollout, or "only
 thread in this directory." Those may appear in diagnostics but cannot populate
 `RootID`.
 
-Read `/proc/<pid>/environ` behind a small injected interface and a Linux build
-tag. Treat permission denied, process gone, malformed NUL records, and missing
-variables as ordinary unbound results. Key cached bindings by PID plus process
-start identity and forget them on session death.
-
-Expose a narrow method for C6 to register an exact hook binding. C3 defines the
+Expose a narrow method for C6 to register an exact hook binding. Key it by PID
+plus process-start identity and forget it on session death. C3 defines the
 method in its own package; C6 wires trusted lifecycle hook input to it later.
 `SessionStart` is expected first, but a later hook must be able to self-heal a
 binding when startup delivery preceded process discovery.

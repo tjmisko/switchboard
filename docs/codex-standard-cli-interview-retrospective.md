@@ -1,220 +1,91 @@
-# Retrospective — interview detection targeted the wrong Codex launch contract
+# Retrospective: standard Codex interview attribution
 
-> Date: 2026-08-21
->
-> Decision: Switchboard must work when the user launches the standard `codex`
-> command. Requiring `switchboard-codex`, a private per-TUI app-server, a shell
-> alias, or another launcher is not an acceptable solution.
->
-> Status (updated 2026-08-22): the item-based app-server change is not a fix for
-> the reported standard-Codex symptom. The standard path is fixed separately
-> with content-free Codex hooks: `request_user_input` opens on `PreToolUse` and
-> resolves by exact `tool_use_id` on `PostToolUse` (or by the turn's `Stop`). No
-> alternate launcher or private endpoint is part of the implementation. Restart
-> recovery for an already-open hook-only interview remains unknown.
+## User requirement
 
-## Reported symptom
+Switchboard must work when the user starts an ordinary `codex` TUI. Trusted
+hooks are the exact identity and immediate lifecycle boundary. Optional
+app-server observation may enrich that same root but cannot change how the user
+starts Codex.
 
-The Codex TUI was displaying an interview with unanswered questions, but
-Switchboard showed the session as active/green. The desired behavior is red for
-the full interval in which Codex is waiting for an interview response.
+## What failed
 
-The important deployment fact is that the TUI was launched as ordinary
-`codex`. The eventual recommendation to relaunch it through
-`switchboard-codex` changed that requirement instead of solving it.
+An earlier design made full observation depend on a separate process topology
+and registration/control protocol. Ordinary sessions therefore kept only the
+partial hook graph. The implementation could demonstrate rich status in its
+special topology while leaving the actual supported workflow unresolved.
 
-## What was implemented
+That was a scope failure, not merely a missing setup note. A prerequisite that
+changes the command the user runs changes the feature being delivered.
 
-The attempted change augmented the Codex app-server graph with three attention
-signals:
+The design also conflated three concerns:
 
-1. the existing `waitingOnUserInput` thread flag;
-2. an in-progress `dynamicToolCall` named `request_user_input` in a
-   `thread/read(includeTurns=true)` snapshot or item notification;
-3. an `item/tool/requestUserInput` server request, correlated with
-   `serverRequest/resolved` and bounded by item/turn completion.
+- OS discovery and navigation of a visible process;
+- exact attribution of a Codex conversation;
+- optional structured observation of that conversation.
 
-That is a coherent reducer inside an attached app-server observer. Its tests
-show that empty active flags cannot clear a separately observed pending input
-item. Those tests do not show that an observer exists or receives those events
-for a standard `codex` process.
+When attribution was unavailable to the observer, the design tried to solve it
+by changing process topology instead of preserving hooks as the authority.
 
-## The end-to-end path that was missed
+## Corrected architecture
 
-In the architecture being edited, the new signals are reachable only after a
-launcher registers a private endpoint:
+The standard path now has one identity flow:
 
 ```text
-switchboard-codex
-  -> SWITCHBOARD_SLOT_ID
-  -> codex_slot_register(endpoint)
-  -> SlotObserver creates app-server proxy
-  -> thread/item/request events reach graphState
-  -> item-based interview detector can produce RED
+ordinary codex process
+  -> discovery establishes (pid, started_at)
+  -> trusted hook supplies exact conversation ID
+  -> hook reducer publishes immediate partial status
+  -> generic observer may read only that exact ID
 ```
 
-The required launch path does not have those edges:
+The observer performs no independent loaded-thread discovery and cannot mutate
+a visible thread. If it is off or unavailable, discovery, navigation, hook
+status, and display-name generation continue to work. Structured child graphs
+and native-rename override resume when authoritative observation returns.
 
-```text
-plain codex
-  -> no slot id
-  -> no registered private endpoint
-  -> SlotObserver returns no app-server graph
-  -> status is hook-only (when hooks bind successfully)
-  -> item-based interview detector is never called
-```
+`/clear` is a conversation rotation within the same process lifetime. The
+new trusted hook identity retires the old one, clears conversation-bound data,
+and fences late events. PID reuse is separately fenced by `started_at`.
 
-The repository already said this explicitly: Codex processes not started
-through `switchboard-codex` remain hook-only. That statement should have been
-treated as an architecture stop, not as a deployment footnote.
+## Interview wait lesson
 
-## Where the reasoning failed
+Plan-mode `request_user_input` cannot be reduced from a generic active/idle
+snapshot alone. The trusted hooks therefore own a correlator latch:
 
-### 1. The operating constraint was not established first
+1. matching `PreToolUse` opens a user-input wait;
+2. matching `PostToolUse`, the turn's `Stop`, or conversation rotation closes
+   it;
+3. unrelated tool activity and generic snapshots cannot clear it.
 
-The first question should have been: “Must this work with unmodified, standard
-`codex`?” Instead, the investigation selected the richest available protocol
-signal and only later revealed that consuming it required a different launcher.
+Only lifecycle IDs and tool identity cross the boundary. Question and answer
+content are excluded.
 
-A solution that requires changing the user's launch command is a product
-decision, not an implementation detail. It needed explicit agreement before
-code was changed.
+## Session naming lesson
 
-### 2. Protocol expressiveness was confused with transport reachability
+First-prompt naming was also premature: it described the request before the
+turn's outcome was known and encouraged native-state mutation. The corrected
+flow waits for a usable completed turn, combines bounded prompt and final
+assistant response, and persists only a Switchboard display record. A later
+authoritative native rename clears that record.
 
-The generated 0.149 schema proves that Codex defines
-`waitingOnUserInput`, `dynamicToolCall`, `item/tool/requestUserInput`, and
-`serverRequest/resolved`. It does not prove that Switchboard can subscribe to
-those messages for a standard TUI.
+## Process corrections
 
-The implementation answered “can this payload be reduced correctly?” while
-the blocking question was “can this payload reach the process we are building
-for?”
+Future provider work must start with a command-level acceptance statement:
 
-### 3. Schema-derived fixtures were treated as live behavioral evidence
+> A fresh ordinary `codex` process, with documented hooks configured, reaches
+> the promised behavior without any alternate invocation or manual registration.
 
-The existing evidence report explicitly says that no live app-server capture
-was obtained and that the wait fixtures are schema-derived. During this task,
-an attempted connection through the default app-server proxy returned no
-events. That should have lowered confidence and stopped implementation until a
-reachable standard-Codex signal was characterized.
+Every richer observation tier must be tested as an optional enhancement over
+that baseline. Documentation may explain degradation, but cannot redefine the
+baseline around the mechanism that was easiest to instrument.
 
-Instead, synthetic snapshots were added showing an in-progress
-`request_user_input` item. They validate parser behavior for that hypothetical
-input, not the presence, ordering, or retention of such an item in the reported
-session.
+The regression suite now includes:
 
-### 4. Unit coverage was mistaken for product coverage
-
-The new tests construct `rpcThread`, `rpcItem`, and RPC notification values
-directly. They prove the in-memory latch and clear rules. No test launches or
-models the required path:
-
-```text
-standard codex -> hook/protocol transport -> Switchboard root -> red chip
-```
-
-The missing acceptance test made it possible for every new test to pass while
-the user's launch mode could never execute the code.
-
-### 5. The handoff quietly changed the solution
-
-The rebuild instructions ended with “new Codex terminals should then be
-launched with `switchboard-codex`.” That was the clearest evidence of the scope
-error: the proposed operational step worked around the mismatch by replacing
-the user's launcher.
-
-The correct handoff should have said that the implementation was not reachable
-from plain `codex` and was therefore not ready to deploy.
-
-## What should have been investigated instead
-
-The next investigation must begin on a standard `codex` process and retain only
-content-free metadata.
-
-### Gate 1 — characterize hooks during an interview
-
-Capture the ordered hook metadata for one interview without retaining question
-text, answers, or tool arguments:
-
-- event name;
-- normalized tool name;
-- opaque session id;
-- whether the hook subprocess ancestry reaches the visible Codex PID;
-- monotonic timestamp.
-
-The key questions are:
-
-1. Does `PreToolUse` fire before the interview becomes visible?
-2. Is its tool name `request_user_input`, `functions.request_user_input`, or
-   something else?
-3. Does `PostToolUse` fire after an answer?
-4. What fires when the interview is interrupted or dismissed?
-5. Are those hooks still owned by the interactive TUI when no shared app-server
-   daemon is enabled?
-
-The verified hook contract provides the required onset and resolution edges.
-The implemented design is a hook-owned pending-input latch for plain Codex:
-`request_user_input` is the narrow exception to generic `PreToolUse` activity,
-and opaque `tool_use_id` correlation prevents another call's completion from
-clearing the wait. Turn `Stop` handles interruption, conversation rotation
-retires the old identity, and generic app-server snapshots cannot override the
-still-pending hook evidence.
-
-### Gate 2 — find a recovery source
-
-Hooks are edge-triggered, so they cannot alone reconstruct an interview that
-was already open when Switchboard restarted or missed the onset event. Before
-calling a hook latch complete, determine whether the exact rollout identified
-by the hook exposes a content-free pending tool-call state while the interview
-is open. Do not infer ownership from cwd, newest-file order, or timestamps.
-
-If rollout state cannot recover it, the limitation must be explicit: hook-speed
-detection works only after an observed onset edge, and restart recovery remains
-unknown rather than confidently green.
-
-### Gate 3 — only then consider terminal UI evidence
-
-Terminal title or pane-content inspection is a last-resort degraded signal. It
-may be useful if standard Codex exposes no structured passive source, but it
-must be characterized for configurability, localization, stale frames,
-suspension, and multiple same-cwd sessions. A visual string match must never be
-quietly described as authoritative protocol state.
-
-## Acceptance criteria for a workable fix
-
-A replacement is not complete until all of these pass without a launcher
-wrapper:
-
-- launching `codex` directly creates the observed root;
-- opening an interview changes that exact root to user-input/red promptly;
-- an empty or generic active event cannot clear the wait;
-- answering clears red promptly to the actual subsequent runtime state;
-- interrupting or dismissing the interview does not leave a long-lived false
-  red;
-- two standard Codex TUIs in the same cwd cannot affect each other's status;
-- a missed event or Switchboard restart fails unknown unless pending state can
-  be reconstructed exactly;
-- no prompt, answer, tool arguments, cwd, or transcript content is persisted in
-  diagnostics or fixtures.
-
-At least one test must exercise the standard-Codex ingestion boundary rather
-than constructing an app-server graph directly.
-
-## Disposition of the attempted change
-
-The item/request reducer may be useful if private per-TUI endpoints ever become
-an accepted optional mode. It should not be merged or advertised as resolving
-standard-Codex interview detection on the strength of its current tests.
-
-This retrospective does not itself revert the experimental worktree changes.
-Their disposition should be an explicit follow-up: revert them, or retain them
-only with clear wrapper-only scope and separate tests. The standard-Codex fix
-must be developed from the evidence gates above.
-
-## Related documentation
-
-- [Shared app-server attribution incident](codex-app-server-hook-attribution-incident.md)
-- [Codex status investigation](codex-investigation.md)
-- [Codex evidence report](codex-session-status/evidence-report.md)
-- [Status color state model](status-color-state-model.md)
+- exact hook binding for an ordinary process;
+- no cwd/recency/loaded-thread attribution;
+- hook-only interview waits;
+- observer-disabled display generation;
+- conversation rotation and retired-event fencing;
+- full fake app-server enrichment for the exact hook ID;
+- no visible-thread mutation request;
+- later native rename precedence.

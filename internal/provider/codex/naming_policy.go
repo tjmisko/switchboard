@@ -57,8 +57,12 @@ var fallbackStopwords = map[string]struct{}{
 }
 
 // FallbackName is deterministic and content-local; it performs no I/O and is
-// used after the single transient retry is exhausted.
-func FallbackName(prompt string) string {
+// used after both generation attempts are exhausted.
+func FallbackName(input NamingContext) string {
+	prompt := input.UserPrompt
+	if strings.TrimSpace(prompt) == "" {
+		prompt = input.AssistantResponse
+	}
 	var words []string
 	var current strings.Builder
 	flush := func() {

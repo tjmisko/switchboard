@@ -603,9 +603,8 @@ status, complete/partial snapshot, live/wait/error counts, observer rollout
 mode, the latest finite error category, and Claude graph-vs-legacy shadow
 agreement. It never emits cwd, transcript paths, node names/descriptions,
 prompts, commands, or raw provider payloads. For an unbound Codex root, verify
-that the daemon can read `CODEX_THREAD_ID` from the root process or that the
-root `SessionStart` hook is trusted and reaching Switchboard. Never “repair” a
-binding with cwd correlation.
+that its trusted `SessionStart` or later lifecycle hook is reaching
+Switchboard. Never “repair” a binding with cwd correlation.
 
 **0. Use `switchboard-ctl diagnose` (the built tool).** It pulls the relevant
 decision lines for a time window, keeps the ones a plain-English symptom makes

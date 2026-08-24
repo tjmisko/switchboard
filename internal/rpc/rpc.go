@@ -51,15 +51,15 @@ type Request struct {
 	Event      string    `json:"event,omitempty"`
 	PID        int       `json:"pid,omitempty"`
 	SessionID  string    `json:"session_id,omitempty"`
-	SlotID     string    `json:"slot_id,omitempty"`
-	Endpoint   string    `json:"endpoint,omitempty"`
-	StartedAt  time.Time `json:"started_at,omitzero"`
 	ObservedAt time.Time `json:"observed_at,omitzero"`
-	Generation uint64    `json:"generation,omitempty"`
-	// Prompt is an ephemeral, bounded autonaming input. It is never stored or
+	// Prompt is an ephemeral, bounded display-name input. It is never stored or
 	// logged by the daemon.
-	Prompt     string `json:"prompt,omitempty"`
-	Transcript string `json:"transcript,omitempty"`
+	Prompt string `json:"prompt,omitempty"`
+	// LastAssistantMessage is the matching bounded Stop-hook naming input. Like
+	// Prompt, it is ephemeral and must never enter state, history, diagnostics,
+	// or logs.
+	LastAssistantMessage string `json:"last_assistant_message,omitempty"`
+	Transcript           string `json:"transcript,omitempty"`
 	// HookSource is Codex SessionStart.source (startup, resume, clear, compact).
 	// It is lifecycle metadata, not provider content, and lets the daemon avoid
 	// treating an immediate post-/clear continuation as a real idle interval.
@@ -164,10 +164,6 @@ type AgentHookHandler func(Request, state.Session)
 // AgentDiagnosticSource supplies the content-free provider health snapshot.
 type AgentDiagnosticSource func() []AgentDiagnostic
 
-// CodexSlotHandler owns launcher registration, unregistration, and manual
-// autoname retry. It is invoked outside the state-store lock.
-type CodexSlotHandler func(Request) error
-
 type Server struct {
 	store       *state.Store
 	socketPath  string
@@ -178,7 +174,6 @@ type Server struct {
 	fanout      *fanout.Observer
 	agentHook   AgentHookHandler
 	diagnostics AgentDiagnosticSource
-	codexSlot   CodexSlotHandler
 	// readProc is the seam findTrackedAncestor walks the ppid chain through.
 	// Production is proc.Read; tests substitute a synthetic chain so hook
 	// attribution can be exercised against process shapes (a nested `claude -p`,
@@ -213,8 +208,6 @@ func (s *Server) SetAgentHookHandler(handler AgentHookHandler) { s.agentHook = h
 
 // SetAgentDiagnosticSource installs the additive, content-free diagnostics RPC.
 func (s *Server) SetAgentDiagnosticSource(source AgentDiagnosticSource) { s.diagnostics = source }
-
-func (s *Server) SetCodexSlotHandler(handler CodexSlotHandler) { s.codexSlot = handler }
 
 // Serve listens on the socket path and accepts connections until ctx is done.
 // The socket file is removed on startup (in case of unclean shutdown) and on
@@ -287,16 +280,6 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 				diagnostics = s.diagnostics()
 			}
 			_ = enc.Encode(Response{OK: true, Diagnostics: diagnostics})
-		case "codex_slot_register", "codex_slot_unregister", "autoname":
-			if s.codexSlot == nil {
-				_ = enc.Encode(Response{Error: "Codex slot control unavailable"})
-				continue
-			}
-			if err := s.codexSlot(req); err != nil {
-				_ = enc.Encode(Response{Error: err.Error()})
-			} else {
-				_ = enc.Encode(Response{OK: true})
-			}
 		case "activity":
 			err := s.handleActivity(req)
 			if err != nil {
@@ -777,17 +760,6 @@ func (s *Server) dispatchAgentHook(req Request) {
 	tracked := make(map[int]*state.Session, len(snap.Sessions))
 	for i := range snap.Sessions {
 		tracked[snap.Sessions[i].PID] = &snap.Sessions[i]
-	}
-	if req.SlotID != "" {
-		for i := range snap.Sessions {
-			if snap.Sessions[i].SlotID == req.SlotID {
-				s.agentHook(req, snap.Sessions[i])
-				return
-			}
-		}
-		// Exact slot identity never falls back to ancestry: doing so could route a
-		// hook from one of several TUIs onto its parent or neighbour.
-		return
 	}
 	pid := findTrackedAncestor(tracked, req.PID, s.readProc)
 	if pid == 0 {

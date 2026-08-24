@@ -2,12 +2,11 @@
 
 **Status:** Draft · **Supersedes:** v0.1 · **Scope:** v1
 
-> **2026-08-21 Codex architecture amendment.** The validated Go reference now
-> models a visible terminal slot separately from its replaceable conversation,
-> launches each new Codex TUI against a private app-server Unix socket, and
-> observes status, approval, names, and `/clear` rotations through that endpoint.
-> Section 5.S below supersedes the older one-process/one-session and
-> rollout-only Codex assumptions wherever they conflict.
+> **2026-08-24 Codex architecture amendment.** The validated Go reference now
+> supports the ordinary `codex` command through exact trusted hooks, a generic
+> read-only observer, and conversation-bound Switchboard display names created
+> after a completed turn. Section 5.S below supersedes the former Codex
+> process-control and native-name-mutation design wherever they conflict.
 
 > **What changed from v0.1.** v0.1 was written as though the problem were new.
 > It is not: `switchboard` is a working ~39k-LOC Go implementation of this
@@ -135,18 +134,15 @@ behavior the spec does not know exists.
 
 Terms from v0.1 are retained. Added, because the domain needs them:
 
-- **Terminal slot** — one visible, navigable TUI lifetime. For launcher-owned
-  Codex sessions it is identified by a random UUID and carries endpoint plus
-  pid/process-start metadata. It survives `/clear`.
-- **Conversation** — one provider thread currently displayed in a terminal
-  slot. Conversation-scoped name, status, attention, writers/children, pending
-  work, and timestamps are discarded when the binding rotates.
-- **Conversation binding** — the slot's current provider conversation id plus a
-  monotonically increasing generation. A stale id/generation can never mutate
-  the current conversation.
-- **Session** — the existing generic live-agent record. New code must say
-  *terminal slot* or *conversation* when that distinction matters; pid is
-  liveness/navigation metadata, not permanent conversation ownership.
+- **Process lifetime** — one visible, navigable TUI process identified by the
+  pair `(pid, started_at)`. PID reuse cannot inherit provider state.
+- **Conversation** — one exact provider thread currently hosted by a process
+  lifetime. Conversation-scoped status, attention, writers/children, and
+  display metadata are discarded when trusted evidence rotates the identity.
+- **Display name** — Switchboard-owned, conversation-bound label metadata. It
+  never mutates a provider's native thread name.
+- **Session** — the generic live-agent record joining process/navigation state
+  to its current provider conversation.
 - **Writer** — an independently-blocking actor within a session: the main
   thread, or one in-flight subagent. A session is **1 + N writers** that share
   a pid and a chip and can each block on their own permission prompt.
@@ -196,10 +192,10 @@ AP1–AP3, AP5, AP6 stand as written in v0.1. Revised and added:
   published schema is a public API. It changes only through the versioning rules
   in FR-O, and a golden fixture fails the build when a field's name, type, order,
   or presence semantics move.
-- **AP11 [NEW] — Endpoint attribution is structural.** A visible Codex TUI owns
-  one private app-server endpoint. Slot identity precedes process ancestry;
-  ancestry is only a fallback for pre-wrapper sessions. Loaded threads on a
-  shared daemon are never correlated to visible clients by cwd or recency.
+- **AP11 [NEW] — Codex attribution is exact.** Discovery owns the visible
+  `(pid, started_at)` lifetime; a trusted hook supplies its conversation ID.
+  The observer cannot discover or correlate roots by cwd, recency, title, or a
+  loaded-thread list.
 
 ---
 
@@ -767,83 +763,64 @@ library versions or field-modelling choices if left unstated:
   such error as a design question, not a cast to silence.
 - **FR-R2 [MUST].** All published timestamps are RFC 3339 UTC.
 
-### FR-S · Codex terminal slots and app-server endpoints *(2026-08-21 amendment)*
+### FR-S · Standard Codex identity and display naming *(2026-08-24 amendment)*
 
-- **FR-S1 [MUST] — Split slot from conversation.** A Codex terminal slot is
-  keyed by a random UUID created by the launcher and is stable for one visible
-  TUI lifetime. Its current conversation is `{thread_id, generation}`. PID and
-  process start time are liveness/discovery metadata only and must never be the
-  permanent provider-session key.
-- **FR-S2 [MUST] — Rotation, not conflict.** An exactly attributed event naming
-  a different, non-retired thread increments generation, retires the old
-  binding, clears all conversation-scoped state, and applies the triggering
-  event immediately. Any later event naming a retired thread, carrying a
-  mismatched non-zero generation, or predating the newest accepted event is
-  rejected without changing name, status, attention, writers/children, pending
-  work, or timestamps. The timestamp fence also rejects an out-of-order
-  intermediate thread that was never observed before a rapid second `/clear`.
-  Duplicate current-thread events are idempotent.
-- **FR-S3 [MUST] — One endpoint per visible TUI.** The `agent-watcher-codex`
-  launcher creates `$XDG_RUNTIME_DIR/agent-watcher/codex/<slot-id>/`, starts
-  `codex app-server --listen unix://.../app-server.sock`, exports a stable slot
-  variable and the endpoint, starts `codex --remote unix://...`, registers the
-  slot, and supervises both children. It removes the socket on exit. A shared
-  Codex daemon is not an attribution source for visible TUIs.
-- **FR-S4 [MUST] — Launcher control protocol.** The RPC vocabulary includes
-  `codex_slot_register {slot_id, endpoint, pid, started_at}`,
-  `codex_slot_unregister {slot_id}`, hook observations carrying `slot_id`,
-  `session_id`, and `observed_at` (plus optional generation), and
-  `autoname {slot_id?}`. Exact
-  slot identity precedes ancestry; an unknown explicit slot is dropped and
-  counted rather than falling back to a different process.
-- **FR-S5 [MUST] — Per-slot observer.** One supervised app-server client exists
-  per registered endpoint. It initializes without starting turns or answering
-  approvals, reconciles `thread/loaded/list`, reads the bound thread and
-  descendants, treats notifications as invalidation hints, polls every second
-  while active and every ten seconds while idle, reconnects with capped
-  exponential backoff, and retains a last complete snapshot only through its
-  explicit freshness boundary. The [official Codex app-server protocol](https://learn.chatgpt.com/docs/app-server)
-  defines the thread/read/name methods; the Unix JSONL proxy bridge is a
-  version-pinned local capability.
+- **FR-S1 [MUST] — Process and conversation identity.** A visible Codex session
+  is keyed by `(pid, started_at)`; its current provider identity is the exact
+  hook-supplied conversation ID. PID reuse cannot inherit state. Cwd, rollout
+  recency, timestamps, and loaded-thread enumeration are not attribution
+  sources.
+- **FR-S2 [MUST] — Rotation fence.** Trusted forward evidence naming a new
+  conversation retires the old identity, clears conversation-bound graph,
+  pending, and display metadata, and applies the triggering event. Late events
+  from retired identities and chronologically older events are rejected.
+  Duplicate current-conversation events are idempotent.
+- **FR-S3 [MUST] — Standard invocation.** The supported visible-session path is
+  the ordinary `codex` command plus trusted hooks. No separate process-control
+  command, registration protocol, or per-session transport architecture is part
+  of the design.
+- **FR-S4 [MUST] — Hook boundary.** Hook RPC accepts exact
+  `session_id`, `turn_id`, lifecycle correlators, and `observed_at`.
+  `prompt` is forwarded only for Codex `UserPromptSubmit`; the final
+  assistant message is forwarded only for Codex `Stop`. Each is trimmed to
+  1,000 Unicode characters and remains transient.
+- **FR-S5 [MUST] — Generic read-only observer.** Observation binds only after an
+  exact hook identity. It may initialize, read the bound thread and descendants,
+  and consume thread/turn/item/native-name notifications. It exposes no
+  visible-thread write operation and performs no independent root discovery.
+  Failure degrades to hook-only state.
 - **FR-S6 [MUST] — Status authority.** Hooks supply immediate prompt, tool,
-  completion, and permission edges. App-server runtime/attention state corrects
-  missed or delayed hooks. Reduction precedence remains attention first,
-  active/delegating second, idle third, and cannot-tell otherwise. This endpoint
-  closes the old rollout-only approval gap for wrapper-launched sessions;
-  FR-E8's weaker hook/rollout tier still describes legacy sessions without a
-  registered endpoint.
-- **FR-S7 [MUST] — Names are conversation state.** App-server thread name is
-  authoritative. `thread/name/updated` and thread reads project into the visible
-  nickname. Any non-empty name not matching Switchboard's pending generated
-  value is `origin=user`, cancels generation, and is never overwritten by
-  autonaming. `/clear` starts unnamed; retired history may preserve the old
-  name, but the visible slot may not.
-- **FR-S8 [MUST] — Zero-effort autonaming.** After the first substantive prompt
-  on an unnamed generation, send at most its first 1,000 characters plus cwd
-  basename to an isolated, ephemeral naming app-server. Default model is
-  `gpt-5.6-luna`, configurable. Validate lowercase 2–5-word kebab-case output
-  capped at 40 characters, retry one transient failure, then use a deterministic
-  prompt-derived fallback. Gate `thread/name/set` by slot, thread, and
-  generation; serialize name writes per slot. Never persist or log the prompt.
-  Manual `autoname` is retry-only.
-- **FR-S9 [MUST] — Normalized event contract.** Both provider paths enter the
-  reducer as `{slot_id, provider, conversation_id, generation?, activity,
-  attention, optional_name_update, observed_at, provenance}`. Provider adapters
-  may add richer evidence beside this contract, but may not bypass the
-  generation fence. Claude's hook/transcript behavior remains unchanged.
-- **FR-S10 [MUST] — Clean Rust boundary.** Port the slot/conversation types,
-  normalized event reducer, launcher RPC vocabulary, and conformance suite.
-  Do **not** port Go schema-v1 compatibility or the one-process/one-session
-  binding model. The v2 schema publishes the slot UUID, current binding and
-  generation, name origin, endpoint health/snapshot age, and autoname state.
-- **FR-S11 [MUST] — Conformance.** The shared suite covers the discovering event
-  across rotation, stale status/name/attention/children rejection, missed
-  `SessionStart`, duplicate/reordered hooks, rapid `/clear`, daemon reconnect,
-  active→idle→active and approval transitions, explicit rename races,
-  generated-name validation/retry/fallback/cancellation, and two concurrent
-  same-cwd slots whose state never crosses. Ephemeral naming threads must never
-  appear as visible slots. Claude's existing corpus must remain green.
-
+  completion, permission, and user-input edges. Complete app-server
+  runtime/attention state corrects missed or delayed evidence. Reduction remains
+  attention first, active/delegating second, idle third, and cannot-tell
+  otherwise.
+- **FR-S7 [MUST] — Display precedence.** A valid, conversation-matching
+  Switchboard display record renders before the native graph nickname, short
+  conversation ID, cwd basename, and PID fallbacks. Project prefixing is applied
+  afterward. Native metadata is observed, never mutated.
+- **FR-S8 [MUST] — Completed-turn generation.** Retain a bounded prompt candidate
+  on `UserPromptSubmit`. Accept only a chronologically later nonempty `Stop`;
+  require equal turn IDs when both exist. Generate from cwd basename, prompt,
+  and final response in an isolated ephemeral turn. Default to
+  `gpt-5.6-luna`, validate lowercase 2–5-word kebab-case output capped at 40
+  Unicode characters, try twice, then use a deterministic fallback.
+- **FR-S9 [MUST] — Cancellation and exactly once.** A newer prompt replaces an
+  incomplete candidate. Empty completion discards it. A newer completed attempt,
+  conversation rotation, process death/PID reuse, or shutdown cancels pending
+  work. Commit only while process lifetime and conversation still match, and
+  never generate twice for one committed conversation.
+- **FR-S10 [MUST] — Schema-v3 privacy boundary.** Persist only
+  `display_name {value, origin, conversation_id, native_baseline?}`.
+  `origin` is `generated` or `fallback`. Prompt, assistant response, turn
+  ID, pending state, and cancellation data never enter state, history,
+  diagnostics, or logs. Incompatible schema-v2 mirrors are ignored.
+- **FR-S11 [MUST] — Native override and conformance.** Capture the authoritative
+  native name at commit or the first authoritative observation afterward. A
+  later differing authoritative value clears the display record; partial hook
+  graphs cannot. The suite covers hook bounds/malformed input, ordering and
+  turn matching, interruption/replacement, retry/fallback/timeout/cancellation,
+  rotation/PID reuse/shutdown, restart, schema privacy, render/history
+  precedence, exact observer binding, and native rename override.
 ---
 
 ## 6. Cross-Platform Capability Matrix — corrected
@@ -1062,10 +1039,10 @@ OQ1–OQ6 stand. Added:
   with a client/server split or no file transcript is worth more as a design
   probe than a third JSONL-and-hooks tool. Failing an integration target, the
   hostile fake of FR-E9c is the fallback.
-- **OQ15 — RESOLVED by FR-S5/FR-S6.** Wrapper-launched Codex sessions expose
-  structured approval/user-input state through their private app-server
-  endpoint, so pane scraping is unnecessary for that tier. Legacy sessions
-  without an endpoint retain FR-E8's documented observability gap until exit.
+- **OQ15 — RESOLVED by FR-S4/FR-S6.** Trusted hooks own exact approval and
+  `request_user_input` edges for ordinary Codex sessions. The read-only observer
+  enriches them with structured graph state when available; pane scraping is
+  unnecessary.
 - **OQ11 [NEW per D2].** Does the Windows session anchor (FR-A6) have a reliable
   answer? Spike it at M2. If a stable console identity cannot be resolved,
   Windows ships Observe-only and FR-A8 becomes its normal case rather than its

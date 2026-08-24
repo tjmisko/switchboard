@@ -16,9 +16,9 @@
 > daemon solely for Switchboard until that exact-binding gap is fixed. See the
 > [incident report](codex-app-server-hook-attribution-incident.md).
 
-> **Standard-CLI requirement (updated 2026-08-22):** requiring a private
-> endpoint launcher is not an acceptable solution. Plain `codex` now detects
-> interactive questions through an exact, content-free
+> **Standard-CLI requirement (updated 2026-08-24):** ordinary `codex` plus
+> trusted hooks is the supported path. Interactive questions use an exact,
+> content-free
 > `PreToolUse`/`PostToolUse` latch. The app-server item detector is not evidence
 > for the standard path. See the
 > [interview-detection retrospective](codex-standard-cli-interview-retrospective.md).
@@ -61,32 +61,25 @@ terminal target. See the
 
 ## Exact root binding
 
-A correct graph is useless if attached to the wrong TUI. Binding therefore
-accepts only exact identity sources:
+A correct graph is useless if attached to the wrong TUI. Binding therefore uses
+one exact identity source: the trusted root lifecycle hook's `session_id`,
+registered against the discovered `(pid, started_at)` process lifetime.
 
-1. `CODEX_THREAD_ID` read from the discovered root process environment on
-   Linux, before a hook identity has arrived.
-2. The root lifecycle hooks' common `session_id`, registered against the same
-   `(pid, started_at)` process lifetime. `SessionStart` normally establishes it;
-   a later hook self-heals when startup delivery races process discovery. Once
-   registered, hook identity wins because it can rotate on `/clear` while the
-   process-start environment is immutable.
-
-Switchboard also restores a persisted exact identity for the same process
-lifetime after its own daemon restarts. It never carries that binding across a
-different PID/start pair.
+`SessionStart` normally establishes the identity. A later trusted lifecycle
+hook self-heals when startup delivery races discovery. `/clear` rotates the
+conversation within the same process lifetime, retires the prior identity, and
+fences its late events. A valid schema-v3 identity may be restored only for the
+same live process lifetime.
 
 The observer never binds by cwd, timestamp proximity, rollout recency, title,
-or a same-directory heuristic. `CODEX_SESSION_ID` is intentionally ignored:
-sanitized 0.149 capture showed `CODEX_THREAD_ID` and `CODEX_SESSION_ID` can
-differ, with the latter naming a parent session.
+process environment, loaded-thread enumeration, or a same-directory heuristic.
+The hook ID is also the only conversation identity accepted by display-name
+generation.
 
 The official hooks documentation defines `SessionStart`, the common
 `session_id` field, and the three-level event → matcher group → command-handler
 configuration. It also states that subagent hooks use the parent session id.
 See the [official OpenAI hooks documentation](https://learn.chatgpt.com/docs/hooks).
-The use of `CODEX_THREAD_ID` is a locally verified Switchboard binding, not a
-claim made by that public hooks page.
 
 ## Primary observation and degradation
 
@@ -94,8 +87,8 @@ The observer's normal path is:
 
 1. Version-check the `codex` CLI (minimum locally verified proxy capability:
    `0.149.0`).
-2. Start only the disposable stdio proxy. Never open the private control socket
-   directly and never start or stop the shared app-server. The
+2. Start only the disposable stdio proxy. Never start or stop the shared
+   app-server as part of Switchboard. The
    [2026-08-21 incident](codex-app-server-hook-attribution-incident.md) shows
    that enabling the shared daemon changes new-thread ownership and currently
    breaks hook-to-TUI attribution.
@@ -178,41 +171,25 @@ waits for 24 hours, and idle edges for 7 days.
 
 ## Terminal titles, spinners, and session names
 
-Codex's terminal title is an output surface, not a hidden primary state feed.
-The locally installed 0.149 TUI exposes configurable terminal-title items for:
+Codex's terminal title is an output surface, not a primary state feed. Its
+configurable items can include a spinner, run state, thread title or UUID,
+project, cwd, model, branch, tokens, and usage. Reading it would lose graph
+structure, conflate attention types, and make a chip repaint with animation.
 
-- a spinner while working / an action-required message while blocked;
-- compact run-state text such as ready, working, or thinking;
-- the current thread title, falling back to its thread identifier when unnamed;
-- project, cwd, model, branch, token, context, usage, and other metadata.
+Switchboard instead reads structured runtime/attention state and native
+`Thread.name` metadata. Codex labels never fall back to terminal titles.
 
-The same installed app-server schema exposes the richer machine-facing sibling
-projection: `Thread.status`, `activeFlags`, `thread/status/changed`, turn/item
-events, child threads, and approval/user-input requests. It also exposes the
-stable naming fields `Thread.name` (optional user-facing title) and
-`Thread.preview` (usually the first user message), plus
-`thread/name/updated`/`thread/name/set`.
+For an ordinary `codex` session, Switchboard also creates a display-only label
+after the first usable completed turn. The exact hooks provide a bounded prompt
+and final assistant message; an isolated ephemeral naming turn produces a
+validated 2–5-word kebab-case result. Only
+`display_name {value, origin, conversation_id, native_baseline?}` persists.
 
-Switchboard therefore does not infer Codex state from the spinner or terminal
-title. Watching the title would lose information and add failure modes:
-
-- title items and their order are user-configurable and may be disabled;
-- spinner frames repaint at animation frequency and create needless WM/bar
-  churn;
-- a compact “action required” title cannot preserve approval versus user-input
-  waits or identify a blocked child;
-- one root pane title cannot represent the descendant graph;
-- a frozen/suspended pane or terminal integration failure can leave stale text;
-- an unnamed thread's title fallback is a UUID, not a usable task name.
-
-The existing app-server observer is already the simplification: it consumes
-Codex's structured runtime projection directly. Titles remain terminal/WM
-metadata only. For display naming, Switchboard prefers `Thread.name`; when it is
-empty, the label layer uses the first two characters of the stable root thread
-ID. Codex labels never fall back to terminal titles, so spinner animation,
-branch/model suffixes, and the full UUID cannot appear on Switchboard. This
-fallback is display-only and does not mutate the Codex thread via
-`thread/name/set`.
+Rendering prefers a valid display record, then the native name, then a compact
+thread ID. Switchboard does not mutate native thread state. A later
+authoritative native-name notification or snapshot that differs from the
+captured baseline clears the display record, so `/rename` wins. A partial hook
+overlay cannot manufacture this override.
 
 ## Historical findings retained
 

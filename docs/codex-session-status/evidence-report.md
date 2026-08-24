@@ -62,13 +62,12 @@ negotiated live capabilities are unknown.
 These observations are live point samples, but they are not app-server event
 captures:
 
-- The process environment exposed both IDs as non-empty:
-  `CODEX_THREAD_ID=<redacted-thread>` and
-  `CODEX_SESSION_ID=<redacted-session>`.
+- The historical process-environment sample exposed two non-empty, redacted
+  provider IDs. They are retained as evidence only and are not binding inputs.
 - The two redacted values were unequal.
 - A strictly read-only SQLite connection (`mode=ro&immutable=1`) found rows for
   both values. The current thread had a spawn edge whose direct parent equaled
-  `CODEX_SESSION_ID`.
+  the second sampled provider ID.
 - At the point sample, that parent had three direct child edges, all with the
   persisted edge status `open`.
 - The current child's persisted source metadata had depth 1 and a nickname

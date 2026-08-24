@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -40,12 +39,10 @@ var descendantSourceKinds = []string{
 }
 
 // Config controls observer I/O and bounded retention. Zero durations receive
-// production defaults. Connector and Environment are injectable so tests never
-// touch an installed Codex binary, socket, or live process environment.
+// production defaults. Connector is injectable so tests never touch an
+// installed Codex binary or live app-server proxy.
 type Config struct {
 	Connector           Connector
-	EndpointConnector   func(string) Connector
-	Environment         EnvironmentReader
 	Freshness           time.Duration
 	ResnapshotInterval  time.Duration
 	ActivePollInterval  time.Duration
@@ -72,18 +69,17 @@ type WaitClassificationDiagnostic struct {
 }
 
 type rootRecord struct {
-	threadID          string
-	binding           BindingSource
-	bindingGeneration uint64
-	graph             *graphState
-	observation       agentgraph.Observation
-	generation        uint64
-	expiry            *time.Timer
+	threadID    string
+	binding     BindingSource
+	graph       *graphState
+	observation agentgraph.Observation
+	generation  uint64
+	expiry      *time.Timer
 }
 
 // Observer is a supervised provider.Observer. NewObserver starts its proxy
 // supervisor immediately; callers should register exact hook bindings before
-// their first Observe when process-environment binding is unavailable.
+// their first Observe.
 type Observer struct {
 	config   Config
 	bindings *BindingRegistry
@@ -108,15 +104,6 @@ type Observer struct {
 
 	refresh chan struct{}
 	cadence chan struct{}
-	control chan nameSetRequest
-}
-
-type nameSetRequest struct {
-	ctx      context.Context
-	key      provider.RootKey
-	threadID string
-	name     string
-	done     chan error
 }
 
 var _ provider.Observer = (*Observer)(nil)
@@ -126,11 +113,11 @@ func NewObserver(config Config) *Observer {
 	config = withDefaults(config)
 	ctx, cancel := context.WithCancel(context.Background())
 	observer := &Observer{
-		config: config, bindings: newBindingRegistry(config.Environment),
+		config: config, bindings: newBindingRegistry(),
 		queue: provider.NewInvalidationQueue(config.UpdateBuffer), ctx: ctx, cancel: cancel,
 		roots: make(map[provider.RootKey]*rootRecord), pendingStatuses: make(map[string]rpcStatus),
 		pendingWaits: make(map[string][]rpcNotification),
-		refresh:      make(chan struct{}, 1), cadence: make(chan struct{}, 1), control: make(chan nameSetRequest),
+		refresh:      make(chan struct{}, 1), cadence: make(chan struct{}, 1),
 	}
 	observer.wg.Add(1)
 	go observer.run()
@@ -190,10 +177,8 @@ func withDefaults(config Config) Config {
 	return config
 }
 
-// RegisterHookBinding records a daemon-verified exact thread ID. It supersedes
-// the immutable process-start CODEX_THREAD_ID so /clear can rotate the thread
-// under a stable TUI process. Registration triggers a resnapshot and is safe to
-// call before or after the first Observe.
+// RegisterHookBinding records a daemon-verified exact thread ID. A later hook
+// can rotate the binding after /clear under the same process lifetime.
 func (o *Observer) RegisterHookBinding(key provider.RootKey, threadID string) error {
 	_, err := o.ReconcileHookBinding(key, threadID)
 	return err
@@ -214,26 +199,15 @@ func (o *Observer) ReconcileHookBinding(key provider.RootKey, threadID string) (
 // copy of the last complete snapshot. Expiration is represented by the
 // observation's unchanged FreshUntil boundary; consumers use neutral freshness
 // reduction rather than a guessed fallback graph.
-func (o *Observer) Observe(ctx context.Context, ref provider.RootRef, _ time.Time) (agentgraph.Observation, error) {
+func (o *Observer) Observe(_ context.Context, ref provider.RootRef, _ time.Time) (agentgraph.Observation, error) {
 	if ref.Provider != "" && ref.Provider != agentgraph.ProviderCodex {
 		return agentgraph.Observation{}, fmt.Errorf("codex observer cannot observe provider %q", ref.Provider)
 	}
 	if ref.PID <= 0 || ref.StartedAt.IsZero() {
 		return agentgraph.Observation{Provider: agentgraph.ProviderCodex, Complete: false, Diagnostic: "process start identity unavailable"}, nil
 	}
-	binding, diagnostic := o.bindings.resolve(ctx, ref)
+	binding, diagnostic := o.bindings.resolve(ref)
 	if binding.ThreadID == "" {
-		// A launcher-owned endpoint can discover its current root without guessing
-		// by cwd or process ancestry. The supervisor reconciles loaded threads.
-		if ref.SlotID != "" && ref.ProviderEndpoint != "" {
-			key := ref.Key()
-			o.mu.Lock()
-			if o.roots[key] == nil {
-				o.roots[key] = &rootRecord{}
-			}
-			o.mu.Unlock()
-			o.signalRefresh()
-		}
 		return agentgraph.Observation{Provider: agentgraph.ProviderCodex, Complete: false, Diagnostic: diagnostic}, nil
 	}
 
@@ -246,14 +220,14 @@ func (o *Observer) Observe(ctx context.Context, ref provider.RootRef, _ time.Tim
 	record := o.roots[key]
 	changed := false
 	if record == nil {
-		record = &rootRecord{threadID: binding.ThreadID, binding: binding.Source, bindingGeneration: binding.Generation}
+		record = &rootRecord{threadID: binding.ThreadID, binding: binding.Source}
 		o.roots[key] = record
 		changed = true
-	} else if record.threadID != binding.ThreadID || record.bindingGeneration != binding.Generation {
+	} else if record.threadID != binding.ThreadID {
 		if record.expiry != nil {
 			record.expiry.Stop()
 		}
-		record = &rootRecord{threadID: binding.ThreadID, binding: binding.Source, bindingGeneration: binding.Generation}
+		record = &rootRecord{threadID: binding.ThreadID, binding: binding.Source}
 		o.roots[key] = record
 		changed = true
 	}
@@ -273,28 +247,6 @@ func (o *Observer) Observe(ctx context.Context, ref provider.RootRef, _ time.Tim
 }
 
 func (o *Observer) Updates() <-chan provider.RootKey { return o.queue.Updates() }
-
-// SetThreadName is the observer's sole intentional write. It is serialized on
-// the connection supervisor and gated by the current thread binding.
-func (o *Observer) SetThreadName(ctx context.Context, key provider.RootKey, threadID, name string) error {
-	request := nameSetRequest{ctx: ctx, key: key, threadID: strings.TrimSpace(threadID), name: strings.TrimSpace(name), done: make(chan error, 1)}
-	if request.threadID == "" || request.name == "" {
-		return errors.New("codex: thread name requires thread id and name")
-	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-o.ctx.Done():
-		return errors.New("codex observer is closed")
-	case o.control <- request:
-	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-request.done:
-		return err
-	}
-}
 
 // Forget drops all binding, graph, and timer state for one process lifetime.
 // It is idempotent and does not affect another process that reused the PID.
@@ -412,19 +364,6 @@ func (o *Observer) run() {
 				ticker.Reset(o.pollInterval())
 			case <-o.cadence:
 				ticker.Reset(o.pollInterval())
-			case request := <-o.control:
-				o.mu.Lock()
-				record := o.roots[request.key]
-				valid := record != nil && record.threadID == request.threadID && o.generation == generation
-				o.mu.Unlock()
-				if !valid {
-					request.done <- errors.New("codex: stale thread name request")
-					continue
-				}
-				ctx, cancel := context.WithTimeout(request.ctx, o.config.RequestTimeout)
-				err := client.request(ctx, "thread/name/set", map[string]any{"threadId": request.threadID, "name": request.name}, &struct{}{})
-				cancel()
-				request.done <- err
 			case <-ticker.C:
 				o.beginSync(generation)
 				o.resnapshotAll(client, generation)
@@ -470,37 +409,6 @@ func (o *Observer) resnapshotAll(client *rpcClient, generation uint64) {
 	}
 	o.mu.Unlock()
 	for _, target := range targets {
-		// Per-TUI endpoints reconcile their loaded root on every poll. This heals
-		// missed SessionStart hooks, /clear, and app-server restarts.
-		if target.key.SlotID != "" || target.id == "" {
-			discovered, err := o.discoverLoadedRoot(client)
-			if err != nil {
-				o.recordError("loaded_thread_reconcile_error")
-				continue
-			}
-			if discovered != "" && discovered != target.id {
-				update, bindErr := o.bindings.RegisterHook(target.key, discovered)
-				if bindErr != nil || update.Stale {
-					continue
-				}
-				o.mu.Lock()
-				record := o.roots[target.key]
-				if o.generation != generation || record == nil || record.threadID != target.id {
-					o.mu.Unlock()
-					continue
-				}
-				if record.expiry != nil {
-					record.expiry.Stop()
-				}
-				record.threadID = discovered
-				record.binding = BindingHook
-				record.bindingGeneration = update.Generation
-				record.graph = nil
-				record.observation = agentgraph.Observation{}
-				o.mu.Unlock()
-				target.id = discovered
-			}
-		}
 		if target.id == "" {
 			continue
 		}
@@ -517,49 +425,6 @@ func (o *Observer) recordError(category string) {
 	o.mu.Lock()
 	o.lastError = category
 	o.mu.Unlock()
-}
-
-func (o *Observer) discoverLoadedRoot(client *rpcClient) (string, error) {
-	ctx, cancel := context.WithTimeout(o.ctx, o.config.RequestTimeout)
-	defer cancel()
-	var candidates []rpcThread
-	var cursor string
-	for {
-		params := map[string]any{}
-		if cursor != "" {
-			params["cursor"] = cursor
-		}
-		var loaded threadLoadedListResult
-		if err := client.request(ctx, "thread/loaded/list", params, &loaded); err != nil {
-			return "", err
-		}
-		for _, id := range loaded.Data {
-			var result threadReadResult
-			if err := client.request(ctx, "thread/read", map[string]any{"threadId": id, "includeTurns": false}, &result); err != nil {
-				continue
-			}
-			if result.Thread.ID == id && result.Thread.ParentThreadID == "" {
-				candidates = append(candidates, result.Thread)
-			}
-		}
-		if loaded.NextCursor == nil || *loaded.NextCursor == "" {
-			break
-		}
-		cursor = *loaded.NextCursor
-	}
-	if len(candidates) == 0 {
-		return "", nil
-	}
-	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].CreatedAt != candidates[j].CreatedAt {
-			return candidates[i].CreatedAt > candidates[j].CreatedAt
-		}
-		if candidates[i].UpdatedAt != candidates[j].UpdatedAt {
-			return candidates[i].UpdatedAt > candidates[j].UpdatedAt
-		}
-		return candidates[i].ID > candidates[j].ID
-	})
-	return candidates[0].ID, nil
 }
 
 func (o *Observer) snapshot(client *rpcClient, rootID string) (*graphState, error) {
@@ -790,7 +655,7 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 			if params.ThreadName != nil {
 				name = *params.ThreadName
 			}
-			if state.setThreadName(params.ThreadID, name) {
+			if state.observeThreadName(params.ThreadID, name) {
 				state.nodes[params.ThreadID].node.UpdatedAt = o.config.Now()
 				touches = true
 			}

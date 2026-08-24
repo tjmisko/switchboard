@@ -15,14 +15,12 @@ var (
 )
 
 var allowedRequests = map[string]struct{}{
-	"initialize":         {},
-	"thread/read":        {},
-	"thread/list":        {},
-	"thread/loaded/list": {},
-	"thread/name/set":    {},
+	"initialize":  {},
+	"thread/read": {},
+	"thread/list": {},
 }
 
-var autonameRequests = map[string]struct{}{
+var displayNameRequests = map[string]struct{}{
 	"initialize":   {},
 	"thread/start": {},
 	"turn/start":   {},

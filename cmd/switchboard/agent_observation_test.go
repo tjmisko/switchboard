@@ -25,22 +25,12 @@ type fakeCodexCoordinatorObserver struct {
 	forgets      map[provider.RootKey]int
 	closes       int
 	observes     int
-	nameCalls    chan codexNameCall
-	nameErrors   chan error
-}
-
-type codexNameCall struct {
-	key        provider.RootKey
-	threadID   string
-	generation uint64
-	name       string
 }
 
 func newFakeCodexCoordinatorObserver() *fakeCodexCoordinatorObserver {
 	return &fakeCodexCoordinatorObserver{
 		observations: make(map[provider.RootKey]agentgraph.Observation), updates: make(chan provider.RootKey, 64),
 		bindings: make(map[provider.RootKey]string), forgets: make(map[provider.RootKey]int),
-		nameCalls: make(chan codexNameCall, 16),
 	}
 }
 
@@ -79,14 +69,6 @@ func (f *fakeCodexCoordinatorObserver) RegisterHookBinding(key provider.RootKey,
 	f.mu.Lock()
 	f.bindings[key] = id
 	f.mu.Unlock()
-	return nil
-}
-
-func (f *fakeCodexCoordinatorObserver) SetThreadName(_ context.Context, key provider.RootKey, threadID string, generation uint64, name string) error {
-	f.nameCalls <- codexNameCall{key: key, threadID: threadID, generation: generation, name: name}
-	if f.nameErrors != nil {
-		return <-f.nameErrors
-	}
 	return nil
 }
 

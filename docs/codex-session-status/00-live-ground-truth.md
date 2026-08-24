@@ -56,8 +56,8 @@ and construct the missing fixture from the installed JSON schema. Mark it
 - Turn start/completion notifications.
 - Collaborative tool items for spawn, message/follow-up, wait, and close/finish.
 - `thread/list` filtered by `parentThreadId` and `ancestorThreadId`.
-- The process environment's `CODEX_THREAD_ID` and `CODEX_SESSION_ID` equality or
-  difference, recorded as booleans and redacted values.
+- Exact lifecycle-hook `session_id` and optional `turn_id` relationships, with
+  values replaced by stable synthetic IDs.
 - Hook payload shapes for `SubagentStart` and `SubagentStop` only if hooks are
   already configured; do not configure them for this phase.
 - Read-only observations of `thread_spawn_edges` and turn status for the captured

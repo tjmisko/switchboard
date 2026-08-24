@@ -22,15 +22,16 @@ func TestNormalizeGeneratedName(t *testing.T) {
 }
 
 func TestFallbackNameIsDeterministicAndValid(t *testing.T) {
-	first := FallbackName("Please fix the flaky integration tests in RPC")
-	second := FallbackName("Please fix the flaky integration tests in RPC")
+	input := NamingContext{UserPrompt: "Please fix the flaky integration tests in RPC", AssistantResponse: "Done"}
+	first := FallbackName(input)
+	second := FallbackName(input)
 	if first != second {
 		t.Fatalf("fallback is not deterministic: %q != %q", first, second)
 	}
 	if normalized, ok := NormalizeGeneratedName(first); !ok || normalized != first {
 		t.Fatalf("fallback %q does not satisfy naming contract", first)
 	}
-	if got := FallbackName("!!!"); got == "" {
+	if got := FallbackName(NamingContext{UserPrompt: "!!!"}); got == "" {
 		t.Fatal("punctuation-only prompt produced an empty fallback")
 	}
 }

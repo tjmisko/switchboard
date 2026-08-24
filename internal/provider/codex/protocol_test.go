@@ -99,13 +99,13 @@ func TestRootThreadNameSnapshotAndUpdateRemainExplicitAndDisplayOnly(t *testing.
 	}
 	assertNode(t, observation, fixtureRoot, "", "Initial title", "", agentgraph.RuntimeIdle, agentgraph.AttentionNone, agentgraph.LifecycleUnknown)
 
-	if !state.setThreadName(fixtureRoot, "Short rename") {
+	if !state.observeThreadName(fixtureRoot, "Short rename") {
 		t.Fatal("root thread name update was not applied")
 	}
 	if got := state.nodes[fixtureRoot].node.Nickname; got != "Short rename" {
 		t.Fatalf("updated root nickname = %q, want Short rename", got)
 	}
-	if !state.setThreadName(fixtureRoot, "") {
+	if !state.observeThreadName(fixtureRoot, "") {
 		t.Fatal("root thread name clear was not applied")
 	}
 	if got := state.nodes[fixtureRoot].node.Nickname; got != "" {

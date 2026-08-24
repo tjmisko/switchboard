@@ -23,11 +23,6 @@ type threadListResult struct {
 	NextCursor *string     `json:"nextCursor"`
 }
 
-type threadLoadedListResult struct {
-	Data       []string `json:"data"`
-	NextCursor *string  `json:"nextCursor"`
-}
-
 type rpcThread struct {
 	ID             string          `json:"id"`
 	ParentThreadID string          `json:"parentThreadId"`
@@ -195,12 +190,12 @@ func (s *graphState) upsertThread(thread rpcThread, root bool) {
 	s.deriveAll()
 }
 
-// setThreadName applies Codex's thread/name/updated notification without
+// observeThreadName applies a Codex native-name notification without
 // needing a full thread snapshot. The graph carries only Codex's explicit
 // user-facing root name; renderers own the short thread-ID fallback used while
 // it is unnamed. Child display remains owned by the agent nickname supplied
 // with its spawn metadata.
-func (s *graphState) setThreadName(id, name string) bool {
+func (s *graphState) observeThreadName(id, name string) bool {
 	state := s.nodes[id]
 	if state == nil {
 		return false

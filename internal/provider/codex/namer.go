@@ -7,10 +7,19 @@ import (
 	"strings"
 )
 
-const DefaultAutonameModel = "gpt-5.6-luna"
+const DefaultDisplayNameModel = "gpt-5.6-luna"
+
+// NamingContext is the bounded, ephemeral context for one completed Codex
+// turn. Callers must bound both content fields before constructing it; no
+// implementation may persist or log them.
+type NamingContext struct {
+	CWDBase           string
+	UserPrompt        string
+	AssistantResponse string
+}
 
 type NameGenerator interface {
-	Generate(context.Context, string, string, string) (string, error)
+	Generate(context.Context, NamingContext, string) (string, error)
 }
 
 // EphemeralNamer creates one isolated, non-persisted app-server thread. It
@@ -19,7 +28,7 @@ type EphemeralNamer struct {
 	Connector Connector
 }
 
-func (n EphemeralNamer) Generate(ctx context.Context, prompt, cwdBase, model string) (string, error) {
+func (n EphemeralNamer) Generate(ctx context.Context, input NamingContext, model string) (string, error) {
 	connector := n.Connector
 	if connector == nil {
 		connector = StdioServerConnector{}
@@ -52,11 +61,11 @@ func (n EphemeralNamer) Generate(ctx context.Context, prompt, cwdBase, model str
 			default:
 			}
 		}
-	}, autonameRequests)
+	}, displayNameRequests)
 	defer client.Close()
 	var initialized initializeResult
 	if err := client.request(ctx, "initialize", map[string]any{
-		"clientInfo": map[string]string{"name": "switchboard_autoname", "title": "Switchboard Autoname", "version": "1"},
+		"clientInfo": map[string]string{"name": "switchboard_display_name", "title": "Switchboard Display Name", "version": "1"},
 	}, &initialized); err != nil {
 		return "", err
 	}
@@ -67,7 +76,7 @@ func (n EphemeralNamer) Generate(ctx context.Context, prompt, cwdBase, model str
 		return "", err
 	}
 	if model == "" {
-		model = DefaultAutonameModel
+		model = DefaultDisplayNameModel
 	}
 	var started struct {
 		Thread struct {
@@ -80,12 +89,13 @@ func (n EphemeralNamer) Generate(ctx context.Context, prompt, cwdBase, model str
 		return "", err
 	}
 	if started.Thread.ID == "" {
-		return "", errors.New("autoname app-server returned no thread")
+		return "", errors.New("display-name app-server returned no thread")
 	}
-	input := "Create a lowercase 2-5 word kebab-case title, at most 40 characters. Return only the title.\nproject: " + cwdBase + "\nrequest: " + prompt
+	prompt := "Create a lowercase 2-5 word kebab-case title, at most 40 characters, for this completed coding turn. Return only the title.\n" +
+		"project: " + input.CWDBase + "\nuser request: " + input.UserPrompt + "\nfinal response: " + input.AssistantResponse
 	if err := client.request(ctx, "turn/start", map[string]any{
 		"threadId": started.Thread.ID,
-		"input":    []map[string]string{{"type": "text", "text": input}},
+		"input":    []map[string]string{{"type": "text", "text": prompt}},
 	}, &struct{}{}); err != nil {
 		return "", err
 	}
@@ -100,7 +110,7 @@ func (n EphemeralNamer) Generate(ctx context.Context, prompt, cwdBase, model str
 			case value := <-message:
 				return strings.TrimSpace(value), nil
 			default:
-				return "", errors.New("autoname turn completed without a name")
+				return "", errors.New("display-name turn completed without a name")
 			}
 		}
 	}

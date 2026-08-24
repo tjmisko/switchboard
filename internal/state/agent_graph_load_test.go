@@ -12,7 +12,7 @@ import (
 func TestLoadHydratesPartialAgentGraphAxesAndOrder(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	testsupport.WriteFile(t, path, `{
-  "schema_version": 2,
+  "schema_version": 3,
   "sessions": [{
     "pid": 7,
     "cwd": "/workspace",
@@ -66,7 +66,7 @@ func TestLoadHydratesPartialAgentGraphAxesAndOrder(t *testing.T) {
 func TestLoadExpiresRestoredAgentGraphWithoutDroppingStructure(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	testsupport.WriteFile(t, path, `{
-  "schema_version": 2,
+  "schema_version": 3,
   "sessions": [{
     "pid": 8,
     "cwd": "/workspace",
@@ -106,7 +106,7 @@ func TestLoadExpiresRestoredAgentGraphWithoutDroppingStructure(t *testing.T) {
 func TestLoadDoesNotRestoreCodexHookUserInputWithoutCorrelationLatch(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	testsupport.WriteFile(t, path, `{
-  "schema_version": 2,
+  "schema_version": 3,
   "sessions": [{
     "pid": 10,
     "cwd": "/workspace",
@@ -141,7 +141,7 @@ func TestLoadDoesNotRestoreCodexHookUserInputWithoutCorrelationLatch(t *testing.
 func TestLoadDropsStructurallyInvalidAgentGraphSafely(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	testsupport.WriteFile(t, path, `{
-  "schema_version": 2,
+  "schema_version": 3,
   "sessions": [{
     "pid": 9,
     "cwd": "/workspace",

@@ -17,12 +17,6 @@ import (
 	"github.com/tjmisko/switchboard/internal/state"
 )
 
-type integrationCodexEnvironment struct{}
-
-func (integrationCodexEnvironment) Environ(context.Context, provider.RootKey) ([]byte, error) {
-	return nil, errors.New("process environment unavailable in integration test")
-}
-
 type integrationCodexStatus struct {
 	Type        string   `json:"type"`
 	ActiveFlags []string `json:"activeFlags,omitempty"`
@@ -47,6 +41,7 @@ type integrationCodexTurn struct {
 type integrationCodexThread struct {
 	ID             string                 `json:"id"`
 	ParentThreadID string                 `json:"parentThreadId,omitempty"`
+	Name           string                 `json:"name,omitempty"`
 	AgentNickname  string                 `json:"agentNickname,omitempty"`
 	AgentRole      string                 `json:"agentRole,omitempty"`
 	Status         integrationCodexStatus `json:"status"`
@@ -83,6 +78,7 @@ type integrationCodexAppServer struct {
 	connections int
 	readRoots   []string
 	listRoots   []string
+	methods     []string
 }
 
 func newIntegrationCodexAppServer(t *testing.T, root integrationCodexThread, descendants []integrationCodexThread) *integrationCodexAppServer {
@@ -123,6 +119,9 @@ func (s *integrationCodexAppServer) serve(connection *integrationCodexConnection
 		}
 
 		var result json.RawMessage
+		s.mu.Lock()
+		s.methods = append(s.methods, request.Method)
+		s.mu.Unlock()
 		switch request.Method {
 		case "initialize":
 			result = integrationMustJSON(map[string]string{"userAgent": "codex_app_server/0.149.0"})
@@ -228,6 +227,12 @@ func (s *integrationCodexAppServer) requestRoots() (reads, lists []string, conne
 	return append([]string(nil), s.readRoots...), append([]string(nil), s.listRoots...), s.connections
 }
 
+func (s *integrationCodexAppServer) requestMethods() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.methods...)
+}
+
 func cloneIntegrationRawMessages(values []json.RawMessage) []json.RawMessage {
 	clone := make([]json.RawMessage, len(values))
 	for i, value := range values {
@@ -261,6 +266,101 @@ func waitForIntegrationCodexGraph(t *testing.T, store *state.Store, key provider
 	return nil
 }
 
+func TestStandardCodexHooksGenerateDisplayNameAndNativeRenameOverridesIt(t *testing.T) {
+	const rootID = "root-standard"
+	root := integrationCodexThread{
+		ID: rootID, Name: "session-naming", Status: integrationCodexStatus{Type: "idle"},
+	}
+	appServer := newIntegrationCodexAppServer(t, root, nil)
+	observer := codexprovider.NewObserver(codexprovider.Config{
+		Connector: appServer,
+		Freshness: 250 * time.Millisecond, ResnapshotInterval: time.Hour,
+		RequestTimeout: time.Second, ReconnectMinimum: 5 * time.Millisecond,
+		ReconnectMaximum: 10 * time.Millisecond, Jitter: func(time.Duration) time.Duration { return 0 },
+	})
+	store := state.New("")
+	ref := seedCoordinatorSession(store, 4800, time.Now().Add(-time.Hour), state.AgentKindCodex, "", "/project")
+	coordinator := newAgentCoordinator(store, nil, nil, observer)
+	namer := &scriptedDisplayNamer{results: []scriptedDisplayNameResult{{name: "context-aware-display"}}}
+	coordinator.SetCodexDisplayNamer(namer, "test-model")
+	coordinator.Start(context.Background(), time.Hour)
+	t.Cleanup(func() {
+		coordinator.Close()
+		appServer.disconnect()
+	})
+
+	// A standard hook is the only identity source. The observer may read that
+	// exact thread but has no discovery or write path of its own.
+	session, _ := sessionForKey(store.Snapshot(), ref.Key())
+	coordinator.HandleHook(rpc.Request{
+		Agent: state.AgentKindCodex, Event: "SessionStart", SessionID: rootID,
+		ObservedAt: time.Now(),
+	}, session)
+	initial := waitForIntegrationCodexGraph(t, store, ref.Key(), func(graph *state.AgentGraph) bool {
+		return graph != nil && graph.RootID == rootID && graph.Source == agentgraph.SourceCodexAppServer &&
+			graph.Complete && len(graph.Nodes) == 1 && graph.Nodes[0].Nickname == "session-naming"
+	})
+	if initial.Nodes[0].ID != rootID {
+		t.Fatalf("observer bound a non-root thread: %#v", initial.Nodes)
+	}
+
+	base := time.Now()
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "UserPromptSubmit", SessionID: rootID, TurnID: "turn-1",
+		Prompt: "Implement context-aware names", ObservedAt: base,
+	})
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "Stop", SessionID: rootID, TurnID: "turn-1",
+		LastAssistantMessage: "Implemented and verified", ObservedAt: base.Add(time.Millisecond),
+	})
+	waitForDisplayName(t, store, "context-aware-display")
+
+	// The Stop hook is partial, so wait for the next authoritative read to pin
+	// the native baseline. The generated label remains the visible winner.
+	baselineDeadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(baselineDeadline) {
+		session, ok := sessionForKey(store.Snapshot(), ref.Key())
+		if ok && session.DisplayName != nil && session.DisplayName.NativeBaseline != nil &&
+			*session.DisplayName.NativeBaseline == "session-naming" {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	session, _ = sessionForKey(store.Snapshot(), ref.Key())
+	if session.DisplayName == nil || session.DisplayName.NativeBaseline == nil || *session.DisplayName.NativeBaseline != "session-naming" {
+		t.Fatalf("authoritative baseline was not captured: %+v", session.DisplayName)
+	}
+
+	root.Name = "manual-native-name"
+	appServer.setSnapshot(t, root, nil)
+	if !appServer.notify("thread/name/updated", map[string]any{
+		"threadId": rootID, "threadName": "manual-native-name",
+	}) {
+		t.Fatal("fake app-server had no live observer connection")
+	}
+	waitForNoDisplayName(t, store)
+	waitForIntegrationCodexGraph(t, store, ref.Key(), func(graph *state.AgentGraph) bool {
+		return graph != nil && len(graph.Nodes) > 0 && graph.Nodes[0].Nickname == "manual-native-name"
+	})
+
+	reads, lists, _ := appServer.requestRoots()
+	if len(reads) == 0 || len(lists) == 0 {
+		t.Fatalf("observer did not use read/list: reads=%v lists=%v", reads, lists)
+	}
+	for _, threadID := range append(reads, lists...) {
+		if threadID != rootID {
+			t.Fatalf("observer escaped exact hook binding: %q", threadID)
+		}
+	}
+	for _, method := range appServer.requestMethods() {
+		switch method {
+		case "initialize", "initialized", "thread/read", "thread/list":
+		default:
+			t.Fatalf("observer attempted a non-read request; methods=%v", appServer.requestMethods())
+		}
+	}
+}
+
 func TestCodexAppServerObserverThroughCoordinatorStateAndHistory(t *testing.T) {
 	const rootID = "root-exact"
 	root := integrationCodexThread{
@@ -291,7 +391,7 @@ func TestCodexAppServerObserverThroughCoordinatorStateAndHistory(t *testing.T) {
 	historyDir := t.TempDir()
 	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: historyDir})
 	observer := codexprovider.NewObserver(codexprovider.Config{
-		Connector: appServer, Environment: integrationCodexEnvironment{},
+		Connector: appServer,
 		Freshness: 250 * time.Millisecond, ResnapshotInterval: time.Hour,
 		RequestTimeout: time.Second, ReconnectMinimum: 5 * time.Millisecond,
 		ReconnectMaximum: 10 * time.Millisecond, Jitter: func(time.Duration) time.Duration { return 0 },

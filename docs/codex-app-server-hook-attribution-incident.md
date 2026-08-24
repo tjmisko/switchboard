@@ -117,7 +117,7 @@ The investigation used content-free diagnostics and sanitized local metadata:
 | Codex feature report | `hooks` was enabled | Hooks were not globally disabled |
 | Codex logs | Shared-daemon hook lifecycle activity was present | Codex was processing hook lifecycle work in the daemon-owned runtime |
 | Codex log `process_uuid` correlation | New thread IDs belonged to the shared app-server PID | New threads were not owned by their visible TUI roots |
-| Root process environments | No usable `CODEX_THREAD_ID` was exported | Hooks were the only available exact fallback binding |
+| Root process metadata | No usable exact conversation identity was exported | Hooks were the only available exact binding |
 | Switchboard observer diagnostics | New TUI PIDs stayed `unbound` | No hook established an exact root association |
 | Working-session control | Existing TUI-owned thread remained hook-bound | Rendering, freshness, and the hook event mapping worked when attribution succeeded |
 
@@ -215,14 +215,15 @@ same repository. Acceptable directions include:
 1. a supported Codex identity exposed directly on each visible client process;
 2. a supported app-server association between a thread and its attached TUI
    client/terminal;
-3. an explicit launcher-provided token shared by the TUI and hook command;
+3. an explicit supported identity token exposed to both the visible client and
+   its hook command;
 4. detecting shared-daemon ownership and reporting a dedicated incompatible
    binding diagnostic instead of generic `exact_binding_unavailable`.
 
 The implementation should also record content-free hook receipt outcomes such
 as `accepted`, `no_tracked_ancestor`, and `binding_conflict`. That preserves the
-non-blocking hook contract while making “not launched” distinguishable from
-“launched but safely rejected.”
+non-blocking hook contract while making “not observed” distinguishable from
+“observed but safely rejected.”
 
 No permanent fix should use cwd, title, rollout recency, or timestamp proximity
 as identity.

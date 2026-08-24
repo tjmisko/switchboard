@@ -2,12 +2,11 @@
 
 **For:** a fresh Claude Code instance · **Written:** 2026-08-12 · **Read this first, entirely, before any tool call.**
 
-> **2026-08-21 supersession.** The Go oracle now has a validated Codex terminal
-> slot/conversation split, per-TUI app-server socket, generation-fenced reducer,
-> authoritative rename projection, and isolated automatic naming. The Rust port
+> **2026-08-24 supersession.** The Go oracle now supports ordinary `codex`
+> through exact trusted hooks, a generic read-only observer, completed-turn
+> display naming, and authoritative native-rename precedence. The Rust port
 > must adopt `docs/rust-rewrite-requirements-v0.2.md` FR-S and must not reproduce
-> the older one-process/one-session or rollout-only Codex model described later
-> in this historical kickoff brief.
+> the former Codex process-control or native-name-mutation model.
 
 ---
 
@@ -141,9 +140,9 @@ These come from the audit. Violating one is a defect, not a style difference.
   These are deliberate guards with no tuning knob.
 - **No modelling a session as one agent.** A session is 1 + N independently-blocking
   writers sharing a pid (FR-M1).
-- **No modelling a visible Codex terminal as one permanent conversation.** The
-  slot survives `/clear`; its replaceable `{thread_id, generation}` binding owns
-  every conversation-scoped field (FR-S1/FR-S2).
+- **No modelling a visible Codex process as one permanent conversation.**
+  `/clear` rotates the exact hook-supplied conversation identity and clears
+  every conversation-bound graph and display field (FR-S1/FR-S2).
 - **No parsed-JSON golden comparison.** Byte-level, or the fixture is not a tripwire.
 
 ---

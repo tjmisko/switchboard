@@ -26,13 +26,13 @@
 - Host: Linux `7.1.6-400.asahi.fc44.aarch64+16k`, `arm64`,
   `CGO_ENABLED=1`
 - Go: `go version go1.26.5-X:nodwarf5 linux/arm64`
-- Primary cache: `GOCACHE=/tmp/switchboard-codex-v7-gocache`
+- Primary cache: `GOCACHE=/tmp/switchboard-v7-gocache`
 - Primary temporary roots: `GOTMPDIR=/tmp/sbv7` for the initial pass and
   `GOTMPDIR=/tmp/sbv7f` for the final pass. These short paths prevent an
   unrelated Unix socket path-length `EINVAL` from obscuring the sandbox's
   actual socket denial.
 - Baseline-reproduction cache/root:
-  `/tmp/switchboard-codex-v7-baseline-gocache` and `/tmp/sbv7base`
+  `/tmp/switchboard-v7-baseline-gocache` and `/tmp/sbv7base`
 
 The first final-candidate compile attempt hit the shared host's temporary-file
 quota before any test executed (`link: mapping output file failed: disk quota
@@ -245,9 +245,8 @@ go test -count=20 ./internal/discovery
   only matching duplicate projections.
 - Claude shadow/fanout equivalence and simultaneous Claude/Codex coordinator
   behavior.
-- Codex binding keyed by PID plus process start, including PID reuse, process
-  environment denial fallback, no CWD binding, and no use of
-  `CODEX_SESSION_ID` as a thread ID.
+- Codex binding keyed by PID plus process start, including PID reuse, exact
+  hook-only identity, and no CWD binding.
 - Discovery's complete Codex invocation matrix, including sandbox wrappers,
   `exec`, app-server forms, help/version, unknown verbs/options, and masked
   process data.

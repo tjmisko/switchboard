@@ -32,10 +32,10 @@ import (
 var spinnerPrefixes = []string{"✳ ", "⠂ ", "⠐ ", "⠁ ", "⠈ ", "⠠ ", "⠄ ", "⡀ ", "⢀ "}
 
 // RawName picks the human name for a session before project prefixing. Codex
-// uses an explicit root name supplied by app-server, then the first two
-// characters of its stable thread ID; it deliberately never uses its terminal
-// title, whose configurable branch/model fields and activity spinner do not
-// belong in a session label. Claude prefers its authoritative
+// uses a conversation-matching Switchboard display name, then an authoritative
+// native graph name, then the first two characters of its stable thread ID. It
+// deliberately never uses its terminal title, whose configurable branch/model
+// fields and activity spinner do not belong in a session label. Claude prefers its authoritative
 // ~/.claude/sessions/<pid>.json name, then a spinner-stripped terminal title.
 // Both providers fall back to cwd and finally pid.
 func RawName(s state.Session) string {
@@ -51,6 +51,16 @@ func Chip(cfg projectname.Config, s state.Session) string {
 // cached and uncached paths cannot drift apart.
 func rawName(s state.Session, claudeName func(pid int) string) string {
 	if s.Agent == state.AgentKindCodex {
+		conversationID := codexConversationID(s)
+		if s.DisplayName.ValidFor(conversationID) {
+			return strings.TrimSpace(s.DisplayName.Value)
+		}
+		if (conversationID == "" || (s.AgentGraph != nil && s.AgentGraph.RootID == conversationID)) && graphRootName(s.AgentGraph) != "" {
+			return graphRootName(s.AgentGraph)
+		}
+		if conversationID != "" {
+			return shortCodexSessionID(conversationID)
+		}
 		if n := graphRootName(s.AgentGraph); n != "" {
 			return n
 		}
@@ -79,6 +89,16 @@ func rawName(s state.Session, claudeName func(pid int) string) string {
 		return filepath.Base(s.CWD)
 	}
 	return fmt.Sprintf("pid %d", s.PID)
+}
+
+func codexConversationID(s state.Session) string {
+	if info := s.Enrichment(); info != nil && strings.TrimSpace(info.SessionID) != "" {
+		return strings.TrimSpace(info.SessionID)
+	}
+	if s.AgentGraph != nil {
+		return strings.TrimSpace(s.AgentGraph.RootID)
+	}
+	return ""
 }
 
 const shortCodexSessionIDRunes = 2

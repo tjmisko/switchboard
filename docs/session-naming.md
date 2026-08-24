@@ -50,41 +50,73 @@ auto-prefix a *running* session's own name — hence the display-time approach.
 
 ## Codex names
 
-The locally verified Codex 0.149 app-server `Thread` object carries the stable
-thread `id` and an optional user-facing `name`. A Codex rename emits
-`thread/name/updated`, which Switchboard applies immediately.
+Ordinary `codex` sessions receive a Switchboard-owned display label after
+their first usable completed turn. `UserPromptSubmit` retains a bounded prompt
+candidate for the exact process lifetime and conversation; the matching later
+`Stop` supplies the bounded final assistant message. Empty or interrupted
+completions are discarded, and the next completed turn gets another chance.
 
-The explicit Codex name always wins. While it is empty, Switchboard renders
-only the first two characters of the thread ID. Project prefixing happens after
-that choice, so an unnamed Switchboard thread is `sb-01` and a thread renamed
-to `my-short-name` is `sb-my-short-name`. This is display-only: Switchboard does
-not call `thread/name/set`, rewrite Codex storage, or feed the fallback back into
-the live TUI. If app-server metadata is temporarily unavailable, the exact
-session ID supplied by Codex hooks provides the same short fallback; only a
-session with no known ID falls back to the project/cwd name and then `pid N`.
-The configurable terminal title is never a naming input, so its spinner,
-branch, model, and full UUID cannot leak into the chip.
+The naming turn receives only the cwd basename, prompt, and final response. Both
+content fields are limited to 1,000 Unicode characters and remain ephemeral.
+The selected model must return a lowercase 2–5-word kebab-case title no longer
+than 40 characters. Switchboard retries once, then chooses a deterministic
+fallback. The model defaults to `gpt-5.6-luna` and is configurable with
+`-codex-autoname-model`.
 
-This separation keeps naming independent from status. App-server runtime and
-attention notifications continue to paint the chip color; a name or spinner
-change cannot turn a chip green, orange, or red.
+Only this record is persisted:
+
+```json
+{
+  "value": "context-aware-session-names",
+  "origin": "generated",
+  "conversation_id": "<codex-thread-id>",
+  "native_baseline": "session-naming"
+}
+```
+
+No prompt, assistant response, pending attempt, or turn ID enters
+`state.json`, history, diagnostics, or logs. The record is valid only for its
+bound conversation. A daemon restart preserves a valid record for the same
+live conversation but never reconstructs discarded naming context.
+
+Codex label precedence is:
+
+1. a valid Switchboard `display_name`;
+2. the current native app-server root name;
+3. the first two characters of the exact thread ID;
+4. the cwd basename;
+5. `pid N`.
+
+Project prefixing happens after this choice. For example, a generated
+`context-aware-names` label in Switchboard renders as
+`sb-context-aware-names`.
+
+Switchboard never mutates Codex's native name. When the read-only observer sees
+an authoritative native name, that value becomes the display record's baseline.
+A later authoritative value that differs clears the generated record, so
+`/rename` takes precedence. Partial hook graphs and unavailable observations
+cannot manufacture a rename. With the observer disabled, generation still
+works; rename precedence is simply delayed until authoritative metadata becomes
+available.
+
+Codex terminal titles are not naming inputs. Their spinner, model, branch, and
+full UUID therefore cannot leak into a chip label.
 
 ## Components
 
 - **`internal/projectname`** — the pure resolver: prefix + dedup (longest-alias,
   hyphen-boundary), git-root detection, and a writable user config layered over
   built-in defaults.
-- **`switchboard-ctl name`** — `resolve --cwd --name` (used by the wrapper),
+- **`switchboard-ctl name`** — `resolve --cwd --name`,
   `abbrev --cwd` (current abbreviation), `set <dir> <abbrev>` (persist).
 - **`internal/label`** — sources Claude names from
   `~/.claude/sessions/<pid>.json` (with its existing terminal-title fallback)
-  and Codex names from the app-server root node, falling back to two characters
-  of its root/session ID (never its terminal title), then applies the project
-  prefix. Shared by the Waybar chips and `switchboard-ctl pick`/`list`.
-- **`internal/provider/codex`** — reads the explicit `Thread.name` and consumes
-  `thread/name/updated`; an empty name remains empty in the graph so renderers
-  can apply the compact ID fallback consistently.
-- **launcher wrapper** — `~/.config/scripts/claude-name-wrapper.sh`.
+  and Codex names from a conversation-bound `display_name` or the app-server
+  root node, then applies the compact-ID fallback and project prefix. Shared by
+  the Waybar chips and `switchboard-ctl pick`/`list`.
+- **`internal/provider/codex`** — generates validated display labels in an
+  isolated ephemeral turn and observes native names through a read-only graph.
+- **Claude startup wrapper** — `~/.config/scripts/claude-name-wrapper.sh`.
 - **hover rename** — middle-click a chip → `~/.config/scripts/claude-abbrev-edit`.
 
 ## Abbreviations & new projects

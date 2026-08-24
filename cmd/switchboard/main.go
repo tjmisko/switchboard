@@ -80,7 +80,7 @@ func main() {
 	terminalFlag := flag.String("terminal", "auto", "terminal backend: auto|wezterm|tmux|none")
 	historyDir := flag.String("history-dir", "", "activity-log directory (default $XDG_STATE_HOME/switchboard/history)")
 	codexObserverFlag := flag.String("codex-observer", string(defaultCodexObserverMode), "Codex app-server observer: auto|off")
-	codexAutonameModel := flag.String("codex-autoname-model", codexprovider.DefaultAutonameModel, "model for isolated Codex automatic naming")
+	codexDisplayNameModel := flag.String("codex-autoname-model", codexprovider.DefaultDisplayNameModel, "model for isolated Codex display-name generation")
 	flag.Parse()
 	codexMode, err := parseCodexObserverMode(*codexObserverFlag)
 	if err != nil {
@@ -148,7 +148,7 @@ func main() {
 	// disposable read-only child and is closed exactly once with the daemon.
 	claudeObs := claudeprovider.NewObserver(sink.Dir(), claudeprovider.WithTuning(tun))
 	codexObs := codexObserverForMode(codexMode, func() codexObserver {
-		return codexprovider.NewSlotObserver(codexprovider.Config{Diagnostic: func(string) {
+		return codexprovider.NewObserver(codexprovider.Config{Diagnostic: func(string) {
 			// The adapter guarantees this callback contains only a finite, content-free
 			// protocol category. Keep the log equally content-free.
 			log.Printf("agent-observer: provider=codex category=unknown_protocol_enum count=1")
@@ -159,7 +159,7 @@ func main() {
 	})
 	log.Printf("agent-observer: provider=codex category=%s count=1", codexObserverModeCategory(codexMode))
 	agentRuntime := newAgentCoordinator(store, sink, claudeObs, codexObs)
-	agentRuntime.SetCodexAutonamer(codexprovider.EphemeralNamer{}, *codexAutonameModel)
+	agentRuntime.SetCodexDisplayNamer(codexprovider.EphemeralNamer{}, *codexDisplayNameModel)
 	agentRuntime.Start(ctx, *reconcileInterval)
 	defer agentRuntime.Close()
 	forgetRoot := func(pid int) {
@@ -187,7 +187,7 @@ func main() {
 			// their explicit freshness deadline instead of being erased on scan one.
 			if prior := m[sess.PID]; prior != nil && prior.Agent == sess.Agent {
 				sess.StartedAt = prior.StartedAt
-				sess.SlotID = prior.SlotID
+				sess.DisplayName = prior.DisplayName
 				sess.Claude, sess.Codex, sess.AgentGraph = prior.Claude, prior.Codex, prior.AgentGraph
 				sess.MemAgentBytes, sess.MemTreeBytes = prior.MemAgentBytes, prior.MemTreeBytes
 			}
@@ -230,7 +230,6 @@ func main() {
 	server.SetHistory(sink)
 	server.SetAgentHookHandler(agentRuntime.HandleHook)
 	server.SetAgentDiagnosticSource(agentRuntime.Diagnostics)
-	server.SetCodexSlotHandler(agentRuntime.HandleCodexSlot)
 	if err := os.MkdirAll(filepath.Dir(*socketPath), 0o755); err != nil {
 		log.Fatalf("mkdir socket dir: %v", err)
 	}

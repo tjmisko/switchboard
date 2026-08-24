@@ -142,6 +142,43 @@ func TestObserveLabelEmitsOnChangeOnly(t *testing.T) {
 	}
 }
 
+func TestObserveLabelTracksCodexDisplayNameAndNativeOverrideOncePerVisibleChange(t *testing.T) {
+	histDir := t.TempDir()
+	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+	sess := &state.Session{
+		PID: 424244, Agent: state.AgentKindCodex, CWD: "/home/u/proj",
+		Codex: &state.AgentInfo{SessionID: "thread-1"},
+		AgentGraph: &state.AgentGraph{
+			RootID: "thread-1", Nodes: []state.AgentNode{{ID: "thread-1", Nickname: "initial-native"}},
+		},
+	}
+
+	rs.observeLabel(sink, sess, sess.Codex, time.Now())
+	rs.observeLabel(sink, sess, sess.Codex, time.Now())
+	sess.DisplayName = &state.DisplayName{
+		Value: "generated-display-name", Origin: state.DisplayNameGenerated, ConversationID: "thread-1",
+	}
+	rs.observeLabel(sink, sess, sess.Codex, time.Now())
+	rs.observeLabel(sink, sess, sess.Codex, time.Now())
+	sess.DisplayName = nil
+	sess.AgentGraph.Nodes[0].Nickname = "manual-native-name"
+	rs.observeLabel(sink, sess, sess.Codex, time.Now())
+	rs.observeLabel(sink, sess, sess.Codex, time.Now())
+	sink.Close()
+
+	labels := eventsOfType(readEvents(t, histDir), history.EventSessionLabel)
+	if len(labels) != 3 {
+		t.Fatalf("got %d session_label events, want one per visible change: %+v", len(labels), labels)
+	}
+	want := []string{"initial-native", "generated-display-name", "manual-native-name"}
+	for i := range want {
+		if labels[i].Label != want[i] || labels[i].SessionID != "thread-1" {
+			t.Fatalf("label[%d] = %+v, want %q on thread-1", i, labels[i], want[i])
+		}
+	}
+}
+
 // The authoritative name lives in ~/.claude/sessions/<pid>.json, and `/name`
 // rewrites it under a running session. observeLabel memoizes that read against
 // the file's stamp, so this pins the invalidation: a rename must still produce a

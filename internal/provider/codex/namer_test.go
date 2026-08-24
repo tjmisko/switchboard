@@ -3,7 +3,9 @@ package codex
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -12,7 +14,7 @@ type oneConnection struct{ connection Connection }
 
 func (c oneConnection) Connect(context.Context) (Connection, error) { return c.connection, nil }
 
-func TestEphemeralNamerUsesPrivateEphemeralThread(t *testing.T) {
+func TestEphemeralNamerUsesIsolatedEphemeralThread(t *testing.T) {
 	client, server := net.Pipe()
 	defer server.Close()
 	requests := make(chan rpcEnvelope, 4)
@@ -41,7 +43,7 @@ func TestEphemeralNamerUsesPrivateEphemeralThread(t *testing.T) {
 			if request.Method == "turn/start" {
 				_ = encoder.Encode(map[string]any{
 					"method": "item/completed",
-					"params": map[string]any{"item": map[string]string{"type": "agentMessage", "text": "fix-slot-rotation"}},
+					"params": map[string]any{"item": map[string]string{"type": "agentMessage", "text": "completed-turn-label"}},
 				})
 				_ = encoder.Encode(map[string]any{"method": "turn/completed", "params": map[string]any{}})
 			}
@@ -50,8 +52,9 @@ func TestEphemeralNamerUsesPrivateEphemeralThread(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	got, err := (EphemeralNamer{Connector: oneConnection{connection: client}}).Generate(ctx, "fix rotation", "switchboard", "test-model")
-	if err != nil || got != "fix-slot-rotation" {
+	input := NamingContext{CWDBase: "switchboard", UserPrompt: "fix rotation", AssistantResponse: "implemented and verified the hook lifecycle"}
+	got, err := (EphemeralNamer{Connector: oneConnection{connection: client}}).Generate(ctx, input, "test-model")
+	if err != nil || got != "completed-turn-label" {
 		t.Fatalf("Generate = %q, %v", got, err)
 	}
 
@@ -84,5 +87,29 @@ func TestEphemeralNamerUsesPrivateEphemeralThread(t *testing.T) {
 	}
 	if turn.ThreadID != "ephemeral-name-thread" || len(turn.Input) != 1 || turn.Input[0].Type != "text" || turn.Input[0].Text == "" {
 		t.Fatalf("turn/start = %+v", turn)
+	}
+	for _, want := range []string{input.CWDBase, input.UserPrompt, input.AssistantResponse} {
+		if !strings.Contains(turn.Input[0].Text, want) {
+			t.Errorf("naming prompt omitted %q: %q", want, turn.Input[0].Text)
+		}
+	}
+}
+
+func TestEphemeralNamerHonorsCancellation(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	go func() {
+		var request rpcEnvelope
+		_ = json.NewDecoder(server).Decode(&request)
+		<-ctx.Done()
+	}()
+
+	_, err := (EphemeralNamer{Connector: oneConnection{connection: client}}).Generate(ctx, NamingContext{
+		CWDBase: "switchboard", UserPrompt: "cancel naming", AssistantResponse: "still pending",
+	}, "test-model")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Generate error = %v, want deadline exceeded", err)
 	}
 }

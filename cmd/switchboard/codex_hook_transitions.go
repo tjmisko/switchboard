@@ -125,7 +125,7 @@ func (c *agentCoordinator) handleCodexHookNow(ref provider.RootRef, req rpc.Requ
 		return
 	}
 	var accepted bool
-	ref, accepted = c.reconcileCodexBinding(ref, rootID, req.Generation, now)
+	ref, accepted = c.reconcileCodexBinding(ref, rootID, now)
 	if !accepted {
 		c.codexHookMu.Unlock()
 		c.recordDiagnostic(ref.Provider, "stale_observation_rejected", now)
@@ -167,8 +167,11 @@ func (c *agentCoordinator) handleCodexHookNow(ref provider.RootRef, req rpc.Requ
 		generation := c.begin(ref.Key())
 		c.applyObservationWithHookOwnership(ref, generation, observation, claudeprovider.Compatibility{}, now, hookOwnsTransition)
 	}
-	if req.Event == "UserPromptSubmit" && req.Prompt != "" && ref.SlotID != "" {
-		c.startAutoname(ref, rootID, req.Prompt, false)
+	switch req.Event {
+	case "UserPromptSubmit":
+		c.retainCodexNamingCandidate(ref, rootID, req.TurnID, req.Prompt, now)
+	case "Stop":
+		c.completeCodexNaming(ref, rootID, req.TurnID, req.LastAssistantMessage, now)
 	}
 	if c.codex != nil {
 		c.Request(ref.Key())
@@ -297,6 +300,7 @@ func (c *agentCoordinator) forgetCodexHookState(key provider.RootKey) {
 	}
 	delete(c.codexHookRoots, key)
 	c.codexHookMu.Unlock()
+	c.cancelCodexNaming(key, true)
 }
 
 func codexHookObservation(rootID string, req rpc.Request, startedAt, now time.Time) (agentgraph.Observation, bool) {

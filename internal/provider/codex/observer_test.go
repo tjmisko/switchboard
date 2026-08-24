@@ -18,14 +18,16 @@ func TestObserverReconnectFreshnessGenerationAndCoalescing(t *testing.T) {
 	proxy := newFakeProxy()
 	started := time.Unix(100, 0)
 	key := provider.RootKey{PID: 42, StartedAt: started}
-	environment := &fakeEnvironment{values: map[provider.RootKey][]byte{key: []byte("CODEX_THREAD_ID=root\x00")}}
 	observer := NewObserver(Config{
-		Connector: proxy, Environment: environment,
+		Connector: proxy,
 		Freshness: 500 * time.Millisecond, ResnapshotInterval: time.Hour,
 		RequestTimeout: time.Second, ReconnectMinimum: 5 * time.Millisecond,
 		ReconnectMaximum: 10 * time.Millisecond, Jitter: func(time.Duration) time.Duration { return 0 },
 	})
 	defer observer.Close()
+	if err := observer.RegisterHookBinding(key, "root"); err != nil {
+		t.Fatal(err)
+	}
 	ref := provider.RootRef{PID: key.PID, StartedAt: key.StartedAt, Provider: agentgraph.ProviderCodex, CWD: "/same"}
 
 	initial, err := observer.Observe(context.Background(), ref, time.Now())
@@ -215,9 +217,8 @@ func TestNotificationSignalExposesMutation(t *testing.T) {
 func TestObserverHookBindingAndRootIDVerification(t *testing.T) {
 	proxy := newFakeProxy()
 	proxy.readOverride = rpcThread{ID: "different", Status: rpcStatus{Type: "idle"}}
-	environment := &fakeEnvironment{errors: map[provider.RootKey]error{}}
 	observer := NewObserver(Config{
-		Connector: proxy, Environment: environment, ResnapshotInterval: time.Hour,
+		Connector: proxy, ResnapshotInterval: time.Hour,
 		RequestTimeout: 30 * time.Millisecond, ReconnectMinimum: 5 * time.Millisecond,
 		ReconnectMaximum: 10 * time.Millisecond, Jitter: func(time.Duration) time.Duration { return 0 },
 	})
@@ -244,14 +245,16 @@ func TestObserverHookBindingAndRootIDVerification(t *testing.T) {
 func TestObserverDisconnectDuringDescendantListKeepsLastCompleteSnapshot(t *testing.T) {
 	proxy := newFakeProxy()
 	key := provider.RootKey{PID: 88, StartedAt: time.Unix(88, 0)}
-	environment := &fakeEnvironment{values: map[provider.RootKey][]byte{key: []byte("CODEX_THREAD_ID=root\x00")}}
 	observer := NewObserver(Config{
-		Connector: proxy, Environment: environment,
+		Connector: proxy,
 		Freshness: 2 * time.Second, ResnapshotInterval: time.Hour,
 		RequestTimeout: time.Second, ReconnectMinimum: 5 * time.Millisecond,
 		ReconnectMaximum: 10 * time.Millisecond, Jitter: func(time.Duration) time.Duration { return 0 },
 	})
 	defer observer.Close()
+	if err := observer.RegisterHookBinding(key, "root"); err != nil {
+		t.Fatal(err)
+	}
 	ref := provider.RootRef{PID: key.PID, StartedAt: key.StartedAt, Provider: agentgraph.ProviderCodex}
 
 	if _, err := observer.Observe(context.Background(), ref, time.Now()); err != nil {
@@ -417,18 +420,6 @@ func (p *fakeProxy) serve(connection net.Conn) {
 			result = initializeResult{UserAgent: "codex_app_server/0.149.0"}
 		case "thread/read":
 			result = threadReadResult{Thread: root}
-		case "thread/loaded/list":
-			result = threadLoadedListResult{Data: []string{root.ID}}
-		case "thread/name/set":
-			var request struct {
-				ThreadID string `json:"threadId"`
-				Name     string `json:"name"`
-			}
-			_ = json.Unmarshal(envelope.Params, &request)
-			if request.ThreadID == p.root.ID {
-				p.root.Name = request.Name
-			}
-			result = struct{}{}
 		case "thread/list":
 			var request fakeListRequest
 			_ = json.Unmarshal(envelope.Params, &request)

@@ -42,107 +42,87 @@ delta.
 
 ```jsonc
 {
-	"schema_version": 2,
+  "schema_version": 3,
   "sessions": [ /* Session objects, see below */ ],
-	"slots": [ /* CodexSlot objects, see below */ ],
   "updated_at": "2026-05-28T09:05:30Z"
 }
 ```
 
 | Field | JSON type | Always present | Meaning |
 |-------|-----------|----------------|---------|
-| `schema_version` | integer | yes | Persisted-state schema version. Current value: `2`. A daemon loading an incompatible version performs a clean reset rather than guessing at legacy process/conversation ownership. Unversioned Claude-only mirrors remain readable because Claude's transport is unchanged; any unversioned mirror containing Codex is reset. |
-| `sessions` | array of `Session` | yes | All currently-tracked coding-agent sessions (Claude Code and Codex). May be empty (`[]`) when no sessions exist. |
-| `slots` | array of `CodexSlot` | when non-empty | Stable visible Codex TUI slots and their replaceable conversation bindings. Omitted when there are no launcher-registered Codex slots. |
-| `updated_at` | RFC 3339 timestamp string | yes | When this snapshot was produced (`time.Now()` at encode). Monotonic-ish wall clock; advisory only. |
+| `schema_version` | integer | yes | Persisted-state schema version. Current value: `3`. A daemon loading an incompatible version ignores the mirror and rebuilds live sessions through discovery and hooks. Schema-v2 Codex state is intentionally not migrated. |
+| `sessions` | array of `Session` | yes | All currently tracked Claude and Codex root sessions. May be empty. |
+| `updated_at` | RFC 3339 timestamp | yes | Time of the last observable state change; advisory, not a daemon-liveness signal. |
 
-**Ordering guarantee:** `sessions` is sorted ascending by `started_at`. ⚠ The
-sort is currently by `started_at` **only** and is not stabilized by a
-tie-break, so sessions with identical timestamps have an unspecified relative
-order. A PID tie-break is a pending fix (see `docs/decisions.md`); until then
-consumers must **not** rely on positional/index identity across snapshots and
-should key on `pid`.
+**Ordering guarantee:** `sessions` is sorted by `started_at`, then ascending
+`pid` when timestamps are equal. Consumers should still key sessions by the
+pair `(pid, started_at)`; a PID alone can be reused.
 
 ## `Session`
 
-The session record. Five fields are always present; `suspended` and `headless`
-appear only when true; the two `mem_*` fields appear only when a reading
-succeeded; the backend/enrichment blocks are optional and omitted entirely when
-their data has not been resolved yet.
+The five process fields are always present. Optional process, backend,
+enrichment, graph, and display-name fields are omitted when unavailable.
 
 ```jsonc
 {
-  "pid": 4821,
-  "cwd": "/home/tjmisko/Projects/switchboard",
-  "tty": "/dev/pts/3",
-  "started_at": "2026-05-28T09:00:00Z",
-  "focused": true,
-  "suspended": true,         // omitted when false
-  "headless": true,          // omitted when false
-  "agent": "claude",         // "claude" | "codex"; omitted until the kind is known
-	"slot_id": "a0f75199-...", // Codex launcher slot; omitted otherwise
-  "mem_agent_bytes": 461373440,  // omitted when unmeasured
-  "mem_tree_bytes": 674234368,   // omitted when unmeasured
-  "wezterm":  { /* WeztermInfo, optional */ },
-  "hyprland": { /* HyprlandInfo, optional */ },
-  "claude":   { /* AgentInfo, optional — present for a claude session */ },
-  "codex":    { /* AgentInfo, optional — present for a codex session */ },
-  "agent_graph": { /* AgentGraph, optional — root + nested child threads */ }
+  "pid": 4999,
+  "cwd": "/home/tjmisko/Projects/api",
+  "tty": "/dev/pts/7",
+  "started_at": "2026-05-28T09:02:00Z",
+  "focused": false,
+  "agent": "codex",
+  "display_name": {
+    "value": "context-aware-session-names",
+    "origin": "generated",
+    "conversation_id": "0199736b-b713-74e2-99a2-f015a1c42816",
+    "native_baseline": "session-naming"
+  },
+  "mem_agent_bytes": 298844160,
+  "mem_tree_bytes": 298844160,
+  "codex": { /* AgentInfo, optional */ },
+  "agent_graph": { /* AgentGraph, optional */ }
 }
 ```
 
-| Field | JSON type | Presence | Stability | Meaning |
-|-------|-----------|----------|-----------|---------|
-| `pid` | integer | always | **stable key** | OS process id of the interactive Claude or Codex root. The primary identity of a switchable session. Unique within a snapshot. Child graph nodes do not get separate `Session` records or PIDs. |
-| `cwd` | string | always | stable | Working directory of the coding-agent root process. May be `""` if the kernel masked it. Resolved from `/proc/<pid>/cwd`, falling back to the terminal pane's reported cwd. It is never used to bind a provider thread. |
-| `tty` | string | always | stable | Controlling pseudo-terminal, e.g. `/dev/pts/3`. **OS-specific literal** (macOS will report `/dev/ttysNNN`); consumers should treat it as an opaque join key, never parse the prefix. May be `""` for a non-tty-attached process — such a session cannot be mapped to a terminal/window (Observe-only). |
-| `started_at` | RFC 3339 timestamp | always | stable | When Switchboard first observed the session (wall clock at discovery), **not** the process's real start time. |
-| `focused` | boolean | always | stable | Whether this session's window is the active window in the WM. Best-effort; `false` for any session without a resolved WM address. |
-| `suspended` | boolean | omitted when false | stable | Whether the agent process is job-control-stopped — paused by `SIGTSTP`/`SIGSTOP` (Ctrl-Z). Derived from the `State:` field of `/proc/<pid>/status` (`T`); refreshed each reconcile tick (~5 s). Renderers grey such chips out, since the status is stale while paused. `t` (tracing stop, e.g. under a debugger) does **not** count. Linux-only signal today; absent on backends that can't read process run-state. |
-| `headless` | boolean | omitted when false | additive | Whether this is a non-interactive `claude -p`/SDK run (see `discovery.IsHeadless`). Such a session appears in bars for visibility but has no TUI to navigate to, so renderers style it inert and focus/cycle/pick skip it. |
-| `agent` | string | omitted until known | additive | Which coding-agent CLI owns the session: `"claude"` or `"codex"`. Set at discovery from the process. Selects which enrichment block (`claude`/`codex`) carries the status. Consumers should tolerate its absence (pre-multi-agent daemons) and any unrecognized value. |
-| `slot_id` | UUID string | omitted when absent | additive | Stable visible-TUI identity supplied by `switchboard-codex`. It outlives `/clear` and joins this process/liveness record to the matching top-level `slots[]` entry. Hooks carrying a known slot use it before process ancestry; an unknown exact slot never falls back to a neighboring pid. |
-| `mem_agent_bytes` | integer | omitted when unmeasured | additive | Live resident cost of the agent process alone, in **bytes**: `Pss + SwapPss` from `/proc/<pid>/smaps_rollup`. PSS (proportional set size) charges each shared page to its sharers in fractions, so summing it across sessions never double-counts. Swap is included because a page pushed to swap is still memory the session is responsible for. Refreshed each reconcile tick (~5 s). Linux-only; absent on backends that cannot read it, and absent (rather than `0`) whenever a reading failed — `0` would mean "measured, and empty". |
-| `mem_tree_bytes` | integer | omitted when unmeasured | additive | Same measure summed over the agent process **and every descendant** — the session's whole process tree. Subagents have no PIDs of their own, so the tree is the only unit that captures spawned work. Subtract `mem_agent_bytes` to get what the session's children cost. Same units, cadence, and absence semantics as above. |
-| `wezterm` | object \| absent | optional | provisional | Terminal-locator data. Present once the tty is matched to a **wezterm** pane. Other terminal backends (e.g. tmux) do **not** populate it — those sessions are still observed via `/proc`, and focus re-locates the pane by tty at request time. Field set is terminal-backend-specific and may generalize when the seam grows a neutral terminal block. |
-| `hyprland` | object \| absent | optional | provisional | Window-manager data. Present once the pane is matched to a WM window. WM-backend-specific; will generalize behind a neutral window block as other WM backends land. |
-| `claude` | object \| absent | optional | stable | Claude compatibility enrichment fed by the Claude provider adapter. Shape is `AgentInfo` (below). |
-| `codex` | object \| absent | optional | additive | Codex compatibility enrichment projected from the authoritative graph or a hook fallback. Same `AgentInfo` shape as `claude`. A session populates exactly one of `claude`/`codex`, matching `agent`. |
-| `agent_graph` | object \| absent | optional | additive | Provider-neutral, bounded current view of the root thread and nested child threads. Present after a valid provider observation or restored last-known projection. Child nodes are display/history detail only and are never navigation sessions. See `AgentGraph` below. |
+| Field | JSON type | Presence | Meaning |
+|-------|-----------|----------|---------|
+| `pid` | integer | always | OS process ID of the interactive root. Child graph nodes do not become sessions. |
+| `cwd` | string | always | Root working directory. It is display/project metadata and is never used to bind a provider thread. |
+| `tty` | string | always | Opaque controlling-terminal identity; may be empty on an Observe-only root. |
+| `started_at` | RFC 3339 timestamp | always | Process-lifetime discriminator recorded by discovery. |
+| `focused` | boolean | always | Whether the resolved window is active. |
+| `suspended` | boolean | omitted when false | Whether the root is job-control-stopped. |
+| `headless` | boolean | omitted when false | Whether the discovered run has no navigable interactive TUI. |
+| `agent` | string | omitted until known | `claude` or `codex`; selects the matching enrichment block. |
+| `display_name` | object | omitted when absent | Switchboard-owned Codex display metadata, valid only for its exact conversation. It never changes the native Codex thread. |
+| `mem_agent_bytes` | integer | omitted when unmeasured | Root process PSS + SwapPss. |
+| `mem_tree_bytes` | integer | omitted when unmeasured | PSS + SwapPss for the root and all descendants. |
+| `wezterm` | object | optional | Wezterm locator data. |
+| `hyprland` | object | optional | Hyprland window data. |
+| `claude` | object | optional | Claude compatibility enrichment. |
+| `codex` | object | optional | Codex compatibility enrichment. |
+| `agent_graph` | object | optional | Bounded provider-neutral root/child graph. |
 
-## `slots[]` (`CodexSlot`) — schema v2
+### `display_name` — schema v3
 
-A Codex slot is one visible terminal/TUI lifetime. The slot owns navigation,
-endpoint, pid, and process-start metadata; its `conversation` owns all mutable
-conversation state. `/clear` replaces only the binding and generation, so the
-visible chip does not disappear or inherit the retired thread's state.
+A display record is committed only after a usable Codex
+`UserPromptSubmit`/`Stop` pair completes naming. The prompt, final assistant
+message, turn ID, pending attempt, and cancellation state are transient and must
+never appear in this document.
 
 | Field | JSON type | Presence | Meaning |
 |-------|-----------|----------|---------|
-| `slot_id` | UUID string | always | Random launcher identity, stable for one visible TUI lifetime. |
-| `endpoint` | string | always | That TUI's private app-server Unix socket or `unix://` endpoint. Never shared between visible TUIs. |
-| `pid` | integer | always | Visible TUI pid; liveness/discovery metadata, not conversation identity. |
-| `started_at` | RFC 3339 timestamp | always | Process-lifetime discriminator paired with `pid`. |
-| `conversation` | object \| absent | optional | Current `ConversationBinding`; absent while the endpoint is alive but has no loaded root. |
-| `retired` | array | omitted when empty | Slot-lifetime retired identity/name history. Runtime, attention, children, pending operations, and prompts are never copied here. |
-| `endpoint_connected` | boolean | always | Whether the per-slot observer currently has an initialized endpoint connection. |
-| `snapshot_at` | RFC 3339 timestamp | omitted until observed | Timestamp of the last complete app-server snapshot. |
-| `diagnostic` | string | omitted when healthy/unknown | Finite content-free state such as `endpoint disconnected`, `slot alive but no thread bound`, `conversation rotated`, or a snapshot error category. |
-| `last_error` | string | omitted before an endpoint error | Most recent content-free endpoint error category, retained independently of current connectivity. |
-| `autoname` | string | omitted before naming | `pending`, `generated`, `fallback`, or `suppressed_explicit`. |
+| `value` | string | always | Validated 2–5-word lowercase kebab-case label, at most 40 Unicode characters. |
+| `origin` | string | always | `generated` for accepted model output or `fallback` after both attempts fail. |
+| `conversation_id` | string | always | Exact Codex thread ID. A record for any other live conversation is invalid and is not rendered. |
+| `native_baseline` | string | omitted until authoritative | Native root name visible when the display record commits, or the first authoritative name observed afterward. An authoritative later value that differs clears the display record so the native rename wins. An empty string is meaningful and distinct from an omitted, unavailable baseline. |
 
-`ConversationBinding` contains `thread_id`, monotonic `generation`, optional
-`name`, optional `name_origin` (`user`, `generated`, or `fallback`), `bound_at`,
-and the accepted-event reorder fence `observed_at`. A different exact `thread_id` advances the generation and clears
-the visible conversation state before the discovering event is applied. An
-event naming a retired thread, or carrying a stale non-zero generation, cannot
-change status, attention, children, pending work, or name.
-
-The app-server thread name is authoritative. The legacy `codex.session_id`,
-`codex.status`, and root graph nickname are projections of this current binding,
-not independent state. Explicit external names are `origin=user` and suppress a
-pending generated name. Automatic-naming prompt text and the pending generated
-value are in-memory only and never appear in `state.json`.
+After restart, a valid record is retained only when discovery confirms the same
+process lifetime and conversation. When there is no record, Switchboard waits
+for the next completed turn; it does not reconstruct naming context from
+history. Hook payloads cannot introduce or change `native_baseline`; a nonempty native
+name carried through a partial status overlay remains attributable to the last
+complete app-server observation.
 
 ### `wezterm` (`WeztermInfo`) — provisional
 

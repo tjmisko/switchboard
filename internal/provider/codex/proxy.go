@@ -14,15 +14,11 @@ import (
 
 const minimumProxyVersion = "0.149.0"
 
-// CommandConnector supervises only the disposable stdio proxy child. It never
-// opens the private socket directly and never starts or stops the shared
-// app-server. The installed capability was established for Codex 0.149.0, so a
-// version preflight rejects older or unparseable CLIs.
+// CommandConnector supervises only the disposable read-only proxy child. The
+// installed capability was established for Codex 0.149.0, so a version
+// preflight rejects older or unparseable CLIs.
 type CommandConnector struct {
 	Binary string
-	// Sock connects the disposable proxy to one launcher-owned app-server.
-	// Empty retains the legacy default-control-socket behavior for tests/tools.
-	Sock string
 }
 
 // StdioServerConnector starts an isolated app-server process. It is used only
@@ -71,11 +67,7 @@ func (c CommandConnector) Connect(ctx context.Context) (Connection, error) {
 		return nil, err
 	}
 
-	args := []string{"app-server", "proxy"}
-	if c.Sock != "" {
-		args = append(args, "--sock", c.Sock)
-	}
-	cmd := exec.CommandContext(ctx, binary, args...)
+	cmd := exec.CommandContext(ctx, binary, "app-server", "proxy")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err

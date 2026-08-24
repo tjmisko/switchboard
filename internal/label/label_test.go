@@ -97,6 +97,47 @@ func TestRawName_CodexPrefersAppServerRootNameOverAnimatedTerminalTitle(t *testi
 	}
 }
 
+func TestRawName_CodexDisplayNamePrecedesMatchingNativeName(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := state.Session{
+		PID: 4248, Agent: state.AgentKindCodex, CWD: "/home/u/Projects/switchboard",
+		Codex: &state.AgentInfo{SessionID: "thread-1"},
+		DisplayName: &state.DisplayName{
+			Value: "context-aware-names", Origin: state.DisplayNameGenerated,
+			ConversationID: "thread-1",
+		},
+		AgentGraph: &state.AgentGraph{
+			RootID: "thread-1",
+			Nodes:  []state.AgentNode{{ID: "thread-1", Nickname: "native-title"}},
+		},
+	}
+	if got := RawName(s); got != "context-aware-names" {
+		t.Fatalf("RawName = %q, want generated display name", got)
+	}
+	if got := Chip(projectname.DefaultConfig(), s); got != "sb-context-aware-names" {
+		t.Fatalf("Chip = %q, want project-prefixed display name", got)
+	}
+}
+
+func TestRawName_CodexRejectsDisplayNameForAnotherConversation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := state.Session{
+		PID: 4249, Agent: state.AgentKindCodex,
+		Codex: &state.AgentInfo{SessionID: "thread-current"},
+		DisplayName: &state.DisplayName{
+			Value: "stale-generated-name", Origin: state.DisplayNameGenerated,
+			ConversationID: "thread-old",
+		},
+		AgentGraph: &state.AgentGraph{
+			RootID: "thread-current",
+			Nodes:  []state.AgentNode{{ID: "thread-current", Nickname: "manual-native-name"}},
+		},
+	}
+	if got := RawName(s); got != "manual-native-name" {
+		t.Fatalf("RawName = %q, want current native name", got)
+	}
+}
+
 func TestRawName_CodexUsesShortRootIDInsteadOfTerminalTitle(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	base := state.Session{

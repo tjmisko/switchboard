@@ -108,12 +108,6 @@ func main() {
 			fail("codex-hook requires an event name")
 		}
 		cmdHook(c, args[1], state.AgentKindCodex)
-	case "autoname":
-		slotID := ""
-		if len(args) > 1 {
-			slotID = args[1]
-		}
-		cmdAutoname(c, slotID)
 	case "activity":
 		if len(args) < 2 {
 			fail("activity requires a value: idle|active")
@@ -387,86 +381,65 @@ func sessionStatus(s state.Session) string {
 // snake_case stdin fields (session_id, transcript_path). Failures are silenced
 // so a broken hook can never block the agent.
 func cmdHook(c *rpc.Client, event, agent string) {
-	pid := os.Getppid()
-	sessionID := ""
-	transcript := ""
-	toolName := ""
-	toolInputHash := ""
-	agentID := ""
-	agentType := ""
-	prompt := ""
-	hookSource := ""
-	turnID := ""
-	toolUseID := ""
-	permissionMode := ""
-	if body, err := io.ReadAll(os.Stdin); err == nil && len(body) > 0 {
-		var payload struct {
-			SessionID      string `json:"session_id"`
-			TranscriptPath string `json:"transcript_path"`
-			// tool_name is present on PreToolUse/PermissionRequest/PostToolUse payloads. It
-			// lets the daemon clear a red chip at hook speed when the approved tool
-			// itself completes (see rpc.clearsPermission); absent on other events,
-			// which just disables that fast path.
-			ToolName string `json:"tool_name"`
-			// tool_input is present on PermissionRequest AND PostToolUse
-			// (claude-code-hook-schema.md §2), which makes it the "which call"
-			// correlator sitting between agent_id ("which writer") and tool_name
-			// ("which kind" — collides constantly). It is captured raw here only so
-			// hashToolInput can reduce it; the raw bytes never leave this function.
-			ToolInput json.RawMessage `json:"tool_input"`
-			// SubagentStart/Stop carry the subagent's identity. The wire form is
-			// snake_case (verified against the 2.1.195 binary); the camelCase
-			// fallbacks tolerate a build that reuses the dir-style key. Best-effort —
-			// the daemon only uses them to TRIGGER a dir re-scan, keyed off agent_id.
-			AgentID        string `json:"agent_id"`
-			AgentType      string `json:"agent_type"`
-			AgentIDAlt     string `json:"agentId"`
-			AgentTypeAlt   string `json:"agentType"`
-			Prompt         string `json:"prompt"`
-			Source         string `json:"source"`
-			TurnID         string `json:"turn_id"`
-			ToolUseID      string `json:"tool_use_id"`
-			PermissionMode string `json:"permission_mode"`
-		}
-		if json.Unmarshal(body, &payload) == nil {
-			sessionID = payload.SessionID
-			transcript = payload.TranscriptPath
-			toolName = payload.ToolName
-			toolInputHash = hashToolInput(payload.ToolInput)
-			agentID = firstNonEmpty(payload.AgentID, payload.AgentIDAlt)
-			agentType = firstNonEmpty(payload.AgentType, payload.AgentTypeAlt)
-			if agent == state.AgentKindCodex && event == "UserPromptSubmit" {
-				prompt = truncatePrompt(payload.Prompt, 1000)
-			}
-			hookSource = payload.Source
-			turnID = payload.TurnID
-			toolUseID = payload.ToolUseID
-			permissionMode = payload.PermissionMode
-		}
-	}
-	_ = c.Send(rpc.Request{
-		Cmd:            "hook",
-		Event:          event,
-		PID:            pid,
-		SessionID:      sessionID,
-		Transcript:     transcript,
-		ObservedAt:     time.Now().UTC(),
-		HookSource:     hookSource,
-		TurnID:         turnID,
-		ToolUseID:      toolUseID,
-		PermissionMode: permissionMode,
-		ToolName:       toolName,
-		ToolInputHash:  toolInputHash,
-		AgentID:        agentID,
-		AgentType:      agentType,
-		Agent:          agent,
-		SlotID:         strings.TrimSpace(os.Getenv("SWITCHBOARD_SLOT_ID")),
-		Prompt:         prompt,
-	})
+	body, _ := io.ReadAll(os.Stdin)
+	req := parseHookPayload(body, event, agent)
+	req.PID = os.Getppid()
+	req.ObservedAt = time.Now().UTC()
+	_ = c.Send(req)
 	var resp rpc.Response
 	_ = c.Recv(&resp)
 }
 
+type hookPayload struct {
+	SessionID      string `json:"session_id"`
+	TranscriptPath string `json:"transcript_path"`
+	ToolName       string `json:"tool_name"`
+	// ToolInput exists only long enough to become a bounded correlation hash.
+	// Raw tool input never leaves parseHookPayload.
+	ToolInput            json.RawMessage `json:"tool_input"`
+	AgentID              string          `json:"agent_id"`
+	AgentType            string          `json:"agent_type"`
+	AgentIDAlt           string          `json:"agentId"`
+	AgentTypeAlt         string          `json:"agentType"`
+	Prompt               string          `json:"prompt"`
+	LastAssistantMessage string          `json:"last_assistant_message"`
+	Source               string          `json:"source"`
+	TurnID               string          `json:"turn_id"`
+	ToolUseID            string          `json:"tool_use_id"`
+	PermissionMode       string          `json:"permission_mode"`
+}
+
+// parseHookPayload is the hook privacy boundary. It always returns a sendable
+// content-free lifecycle request, even for empty or malformed JSON. Codex
+// naming content is admitted only on the two matching lifecycle edges and is
+// bounded by Unicode code points before it can reach RPC.
+func parseHookPayload(body []byte, event, agent string) rpc.Request {
+	req := rpc.Request{Cmd: "hook", Event: event, Agent: agent}
+	if len(body) == 0 {
+		return req
+	}
+	var payload hookPayload
+	if json.Unmarshal(body, &payload) != nil {
+		return req
+	}
+	req.SessionID = payload.SessionID
+	req.Transcript = payload.TranscriptPath
+	req.ToolName = payload.ToolName
+	req.ToolInputHash = hashToolInput(payload.ToolInput)
+	req.AgentID = firstNonEmpty(payload.AgentID, payload.AgentIDAlt)
+	req.AgentType = firstNonEmpty(payload.AgentType, payload.AgentTypeAlt)
+	req.HookSource = payload.Source
+	req.TurnID = payload.TurnID
+	req.ToolUseID = payload.ToolUseID
+	req.PermissionMode = payload.PermissionMode
+	if agent == state.AgentKindCodex && event == "UserPromptSubmit" {
+		req.Prompt = truncatePrompt(payload.Prompt, 1000)
+	}
+	if agent == state.AgentKindCodex && event == "Stop" {
+		req.LastAssistantMessage = truncatePrompt(payload.LastAssistantMessage, 1000)
+	}
+	return req
+}
 func truncatePrompt(prompt string, limit int) string {
 	prompt = strings.TrimSpace(prompt)
 	if limit <= 0 {
@@ -477,19 +450,6 @@ func truncatePrompt(prompt string, limit int) string {
 		runes = runes[:limit]
 	}
 	return string(runes)
-}
-
-func cmdAutoname(c *rpc.Client, slotID string) {
-	if err := c.Send(rpc.Request{Cmd: "autoname", SlotID: strings.TrimSpace(slotID)}); err != nil {
-		fail("send: %v", err)
-	}
-	var resp rpc.Response
-	if err := c.Recv(&resp); err != nil {
-		fail("recv: %v", err)
-	}
-	if resp.Error != "" {
-		fail("%s", resp.Error)
-	}
 }
 
 // toolInputHashLen is how much of the sha256 hex digest is forwarded. 16 hex
@@ -667,7 +627,6 @@ commands:
                             set-full --cwd --name <full> (pretty display name)
   hook <event>            forward Claude Code hook enrichment (stdin = JSON)
   codex-hook <event>      forward Codex hook enrichment (stdin = JSON)
-  autoname [slot-id]      retry Codex automatic naming for one/all slots
   activity idle|active    report a global user-activity edge for the delegation
                             metrics (idle daemon, e.g. hypridle); session-less
   bottombar [sub]         manage the bottom waybar lifecycle:

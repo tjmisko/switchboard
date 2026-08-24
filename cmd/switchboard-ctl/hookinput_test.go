@@ -5,6 +5,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -256,6 +258,30 @@ func TestCmdHookShouldForwardContentFreeStandardCodexLifecycleMetadata(t *testin
 	}
 }
 
+func TestCmdHookForwardsBoundedCodexNamingContextOnlyOnItsLifecycleEdges(t *testing.T) {
+	longPrompt := "  " + strings.Repeat("界", 1002) + "  "
+	longResponse := "  " + strings.Repeat("🙂", 1002) + "  "
+	payload := `{"session_id":"thread-1","prompt":` + strconv.Quote(longPrompt) +
+		`,"last_assistant_message":` + strconv.Quote(longResponse) + `}`
+
+	prompt := parseHookPayload([]byte(payload), "UserPromptSubmit", "codex")
+	if len([]rune(prompt.Prompt)) != 1000 || prompt.LastAssistantMessage != "" {
+		t.Fatalf("UserPromptSubmit naming fields = prompt runes %d, assistant %q", len([]rune(prompt.Prompt)), prompt.LastAssistantMessage)
+	}
+	stop := parseHookPayload([]byte(payload), "Stop", "codex")
+	if stop.Prompt != "" || len([]rune(stop.LastAssistantMessage)) != 1000 {
+		t.Fatalf("Stop naming fields = prompt %q, assistant runes %d", stop.Prompt, len([]rune(stop.LastAssistantMessage)))
+	}
+	other := parseHookPayload([]byte(payload), "PreToolUse", "codex")
+	if other.Prompt != "" || other.LastAssistantMessage != "" {
+		t.Fatalf("non-naming Codex event forwarded context: %+v", other)
+	}
+	claude := parseHookPayload([]byte(payload), "Stop", "claude")
+	if claude.Prompt != "" || claude.LastAssistantMessage != "" {
+		t.Fatalf("Claude hook forwarded Codex naming context: %+v", claude)
+	}
+}
+
 func TestCmdHookShouldForwardToolInputHashWhenPayloadCarriesToolInput(t *testing.T) {
 	req := hookRequestForPayload(t, `{
 		"session_id": "sess-1",
@@ -325,6 +351,13 @@ func TestCmdHookShouldStillSendWhenPayloadIsMalformed(t *testing.T) {
 	}
 	if req.ToolInputHash != "" {
 		t.Errorf("expected no hash from a malformed payload, got %q", req.ToolInputHash)
+	}
+}
+
+func TestMalformedCodexStopCarriesNoAssistantContext(t *testing.T) {
+	req := parseHookPayload([]byte(`{"session_id":"thread-1","last_assistant_message":`), "Stop", "codex")
+	if req.Cmd != "hook" || req.Event != "Stop" || req.LastAssistantMessage != "" || req.Prompt != "" {
+		t.Fatalf("malformed Codex Stop = %+v", req)
 	}
 }
 
