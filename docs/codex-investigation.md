@@ -1,10 +1,11 @@
 # Investigation — Codex status and agent graphs in Switchboard
 
-> Status: **implemented; the earlier hook-primary recommendation is
-> superseded.** Switchboard now treats Codex app-server as the primary source
-> for thread runtime, attention, lifecycle, and parentage. Hooks provide an
-> exact root binding when process-environment identity is unavailable and a
-> bounded partial fallback. The implementation plan and merge contract are
+> Status: **implemented as a no-wrapper transport spike; live child lifecycle
+> remains unproved.** A disposable `codex app-server --stdio` process supplies
+> exact structural topology for plain `codex` TUIs. Exact lifecycle hooks bind
+> the root and retain bounded root runtime/attention when the standalone server
+> reports `notLoaded`. No child lifecycle is inferred from topology alone. The
+> implementation plan and merge contract are
 > in [`docs/codex-session-status/`](codex-session-status/README.md); the captured,
 > sanitized 0.149 evidence is in
 > [`evidence-report.md`](codex-session-status/evidence-report.md).
@@ -23,35 +24,46 @@
 > for the standard path. See the
 > [interview-detection retrospective](codex-standard-cli-interview-retrospective.md).
 
+> **Live finding (2026-08-23):** two simultaneous plain Codex TUIs in the same
+> cwd bound to different correct process lifetimes. Standalone stdio snapshots
+> repeatedly recovered four bound roots plus descendant IDs, immediate
+> parentage, and nicknames without erasing later hook-derived root status. The
+> recovered children remained `notLoaded` with lifecycle `unknown`, so durable
+> child-state fanout is still an open production invariant. See the
+> [no-wrapper probe](codex-no-wrapper-binding-probe.md).
+
 This document preserves the useful findings from the original investigation,
 records which conclusions changed, and describes the shipped observer boundary.
 
 ## Current conclusion
 
-Switchboard has two different kinds of truth:
+Switchboard has three different kinds of truth:
 
 - OS discovery owns the interactive **root process**, its PID/tty/cwd, and its
   navigation target.
-- A provider observer owns the root's **agent graph**: the root thread plus
-  nested, non-switchable child threads.
+- Exact Codex lifecycle hooks bind one root thread to one OS process lifetime
+  and own bounded root runtime/attention when app-server has no live value.
+- A provider observer owns structural **agent graph** topology: the root thread
+  plus nested, non-switchable child threads.
 
-For Codex, `internal/provider/codex` uses the app-server protocol through a
-disposable `codex app-server proxy` child. It initializes a read-only client,
-reads the exact root, lists all descendants with an explicit subagent
-`sourceKinds` filter and `ancestorThreadId`, then consumes thread/turn/item
-notifications. The daemon normalizes that evidence into `internal/agentgraph`,
-projects it into `state.json`, and expires authority when the observation is no
-longer fresh.
+For Codex, `internal/provider/codex` uses a disposable standalone
+`codex app-server --stdio` child. It initializes a read-only client, reads the
+exact hook-bound root, and lists descendants with an explicit subagent
+`sourceKinds` filter and `ancestorThreadId`. The daemon normalizes that evidence
+into `internal/agentgraph`, composes unavailable root fields with the exact
+hook observation, projects the result into `state.json`, and expires each
+authority at its original freshness deadline.
 
 OpenAI's public documentation establishes that app-server is a bidirectional
 JSON-RPC interface, uses JSONL on stdio, exposes `thread/read` and `thread/list`,
 returns thread runtime status, supports descendant filters, and streams agent
 events and approval requests. See the
 [official OpenAI app-server documentation](https://learn.chatgpt.com/docs/app-server).
-The public page does **not** currently document `app-server proxy`. That command
-was verified against the locally installed Codex 0.149.0 CLI and is guarded by a
-minimum-version preflight in Switchboard. It should not be described as a
-general public protocol promise.
+The public documentation search did not establish the standalone CLI transport
+behavior used here. `codex app-server --stdio` was verified through installed
+0.149.0 CLI help and a live host run and is guarded by a minimum-version
+preflight in Switchboard. It should be described as empirical compatibility
+evidence, not a general public protocol promise.
 
 OpenAI documents subagents as separate agent threads that supported clients can
 inspect. Switchboard preserves that model in the graph, but navigation stays on
@@ -90,12 +102,12 @@ claim made by that public hooks page.
 
 ## Primary observation and degradation
 
-The observer's normal path is:
+The observer's current path is:
 
-1. Version-check the `codex` CLI (minimum locally verified proxy capability:
+1. Version-check the `codex` CLI (minimum locally verified stdio capability:
    `0.149.0`).
-2. Start only the disposable stdio proxy. Never open the private control socket
-   directly and never start or stop the shared app-server. The
+2. Start only `codex app-server --stdio`. Never open a private control socket
+   and never start or stop the shared app-server. The
    [2026-08-21 incident](codex-app-server-hook-attribution-incident.md) shows
    that enabling the shared daemon changes new-thread ownership and currently
    breaks hook-to-TUI attribution.
@@ -104,8 +116,10 @@ The observer's normal path is:
 5. Page `thread/list` with `ancestorThreadId`, `useStateDbOnly`, and all accepted
    0.149 subagent source kinds. Omitting `sourceKinds` would select only the
    interactive `cli`/`vscode` defaults and lose descendants.
-6. Apply live `thread/*`, `turn/*`, and `item/*` notifications, periodically
-   resnapshot, and fence events/results by connection generation.
+6. Apply any `thread/*`, `turn/*`, and `item/*` notifications received,
+   periodically resnapshot, and fence events/results by connection generation.
+   The reducer supports these edges, but the 2026-08-23 standalone live run did
+   not prove child lifecycle delivery.
 
 Production defaults are a 10-second resnapshot interval, 15-second observation
 freshness, 5-second request timeout, reconnect backoff from 100 ms to 5 seconds
@@ -120,8 +134,8 @@ become authoritative. Unknown protocol enums degrade the affected axis to
 `unknown` and emit only a rate-limited, content-free diagnostic.
 
 The daemon flag `-codex-observer auto|off` controls rollout. `auto` is the
-default. `off` does not construct or run the proxy, but OS discovery/navigation
-and configured Codex hook fallback remain active.
+default. `off` does not construct or run the standalone app-server, but OS
+discovery/navigation and configured Codex hook fallback remain active.
 
 ## Attention and lifecycle fidelity
 
@@ -205,14 +219,13 @@ title. Watching the title would lose information and add failure modes:
 - a frozen/suspended pane or terminal integration failure can leave stale text;
 - an unnamed thread's title fallback is a UUID, not a usable task name.
 
-The existing app-server observer is already the simplification: it consumes
-Codex's structured runtime projection directly. Titles remain terminal/WM
-metadata only. For display naming, Switchboard prefers `Thread.name`; when it is
-empty, the label layer uses the first two characters of the stable root thread
-ID. Codex labels never fall back to terminal titles, so spinner animation,
-branch/model suffixes, and the full UUID cannot appear on Switchboard. This
-fallback is display-only and does not mutate the Codex thread via
-`thread/name/set`.
+The existing app-server observer consumes Codex's structured topology directly;
+it does not need title inference. Titles remain terminal/WM metadata only. For
+display naming, Switchboard prefers `Thread.name`; when it is empty, the label
+layer uses the first two characters of the stable root thread ID. Codex labels
+never fall back to terminal titles, so spinner animation, branch/model suffixes,
+and the full UUID cannot appear on Switchboard. This fallback is display-only
+and does not mutate the Codex thread via `thread/name/set`.
 
 ## Historical findings retained
 
@@ -243,9 +256,9 @@ can support working/idle recovery.
 The important limitation also remains true: the rollout does not provide a
 reliable passive distinction between a command still executing and one blocked
 on approval. The original investigation therefore correctly rejected rollout
-tailing as the primary source for approval state. In the shipped design this is
-no longer a product limitation because live app-server status carries distinct
-approval and user-input flags; rollout is degraded evidence only.
+tailing as the primary source for approval state. The protocol can carry
+distinct approval and user-input flags, but their live delivery through the
+standalone server is not yet proven. Rollout remains degraded evidence only.
 
 ### Hooks and legacy `notify`
 
@@ -286,7 +299,13 @@ minimal tier, while nickname/role/cwd/description are scrubbed.
 
 ## Remaining boundaries
 
-- The proxy integration depends on the locally verified CLI capability and may
+- Standalone stdio topology is live-proven, but child runtime/lifecycle edges
+  are not. A recovered `notLoaded` child with lifecycle `unknown` must not be
+  counted as proven live or written as a confident child transition.
+- The exact `/clear` then “implement plan” sequence in issue #86 still needs a
+  content-free live replay proving red input wait, session rotation, and the
+  next active/green edge without a stale old-thread repaint.
+- The stdio integration depends on the locally verified CLI capability and may
   need revision if Codex changes or publicly specifies that surface.
 - Non-Linux process-environment binding needs an injected platform reader or a
   trusted `SessionStart` hook.

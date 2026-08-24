@@ -1,5 +1,13 @@
 # Phase 3 — Codex app-server observer
 
+> **Historical plan; transport superseded 2026-08-23.** The implementation now
+> launches disposable `codex app-server --stdio`, not `app-server proxy`, and
+> does not depend on the shared daemon. Live testing proves exact structural
+> snapshots, while recovered child runtime/lifecycle remains unknown. Treat the
+> notification and child-transition requirements below as unfinished acceptance
+> gates; see the
+> [canonical no-wrapper result](../codex-no-wrapper-binding-probe.md).
+
 ## Mission
 
 Implement a supervised, read-only Codex provider observer whose primary truth is

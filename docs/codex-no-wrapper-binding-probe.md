@@ -1,7 +1,8 @@
 # Plain-Codex exact-binding probe
 
-> Status: diagnostic spike. A match does not bind a hook or authorize a status
-> update.
+> Status: live no-wrapper root binding, standalone transport, and bounded root
+> status composition passed on 2026-08-23. Live child lifecycle fanout remains
+> unproved.
 
 ## Decision
 
@@ -10,12 +11,15 @@ wrapper, alias, replacement launcher, private per-TUI app-server endpoint,
 launcher-generated token, or manual slot registration is not an acceptable
 dependency or acceptance test.
 
-The architecture must separate two concerns that the wrapper had combined:
+The architecture separates three concerns that the wrapper had combined:
 
-1. **Observation transport:** one read-only shared app-server connection may
-   observe thread graphs for every Codex root.
+1. **Observation transport:** one disposable standalone
+   `codex app-server --stdio` connection reads thread graphs for Codex roots.
 2. **Exact root binding:** a separate supported identity must join a root thread
    to one discovered interactive TUI process lifetime.
+3. **Field authority:** app-server owns topology, while an exact hook may own
+   bounded root runtime/attention only when app-server reports that field
+   unavailable.
 
 Per-TUI app-server endpoints are unnecessary if the second join can be made
 exactly. Cwd, title, timestamps, and launch order remain forbidden joins.
@@ -88,15 +92,16 @@ plain codex TUI --OS discovery--> RootKey(PID, process start)
        |
 standard lifecycle hook --exact terminal identity + session_id--+
                                                                |
-shared read-only app-server --thread graph keyed by root ID-----+--> coordinator
+standalone stdio app-server --thread graph keyed by root ID-----+--> coordinator
                                                                     |
                                                              agent_state history
 ```
 
-The shared observer owns transport and a provider-wide graph cache. The binder
-owns `RootKey <-> root thread ID`, including `/clear` rotation and process death.
-Only an exact binding lets the coordinator project graph state or durable child
-history. Transport loss, partial snapshots, or binding loss degrade to unknown.
+The standalone observer owns transport and structural graph snapshots. The
+binder owns `RootKey <-> root thread ID`, including `/clear` rotation and
+process death. Only an exact binding lets the coordinator project graph state
+or durable child history. Transport loss, partial snapshots, or binding loss
+degrade to unknown.
 
 ## If the probe fails
 
@@ -135,11 +140,12 @@ its subprocess pipes but failed the first `initialize` request. The installed
 CLI describes that command as a byte proxy to an already-running app-server
 control socket; no usable socket was present.
 
-The spike now launches `codex app-server --stdio` instead. This is an official
-standalone transport exposed by the unmodified Codex binary. It does not require
-a wrapper, alias, replacement launcher, private per-TUI endpoint, or any change
-to the shared Codex daemon. The experiment must establish both halves of the
-feature before promotion:
+The spike now launches `codex app-server --stdio` instead. This standalone
+transport is exposed by the installed unmodified Codex binary; public
+documentation did not establish its compatibility contract. It does not
+require a wrapper, alias, replacement launcher, private per-TUI endpoint, or
+any change to the shared Codex daemon. The experiment must establish both
+halves of the feature before promotion:
 
 1. the standalone server can read the hook-bound root thread and its descendants;
 2. its snapshots or notifications remain sufficiently live to retain every
@@ -147,7 +153,7 @@ feature before promotion:
 
 Successful initialization alone is transport progress, not proof of either
 invariant. `observer_initialized` must be followed by snapshot target/read/list
-success and complete app-server-sourced graphs.
+success, complete structural graphs, and independent live transition evidence.
 
 ### First live stdio result
 
@@ -163,3 +169,25 @@ topology, while the last exact root hook retains working/idle/attention only
 until its original state-specific freshness deadline. A later app-server value
 other than `unknown`/`notLoaded` wins immediately. Unknown child lifecycle stays
 unknown; the spike does not infer liveness from topology alone.
+
+### Final live validation
+
+After installing commit `17af1aa`, the observer initialized immediately and
+continued installing snapshots for the exact hook-bound roots without read or
+list errors. Later snapshots preserved bounded hook transitions, including
+idle-to-working and working-to-idle edges, instead of repainting those roots as
+not loaded. The original hook freshness deadline remained authoritative.
+
+The recovered descendants still had runtime `not_loaded` and lifecycle
+`unknown`. Their IDs, immediate parentage, and nicknames prove topology only;
+they do not prove that the children are currently live or that lifecycle edges
+will reach durable `agent_state` history.
+
+| Invariant | Result |
+|---|---|
+| Two same-cwd plain Codex TUIs bind to distinct correct process lifetimes | Pass |
+| Unmodified `codex app-server --stdio` initializes and snapshots | Pass |
+| Exact root and descendant topology is recovered | Pass |
+| Bounded exact-hook root status survives later not-loaded snapshots | Pass |
+| Live child runtime/lifecycle transitions and durable fanout | Unproved; blocks #83 |
+| `/clear` then implement-plan red/rotation/green sequence | Unproved; blocks #86 |

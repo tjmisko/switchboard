@@ -13,6 +13,13 @@
 > alternate launcher or private endpoint is part of the implementation. Restart
 > recovery for an already-open hook-only interview remains unknown.
 
+> Follow-up (2026-08-23): plain-Codex exact binding and standalone
+> `codex app-server --stdio` topology are live-proven. Bounded hook root status
+> survives later not-loaded snapshots. The exact `/clear` then implement-plan
+> sequence from issue #86 has not yet been replayed end to end, so red wait,
+> session rotation, and the next active/green edge remain explicit acceptance
+> work rather than a claimed fix.
+
 ## Reported symptom
 
 The Codex TUI was displaying an interview with unanswered questions, but
