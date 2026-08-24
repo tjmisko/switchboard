@@ -321,6 +321,9 @@ func (c *agentCoordinator) observe(ctx context.Context, ref provider.RootRef) {
 	}
 	generation := c.begin(ref.Key())
 	now := time.Now()
+	if ref.Provider == agentgraph.ProviderCodex {
+		defer func() { c.reconcileCodexChildHooks(ref, time.Now()) }()
+	}
 	observation, err := observer.Observe(ctx, ref, now)
 	if err != nil {
 		c.recordDiagnostic(ref.Provider, "observe_error", now)
@@ -393,6 +396,7 @@ func (c *agentCoordinator) applyObservationWithHookOwnership(ref provider.RootRe
 	if ref.Provider == agentgraph.ProviderCodex {
 		observation = c.overlayCodexHookRootObservation(ref.Key(), observation, now)
 		observation = c.overlayCodexPendingObservation(ref.Key(), observation, now)
+		observation = c.overlayCodexChildObservation(ref.Key(), observation, now)
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -673,6 +677,10 @@ func (c *agentCoordinator) HandleHook(req rpc.Request, sess state.Session) {
 		}
 		if rootID == "" {
 			c.recordDiagnostic(ref.Provider, "exact_binding_unavailable", now)
+			return
+		}
+		if req.Event == "SubagentStart" || req.Event == "SubagentStop" {
+			c.enqueueCodexChildHook(ref, req, rootID, now)
 			return
 		}
 		if shouldSettleCodexSessionStart(req) {

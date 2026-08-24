@@ -1,11 +1,11 @@
 # Investigation — Codex status and agent graphs in Switchboard
 
-> Status: **implemented as a no-wrapper transport spike; live child lifecycle
-> remains unproved.** A disposable `codex app-server --stdio` process supplies
-> exact structural topology for plain `codex` TUIs. Exact lifecycle hooks bind
-> the root and retain bounded root runtime/attention when the standalone server
-> reports `notLoaded`. No child lifecycle is inferred from topology alone. The
-> implementation plan and merge contract are
+> Status: **implemented as a no-wrapper transport plus exact child-edge
+> fusion.** A disposable `codex app-server --stdio` process supplies exact
+> structural topology for plain `codex` TUIs. Exact lifecycle hooks bind the
+> root, retain bounded unavailable root state, and fill child runtime/lifecycle
+> only after an exact graph match. No child lifecycle is inferred from topology
+> alone. The implementation plan and merge contract are
 > in [`docs/codex-session-status/`](codex-session-status/README.md); the captured,
 > sanitized 0.149 evidence is in
 > [`evidence-report.md`](codex-session-status/evidence-report.md).
@@ -29,15 +29,16 @@
 > repeatedly recovered four bound roots plus descendant IDs, immediate
 > parentage, and nicknames without erasing later hook-derived root status. The
 > recovered children remained `notLoaded` with lifecycle `unknown`, so durable
-> child-state fanout is still an open production invariant. See the
-> [no-wrapper probe](codex-no-wrapper-binding-probe.md).
+> child-state fanout required a separate edge channel. August 23–24 hook probes
+> found exact graph matches for every logged child lifecycle edge. See the
+> [child-lifecycle decision](codex-no-wrapper-child-lifecycle.md).
 
 This document preserves the useful findings from the original investigation,
 records which conclusions changed, and describes the shipped observer boundary.
 
 ## Current conclusion
 
-Switchboard has three different kinds of truth:
+Switchboard has separate, field-scoped kinds of truth:
 
 - OS discovery owns the interactive **root process**, its PID/tty/cwd, and its
   navigation target.
@@ -45,6 +46,8 @@ Switchboard has three different kinds of truth:
   and own bounded root runtime/attention when app-server has no live value.
 - A provider observer owns structural **agent graph** topology: the root thread
   plus nested, non-switchable child threads.
+- Exact child hooks own only matched child runtime/lifecycle intervals; they
+  retain app-server identity and immediate parentage.
 
 For Codex, `internal/provider/codex` uses a disposable standalone
 `codex app-server --stdio` child. It initializes a read-only client, reads the
@@ -118,8 +121,8 @@ The observer's current path is:
    interactive `cli`/`vscode` defaults and lose descendants.
 6. Apply any `thread/*`, `turn/*`, and `item/*` notifications received,
    periodically resnapshot, and fence events/results by connection generation.
-   The reducer supports these edges, but the 2026-08-23 standalone live run did
-   not prove child lifecycle delivery.
+   The August 23–24 run found no usable lifecycle signal in these app-server
+   channels, so trusted child hooks supply exact edges after topology matching.
 
 Production defaults are a 10-second resnapshot interval, 15-second observation
 freshness, 5-second request timeout, reconnect backoff from 100 ms to 5 seconds
@@ -189,6 +192,19 @@ still settles idle. `SessionStart(compact)` stays active because the documented
 lifecycle continues the model immediately. The fallback is root-only and
 incomplete. Active evidence remains fresh for 10 minutes, approval or user-input
 waits for 24 hours, and idle edges for 7 days.
+
+`SubagentStart` and `SubagentStop` are independently ordered child edges. The
+coordinator queues at most 256 per root lifetime for ten minutes and applies an
+edge only when its exact `agent_id` names a non-root node in a fresh app-server
+graph. Start produces active/running and clears completion; stop produces
+idle/completed at the hook timestamp. A later start reopens the same child.
+Running evidence expires after ten minutes without a later edge, while
+completion persists until reactivation, newer concrete provider evidence,
+complete omission, root rotation, or process death. Hooks never modify child
+attention, create nodes, or change `parent_id`. Canonical graph and history
+source remains `codex_app_server`; content-free diagnostics record hook-overlay
+provenance. The full evidence and authority table are in the
+[no-wrapper child-lifecycle decision](codex-no-wrapper-child-lifecycle.md).
 
 ## Terminal titles, spinners, and session names
 
@@ -299,9 +315,10 @@ minimal tier, while nickname/role/cwd/description are scrubbed.
 
 ## Remaining boundaries
 
-- Standalone stdio topology is live-proven, but child runtime/lifecycle edges
-  are not. A recovered `notLoaded` child with lifecycle `unknown` must not be
-  counted as proven live or written as a confident child transition.
+- Standalone stdio topology and the exact child-id hook join are live-proven.
+  The fused production path still needs its final rollout capture before #83
+  closes. A recovered `notLoaded`/unknown child without a matched hook remains
+  visible but is not counted live.
 - The exact `/clear` then “implement plan” sequence in issue #86 still needs a
   content-free live replay proving red input wait, session rotation, and the
   next active/green edge without a stale old-thread repaint.
@@ -321,6 +338,7 @@ minimal tier, while nickname/role/cwd/description are scrubbed.
 - Public lifecycle configuration: [OpenAI Codex hooks](https://learn.chatgpt.com/docs/hooks)
 - Public child-thread model: [OpenAI Codex subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents)
 - Shared-daemon attribution incident: [`codex-app-server-hook-attribution-incident.md`](codex-app-server-hook-attribution-incident.md)
+- Child lifecycle decision: [`codex-no-wrapper-child-lifecycle.md`](codex-no-wrapper-child-lifecycle.md)
 - Sanitized local evidence: [`evidence-report.md`](codex-session-status/evidence-report.md)
 - Observer: `internal/provider/codex/`
 - Neutral contract: `internal/agentgraph/`

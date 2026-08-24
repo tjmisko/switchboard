@@ -445,9 +445,9 @@ func cmdHook(c *rpc.Client, event, agent string) {
 			// hashToolInput can reduce it; the raw bytes never leave this function.
 			ToolInput json.RawMessage `json:"tool_input"`
 			// SubagentStart/Stop carry the subagent's identity. The wire form is
-			// snake_case (verified against the 2.1.195 binary); the camelCase
-			// fallbacks tolerate a build that reuses the dir-style key. Best-effort —
-			// the daemon only uses them to TRIGGER a dir re-scan, keyed off agent_id.
+			// snake_case; the camelCase fallbacks tolerate providers that reuse the
+			// directory-style key. The daemon accepts child lifecycle only after this
+			// exact agent_id joins provider-owned topology.
 			AgentID        string `json:"agent_id"`
 			AgentType      string `json:"agent_type"`
 			AgentIDAlt     string `json:"agentId"`

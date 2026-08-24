@@ -22,7 +22,7 @@ func Reduce(observation Observation, prior Summary, now time.Time) Summary {
 	workingDescendant := false
 	for _, node := range normalized.Nodes {
 		isRoot := node.ID == normalized.RootID
-		live := isRoot || !node.Lifecycle.Terminal()
+		live := isRoot || PositivelyLive(node)
 		if !isRoot && live {
 			next.LiveChildren++
 			if node.Runtime == RuntimeActive || node.Lifecycle == LifecyclePending || node.Lifecycle == LifecycleRunning {
@@ -64,6 +64,24 @@ func Reduce(observation Observation, prior Summary, now time.Time) Summary {
 	}
 
 	return stampSince(next, prior, now)
+}
+
+// PositivelyLive reports whether a non-root node has affirmative evidence that
+// it is still part of the current activity interval. Mere structural presence
+// is not liveness: providers may retain descendants whose runtime is unknown or
+// not loaded and whose lifecycle is also unknown. Terminal lifecycle evidence
+// always wins over stale runtime or attention fields.
+func PositivelyLive(node Node) bool {
+	if node.Lifecycle.Terminal() {
+		return false
+	}
+	if node.Attention == AttentionApproval || node.Attention == AttentionUserInput {
+		return true
+	}
+	if node.Runtime == RuntimeActive || node.Runtime == RuntimeIdle {
+		return true
+	}
+	return node.Lifecycle == LifecyclePending || node.Lifecycle == LifecycleRunning
 }
 
 func stampSince(next, prior Summary, now time.Time) Summary {

@@ -15,10 +15,11 @@
 > it assumes `codex app-server proxy` or live shared-daemon notifications. The
 > current spike launches disposable `codex app-server --stdio`, exactly binds
 > plain Codex roots through standard lifecycle hooks, and composes bounded hook
-> root status with app-server topology. Structural descendants are recovered,
-> but their runtime is `not_loaded` and lifecycle is `unknown`; live child
-> fanout is not yet proved. The canonical result and remaining gates are in the
-> [no-wrapper probe](../codex-no-wrapper-binding-probe.md).
+> root status with app-server topology. Structural descendants are recovered;
+> exact matched `SubagentStart`/`SubagentStop` hooks now provide their bounded
+> live intervals when app-server returns `not_loaded`/`unknown`. The canonical
+> decision and rollout gate are in the
+> [child-lifecycle record](../codex-no-wrapper-child-lifecycle.md).
 
 This directory is an implementation-ready planning packet for adding accurate
 Codex status and fanout visibility to the Go daemon without forcing Codex
@@ -60,9 +61,10 @@ specific:
    but must consume the same graph.
 3. **Codex app-server is structural truth.** The current implementation starts
    a disposable standalone stdio server rather than reading a control socket or
-   depending on the shared daemon. It snapshots existing descendants. Live
-   child lifecycle notifications remain unproved, and the standard-CLI
-   `request_user_input` wait is independently owned by exact lifecycle hooks.
+   depending on the shared daemon. It snapshots existing descendants. Exact
+   child hooks fill runtime/lifecycle only after a fresh non-root topology match;
+   the standard-CLI `request_user_input` wait is independently owned by exact
+   lifecycle hooks.
 4. **Do not guess root identity by CWD.** Prefer `CODEX_THREAD_ID` from the root
    process environment on Linux, then an exact lifecycle-hook association.
    `SessionStart` normally establishes it; a later hook self-heals a discovery
@@ -98,11 +100,16 @@ The reducer derives the legacy root-chip summary in this priority order:
 
 1. Any live node with `approval` or `user_input` -> `permission`.
 2. Root runtime `active` -> `working`.
-3. Root idle/not-loaded and any live descendant active/pending/running ->
+3. Root idle/not-loaded and any positively live descendant
+   active/pending/running ->
    `delegating`.
 4. No active/waiting live node and root idle -> `idle`.
 5. No fresh authoritative observation -> empty legacy status (`unknown` to
    renderers).
+
+Positive child liveness requires pending/running lifecycle, active/idle
+runtime, or actionable attention. A structural child that is
+`not_loaded`/`unknown` on both live axes contributes zero.
 
 `system_error` remains explicit on the node. The first version folds a root
 system error to unknown rather than silently equating an error with a user

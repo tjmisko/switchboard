@@ -1,6 +1,7 @@
 package main
 
 import (
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -12,7 +13,11 @@ import (
 	"github.com/tjmisko/switchboard/internal/state"
 )
 
-const codexHookStartSettle = 250 * time.Millisecond
+const (
+	codexHookStartSettle     = 250 * time.Millisecond
+	codexChildHookQueueLimit = 256
+	codexChildHookRetention  = codexHookActiveFreshness
+)
 
 type codexPendingInput struct {
 	turnID, toolUseID, writer, toolName, inputHash string
@@ -31,6 +36,40 @@ type codexHookRootState struct {
 	rootNode       agentgraph.Node
 	rootObservedAt time.Time
 	rootFreshUntil time.Time
+
+	// Child lifecycle hooks are exact edges, not graph authority. They wait here
+	// until a fresh app-server topology proves that agentID names a non-root node.
+	// receiveSequence is a root-lifetime tie breaker for equal hook timestamps.
+	childQueue       []codexChildHookEdge
+	childOverlays    map[string]codexChildHookOverlay
+	childLastApplied map[string]codexChildHookCursor
+	childProvider    map[string]agentgraph.Node
+	receiveSequence  uint64
+}
+
+type codexChildHookEdge struct {
+	event              string
+	agentID            string
+	at                 time.Time
+	receiveSequence    uint64
+	unmatchedDiagnosed bool
+}
+
+type codexChildHookOverlay struct {
+	event           string
+	at              time.Time
+	receiveSequence uint64
+	runtime         agentgraph.RuntimeState
+	lifecycle       agentgraph.LifecycleState
+	runtimeOwned    bool
+	lifecycleOwned  bool
+	expiresAt       time.Time
+}
+
+type codexChildHookCursor struct {
+	event           string
+	at              time.Time
+	receiveSequence uint64
 }
 
 type pendingCodexStart struct {
@@ -43,6 +82,18 @@ type pendingCodexStart struct {
 }
 
 func (p *pendingCodexStart) finish(wg *sync.WaitGroup) { p.done.Do(wg.Done) }
+
+func newCodexHookRootState(sessionID string, latestAt time.Time) *codexHookRootState {
+	return &codexHookRootState{
+		sessionID:        sessionID,
+		latestAt:         latestAt,
+		retired:          make(map[string]struct{}),
+		pending:          make(map[string]codexPendingInput),
+		childOverlays:    make(map[string]codexChildHookOverlay),
+		childLastApplied: make(map[string]codexChildHookCursor),
+		childProvider:    make(map[string]agentgraph.Node),
+	}
+}
 
 func shouldSettleCodexSessionStart(req rpc.Request) bool {
 	if req.Event != "SessionStart" {
@@ -122,10 +173,7 @@ func (c *agentCoordinator) handleCodexHookNow(ref provider.RootRef, req rpc.Requ
 	c.codexHookMu.Lock()
 	rootState := c.codexHookRoots[ref.Key()]
 	if rootState == nil {
-		rootState = &codexHookRootState{
-			sessionID: currentID, latestAt: currentAt,
-			retired: make(map[string]struct{}), pending: make(map[string]codexPendingInput),
-		}
+		rootState = newCodexHookRootState(currentID, currentAt)
 		c.codexHookRoots[ref.Key()] = rootState
 	}
 	if !codexHookSessionAllowed(rootState, rootID, req, now, introduced) {
@@ -146,12 +194,6 @@ func (c *agentCoordinator) handleCodexHookNow(ref provider.RootRef, req rpc.Requ
 	commitCodexHookSession(rootState, rootID, now)
 	pendingAttention, hookOwnsTransition := reduceCodexPendingInput(rootState, req)
 	c.codexHookMu.Unlock()
-	if req.Event == "SubagentStart" || req.Event == "SubagentStop" {
-		if category := codexSubagentHookDiagnostic(req, currentCodexGraph(c.store.Snapshot(), ref.Key())); category != "" {
-			c.recordDiagnostic(ref.Provider, category, now)
-		}
-	}
-
 	ref.ProviderSessionID = rootID
 	observation, mapped := codexHookObservation(rootID, req, ref.StartedAt, now)
 	if mapped {
@@ -177,31 +219,454 @@ func currentCodexGraph(snapshot state.Snapshot, key provider.RootKey) *state.Age
 	return session.AgentGraph
 }
 
-// codexSubagentHookDiagnostic records whether a standard Codex lifecycle hook
-// supplies an exact child ID that already exists in app-server topology. It
-// returns only a finite category and never the ID, type, prompt, or payload.
-func codexSubagentHookDiagnostic(req rpc.Request, graph *state.AgentGraph) string {
-	base := ""
-	switch req.Event {
-	case "SubagentStart":
-		base = "subagent_hook_start"
-	case "SubagentStop":
-		base = "subagent_hook_stop"
-	default:
-		return ""
-	}
+const codexChildHookOverlayDiagnostic = "codex child hook overlay"
+
+// enqueueCodexChildHook retains an exact child lifecycle edge until the
+// coordinator can validate it against a fresh app-server graph. Child ordering
+// is intentionally independent of root-hook ordering: a sibling edge is not
+// stale merely because another hook for the root arrived later.
+func (c *agentCoordinator) enqueueCodexChildHook(ref provider.RootRef, req rpc.Request, rootID string, now time.Time) {
 	if req.AgentID == "" {
-		return base + "_id_absent"
+		c.recordDiagnostic(agentgraph.ProviderCodex, "subagent_hook_missing_id", now)
+		return
 	}
-	if graph == nil {
-		return base + "_graph_absent"
+	currentID := ref.ProviderSessionID
+	if graph := currentCodexGraph(c.store.Snapshot(), ref.Key()); graph != nil && currentID == "" {
+		currentID = graph.RootID
 	}
-	for _, node := range graph.Nodes {
-		if node.ID == req.AgentID && node.ParentID != "" {
-			return base + "_graph_match"
+
+	c.codexHookMu.Lock()
+	rootState := c.codexHookRoots[ref.Key()]
+	if rootState == nil {
+		rootState = newCodexHookRootState(currentID, time.Time{})
+		c.codexHookRoots[ref.Key()] = rootState
+	}
+	wrongRoot := (currentID != "" && currentID != rootID) ||
+		(rootState.sessionID != "" && rootState.sessionID != rootID)
+	_, retired := rootState.retired[rootID]
+	if wrongRoot || retired {
+		c.codexHookMu.Unlock()
+		c.recordDiagnostic(agentgraph.ProviderCodex, "stale_observation_rejected", now)
+		return
+	}
+	if rootState.sessionID == "" {
+		rootState.sessionID = rootID
+	}
+	if len(rootState.childQueue) >= codexChildHookQueueLimit {
+		c.codexHookMu.Unlock()
+		c.recordDiagnostic(agentgraph.ProviderCodex, "subagent_hook_queue_full", now)
+		return
+	}
+	rootState.receiveSequence++
+	receiveSequence := rootState.receiveSequence
+	rootState.childQueue = append(rootState.childQueue, codexChildHookEdge{
+		event: req.Event, agentID: req.AgentID, at: now, receiveSequence: receiveSequence,
+	})
+	c.codexHookMu.Unlock()
+
+	if c.codex != nil {
+		if err := c.codex.RegisterHookBinding(ref.Key(), rootID); err != nil {
+			c.codexHookMu.Lock()
+			if state := c.codexHookRoots[ref.Key()]; state != nil && state.sessionID == rootID {
+				for i := range state.childQueue {
+					if state.childQueue[i].receiveSequence == receiveSequence {
+						state.childQueue = append(state.childQueue[:i], state.childQueue[i+1:]...)
+						break
+					}
+				}
+			}
+			c.codexHookMu.Unlock()
+			c.recordDiagnostic(agentgraph.ProviderCodex, "binding_conflict", now)
+			return
 		}
 	}
-	return base + "_graph_unmatched"
+	c.recordDiagnostic(agentgraph.ProviderCodex, "subagent_hook_queued", now)
+	c.Request(ref.Key())
+}
+
+// reconcileCodexChildHooks runs only from the coordinator's serialized
+// reconcile path. It never creates topology: an edge remains queued until its
+// exact agent ID names a non-root node in a fresh codex_app_server graph.
+func (c *agentCoordinator) reconcileCodexChildHooks(ref provider.RootRef, now time.Time) {
+	c.expireCodexChildHookState(ref, now)
+	for {
+		graph := currentCodexGraph(c.store.Snapshot(), ref.Key())
+		if graph == nil || graph.Source != agentgraph.SourceCodexAppServer || !graph.Fresh(now) {
+			return
+		}
+		rootID := graph.RootID
+		if rootID == "" {
+			return
+		}
+
+		c.codexHookMu.Lock()
+		rootState := c.codexHookRoots[ref.Key()]
+		if rootState == nil || rootState.sessionID != rootID || len(rootState.childQueue) == 0 {
+			c.codexHookMu.Unlock()
+			return
+		}
+		sort.SliceStable(rootState.childQueue, func(i, j int) bool {
+			left, right := rootState.childQueue[i], rootState.childQueue[j]
+			if left.at.Equal(right.at) {
+				return left.receiveSequence < right.receiveSequence
+			}
+			return left.at.Before(right.at)
+		})
+		matchedIndex := -1
+		for i := range rootState.childQueue {
+			if codexGraphHasChild(graph, rootState.childQueue[i].agentID) {
+				matchedIndex = i
+				break
+			}
+			if !rootState.childQueue[i].unmatchedDiagnosed {
+				rootState.childQueue[i].unmatchedDiagnosed = true
+				c.codexHookMu.Unlock()
+				c.recordDiagnostic(agentgraph.ProviderCodex, "subagent_hook_unmatched_topology", now)
+				c.codexHookMu.Lock()
+				rootState = c.codexHookRoots[ref.Key()]
+				if rootState == nil || rootState.sessionID != rootID {
+					c.codexHookMu.Unlock()
+					return
+				}
+			}
+		}
+		if matchedIndex < 0 {
+			c.codexHookMu.Unlock()
+			return
+		}
+		edge := rootState.childQueue[matchedIndex]
+		rootState.childQueue = append(rootState.childQueue[:matchedIndex], rootState.childQueue[matchedIndex+1:]...)
+		c.codexHookMu.Unlock()
+
+		c.applyCodexChildHookEdge(ref, rootID, edge, now)
+	}
+}
+
+func codexGraphHasChild(graph *state.AgentGraph, id string) bool {
+	if graph == nil || id == "" || id == graph.RootID {
+		return false
+	}
+	for _, node := range graph.Nodes {
+		if node.ID == id && node.ParentID != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func childHookTargets(event string) (agentgraph.RuntimeState, agentgraph.LifecycleState, bool) {
+	switch event {
+	case "SubagentStart":
+		return agentgraph.RuntimeActive, agentgraph.LifecycleRunning, true
+	case "SubagentStop":
+		return agentgraph.RuntimeIdle, agentgraph.LifecycleCompleted, true
+	default:
+		return agentgraph.RuntimeUnknown, agentgraph.LifecycleUnknown, false
+	}
+}
+
+func childHookCursorBefore(left codexChildHookEdge, right codexChildHookCursor) bool {
+	return left.at.Before(right.at) || (left.at.Equal(right.at) && left.receiveSequence <= right.receiveSequence)
+}
+
+func (c *agentCoordinator) applyCodexChildHookEdge(ref provider.RootRef, rootID string, edge codexChildHookEdge, now time.Time) {
+	runtime, lifecycle, ok := childHookTargets(edge.event)
+	if !ok {
+		return
+	}
+	graph := currentCodexGraph(c.store.Snapshot(), ref.Key())
+	if graph == nil || graph.RootID != rootID || graph.Source != agentgraph.SourceCodexAppServer ||
+		!graph.Fresh(now) || !codexGraphHasChild(graph, edge.agentID) {
+		c.requeueCodexChildHook(ref.Key(), rootID, edge)
+		return
+	}
+
+	var graphNode agentgraph.Node
+	for _, node := range observationFromState(agentgraph.ProviderCodex, graph).Nodes {
+		if node.ID == edge.agentID {
+			graphNode = node
+			break
+		}
+	}
+	if graphNode.ID == "" {
+		c.requeueCodexChildHook(ref.Key(), rootID, edge)
+		return
+	}
+
+	c.codexHookMu.Lock()
+	rootState := c.codexHookRoots[ref.Key()]
+	if rootState == nil || rootState.sessionID != rootID {
+		c.codexHookMu.Unlock()
+		return
+	}
+	if last, exists := rootState.childLastApplied[edge.agentID]; exists {
+		if childHookCursorBefore(edge, last) {
+			c.codexHookMu.Unlock()
+			return
+		}
+		if edge.event == last.event && graphNode.Runtime == runtime && graphNode.Lifecycle == lifecycle {
+			// A replay emits no state/history edge, but its newer cursor still
+			// fences an older hook that arrives afterward.
+			rootState.childLastApplied[edge.agentID] = codexChildHookCursor{
+				event: edge.event, at: edge.at, receiveSequence: edge.receiveSequence,
+			}
+			c.codexHookMu.Unlock()
+			return
+		}
+	}
+	providerNode, exists := rootState.childProvider[edge.agentID]
+	if !exists {
+		providerNode = graphNode
+		rootState.childProvider[edge.agentID] = graphNode
+	}
+	runtimeOwned := childHookOwnsRuntime(providerNode, edge.at)
+	lifecycleOwned := childHookOwnsLifecycle(providerNode, edge.at)
+	previousOverlay, hadOverlay := rootState.childOverlays[edge.agentID]
+	previousLast, hadLast := rootState.childLastApplied[edge.agentID]
+	rootState.childLastApplied[edge.agentID] = codexChildHookCursor{
+		event: edge.event, at: edge.at, receiveSequence: edge.receiveSequence,
+	}
+	if !runtimeOwned && !lifecycleOwned {
+		c.codexHookMu.Unlock()
+		if providerNode.Runtime == runtime && providerNode.Lifecycle == lifecycle {
+			return
+		}
+		c.recordDiagnostic(agentgraph.ProviderCodex, "subagent_hook_provider_superseded", now)
+		return
+	}
+	overlay := codexChildHookOverlay{
+		event: edge.event, at: edge.at, receiveSequence: edge.receiveSequence,
+		runtime: runtime, lifecycle: lifecycle,
+		runtimeOwned: runtimeOwned, lifecycleOwned: lifecycleOwned,
+	}
+	if edge.event == "SubagentStart" {
+		overlay.expiresAt = edge.at.Add(codexChildHookRetention)
+	}
+	rootState.childOverlays[edge.agentID] = overlay
+	c.codexHookMu.Unlock()
+
+	observation := observationFromState(agentgraph.ProviderCodex, graph)
+	observation.Diagnostic = codexChildHookOverlayDiagnostic
+	if !applyCodexChildOverlay(&observation, edge.agentID, overlay) {
+		c.rollbackCodexChildHook(ref.Key(), rootID, edge, previousOverlay, hadOverlay, previousLast, hadLast)
+		return
+	}
+	generation := c.begin(ref.Key())
+	if !c.applyObservationWithHookOwnership(ref, generation, observation, claudeprovider.Compatibility{}, now, true) {
+		c.rollbackCodexChildHook(ref.Key(), rootID, edge, previousOverlay, hadOverlay, previousLast, hadLast)
+		return
+	}
+	c.recordDiagnostic(agentgraph.ProviderCodex, "subagent_hook_applied", edge.at)
+}
+
+func childHookOwnsRuntime(providerNode agentgraph.Node, hookAt time.Time) bool {
+	return providerNode.Runtime == agentgraph.RuntimeUnknown || providerNode.Runtime == agentgraph.RuntimeNotLoaded ||
+		providerNode.UpdatedAt.IsZero() || hookAt.After(providerNode.UpdatedAt)
+}
+
+func childHookOwnsLifecycle(providerNode agentgraph.Node, hookAt time.Time) bool {
+	providerAt := providerNode.UpdatedAt
+	if providerNode.Lifecycle.Terminal() && !providerNode.CompletedAt.IsZero() {
+		providerAt = providerNode.CompletedAt
+	}
+	return providerNode.Lifecycle == agentgraph.LifecycleUnknown || providerAt.IsZero() || hookAt.After(providerAt)
+}
+
+func applyCodexChildOverlay(observation *agentgraph.Observation, agentID string, overlay codexChildHookOverlay) bool {
+	for i := range observation.Nodes {
+		node := &observation.Nodes[i]
+		if node.ID != agentID || node.ParentID == "" {
+			continue
+		}
+		if overlay.runtimeOwned {
+			node.Runtime = overlay.runtime
+		}
+		if overlay.lifecycleOwned {
+			node.Lifecycle = overlay.lifecycle
+			if overlay.lifecycle == agentgraph.LifecycleCompleted {
+				node.CompletedAt = overlay.at
+			} else {
+				node.CompletedAt = time.Time{}
+			}
+		}
+		node.UpdatedAt = overlay.at
+		return true
+	}
+	return false
+}
+
+func (c *agentCoordinator) requeueCodexChildHook(key provider.RootKey, rootID string, edge codexChildHookEdge) {
+	c.codexHookMu.Lock()
+	defer c.codexHookMu.Unlock()
+	state := c.codexHookRoots[key]
+	if state == nil || state.sessionID != rootID || len(state.childQueue) >= codexChildHookQueueLimit {
+		return
+	}
+	state.childQueue = append(state.childQueue, edge)
+}
+
+func (c *agentCoordinator) rollbackCodexChildHook(key provider.RootKey, rootID string, edge codexChildHookEdge,
+	previousOverlay codexChildHookOverlay, hadOverlay bool, previousLast codexChildHookCursor, hadLast bool) {
+	c.codexHookMu.Lock()
+	defer c.codexHookMu.Unlock()
+	state := c.codexHookRoots[key]
+	if state == nil || state.sessionID != rootID {
+		return
+	}
+	if current, ok := state.childOverlays[edge.agentID]; ok && current.receiveSequence == edge.receiveSequence {
+		if hadOverlay {
+			state.childOverlays[edge.agentID] = previousOverlay
+		} else {
+			delete(state.childOverlays, edge.agentID)
+		}
+	}
+	if current, ok := state.childLastApplied[edge.agentID]; ok && current.receiveSequence == edge.receiveSequence {
+		if hadLast {
+			state.childLastApplied[edge.agentID] = previousLast
+		} else {
+			delete(state.childLastApplied, edge.agentID)
+		}
+	}
+	if len(state.childQueue) < codexChildHookQueueLimit {
+		state.childQueue = append(state.childQueue, edge)
+	}
+}
+
+// overlayCodexChildObservation fuses retained exact hook edges into a fresh
+// structural snapshot. It never changes attention, parentage, or graph source.
+// Concrete provider transitions that are at least as new retire the matching
+// field; a complete omission retires the whole child overlay.
+func (c *agentCoordinator) overlayCodexChildObservation(key provider.RootKey, observation agentgraph.Observation, now time.Time) agentgraph.Observation {
+	if observation.Source != agentgraph.SourceCodexAppServer || observation.RootID == "" ||
+		observation.Diagnostic == codexChildHookOverlayDiagnostic {
+		return observation
+	}
+	c.codexHookMu.Lock()
+	state := c.codexHookRoots[key]
+	if state == nil || state.sessionID != observation.RootID {
+		c.codexHookMu.Unlock()
+		return observation
+	}
+	present := make(map[string]struct{}, len(observation.Nodes))
+	superseded, expired := 0, 0
+	for i := range observation.Nodes {
+		node := &observation.Nodes[i]
+		present[node.ID] = struct{}{}
+		if node.ID == observation.RootID || node.ParentID == "" {
+			continue
+		}
+		providerNode := *node
+		state.childProvider[node.ID] = providerNode
+		overlay, exists := state.childOverlays[node.ID]
+		if !exists {
+			continue
+		}
+		if overlay.event == "SubagentStart" && !overlay.expiresAt.IsZero() && !now.Before(overlay.expiresAt) {
+			delete(state.childOverlays, node.ID)
+			expired++
+			continue
+		}
+		providerSuperseded := false
+		if overlay.runtimeOwned && !childHookOwnsRuntime(providerNode, overlay.at) {
+			overlay.runtimeOwned = false
+			providerSuperseded = true
+		}
+		if overlay.lifecycleOwned && !childHookOwnsLifecycle(providerNode, overlay.at) {
+			overlay.lifecycleOwned = false
+			providerSuperseded = true
+		}
+		if providerSuperseded {
+			superseded++
+		}
+		if !overlay.runtimeOwned && !overlay.lifecycleOwned {
+			delete(state.childOverlays, node.ID)
+			continue
+		}
+		state.childOverlays[node.ID] = overlay
+		applyCodexChildOverlay(&observation, node.ID, overlay)
+	}
+	if observation.Complete {
+		for id := range state.childOverlays {
+			if _, exists := present[id]; !exists {
+				delete(state.childOverlays, id)
+				superseded++
+			}
+		}
+		for id := range state.childProvider {
+			if _, exists := present[id]; !exists {
+				delete(state.childProvider, id)
+			}
+		}
+	}
+	c.codexHookMu.Unlock()
+	for range superseded {
+		c.recordDiagnostic(agentgraph.ProviderCodex, "subagent_hook_provider_superseded", now)
+	}
+	for range expired {
+		c.recordDiagnostic(agentgraph.ProviderCodex, "subagent_hook_expired", now)
+	}
+	return observation
+}
+
+func (c *agentCoordinator) expireCodexChildHookState(ref provider.RootRef, now time.Time) {
+	type expiredOverlay struct {
+		id   string
+		base agentgraph.Node
+	}
+	var expired []expiredOverlay
+	expiredEdges := 0
+	c.codexHookMu.Lock()
+	state := c.codexHookRoots[ref.Key()]
+	if state == nil {
+		c.codexHookMu.Unlock()
+		return
+	}
+	retained := state.childQueue[:0]
+	for _, edge := range state.childQueue {
+		if !now.Before(edge.at.Add(codexChildHookRetention)) {
+			expiredEdges++
+			continue
+		}
+		retained = append(retained, edge)
+	}
+	state.childQueue = retained
+	for id, overlay := range state.childOverlays {
+		if overlay.event != "SubagentStart" || overlay.expiresAt.IsZero() || now.Before(overlay.expiresAt) {
+			continue
+		}
+		delete(state.childOverlays, id)
+		if base, ok := state.childProvider[id]; ok {
+			expired = append(expired, expiredOverlay{id: id, base: base})
+		}
+	}
+	rootID := state.sessionID
+	c.codexHookMu.Unlock()
+
+	for range expiredEdges + len(expired) {
+		c.recordDiagnostic(agentgraph.ProviderCodex, "subagent_hook_expired", now)
+	}
+	if len(expired) == 0 {
+		return
+	}
+	graph := currentCodexGraph(c.store.Snapshot(), ref.Key())
+	if graph == nil || graph.RootID != rootID || graph.Source != agentgraph.SourceCodexAppServer || !graph.Fresh(now) {
+		return
+	}
+	observation := observationFromState(agentgraph.ProviderCodex, graph)
+	observation.Diagnostic = codexChildHookOverlayDiagnostic
+	changed := false
+	for _, item := range expired {
+		for i := range observation.Nodes {
+			if observation.Nodes[i].ID == item.id && observation.Nodes[i].ParentID != "" {
+				observation.Nodes[i] = item.base
+				changed = true
+				break
+			}
+		}
+	}
+	if changed {
+		c.applyObservationWithHookOwnership(ref, c.begin(ref.Key()), observation, claudeprovider.Compatibility{}, now, true)
+	}
 }
 
 func codexHookSessionAllowed(state *codexHookRootState, rootID string, req rpc.Request, now time.Time, introduced bool) bool {
@@ -226,6 +691,11 @@ func commitCodexHookSession(state *codexHookRootState, rootID string, now time.T
 		state.rootNode = agentgraph.Node{}
 		state.rootObservedAt = time.Time{}
 		state.rootFreshUntil = time.Time{}
+		state.childQueue = nil
+		clear(state.childOverlays)
+		clear(state.childLastApplied)
+		clear(state.childProvider)
+		state.receiveSequence = 0
 	}
 	state.sessionID = rootID
 	if now.After(state.latestAt) {

@@ -479,3 +479,119 @@ func TestCodexAppServerObserverThroughCoordinatorStateAndHistory(t *testing.T) {
 			approvalStarts, approvalClears, sawNotFound, events)
 	}
 }
+
+func TestCodexChildHooksThroughAppServerCoordinatorAndHistory(t *testing.T) {
+	const rootID = "root-child-hooks"
+	root := integrationCodexThread{ID: rootID, Status: integrationCodexStatus{Type: "idle"}}
+	descendants := []integrationCodexThread{
+		{
+			ID: "structural-parent", ParentThreadID: rootID, AgentNickname: "Parent", AgentRole: "worker",
+			Status: integrationCodexStatus{Type: "notLoaded"},
+		},
+		{
+			ID: "nested-child", ParentThreadID: "structural-parent", AgentNickname: "Nested", AgentRole: "worker",
+			Status: integrationCodexStatus{Type: "notLoaded"},
+		},
+	}
+	appServer := newIntegrationCodexAppServer(t, root, descendants)
+	historyDir := t.TempDir()
+	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: historyDir})
+	observer := codexprovider.NewObserver(codexprovider.Config{
+		Connector: appServer, Environment: integrationCodexEnvironment{},
+		Freshness: 2 * time.Second, ResnapshotInterval: time.Hour,
+		RequestTimeout: time.Second, ReconnectMinimum: 5 * time.Millisecond,
+		ReconnectMaximum: 10 * time.Millisecond, Jitter: func(time.Duration) time.Duration { return 0 },
+	})
+	store := state.New("")
+	ref := seedCoordinatorSession(store, 4802, time.Now().Add(-time.Hour), state.AgentKindCodex, rootID, "/project")
+	coordinator := newAgentCoordinator(store, sink, nil, observer)
+	coordinator.Start(context.Background(), time.Hour)
+	closed := false
+	t.Cleanup(func() {
+		coordinator.Close()
+		if !closed {
+			sink.Close()
+		}
+		appServer.disconnect()
+	})
+
+	initial := waitForIntegrationCodexGraph(t, store, ref.Key(), func(graph *state.AgentGraph) bool {
+		return graph != nil && graph.Source == agentgraph.SourceCodexAppServer && graph.Complete && len(graph.Nodes) == 3
+	})
+	if initial.Summary.LiveChildren != 0 {
+		t.Fatalf("topology-only live children = %d, want 0: %#v", initial.Summary.LiveChildren, initial)
+	}
+
+	send := func(event string, at time.Time) {
+		session, ok := sessionForKey(store.Snapshot(), ref.Key())
+		if !ok {
+			t.Fatal("Codex root disappeared")
+		}
+		coordinator.HandleHook(rpc.Request{
+			Agent: state.AgentKindCodex, Event: event, SessionID: rootID,
+			AgentID: "nested-child", ObservedAt: at,
+		}, session)
+	}
+	startAt := time.Now().UTC()
+	send("SubagentStart", startAt)
+	started := waitForIntegrationCodexGraph(t, store, ref.Key(), func(graph *state.AgentGraph) bool {
+		if graph == nil || graph.Summary.LiveChildren != 1 {
+			return false
+		}
+		node := childNode(t, graph, "nested-child")
+		return node.Runtime == agentgraph.RuntimeActive && node.Lifecycle == agentgraph.LifecycleRunning
+	})
+	if node := childNode(t, started, "nested-child"); node.ParentID != "structural-parent" {
+		t.Fatalf("nested immediate parent = %q, want structural-parent", node.ParentID)
+	}
+
+	stopAt := startAt.Add(time.Second)
+	send("SubagentStop", stopAt)
+	waitForIntegrationCodexGraph(t, store, ref.Key(), func(graph *state.AgentGraph) bool {
+		if graph == nil || graph.Summary.LiveChildren != 0 {
+			return false
+		}
+		node := childNode(t, graph, "nested-child")
+		return node.Runtime == agentgraph.RuntimeIdle && node.Lifecycle == agentgraph.LifecycleCompleted && node.CompletedAt.Equal(stopAt)
+	})
+	// Exact replay must not create another canonical history edge.
+	send("SubagentStop", stopAt)
+
+	restartAt := stopAt.Add(time.Second)
+	send("SubagentStart", restartAt)
+	waitForIntegrationCodexGraph(t, store, ref.Key(), func(graph *state.AgentGraph) bool {
+		return graph != nil && graph.Summary.LiveChildren == 1 &&
+			childNode(t, graph, "nested-child").Lifecycle == agentgraph.LifecycleRunning
+	})
+	finalStopAt := restartAt.Add(time.Second)
+	send("SubagentStop", finalStopAt)
+	waitForIntegrationCodexGraph(t, store, ref.Key(), func(graph *state.AgentGraph) bool {
+		return graph != nil && graph.Summary.LiveChildren == 0 &&
+			childNode(t, graph, "nested-child").Lifecycle == agentgraph.LifecycleCompleted
+	})
+
+	coordinator.Close()
+	sink.Close()
+	closed = true
+	events, err := history.ReadRange(historyDir, time.Time{}, time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var childEvents []history.Event
+	for _, event := range events {
+		if event.Type == history.EventAgentState && event.ThreadID == "nested-child" &&
+			event.FromLifecycle != event.ToLifecycle {
+			childEvents = append(childEvents, event)
+		}
+	}
+	wantTimes := []time.Time{startAt, stopAt, restartAt, finalStopAt}
+	if len(childEvents) != len(wantTimes) {
+		t.Fatalf("canonical child events = %d, want %d: %+v", len(childEvents), len(wantTimes), childEvents)
+	}
+	for i, event := range childEvents {
+		if !event.Ts.Equal(wantTimes[i]) || event.ParentThreadID != "structural-parent" ||
+			event.Source != agentgraph.SourceCodexAppServer {
+			t.Fatalf("child event[%d] = %+v", i, event)
+		}
+	}
+}

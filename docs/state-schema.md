@@ -177,6 +177,13 @@ app-server graph outranks ordinary hook fallback, but cannot clear this
 independently owned standard-CLI latch. Rollout files alone still cannot recover
 approval state, but app-server can.
 
+Codex `SubagentStart`/`SubagentStop` do not use this root-status mapping. They
+are required for live child state on the tested standard-CLI path and apply only
+after their exact `agent_id` matches a non-root node in a fresh app-server graph
+for the same `(pid, started_at, root session_id)` lifetime. They cannot create
+nodes, modify attention, or change parentage. See the
+[no-wrapper child-lifecycle decision](codex-no-wrapper-child-lifecycle.md).
+
 ##### `permission` self-heal (reconciler)
 
 `permission` is the only status with no guaranteed clearing hook: declining an
@@ -301,7 +308,7 @@ metadata.
 | Field | JSON type | Presence | Meaning |
 |-------|-----------|----------|---------|
 | `root_id` | string | always | Stable provider id of the root node. Exactly one element of `nodes` has this id and that node has no `parent_id`. |
-| `source` | string | omitted when empty | Evidence source: `codex_app_server`, `hook`, `claude_transcript`, `codex_rollout`, `restored_last_known`, or absent/unknown. Source precedence is daemon policy, not a confidence score consumers should recompute. |
+| `source` | string | omitted when empty | Structural graph authority: `codex_app_server`, `hook`, `claude_transcript`, `codex_rollout`, `restored_last_known`, or absent/unknown. A Codex graph whose child runtime/lifecycle was filled by an exact hook remains `codex_app_server`; bounded diagnostics expose overlay provenance without adding a wire field. Source precedence is daemon policy, not a confidence score consumers should recompute. |
 | `observed_at` | RFC 3339 timestamp | omitted when unknown | Start of the observation's authority interval. |
 | `fresh_until` | RFC 3339 timestamp | omitted when unknown | Exclusive end of the authority interval. A graph is fresh only when `observed_at <= now < fresh_until`. |
 | `complete` | boolean | always | `true` means omission is authoritative for that observation; `false` means a partial view. Completeness does not imply freshness and freshness does not imply completeness. |
@@ -318,7 +325,7 @@ unrecognized value and should still use the explicit freshness timestamps.
 | `runtime` | string | yes | Root runtime: `unknown`, `not_loaded`, `idle`, `active`, or `system_error`. Becomes `unknown` when the observation is not fresh or invalid. |
 | `attention` | string | yes | Folded wait reason: `none`, `approval`, or `user_input`. If both wait kinds exist, `approval` wins only in this compact field; the two counts below preserve both. |
 | `status` | string | yes | Legacy root-chip value: `working`, `idle`, `permission`, `delegating`, or `""` when no fresh rule produces a confident status. |
-| `live_children` | integer | yes | Non-terminal descendants. Terminal means lifecycle `completed`, `interrupted`, `errored`, `shutdown`, or `not_found`. |
+| `live_children` | integer | yes | Descendants with positive liveness: pending/running lifecycle, active/idle runtime, or actionable approval/user-input attention. Terminal lifecycle always excludes a child. `runtime=unknown|not_loaded` plus `lifecycle=unknown` is visible topology but contributes zero. |
 | `waiting_nodes` | integer | yes | Live root/descendant nodes waiting for either approval or user input. Equals `approval_nodes + user_input_nodes`. |
 | `approval_nodes` | integer | yes | Live nodes whose attention is `approval`. |
 | `user_input_nodes` | integer | yes | Live nodes whose attention is `user_input`. |

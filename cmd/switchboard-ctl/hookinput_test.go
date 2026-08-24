@@ -256,6 +256,21 @@ func TestCmdHookShouldForwardContentFreeStandardCodexLifecycleMetadata(t *testin
 	}
 }
 
+func TestCmdHookShouldForwardExactCodexSubagentIdentity(t *testing.T) {
+	req := hookRequestForEventPayload(t, "SubagentStart", "codex", `{
+		"session_id": "root-thread",
+		"hook_event_name": "SubagentStart",
+		"agent_id": "child-thread",
+		"agent_type": "worker",
+		"turn_id": "turn-7"
+	}`)
+
+	if req.Agent != "codex" || req.Event != "SubagentStart" || req.SessionID != "root-thread" ||
+		req.AgentID != "child-thread" || req.AgentType != "worker" || req.TurnID != "turn-7" || req.ObservedAt.IsZero() {
+		t.Fatalf("Codex child identity was not forwarded exactly: %+v", req)
+	}
+}
+
 func TestHookClientHintsShouldUseOnlyBoundedTerminalIdentityAllowlist(t *testing.T) {
 	environment := map[string]string{
 		"SSH_TTY":         "/dev/pts/7", // duplicate of the direct fd-derived tty

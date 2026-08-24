@@ -41,8 +41,8 @@ mkdir -p "$go_bin" "$(dirname -- "$daemon_bin")" "$go_cache" "$go_tmp"
 )
 
 # Add the two standard Codex lifecycle events without retaining a backup. The
-# handlers forward only the existing content-free hook fields; this probe uses
-# them for counters and exact graph-ID comparison, never for state mutation.
+# handlers forward only the existing content-free hook fields. Production
+# applies them only after an exact app-server topology match.
 jq --arg ctl "$ctl" '
   def handler($event):
     [{hooks: [{type: "command", command: ($ctl + " codex-hook " + $event), timeout: 2}]}];
@@ -53,7 +53,7 @@ install -m 0644 "$hooks_tmp" "$hooks_file"
 
 echo "Installed daemon: $daemon_bin"
 echo "Installed hook CLI: $ctl"
-echo "Added diagnostic SubagentStart/SubagentStop handlers to $hooks_file"
+echo "Added production SubagentStart/SubagentStop handlers to $hooks_file"
 echo "Restarting Switchboard only; the Codex daemon remains untouched"
 journal_since=$(date '+%Y-%m-%d %H:%M:%S')
 systemctl --user restart switchboard.service
@@ -68,6 +68,7 @@ codex_state() {
         pid,
         root_id: (if $root == "" then null else $root end),
         root_status: (.codex.status // null),
+        live_children: (.agent_graph.summary.live_children // 0),
         children: [
           (.agent_graph.nodes // [])[]
           | select(.id != $root)
@@ -81,6 +82,50 @@ codex_state() {
         ]
       }
   ]'
+}
+
+print_timeline() {
+	if ! "$ctl" timeline --json 2>/dev/null \
+		| jq '{
+        roots: [
+          (.agent_timeline.roots // [])[]
+          | {
+              session_id,
+              pid,
+              provider,
+              nodes: [
+                .nodes[]
+                | {
+                    thread_id,
+                    parent_thread_id,
+                    depth,
+                    runtime,
+                    attention_state,
+                    lifecycle,
+                    activity
+                  }
+              ]
+            }
+        ],
+        summary: (.agent_timeline.summary // {})
+      }'; then
+		echo '{}  (timeline is disabled or no canonical child lane exists)'
+	fi
+}
+
+print_transition_checks() {
+	if ! jq -s '{
+      saw_running: any(.[]; .type == "agent_state" and .agent == "codex" and .to_runtime == "active" and .to_lifecycle == "running"),
+      saw_completed: any(.[]; .type == "agent_state" and .agent == "codex" and .to_runtime == "idle" and .to_lifecycle == "completed"),
+      saw_nested_parent: any(.[]; .type == "agent_state" and .agent == "codex" and (.parent_thread_id // "") != "" and .parent_thread_id != .session_id),
+      saw_reactivation: (
+        [.[] | select(.type == "agent_state" and .agent == "codex" and .to_lifecycle == "running")]
+        | group_by([.session_id, .thread_id])
+        | any(.[]; length >= 2)
+      )
+    }' "$history_tmp" 2>/dev/null; then
+		echo '{}  (history is disabled or no readable history file exists)'
+	fi
 }
 
 print_history() {
@@ -126,6 +171,12 @@ print_snapshot() {
 	echo "Durable Codex child agent_state events today:"
 	print_history
 	echo
+	echo "Canonical child timeline lanes today:"
+	print_timeline
+	echo
+	echo "Lifecycle acceptance checks today:"
+	print_transition_checks
+	echo
 	echo "Probe journal category counts since restart:"
 	print_probe_journal_summary
 }
@@ -152,20 +203,27 @@ The #83 child-lifecycle probe is ready.
    SubagentStart and SubagentStop handlers if Codex requests trust.
 2. In that same TUI submit:
 
-   Spawn exactly one child agent. Tell it to run `sleep 45`, then return only
-   CHILD_DONE. Wait for the child to finish before replying to me.
+   Spawn exactly one child agent. Tell that child to spawn one nested child
+   which runs `sleep 45` and returns NESTED_DONE. Wait for both children to
+   finish before replying CHILD_DONE.
 
-3. Leave this script running through child start and completion. It reports only:
+3. After CHILD_DONE, ask Codex to reactivate the same completed child and have
+   it return REACTIVATED. If Codex cannot emit a follow-up start for the same
+   child, record that exact limitation; do not substitute a new child.
+
+4. Leave this script running through child start, completion, and the follow-up.
+   The expected live count is `0 -> 1 (or 2 while nested) -> 0`, followed by a
+   new running edge if Codex emits reactivation. The script reports only:
    - whether thread/read or thread/turns/list contains collaboration state;
    - whether the standalone app-server receives lifecycle notifications;
    - whether SubagentStart/Stop carries an ID exactly matching graph topology;
    - root/child IDs and neutral state axes; and
-   - canonical child agent_state fields.
+   - canonical child agent_state fields and sanitized timeline lanes.
 
 No prompts, messages, tool input, commands, cwd, nicknames, roles, or raw
-provider payloads are logged. The hook events are diagnostic-only in this build
-and cannot repaint the graph. Press Ctrl-C after CHILD_DONE to print the final
-counters, graph, and history evidence.
+provider payloads are logged. Press Ctrl-C after REACTIVATED (or after Codex
+reports that reactivation is unavailable) to print the final counters, graph,
+history, timeline, and acceptance checks.
 EOF
 
 watch_state &

@@ -1,8 +1,10 @@
 # Plain-Codex exact-binding probe
 
-> Status: live no-wrapper root binding, standalone transport, and bounded root
-> status composition passed on 2026-08-23. Live child lifecycle fanout remains
-> unproved.
+> Status: live no-wrapper root binding, standalone transport, bounded root
+> composition, and the exact child-hook/topology join passed on 2026-08-23–24.
+> Issue #83 discovery is complete; the fused production rollout remains its
+> closing gate. See the
+> [child-lifecycle decision](codex-no-wrapper-child-lifecycle.md).
 
 ## Decision
 
@@ -189,12 +191,13 @@ will reach durable `agent_state` history.
 | Unmodified `codex app-server --stdio` initializes and snapshots | Pass |
 | Exact root and descendant topology is recovered | Pass |
 | Bounded exact-hook root status survives later not-loaded snapshots | Pass |
-| Live child runtime/lifecycle transitions and durable fanout | Unproved; blocks #83 |
+| Exact child hook id joins app-server topology | Pass; every logged outcome matched |
+| Fused production child runtime/lifecycle and durable fanout | Implementation complete; live rollout still gates #83 |
 | `/clear` then implement-plan red/rotation/green sequence | Unproved; blocks #86 |
 
-## Child-lifecycle probe — iteration 1
+## Child-lifecycle probe result and production decision
 
-The next #83 experiment separates three possible no-wrapper lifecycle channels:
+The #83 experiment separated three possible no-wrapper lifecycle channels:
 
 1. lifecycle-relevant notifications received by the standalone app-server;
 2. persisted `collabAgentToolCall.agentsStates` returned by either
@@ -210,9 +213,17 @@ only finite evidence categories, opaque root/child IDs, neutral state axes, and
 canonical child-history fields. Prompts, messages, tool input, commands, cwd,
 nicknames, roles, and raw provider payloads are excluded.
 
-The hook events are diagnostic-only in this iteration. A start/stop hook cannot
-mutate lifecycle until live evidence proves that its child ID joins the
-structural graph exactly. Likewise, `thread/turns/list` is supplemental evidence
-and does not yet replace the existing `thread/read` reducer. This keeps all
-three candidate routes fail-closed while identifying which one can safely
-supply the missing lifecycle axis.
+Across approximately 800 snapshots, the app-server notification channel
+produced no lifecycle evidence. `thread/read` and `thread/turns/list` exposed
+completed `wait` items but no receiver ids or useful agent states. Child
+snapshots stayed `not_loaded`/`unknown`. In contrast, all logged lifecycle hooks
+matched exact non-root graph ids: nine unique children on August 23, three on
+August 24, and a stop counter of at least 19, with no absent-id, graph-missing,
+or unmatched result.
+
+That evidence promotes only the proven join. Production queues child hooks
+until fresh topology matches, preserves app-server parentage/source, expires
+unclosed running evidence after ten minutes, and never creates a child or
+completion heuristically. The full evidence record, authority matrix, state
+machine, diagnostics, and rollout gate are in
+[`codex-no-wrapper-child-lifecycle.md`](codex-no-wrapper-child-lifecycle.md).

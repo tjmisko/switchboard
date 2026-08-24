@@ -251,7 +251,7 @@ reduce the latency on the `delegating` chip and the "N agents" count. The hook i
 a pure trigger; the daemon's Observer remains the single source of truth, so a
 duplicated or dropped subagent hook can never miscount.
 
-## Codex app-server observer and optional hooks
+## Codex app-server observer and lifecycle hooks
 
 Switchboard discovers interactive **OpenAI Codex** TUI roots while excluding
 wrappers and non-interactive subcommands such as `exec`, `mcp`, and
@@ -264,16 +264,18 @@ standalone Codex app-server and reads the exact bound root with `thread/read`
 plus its descendants with `thread/list`. Live testing with the installed Codex
 0.149.0 CLI proves that this path recovers thread IDs, immediate parentage, and
 nicknames for plain `codex` TUIs. That standalone server currently reports the
-tested interactive roots and recovered children as `notLoaded`, however, so it
-has not yet proved live child lifecycle transitions.
+tested recovered children as `notLoaded` with unknown lifecycle, so structural
+presence alone is not counted as live work.
 
 Authority is therefore composed by field. App-server owns structural topology.
 When its root runtime is `unknown` or `notLoaded`, the last exact lifecycle hook
 may retain bounded root runtime/attention until that hook's original freshness
 deadline; snapshots never extend the deadline. Any available app-server root
-runtime wins immediately. Child lifecycle remains unknown rather than being
-inferred from its presence in a snapshot. The protocol reducer preserves
-distinct `approval` and `user_input` waits when those events are available:
+runtime wins immediately. Trusted `SubagentStart`/`SubagentStop` hooks supply a
+child runtime/lifecycle edge only after their exact `agent_id` matches a
+non-root node in a fresh app-server graph. Missing or unmatched hooks never
+create children, change parentage, or infer completion. The protocol reducer
+preserves distinct `approval` and `user_input` waits when those events are available:
 both make the root chip red, while the child row says `approval` or `user input`
 (`question` in the compact Waybar tooltip). See the
 [official OpenAI app-server documentation](https://learn.chatgpt.com/docs/app-server)
@@ -340,7 +342,9 @@ the root as not loaded:
     "PreToolUse": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook PreToolUse", "timeout": 2}]}],
     "PostToolUse": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook PostToolUse", "timeout": 2}]}],
     "PermissionRequest": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook PermissionRequest", "timeout": 2}]}],
-    "Stop": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook Stop", "timeout": 2}]}]
+    "Stop": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook Stop", "timeout": 2}]}],
+    "SubagentStart": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook SubagentStart", "timeout": 2}]}],
+    "SubagentStop": [{"hooks": [{"type": "command", "command": "switchboard-ctl codex-hook SubagentStop", "timeout": 2}]}]
   }
 }
 ```
@@ -360,11 +364,15 @@ idle edge, while a standalone `/clear` still settles idle.
 `SessionStart(compact)` remains active because Codex continues the model
 immediately after compaction. Only content-free lifecycle metadata is used to
 correlate the wait; its question, answer, and raw tool input stay out of the
-daemon. The hook fallback is partial and root-only. Active evidence remains
+daemon. The root-status hook fallback is partial and root-only. Active evidence remains
 fresh for 10 minutes, approval or user-input waits for 24 hours, and idle edges
 for 7 days. A daemon restart during an already-open hook-only interview cannot
 reconstruct that wait and therefore remains unknown rather than confidently
-green.
+green. The two child hooks are required for live child state on the tested
+standard-CLI path, but not for discovery or topology. Matched running child
+edges expire after 10 minutes without a later edge; matched completions persist
+within the exact root lifetime and can be reopened by a later start. See the
+[no-wrapper child-lifecycle decision](docs/codex-no-wrapper-child-lifecycle.md).
 
 Automatic degradation is fail-open for the root and fail-closed for status:
 
@@ -378,8 +386,9 @@ Automatic degradation is fail-open for the root and fail-closed for status:
   latch above; it does not depend on a launcher or private endpoint. See the
   [standard-CLI retrospective](docs/codex-standard-cli-interview-retrospective.md);
 - `-codex-observer off` never constructs the standalone app-server. Codex hooks
-  can still supply the partial root view; without them the root remains visible
-  with unknown status and no child graph.
+  can still supply the partial root view, but child hooks cannot synthesize
+  topology; without hooks the root remains visible with unknown status and no
+  proven live children.
 
 Use `switchboard-ctl diagnose --observer` to inspect content-free binding,
 source, freshness, completeness, node counts, observer mode, and finite error
