@@ -334,7 +334,7 @@ observation is disabled or temporarily unavailable, hooks still drive status
 and display-name generation; native-rename precedence takes effect when an
 authoritative name observation next becomes available.
 
-Automatic degradation is fail-open for the root and fail-closed for status:
+Automatic degradation is fail-open for discovery and fail-closed for status:
 
 - app-server capability/start/connection failure leaves discovery and navigation working;
 - the last complete graph remains visible only until its explicit freshness
