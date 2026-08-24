@@ -146,11 +146,13 @@ are classified before they reach the graph:
   `interrupted`, `errored`, `shutdown`, `notFound` → the corresponding neutral
   snake-case values.
 
-An unresolved server request becomes `approval` only when it is routed to the
-user, or when no auto-review evidence arrives during the bounded 500 ms
-classification window. A blocking `item/tool/requestUserInput` request with no
-auto-resolution becomes `user_input` immediately. Nonblocking and
-auto-resolving input remains non-attention. `thread/settings/updated`
+An unresolved server request becomes `approval` immediately when it is routed
+to the user. Mechanically ambiguous approvals receive a bounded 30-second
+ownership-classification grace before the Phase-1 timeout fallback may publish
+red. The grace is based on measured Auto-review latency; it does not delay
+blocking `item/tool/requestUserInput` requests with no auto-resolution, which
+become `user_input` immediately. Nonblocking and auto-resolving input remains
+non-attention. `thread/settings/updated`
 `approvalsReviewer`, `item/autoApprovalReview/*`, and an active
 `source.subAgent.other = guardian` thread classify automatic ownership; the
 auto-review notifications are supplementary because their generated schema is
@@ -158,13 +160,17 @@ explicitly unstable. Exact JSON-RPC request IDs and
 `serverRequest/resolved.requestId` bound human attention, including concurrent
 string and integer IDs.
 
-Publication is held only while an ambiguous wait is classified. Auto evidence
-cancels that timer without creating a transient graph or history edge. A
-mechanical gate whose owner remains unknown projects runtime `unknown` with no
-attention, so uncertainty is gray rather than red. Request state is discarded
-on exact resolution, turn/thread completion, deletion, authoritative snapshot
-omission, or reconnect generation replacement. Classification diagnostics
-contain only a finite source label, duration, and suppressed-false-red boolean.
+Publication is held only while an ambiguous wait is classified. Resolution or
+Auto-review evidence inside the grace cancels the timer without creating a
+transient graph or history edge. Late semantic automatic evidence overrides a
+timeout fallback and reports the resulting false-red invariant. A mechanical
+gate with no request and no owner projects runtime `unknown` with no attention,
+so uncertainty is gray rather than red. Request state is discarded on exact
+resolution, turn/thread completion, deletion, authoritative snapshot omission,
+or reconnect generation replacement. Content-free episode diagnostics record
+finite event, request-kind, ownership, evidence, duration, red-publication, and
+human-evidence labels without protocol IDs or provider content. See
+[Codex Auto-review attention ownership](codex-auto-review-attention.md).
 
 Confirmed approval and user input deliberately remain distinct. Either makes
 the root's legacy summary `permission` (red), but child rows show `approval`
@@ -172,9 +178,12 @@ versus `user input` (`question` in the compact Waybar tooltip). Terminal nodes
 no longer count as live work or waiting attention even if a partial provider
 payload still carries an old runtime/attention value.
 
-Hooks are partial observations, with one independently owned attention latch.
+Hooks are partial observations, with independently owned attention latches.
 `Stop` maps the root to idle; `UserPromptSubmit` and ordinary
-`PreToolUse`/`PostToolUse` map it active; and `PermissionRequest` maps approval.
+`PreToolUse`/`PostToolUse` map it active. A generic `PermissionRequest` is
+mechanical approval evidence and uses the same 30-second grace; exact matching
+tool progress cancels it before red. A question-shaped permission request maps
+to user input immediately.
 `request_user_input` is the narrow exception: its `PreToolUse` opens a
 user-input wait keyed by `tool_use_id`, and only the matching `PostToolUse`, the
 turn's `Stop`, or conversation rotation clears it. Generic app-server snapshots

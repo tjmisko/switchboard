@@ -155,8 +155,11 @@ func main() {
 			// protocol category. Keep the log equally content-free.
 			log.Printf("agent-observer: provider=codex category=%s count=1", category)
 		}, WaitDiagnostic: func(diagnostic codexprovider.WaitClassificationDiagnostic) {
-			log.Printf("agent-observer: provider=codex category=wait_classification source=%s duration_ms=%d suppressed_false_red=%t count=1",
-				diagnostic.Source, diagnostic.Duration.Milliseconds(), diagnostic.SuppressedFalseRed)
+			log.Printf("agent-observer: provider=codex category=wait_episode event=%s episode=%d request_kind=%s ownership=%s evidence=%s source=%s duration_ms=%d red_duration_ms=%d red_published=%t human_evidence=%t cleared_without_human_evidence=%t suppressed_false_red=%t old_would_publish_red=%t count=1",
+				diagnostic.Event, diagnostic.Episode, diagnostic.RequestKind, diagnostic.Ownership,
+				diagnostic.Evidence, diagnostic.Source, diagnostic.Duration.Milliseconds(), diagnostic.RedDuration.Milliseconds(),
+				diagnostic.RedPublished, diagnostic.HumanEvidence, diagnostic.ClearedWithoutHumanEvidence,
+				diagnostic.SuppressedFalseRed, diagnostic.LegacyWouldPublishRed)
 		}})
 		log.Printf("agent-observer: provider=codex category=observer_constructed count=1")
 		return observer

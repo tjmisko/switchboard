@@ -57,14 +57,20 @@ reason. If both kinds exist at once, compact summary `attention` chooses
 `approval`, while `approval_nodes` and `user_input_nodes` preserve both counts.
 
 Provider adapters may emit those attention values only for a confirmed,
-unresolved human-owned request. In particular, Codex's
+unresolved human-owned request, with one explicitly instrumented Phase-1
+exception for a Codex ownership timeout. In particular, Codex's
 `waitingOnApproval`/`waitingOnUserInput` active flags describe mechanical
 app-server gates, not who must resolve them. The Codex adapter correlates the
 gate with reviewer settings, exact server-request IDs and resolutions,
 blocking/auto-resolution metadata, auto-review events, and guardian source
-evidence before publishing a neutral graph. An unowned gate is gray/unknown,
-never red. This ownership rule is enforced before graph history is written, so
-an automated review creates no synthetic `permission` interval.
+evidence before publishing a neutral graph. Ambiguous approvals retain their
+prior projection during a 30-second grace. During the instrumented Phase-1
+rollout only, a still-unresolved request may then use a timeout-to-human
+fallback; diagnostics distinguish that fallback from semantic human evidence.
+Known automatic review remains green and an unowned raw gate becomes
+gray/unknown. The target Phase-2 invariant removes the timeout exception so an
+automated review can never create a synthetic `permission` interval. See
+[Codex Auto-review attention ownership](codex-auto-review-attention.md).
 
 The reducer ignores provider/source names and uses only a valid graph plus its
 half-open freshness interval (`observed_at <= now < fresh_until`). It evaluates

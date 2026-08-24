@@ -1,7 +1,9 @@
 package main
 
 import (
+	"log"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +17,8 @@ import (
 
 const (
 	codexHookStartSettle     = 250 * time.Millisecond
+	codexHookApprovalGrace   = 30 * time.Second
+	codexHookLegacyGrace     = 500 * time.Millisecond
 	codexChildHookQueueLimit = 256
 	codexChildHookRetention  = codexHookActiveFreshness
 )
@@ -23,11 +27,25 @@ type codexPendingInput struct {
 	turnID, toolUseID, writer, toolName, inputHash string
 }
 
+type codexPendingApproval struct {
+	turnID, toolUseID, writer, toolName, inputHash string
+	episode                                        uint64
+	startedAt                                      time.Time
+	redPublishedAt                                 time.Time
+	ref                                            provider.RootRef
+	sessionID                                      string
+	timer                                          *time.Timer
+	done                                           sync.Once
+}
+
+func (p *codexPendingApproval) finish(wg *sync.WaitGroup) { p.done.Do(wg.Done) }
+
 type codexHookRootState struct {
 	sessionID string
 	latestAt  time.Time
 	retired   map[string]struct{}
 	pending   map[string]codexPendingInput
+	approvals map[string]*codexPendingApproval
 
 	// Standalone app-server snapshots retain topology but report interactive
 	// TUI roots as notLoaded. Preserve the last exact hook-owned root state under
@@ -89,6 +107,7 @@ func newCodexHookRootState(sessionID string, latestAt time.Time) *codexHookRootS
 		latestAt:         latestAt,
 		retired:          make(map[string]struct{}),
 		pending:          make(map[string]codexPendingInput),
+		approvals:        make(map[string]*codexPendingApproval),
 		childOverlays:    make(map[string]codexChildHookOverlay),
 		childLastApplied: make(map[string]codexChildHookCursor),
 		childProvider:    make(map[string]agentgraph.Node),
@@ -210,20 +229,36 @@ func (c *agentCoordinator) handleCodexHookNow(ref provider.RootRef, req rpc.Requ
 			return
 		}
 	}
+	if rootState.sessionID != "" && rootState.sessionID != rootID {
+		c.clearCodexApprovalsLocked(rootState)
+	}
 	commitCodexHookSession(rootState, rootID, now)
 	pendingAttention, hookOwnsTransition := reduceCodexPendingInput(rootState, req)
+	approvalDeferred, approvalOwnsTransition := c.reduceCodexPendingApprovalLocked(rootState, ref, rootID, req, now)
+	hookOwnsTransition = hookOwnsTransition || approvalOwnsTransition
 	c.codexHookMu.Unlock()
 	ref.ProviderSessionID = rootID
 	observation, mapped := codexHookObservation(rootID, req, ref.StartedAt, now)
 	if mapped {
 		observation = applyCodexPendingAttention(observation, pendingAttention, now)
-		c.rememberCodexHookRootObservation(ref.Key(), observation)
 		if current, ok := sessionForKey(c.store.Snapshot(), ref.Key()); ok {
+			if approvalDeferred && pendingAttention == agentgraph.AttentionNone && current.AgentGraph != nil &&
+				current.AgentGraph.Summary.Attention != agentgraph.AttentionNone {
+				// An ambiguous permission hook may announce internal review, but it
+				// cannot clear an independently proven human-owned request.
+				mapped = false
+			}
 			hookOwnsTransition = hookOwnsTransition || codexAppServerRootUnavailable(current.AgentGraph)
 			observation = overlayCodexHookObservation(observation, current.AgentGraph)
 		}
+	}
+	if mapped {
+		c.rememberCodexHookRootObservation(ref.Key(), observation)
 		generation := c.begin(ref.Key())
 		c.applyObservationWithHookOwnership(ref, generation, observation, claudeprovider.Compatibility{}, now, hookOwnsTransition)
+	}
+	if approvalDeferred {
+		c.recordDiagnostic(agentgraph.ProviderCodex, "hook_approval_grace_started", now)
 	}
 	switch req.Event {
 	case "UserPromptSubmit":
@@ -837,6 +872,199 @@ func reduceCodexPendingInput(state *codexHookRootState, req rpc.Request) (agentg
 	return agentgraph.AttentionNone, ownedTransition
 }
 
+// reduceCodexPendingApprovalLocked gives a generic PermissionRequest the same
+// bounded ownership grace as the app-server observer. The hook says that Codex
+// reached a permission boundary, but it does not say whether a person or the
+// Auto-review agent owns the decision. Progress from the exact same tool call
+// cancels the grace; only an unresolved boundary reaches red at the deadline.
+// c.codexHookMu must be held.
+func (c *agentCoordinator) reduceCodexPendingApprovalLocked(
+	state *codexHookRootState,
+	ref provider.RootRef,
+	rootID string,
+	req rpc.Request,
+	now time.Time,
+) (deferred, ownsTransition bool) {
+	if state.approvals == nil {
+		state.approvals = make(map[string]*codexPendingApproval)
+	}
+	if req.Event == "PermissionRequest" && !isCodexHumanInputPermission(req.ToolName) {
+		c.codexWaitEpisode++
+		pending := &codexPendingApproval{
+			turnID: req.TurnID, toolUseID: req.ToolUseID, writer: req.AgentID,
+			toolName: req.ToolName, inputHash: req.ToolInputHash,
+			episode: c.codexWaitEpisode, startedAt: now, ref: ref, sessionID: rootID,
+		}
+		key := codexPendingApprovalKey(pending)
+		if prior := state.approvals[key]; prior != nil {
+			c.stopCodexApprovalLocked(prior)
+		}
+		state.approvals[key] = pending
+		c.startCodexApprovalTimerLocked(state, key, pending)
+		logCodexHookWait("started", pending, "hook_permission", now)
+		return true, true
+	}
+
+	resolved := make([]string, 0, 1)
+	switch req.Event {
+	case "PreToolUse", "PostToolUse":
+		for key, pending := range state.approvals {
+			if codexPendingApprovalMatches(pending, req) {
+				resolved = append(resolved, key)
+			}
+		}
+	case "Stop":
+		for key, pending := range state.approvals {
+			if req.TurnID == "" || pending.turnID == "" ||
+				(pending.turnID == req.TurnID && pending.writer == req.AgentID) {
+				resolved = append(resolved, key)
+			}
+		}
+	case "SessionStart", "UserPromptSubmit":
+		for key := range state.approvals {
+			resolved = append(resolved, key)
+		}
+	}
+
+	for _, key := range resolved {
+		pending := state.approvals[key]
+		if pending == nil {
+			continue
+		}
+		published := !pending.redPublishedAt.IsZero()
+		c.stopCodexApprovalLocked(pending)
+		delete(state.approvals, key)
+		logCodexHookWait("resolved", pending, "hook_progress", now)
+		ownsTransition = ownsTransition || published
+	}
+	return false, ownsTransition
+}
+
+// startCodexApprovalTimerLocked schedules the Phase-1 timeout-to-human fallback.
+// c.codexHookMu must be held.
+func (c *agentCoordinator) startCodexApprovalTimerLocked(state *codexHookRootState, key string, pending *codexPendingApproval) {
+	delay := c.codexApprovalGrace
+	if delay <= 0 {
+		delay = codexHookApprovalGrace
+	}
+	c.codexTimerWG.Add(1)
+	pending.timer = time.AfterFunc(delay, func() {
+		defer pending.finish(&c.codexTimerWG)
+		appServerSettled := false
+		existingAttention := false
+		if currentSession, ok := sessionForKey(c.store.Snapshot(), pending.ref.Key()); ok && currentSession.AgentGraph != nil {
+			graph := currentSession.AgentGraph
+			existingAttention = graph.Summary.Attention != agentgraph.AttentionNone
+			appServerSettled = graph.Source == agentgraph.SourceCodexAppServer &&
+				!graph.ObservedAt.Before(pending.startedAt) && graph.Summary.Runtime == agentgraph.RuntimeActive &&
+				graph.Summary.Attention == agentgraph.AttentionNone
+		}
+		c.codexHookMu.Lock()
+		current := c.codexHookRoots[pending.ref.Key()]
+		if current != state || current.sessionID != pending.sessionID || current.approvals[key] != pending {
+			c.codexHookMu.Unlock()
+			return
+		}
+		now := time.Now()
+		if existingAttention {
+			delete(current.approvals, key)
+			c.codexHookMu.Unlock()
+			logCodexHookWait("resolved", pending, "existing_human_attention", now)
+			c.recordDiagnostic(agentgraph.ProviderCodex, "hook_approval_suppressed_existing_attention", now)
+			return
+		}
+		if appServerSettled {
+			delete(current.approvals, key)
+			c.codexHookMu.Unlock()
+			logCodexHookWait("resolved", pending, "app_server_non_attention", now)
+			c.recordDiagnostic(agentgraph.ProviderCodex, "hook_approval_resolved_by_app_server", now)
+			return
+		}
+		pending.redPublishedAt = now
+		// Reserve the generation while the pending entry is still protected by
+		// codexHookMu. A concurrent resolving hook will reserve a later generation
+		// and fence this timer out if it wins the race to publication.
+		generation := c.begin(pending.ref.Key())
+		c.codexHookMu.Unlock()
+
+		logCodexHookWait("red_published", pending, "timeout_fallback", now)
+		c.recordDiagnostic(agentgraph.ProviderCodex, "hook_approval_timeout_red", now)
+		observation := codexHookApprovalObservation(pending.sessionID, pending.ref.StartedAt, now)
+		if currentSession, ok := sessionForKey(c.store.Snapshot(), pending.ref.Key()); ok {
+			observation = overlayCodexHookObservation(observation, currentSession.AgentGraph)
+		}
+		c.applyObservationWithHookOwnership(
+			pending.ref, generation, observation, claudeprovider.Compatibility{}, now, true,
+		)
+	})
+}
+
+// clearCodexApprovalsLocked is used for conversation rotation, root removal,
+// and shutdown. c.codexHookMu must be held.
+func (c *agentCoordinator) clearCodexApprovalsLocked(state *codexHookRootState) {
+	if state == nil {
+		return
+	}
+	for key, pending := range state.approvals {
+		c.stopCodexApprovalLocked(pending)
+		delete(state.approvals, key)
+	}
+}
+
+// stopCodexApprovalLocked balances codexTimerWG whether the timer has not fired
+// or its callback is already responsible for completion.
+func (c *agentCoordinator) stopCodexApprovalLocked(pending *codexPendingApproval) {
+	if pending != nil && pending.timer != nil && pending.timer.Stop() {
+		pending.finish(&c.codexTimerWG)
+	}
+}
+
+func codexPendingApprovalKey(pending *codexPendingApproval) string {
+	if pending.toolUseID != "" {
+		return "id:" + pending.toolUseID
+	}
+	if pending.inputHash != "" {
+		return "hash:" + pending.writer + "\x00" + pending.turnID + "\x00" + pending.toolName + "\x00" + pending.inputHash
+	}
+	return "episode:" + strconv.FormatUint(pending.episode, 10)
+}
+
+func codexPendingApprovalMatches(pending *codexPendingApproval, req rpc.Request) bool {
+	if pending.toolUseID != "" || req.ToolUseID != "" {
+		return pending.toolUseID != "" && pending.toolUseID == req.ToolUseID
+	}
+	return pending.inputHash != "" && pending.inputHash == req.ToolInputHash &&
+		pending.writer == req.AgentID && pending.turnID == req.TurnID && pending.toolName == req.ToolName
+}
+
+func isCodexHumanInputPermission(tool string) bool {
+	return isCodexUserInputTool(tool) || strings.EqualFold(tool, "AskUserQuestion")
+}
+
+func logCodexHookWait(event string, pending *codexPendingApproval, evidence string, now time.Time) {
+	redPublished := !pending.redPublishedAt.IsZero()
+	redDuration := elapsedHookWait(pending.redPublishedAt, now)
+	duration := elapsedHookWait(pending.startedAt, now)
+	log.Printf("agent-observer: provider=codex category=wait_episode event=%s episode=%d request_kind=hook_permission ownership=%s evidence=%s source=hook duration_ms=%d red_duration_ms=%d red_published=%t human_evidence=false cleared_without_human_evidence=%t suppressed_false_red=false old_would_publish_red=%t count=1",
+		event, pending.episode, hookWaitOwnership(redPublished), evidence,
+		duration.Milliseconds(), redDuration.Milliseconds(), redPublished,
+		event == "resolved" && redPublished, duration >= codexHookLegacyGrace)
+}
+
+func hookWaitOwnership(redPublished bool) string {
+	if redPublished {
+		return "human"
+	}
+	return "unknown"
+}
+
+func elapsedHookWait(started, now time.Time) time.Duration {
+	if started.IsZero() || now.Before(started) {
+		return 0
+	}
+	return now.Sub(started)
+}
+
 func codexPendingInputKey(pending codexPendingInput) string {
 	if pending.toolUseID != "" {
 		return "id:" + pending.toolUseID
@@ -899,6 +1127,7 @@ func (c *agentCoordinator) forgetCodexHookState(key provider.RootKey) {
 		}
 		delete(c.codexStarts, key)
 	}
+	c.clearCodexApprovalsLocked(c.codexHookRoots[key])
 	delete(c.codexHookRoots, key)
 	c.codexHookMu.Unlock()
 	c.cancelCodexNaming(key, true)
@@ -925,9 +1154,13 @@ func codexHookObservation(rootID string, req rpc.Request, startedAt, now time.Ti
 			attention = agentgraph.AttentionUserInput
 		}
 	case "PermissionRequest":
-		runtime = agentgraph.RuntimeIdle
-		attention = agentgraph.AttentionApproval
-		if isCodexUserInputTool(req.ToolName) || req.ToolName == "AskUserQuestion" {
+		// A generic permission hook does not identify whether the decision is
+		// owned by the user or Auto-review. Keep it active during the grace; the
+		// coordinator publishes approval only if the exact gate remains unresolved
+		// through codexHookApprovalGrace. Structured questions are human-owned.
+		runtime = agentgraph.RuntimeActive
+		if isCodexHumanInputPermission(req.ToolName) {
+			runtime = agentgraph.RuntimeIdle
 			attention = agentgraph.AttentionUserInput
 		}
 	default:
@@ -947,4 +1180,15 @@ func codexHookObservation(rootID string, req rpc.Request, startedAt, now time.Ti
 			Lifecycle: agentgraph.LifecycleRunning, StartedAt: startedAt, UpdatedAt: now,
 		}},
 	}, true
+}
+
+func codexHookApprovalObservation(rootID string, startedAt, now time.Time) agentgraph.Observation {
+	return agentgraph.Observation{
+		Provider: agentgraph.ProviderCodex, RootID: rootID, Source: agentgraph.SourceHook,
+		ObservedAt: now, FreshUntil: now.Add(codexHookAttentionFreshness), Complete: false,
+		Nodes: []agentgraph.Node{{
+			ID: rootID, Runtime: agentgraph.RuntimeIdle, Attention: agentgraph.AttentionApproval,
+			Lifecycle: agentgraph.LifecycleRunning, StartedAt: startedAt, UpdatedAt: now,
+		}},
+	}
 }

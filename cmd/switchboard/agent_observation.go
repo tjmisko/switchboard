@@ -83,11 +83,13 @@ type agentCoordinator struct {
 	namingModel   string
 	namingTimeout time.Duration
 
-	codexHookMu      sync.Mutex
-	codexHookRoots   map[provider.RootKey]*codexHookRootState
-	codexStarts      map[provider.RootKey]*pendingCodexStart
-	codexStartSettle time.Duration
-	codexTimerWG     sync.WaitGroup
+	codexHookMu        sync.Mutex
+	codexHookRoots     map[provider.RootKey]*codexHookRootState
+	codexStarts        map[provider.RootKey]*pendingCodexStart
+	codexStartSettle   time.Duration
+	codexApprovalGrace time.Duration
+	codexWaitEpisode   uint64
+	codexTimerWG       sync.WaitGroup
 }
 
 type codexNamingState struct {
@@ -121,7 +123,7 @@ func newAgentCoordinator(store *state.Store, sink *history.Sink, claude claudeOb
 		naming: make(map[provider.RootKey]*codexNamingState), namer: codexprovider.EphemeralNamer{},
 		namingModel: codexprovider.DefaultDisplayNameModel, namingTimeout: 45 * time.Second,
 		codexHookRoots: make(map[provider.RootKey]*codexHookRootState), codexStarts: make(map[provider.RootKey]*pendingCodexStart),
-		codexStartSettle: codexHookStartSettle,
+		codexStartSettle: codexHookStartSettle, codexApprovalGrace: codexHookApprovalGrace,
 	}
 }
 
@@ -160,6 +162,9 @@ func (c *agentCoordinator) Close() {
 			if pending.timer.Stop() {
 				pending.finish(&c.codexTimerWG)
 			}
+		}
+		for _, root := range c.codexHookRoots {
+			c.clearCodexApprovalsLocked(root)
 		}
 		clear(c.codexStarts)
 		clear(c.codexHookRoots)

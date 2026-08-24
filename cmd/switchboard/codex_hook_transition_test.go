@@ -56,6 +56,117 @@ func waitForCodexGraph(t *testing.T, store *state.Store, rootID, status string) 
 	return nil
 }
 
+func TestGenericCodexPermissionRequestUsesAmbiguousApprovalGrace(t *testing.T) {
+	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
+	coordinator.codexApprovalGrace = 30 * time.Millisecond
+	base := time.Now()
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "UserPromptSubmit", SessionID: "thread-1", TurnID: "turn-1", ObservedAt: base,
+	})
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PermissionRequest", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "call-1",
+		ToolName: "exec_command", ObservedAt: base.Add(time.Millisecond),
+	})
+	if graph := codexGraph(t, store); graph.Summary.Status != state.StatusWorking || graph.Summary.Attention != agentgraph.AttentionNone {
+		t.Fatalf("ambiguous hook approval became red before grace: %#v", graph.Summary)
+	}
+
+	waitForCodexGraph(t, store, "thread-1", state.StatusPermission)
+	graph := codexGraph(t, store)
+	if graph.Summary.Attention != agentgraph.AttentionApproval {
+		t.Fatalf("unresolved hook approval did not use timeout fallback: %#v", graph.Summary)
+	}
+
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PreToolUse", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "call-1",
+		ToolName: "exec_command", ObservedAt: time.Now(),
+	})
+	if graph = codexGraph(t, store); graph.Summary.Status != state.StatusWorking || graph.Summary.Attention != agentgraph.AttentionNone {
+		t.Fatalf("matching tool progress did not clear timeout fallback: %#v", graph.Summary)
+	}
+}
+
+func TestGenericCodexPermissionResolutionInsideGraceNeverPublishesRed(t *testing.T) {
+	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
+	coordinator.codexApprovalGrace = 40 * time.Millisecond
+	base := time.Now()
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PermissionRequest", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "call-1",
+		ToolName: "exec_command", ObservedAt: base,
+	})
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PreToolUse", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "call-1",
+		ToolName: "exec_command", ObservedAt: base.Add(time.Millisecond),
+	})
+	time.Sleep(2 * coordinator.codexApprovalGrace)
+	if graph := codexGraph(t, store); graph.Summary.Status != state.StatusWorking || graph.Summary.Attention != agentgraph.AttentionNone {
+		t.Fatalf("resolved hook approval published a late red edge: %#v", graph.Summary)
+	}
+}
+
+func TestNewerAppServerNonAttentionCancelsHookTimeoutFallback(t *testing.T) {
+	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
+	coordinator.codexApprovalGrace = 40 * time.Millisecond
+	base := time.Now()
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PermissionRequest", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "call-1",
+		ToolName: "exec_command", ObservedAt: base,
+	})
+	ref, _ := providerRootRef(store.Snapshot().Sessions[0])
+	observation := testCodexObservation(ref, "thread-1", base.Add(time.Millisecond), agentgraph.RuntimeActive, agentgraph.AttentionNone)
+	if !coordinator.applyObservation(ref, coordinator.begin(ref.Key()), observation, claudeprovider.Compatibility{}, base.Add(time.Millisecond)) {
+		t.Fatal("newer app-server resolution observation was not applied")
+	}
+
+	time.Sleep(2 * coordinator.codexApprovalGrace)
+	if graph := codexGraph(t, store); graph.Summary.Status != state.StatusWorking || graph.Summary.Attention != agentgraph.AttentionNone {
+		t.Fatalf("settled app-server state allowed a late hook red edge: %#v", graph.Summary)
+	}
+}
+
+func TestCodexHumanInputPermissionRemainsImmediate(t *testing.T) {
+	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
+	coordinator.codexApprovalGrace = time.Second
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PermissionRequest", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "question-1",
+		ToolName: "AskUserQuestion", ObservedAt: time.Now(),
+	})
+	graph := codexGraph(t, store)
+	if graph.Summary.Status != state.StatusPermission || graph.Summary.Attention != agentgraph.AttentionUserInput {
+		t.Fatalf("structured human input was delayed by approval grace: %#v", graph.Summary)
+	}
+}
+
+func TestAmbiguousHookApprovalCannotClearExistingHumanInput(t *testing.T) {
+	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
+	coordinator.codexApprovalGrace = 50 * time.Millisecond
+	base := time.Now()
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PreToolUse", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "question-1",
+		ToolName: "request_user_input", ObservedAt: base,
+	})
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PermissionRequest", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "approval-1",
+		ToolName: "exec_command", ObservedAt: base.Add(time.Millisecond),
+	})
+	graph := codexGraph(t, store)
+	if graph.Summary.Status != state.StatusPermission || graph.Summary.Attention != agentgraph.AttentionUserInput {
+		t.Fatalf("ambiguous approval cleared existing human input: %#v", graph.Summary)
+	}
+	time.Sleep(2 * coordinator.codexApprovalGrace)
+	if graph = codexGraph(t, store); graph.Summary.Attention != agentgraph.AttentionUserInput {
+		t.Fatalf("approval timeout replaced existing human-input reason: %#v", graph.Summary)
+	}
+
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PreToolUse", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "approval-1",
+		ToolName: "exec_command", ObservedAt: base.Add(2 * time.Millisecond),
+	})
+	if graph = codexGraph(t, store); graph.Summary.Attention != agentgraph.AttentionUserInput {
+		t.Fatalf("approval resolution cleared unrelated human input: %#v", graph.Summary)
+	}
+}
+
 func TestStandardCodexHookRPCOwnsRequestUserInputLifecycle(t *testing.T) {
 	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
 	server := rpc.New(store, "", terminal.NewNone(), wm.NewNone())

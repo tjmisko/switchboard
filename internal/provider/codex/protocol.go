@@ -89,10 +89,17 @@ const (
 type rpcRequestID string
 
 type requestEvidence struct {
-	reason agentgraph.AttentionState
-	owner  requestOwner
-	turnID string
-	itemID string
+	reason           agentgraph.AttentionState
+	owner            requestOwner
+	ownerEvidence    string
+	kind             string
+	turnID           string
+	itemID           string
+	episode          uint64
+	startedAt        time.Time
+	redPublishedAt   time.Time
+	redClearedAt     time.Time
+	ambiguousAtStart bool
 }
 
 type waitOwnershipState struct {
@@ -106,6 +113,7 @@ type waitOwnershipState struct {
 	classificationPending bool
 	classifiedUnknown     bool
 	classificationStarted time.Time
+	classificationEpisode uint64
 	classificationToken   uint64
 	classificationTimer   *time.Timer
 }
@@ -159,6 +167,7 @@ func (s *graphState) clone() *graphState {
 		copy.wait.classificationTimer = nil
 		copy.wait.classificationPending = false
 		copy.wait.classificationStarted = time.Time{}
+		copy.wait.classificationEpisode = 0
 		copy.wait.activeAutoReview = cloneSet(state.wait.activeAutoReview)
 		copy.wait.requests = cloneRequests(state.wait.requests)
 		out.nodes[id] = &copy
@@ -394,6 +403,28 @@ func (s *graphState) hasAutoEvidence(id string) bool {
 	return false
 }
 
+func (s *graphState) autoEvidence(id string) string {
+	state := s.nodes[id]
+	if state == nil {
+		return "automatic"
+	}
+	if s.effectiveReviewer(id) == reviewerAuto {
+		return "reviewer_auto"
+	}
+	if state.wait.autoReviewSeen || len(state.wait.activeAutoReview) > 0 {
+		return "auto_review_event"
+	}
+	if state.guardian {
+		return "guardian_source"
+	}
+	for _, candidate := range s.nodes {
+		if candidate.node.ParentID == id && candidate.guardian && candidate.baseRuntime == agentgraph.RuntimeActive && !candidate.node.Lifecycle.Terminal() {
+			return "guardian_source"
+		}
+	}
+	return "automatic"
+}
+
 func (s *graphState) mechanicalWaitCovered(id string) bool {
 	state := s.nodes[id]
 	if state == nil {
@@ -415,7 +446,7 @@ func (s *graphState) mechanicalWaitCovered(id string) bool {
 	return approvalCovered && inputCovered
 }
 
-func (s *graphState) setReviewer(id, value string) bool {
+func (s *graphState) setReviewer(id, value string, now time.Time) bool {
 	state := s.nodes[id]
 	if state == nil {
 		return false
@@ -434,16 +465,16 @@ func (s *graphState) setReviewer(id, value string) bool {
 	for candidateID := range s.nodes {
 		switch s.effectiveReviewer(candidateID) {
 		case reviewerUser:
-			s.classifyPendingRequests(candidateID, requestHuman)
+			s.classifyPendingRequests(candidateID, requestHuman, "reviewer_user", now)
 		case reviewerAuto:
-			s.classifyPendingRequests(candidateID, requestAutomatic)
+			s.classifyPendingRequests(candidateID, requestAutomatic, "reviewer_auto", now)
 		}
 	}
 	s.deriveAll()
 	return true
 }
 
-func (s *graphState) addAutoReview(id, reviewID, targetItemID string, completed bool) bool {
+func (s *graphState) addAutoReview(id, reviewID, targetItemID string, completed bool, now time.Time) bool {
 	state := s.nodes[id]
 	if state == nil {
 		return false
@@ -461,13 +492,18 @@ func (s *graphState) addAutoReview(id, reviewID, targetItemID string, completed 
 	}
 	matched := false
 	for requestID, request := range state.wait.requests {
-		if request.owner != requestPending || request.reason != agentgraph.AttentionApproval {
+		if (request.owner != requestPending && !(request.owner == requestHuman && request.ownerEvidence == "timeout_fallback")) ||
+			request.reason != agentgraph.AttentionApproval {
 			continue
 		}
 		if targetItemID != "" && request.itemID != targetItemID {
 			continue
 		}
 		request.owner = requestAutomatic
+		request.ownerEvidence = "auto_review_event"
+		if !request.redPublishedAt.IsZero() && request.redClearedAt.IsZero() {
+			request.redClearedAt = now
+		}
 		state.wait.requests[requestID] = request
 		matched = true
 	}
@@ -480,24 +516,42 @@ func (s *graphState) addAutoReview(id, reviewID, targetItemID string, completed 
 	return true
 }
 
-func (s *graphState) addRequest(id string, requestID rpcRequestID, reason agentgraph.AttentionState, turnID, itemID string, human bool, ignored bool) bool {
+func (s *graphState) addRequest(
+	id string,
+	requestID rpcRequestID,
+	reason agentgraph.AttentionState,
+	turnID string,
+	itemID string,
+	kind string,
+	episode uint64,
+	startedAt time.Time,
+	explicitOwner requestOwner,
+	explicitEvidence string,
+) bool {
 	state := s.nodes[id]
 	if state == nil || requestID == "" {
 		return false
 	}
 	state.ensureWaitMaps()
-	owner := requestPending
+	owner, evidence := explicitOwner, explicitEvidence
 	switch {
-	case ignored:
-		owner = requestIgnored
-	case human:
-		owner = requestHuman
+	case owner != requestPending:
 	case s.hasAutoEvidence(id):
 		owner = requestAutomatic
+		evidence = s.autoEvidence(id)
 	case s.effectiveReviewer(id) == reviewerUser:
 		owner = requestHuman
+		evidence = "reviewer_user"
 	}
-	state.wait.requests[requestID] = requestEvidence{reason: reason, owner: owner, turnID: turnID, itemID: itemID}
+	request := requestEvidence{
+		reason: reason, owner: owner, ownerEvidence: evidence, kind: kind,
+		turnID: turnID, itemID: itemID, episode: episode, startedAt: startedAt,
+		ambiguousAtStart: owner == requestPending,
+	}
+	if owner == requestHuman {
+		request.redPublishedAt = startedAt
+	}
+	state.wait.requests[requestID] = request
 	if owner == requestPending {
 		state.wait.classifiedUnknown = false
 	}
@@ -505,50 +559,130 @@ func (s *graphState) addRequest(id string, requestID rpcRequestID, reason agentg
 	return true
 }
 
-func (s *graphState) resolveRequest(id string, requestID rpcRequestID) bool {
+func (s *graphState) resolveRequest(id string, requestID rpcRequestID) (requestEvidence, bool) {
 	state := s.nodes[id]
 	if state == nil || requestID == "" {
-		return false
+		return requestEvidence{}, false
 	}
-	if _, ok := state.wait.requests[requestID]; !ok {
-		return false
+	request, ok := state.wait.requests[requestID]
+	if !ok {
+		return requestEvidence{}, false
 	}
 	delete(state.wait.requests, requestID)
 	if state.wait.rawApproval || state.wait.rawUserInput {
 		state.wait.classifiedUnknown = true
 	}
 	s.deriveAll()
-	return true
+	return request, true
 }
 
-func (s *graphState) classifyPendingRequests(id string, owner requestOwner) int {
+func (s *graphState) classifyPendingRequests(id string, owner requestOwner, evidence string, now time.Time) int {
 	state := s.nodes[id]
 	if state == nil {
 		return 0
 	}
 	count := 0
 	for requestID, request := range state.wait.requests {
-		if request.owner != requestPending {
+		if request.owner != requestPending && !(request.owner == requestHuman && request.ownerEvidence == "timeout_fallback") {
 			continue
 		}
 		request.owner = owner
+		request.ownerEvidence = evidence
+		if owner == requestHuman && request.redPublishedAt.IsZero() {
+			request.redPublishedAt = now
+		} else if owner == requestAutomatic && !request.redPublishedAt.IsZero() && request.redClearedAt.IsZero() {
+			request.redClearedAt = now
+		}
 		state.wait.requests[requestID] = request
 		count++
 	}
 	return count
 }
 
-func (s *graphState) expireClassification(id string) bool {
+func (s *graphState) pendingRequests(id string) map[rpcRequestID]requestEvidence {
 	state := s.nodes[id]
 	if state == nil {
-		return false
+		return nil
 	}
-	becameHuman := s.classifyPendingRequests(id, requestHuman) > 0
+	pending := make(map[rpcRequestID]requestEvidence)
+	for requestID, request := range state.wait.requests {
+		if request.owner == requestPending || (request.owner == requestHuman && request.ownerEvidence == "timeout_fallback") {
+			pending[requestID] = request
+		}
+	}
+	return pending
+}
+
+func (s *graphState) request(id string, requestID rpcRequestID) (requestEvidence, bool) {
+	state := s.nodes[id]
+	if state == nil {
+		return requestEvidence{}, false
+	}
+	request, ok := state.wait.requests[requestID]
+	return request, ok
+}
+
+func (s *graphState) classificationKind(id string) string {
+	state := s.nodes[id]
+	if state == nil {
+		return "unknown"
+	}
+	kind := ""
+	for _, request := range state.wait.requests {
+		if request.owner != requestPending {
+			continue
+		}
+		if kind == "" {
+			kind = request.kind
+			continue
+		}
+		if kind != request.kind {
+			return "mixed"
+		}
+	}
+	if kind != "" {
+		return kind
+	}
+	switch {
+	case state.wait.rawApproval && state.wait.rawUserInput:
+		return "raw_mixed_gate"
+	case state.wait.rawApproval:
+		return "raw_approval_gate"
+	case state.wait.rawUserInput:
+		return "raw_user_input_gate"
+	default:
+		return "unknown"
+	}
+}
+
+func (s *graphState) expireClassification(id string, now time.Time, grace time.Duration) []requestEvidence {
+	state := s.nodes[id]
+	if state == nil {
+		return nil
+	}
+	var promoted []requestEvidence
+	remaining := false
+	for requestID, request := range state.wait.requests {
+		if request.owner != requestPending {
+			continue
+		}
+		if elapsedSince(request.startedAt, now) < grace {
+			remaining = true
+			continue
+		}
+		request.owner = requestHuman
+		request.ownerEvidence = "timeout_fallback"
+		request.redPublishedAt = now
+		state.wait.requests[requestID] = request
+		promoted = append(promoted, request)
+	}
 	state.wait.classificationPending = false
 	state.wait.classificationTimer = nil
-	state.wait.classifiedUnknown = !becameHuman
+	state.wait.classificationStarted = time.Time{}
+	state.wait.classificationEpisode = 0
+	state.wait.classifiedUnknown = len(promoted) == 0 && !remaining
 	s.deriveAll()
-	return becameHuman
+	return promoted
 }
 
 func (s *graphState) needsClassification(id string) bool {
@@ -632,6 +766,7 @@ func (state *nodeState) stopClassification() {
 	state.wait.classificationTimer = nil
 	state.wait.classificationPending = false
 	state.wait.classificationStarted = time.Time{}
+	state.wait.classificationEpisode = 0
 }
 
 func (s *graphState) stopClassifications() {

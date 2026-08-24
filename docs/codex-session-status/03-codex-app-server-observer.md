@@ -168,10 +168,12 @@ The adapter preserves inbound JSON-RPC request IDs and correlates them with
 blocking, non-auto-resolving input request becomes `user_input`. Reviewer mode
 `auto_review`/`guardian_subagent`, auto-review events, or an active guardian
 source keeps runtime active with no attention. Ambiguous approval ownership is
-held for at most 500 ms: a request with no auto evidence then becomes human,
-while a flag with no request becomes runtime `unknown`/gray. The delay is before
-publication, not a renderer debounce, so automated reviews create no red graph
-or history transition.
+held for 30 seconds during the instrumented Phase-1 policy: a still-unresolved
+request then uses a timeout-to-human fallback, while a flag with no request
+becomes runtime `unknown`/gray. The delay is before publication, not a renderer
+debounce, so reviews that resolve within the grace create no red graph or
+history transition. Timeout fallback is labeled separately from semantic human
+evidence; see [Codex Auto-review attention ownership](../codex-auto-review-attention.md).
 
 Collaborative-agent status:
 

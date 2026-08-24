@@ -286,7 +286,9 @@ Codex requires non-managed command hooks to be reviewed and trusted; use
 process-lifetime `started_at`, and hook identities retired by `/clear` cannot
 rotate a chip back to an older conversation. The fallback maps
 `UserPromptSubmit` and ordinary `PreToolUse`/`PostToolUse` to active,
-`PermissionRequest` to an approval wait, and `Stop` to idle. A
+an ownership-ambiguous `PermissionRequest` to active during a 30-second grace,
+and `Stop` to idle. Exact progress for the same tool call cancels that grace;
+an unresolved request falls back to approval attention at the deadline. A
 `request_user_input` `PreToolUse` instead opens a user-input wait keyed by its
 opaque `tool_use_id`; only the matching `PostToolUse`, its turn's `Stop`, or a
 new conversation clears that wait. Unrelated tool hooks and generic app-server
@@ -297,10 +299,14 @@ idle edge, while a standalone `/clear` still settles idle.
 immediately after compaction. Only content-free lifecycle metadata is used to
 correlate the wait; its question, answer, and raw tool input stay out of the
 daemon. The root-status hook fallback is partial and root-only. Active evidence
-remains fresh for 10 minutes, approval or user-input waits for 24 hours, and idle edges
-for 7 days. A daemon restart during an already-open hook-only interview cannot
-reconstruct that wait and therefore remains unknown rather than confidently
-green. The two child hooks are required for live child state on the tested
+remains fresh for 10 minutes, confirmed or timeout-fallback approval and
+user-input waits for 24 hours, and idle edges for 7 days. Structured questions
+remain immediately red. See
+[Codex Auto-review attention ownership](docs/codex-auto-review-attention.md) for
+the evidence model and rollout diagnostics. A daemon restart during an
+already-open hook-only interview cannot reconstruct that wait and therefore
+remains unknown rather than confidently green. The two child hooks are required
+for live child state on the tested
 standard-CLI path, but not for discovery or topology. Matched running child
 edges expire after 10 minutes without a later edge; matched completions persist
 within the exact root lifetime and can be reopened by a later start. See the

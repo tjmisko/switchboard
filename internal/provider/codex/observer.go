@@ -24,7 +24,8 @@ const (
 	DefaultReconnectMinimum   = 100 * time.Millisecond
 	DefaultReconnectMaximum   = 5 * time.Second
 	DefaultTerminalLimit      = 32
-	DefaultWaitClassification = 500 * time.Millisecond
+	DefaultWaitClassification = 30 * time.Second
+	legacyWaitClassification  = 500 * time.Millisecond
 
 	DiagnosticUnknownProtocolEnum     = "unknown_protocol_enum"
 	DiagnosticSnapshotThreadRead      = "snapshot_thread_read_error"
@@ -84,12 +85,23 @@ type Config struct {
 }
 
 // WaitClassificationDiagnostic contains finite-label, content-free evidence
-// about one ownership decision. It never contains thread/request IDs, prompts,
-// commands, reasons, or auto-review rationale.
+// about one wait episode. It never contains thread/request IDs, prompts,
+// commands, reasons, tool input, or auto-review rationale. Episode is an
+// observer-local correlation number and has no relationship to a Codex ID.
 type WaitClassificationDiagnostic struct {
-	Source             string
-	Duration           time.Duration
-	SuppressedFalseRed bool
+	Event                       string
+	Episode                     uint64
+	RequestKind                 string
+	Ownership                   string
+	Evidence                    string
+	Source                      string
+	Duration                    time.Duration
+	RedDuration                 time.Duration
+	RedPublished                bool
+	HumanEvidence               bool
+	ClearedWithoutHumanEvidence bool
+	SuppressedFalseRed          bool
+	LegacyWouldPublishRed       bool
 }
 
 type rootRecord struct {
@@ -122,6 +134,7 @@ type Observer struct {
 	queued          []rpcNotification
 	pendingStatuses map[string]rpcStatus
 	pendingWaits    map[string][]rpcNotification
+	waitEpisode     uint64
 	closed          bool
 	lastDiagnostics map[string]time.Time
 
@@ -845,6 +858,7 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 	if !ok {
 		return nil, false, nil
 	}
+	eventAt := o.config.Now()
 	var changed []provider.RootKey
 	var diagnostics []WaitClassificationDiagnostic
 	unknown := false
@@ -865,6 +879,7 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 				continue
 			}
 			if thread.ID == state.rootID || state.nodes[thread.ParentThreadID] != nil || state.nodes[thread.ID] != nil {
+				pending := state.pendingRequests(thread.ParentThreadID)
 				state.upsertThread(thread, thread.ID == state.rootID)
 				if pending, exists := o.pendingStatuses[thread.ID]; exists {
 					state.applyStatus(state.nodes[thread.ID], pending)
@@ -872,6 +887,8 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 				}
 				if isGuardianSource(thread.Source) {
 					classificationSource = "guardian_source"
+					state.classifyPendingRequests(thread.ParentThreadID, requestAutomatic, classificationSource, eventAt)
+					diagnostics = append(diagnostics, classifiedRequestDiagnostics(state, thread.ParentThreadID, pending, classificationSource, eventAt)...)
 				}
 				touches = true
 			}
@@ -927,7 +944,8 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 				touches = true
 			}
 		case "thread/settings/updated":
-			if state.setReviewer(params.ThreadID, params.ThreadSettings.ApprovalsReviewer) {
+			pending := state.pendingRequests(params.ThreadID)
+			if state.setReviewer(params.ThreadID, params.ThreadSettings.ApprovalsReviewer, eventAt) {
 				if state.effectiveReviewer(params.ThreadID) == reviewerAuto {
 					classificationSource = "reviewer_auto"
 				} else if state.effectiveReviewer(params.ThreadID) == reviewerUser {
@@ -936,46 +954,76 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 				} else {
 					classificationSource = "reviewer_unknown"
 				}
+				diagnostics = append(diagnostics, classifiedRequestDiagnostics(state, params.ThreadID, pending, classificationSource, eventAt)...)
 				touches = true
 			}
 		case "item/autoApprovalReview/started", "item/autoApprovalReview/completed":
-			if state.addAutoReview(params.ThreadID, params.ReviewID, params.TargetItemID, notification.Method == "item/autoApprovalReview/completed") {
+			pending := state.pendingRequests(params.ThreadID)
+			if state.addAutoReview(params.ThreadID, params.ReviewID, params.TargetItemID, notification.Method == "item/autoApprovalReview/completed", eventAt) {
 				classificationSource = "auto_review_event"
+				diagnostics = append(diagnostics, classifiedRequestDiagnostics(state, params.ThreadID, pending, classificationSource, eventAt)...)
 				touches = true
 			}
 		case "item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval":
 			requestID, valid := parseRequestID(notification.ID)
-			if valid && state.addRequest(params.ThreadID, requestID, agentgraph.AttentionApproval, params.TurnID, params.ItemID, false, false) {
+			episode := o.nextWaitEpisodeLocked()
+			if valid && state.addRequest(params.ThreadID, requestID, agentgraph.AttentionApproval, params.TurnID, params.ItemID,
+				approvalRequestKind(notification.Method), episode, eventAt, requestPending, "unknown") {
 				classificationSource = "approval_request"
+				if request, exists := state.request(params.ThreadID, requestID); exists {
+					diagnostics = append(diagnostics, requestStartDiagnostics(request, eventAt)...)
+				}
 				forcePublish = state.hasHumanAttention()
 				touches = true
 			}
 		case "applyPatchApproval", "execCommandApproval":
 			requestID, valid := parseRequestID(notification.ID)
-			if valid && state.addRequest(params.ConversationID, requestID, agentgraph.AttentionApproval, "", params.CallID, false, false) {
+			episode := o.nextWaitEpisodeLocked()
+			if valid && state.addRequest(params.ConversationID, requestID, agentgraph.AttentionApproval, "", params.CallID,
+				approvalRequestKind(notification.Method), episode, eventAt, requestPending, "unknown") {
 				classificationSource = "approval_request"
+				if request, exists := state.request(params.ConversationID, requestID); exists {
+					diagnostics = append(diagnostics, requestStartDiagnostics(request, eventAt)...)
+				}
 				forcePublish = state.hasHumanAttention()
 				touches = true
 			}
 		case "item/tool/requestUserInput":
 			requestID, valid := parseRequestID(notification.ID)
 			autoResolving := params.AutoResolution != nil
-			if valid && state.addRequest(params.ThreadID, requestID, agentgraph.AttentionUserInput, params.TurnID, params.ItemID, params.IsBlocking && !autoResolving, !params.IsBlocking || autoResolving) {
+			owner, evidence := requestIgnored, "nonblocking_input"
+			if params.IsBlocking && !autoResolving {
+				owner, evidence = requestHuman, "blocking_user_input"
+			} else if autoResolving {
+				evidence = "auto_resolving_input"
+			}
+			episode := o.nextWaitEpisodeLocked()
+			if valid && state.addRequest(params.ThreadID, requestID, agentgraph.AttentionUserInput, params.TurnID, params.ItemID,
+				"user_input", episode, eventAt, owner, evidence) {
 				classificationSource = "user_input_request"
+				if request, exists := state.request(params.ThreadID, requestID); exists {
+					diagnostics = append(diagnostics, requestStartDiagnostics(request, eventAt)...)
+				}
 				forcePublish = state.hasHumanAttention()
 				touches = true
 			}
 		case "mcpServer/elicitation/request":
 			requestID, valid := parseRequestID(notification.ID)
-			if valid && state.addRequest(params.ThreadID, requestID, agentgraph.AttentionUserInput, params.TurnID, params.ItemID, true, false) {
+			episode := o.nextWaitEpisodeLocked()
+			if valid && state.addRequest(params.ThreadID, requestID, agentgraph.AttentionUserInput, params.TurnID, params.ItemID,
+				"mcp_elicitation", episode, eventAt, requestHuman, "mcp_elicitation") {
 				classificationSource = "user_input_request"
+				if request, exists := state.request(params.ThreadID, requestID); exists {
+					diagnostics = append(diagnostics, requestStartDiagnostics(request, eventAt)...)
+				}
 				forcePublish = true
 				touches = true
 			}
 		case "serverRequest/resolved":
 			requestID, valid := parseRequestID(params.RequestID)
-			if valid && state.resolveRequest(params.ThreadID, requestID) {
+			if request, resolved := state.resolveRequest(params.ThreadID, requestID); valid && resolved {
 				classificationSource = "request_resolved"
+				diagnostics = append(diagnostics, requestDiagnostic("resolved", request, classificationSource, eventAt))
 				touches = true
 			}
 		}
@@ -984,7 +1032,12 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 		}
 		eventMatched = true
 		diagnostics = append(diagnostics, o.reconcileClassificationsLocked(key, record, classificationSource)...)
-		if state.hasPendingClassification() && !forcePublish {
+		// Never let a different ambiguous request hold a previously published red
+		// edge after its owning request resolved or became automatic. Publishing
+		// gray here is preferable to retaining stale human attention; the pending
+		// request will regain its prior/nonattention projection when classified.
+		mustClearStaleAttention := observationHasHumanAttention(record.observation) && !state.hasHumanAttention()
+		if state.hasPendingClassification() && !forcePublish && !mustClearStaleAttention {
 			unknown = unknown || state.unknownEnum
 			continue
 		}
@@ -1031,6 +1084,15 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 		}
 	}
 	return changed, unknown, diagnostics
+}
+
+func observationHasHumanAttention(observation agentgraph.Observation) bool {
+	for _, node := range observation.Nodes {
+		if node.Attention == agentgraph.AttentionApproval || node.Attention == agentgraph.AttentionUserInput {
+			return true
+		}
+	}
+	return false
 }
 
 func pendingWaitThread(method string, params notificationParams) string {
@@ -1089,28 +1151,58 @@ func (o *Observer) reconcileClassificationsLocked(key provider.RootKey, record *
 		needs := state.needsClassification(id)
 		switch {
 		case needs && !node.wait.classificationPending:
-			o.startClassificationLocked(key, record, id, node)
+			diagnostics = append(diagnostics, o.startClassificationLocked(key, record, id, node)...)
 		case !needs && node.wait.classificationPending:
 			started := node.wait.classificationStarted
+			episode := node.wait.classificationEpisode
+			kind := state.classificationKind(id)
 			node.stopClassification()
-			diagnostics = append(diagnostics, classificationDiagnostic(
-				source, elapsedSince(started, o.config.Now()), suppressesFalseRed(source),
-			))
+			// Request-backed waits already emit their own correlated evidence or
+			// resolution event. classificationEpisode is reserved for raw status
+			// gates that have no request ID, avoiding duplicate wait episodes.
+			if episode != 0 {
+				diagnostics = append(diagnostics, classificationDiagnostic(
+					"evidence", episode, kind, source, elapsedSince(started, o.config.Now()), suppressesFalseRed(source),
+				))
+			}
 		}
 	}
 	state.deriveAll()
 	return diagnostics
 }
 
-func (o *Observer) startClassificationLocked(key provider.RootKey, record *rootRecord, threadID string, node *nodeState) {
-	delay := o.config.WaitClassification
-	if delay <= 0 {
-		delay = DefaultWaitClassification
+func (o *Observer) startClassificationLocked(key provider.RootKey, record *rootRecord, threadID string, node *nodeState) []WaitClassificationDiagnostic {
+	grace := o.config.WaitClassification
+	if grace <= 0 {
+		grace = DefaultWaitClassification
+	}
+	now := o.config.Now()
+	delay := grace
+	if state := record.graph.nodes[threadID]; state != nil {
+		for _, request := range state.wait.requests {
+			if request.owner != requestPending {
+				continue
+			}
+			remaining := grace - elapsedSince(request.startedAt, now)
+			if remaining < 0 {
+				remaining = 0
+			}
+			if remaining < delay {
+				delay = remaining
+			}
+		}
 	}
 	node.wait.classificationToken++
 	token := node.wait.classificationToken
 	node.wait.classificationPending = true
-	node.wait.classificationStarted = o.config.Now()
+	node.wait.classificationStarted = now
+	// Structured requests own their episode IDs. Allocate a separate episode
+	// only for a raw mechanical gate for which Codex supplied no request ID.
+	if len(record.graph.pendingRequests(threadID)) == 0 {
+		node.wait.classificationEpisode = o.nextWaitEpisodeLocked()
+	}
+	episode := node.wait.classificationEpisode
+	kind := record.graph.classificationKind(threadID)
 	graph := record.graph
 	generation := record.generation
 	node.wait.classificationTimer = time.AfterFunc(delay, func() {
@@ -1126,10 +1218,11 @@ func (o *Observer) startClassificationLocked(key provider.RootKey, record *rootR
 			return
 		}
 		started := currentNode.wait.classificationStarted
-		becameHuman := graph.expireClassification(threadID)
+		now := o.config.Now()
+		promoted := graph.expireClassification(threadID, now, grace)
+		continued := o.reconcileClassificationsLocked(key, current, "timeout_remaining")
 		publish := !graph.hasPendingClassification() || graph.hasHumanAttention()
 		if publish {
-			now := o.config.Now()
 			observation, err := graph.observation(now, o.config.Freshness)
 			if err == nil {
 				current.observation = observation
@@ -1142,14 +1235,22 @@ func (o *Observer) startClassificationLocked(key provider.RootKey, record *rootR
 		if publish {
 			o.queue.Signal(key)
 		}
-		source := "unknown_timeout"
-		if becameHuman {
-			source = "request_timeout"
+		diagnostics := make([]WaitClassificationDiagnostic, 0, len(promoted)+1)
+		for _, request := range promoted {
+			diagnostics = append(diagnostics, requestDiagnostic("red_published", request, "timeout_fallback", now))
 		}
-		o.emitClassificationDiagnostics([]WaitClassificationDiagnostic{
-			classificationDiagnostic(source, elapsedSince(started, o.config.Now()), false),
-		})
+		diagnostics = append(diagnostics, continued...)
+		if len(promoted) == 0 && episode != 0 {
+			diagnostics = append(diagnostics, classificationDiagnostic(
+				"classified", episode, kind, "unknown_timeout", elapsedSince(started, now), false,
+			))
+		}
+		o.emitClassificationDiagnostics(diagnostics)
 	})
+	if episode == 0 {
+		return nil
+	}
+	return []WaitClassificationDiagnostic{classificationDiagnostic("started", episode, kind, "pending", 0, false)}
 }
 
 func elapsedSince(started, now time.Time) time.Duration {
@@ -1168,8 +1269,115 @@ func suppressesFalseRed(source string) bool {
 	}
 }
 
-func classificationDiagnostic(source string, duration time.Duration, suppressed bool) WaitClassificationDiagnostic {
-	return WaitClassificationDiagnostic{Source: source, Duration: duration, SuppressedFalseRed: suppressed}
+func (o *Observer) nextWaitEpisodeLocked() uint64 {
+	o.waitEpisode++
+	return o.waitEpisode
+}
+
+func approvalRequestKind(method string) string {
+	switch method {
+	case "item/commandExecution/requestApproval":
+		return "command_execution"
+	case "item/fileChange/requestApproval":
+		return "file_change"
+	case "item/permissions/requestApproval":
+		return "permissions"
+	case "applyPatchApproval":
+		return "legacy_patch"
+	case "execCommandApproval":
+		return "legacy_command"
+	default:
+		return "approval"
+	}
+}
+
+func classifiedRequestDiagnostics(state *graphState, threadID string, pending map[rpcRequestID]requestEvidence, source string, now time.Time) []WaitClassificationDiagnostic {
+	var diagnostics []WaitClassificationDiagnostic
+	for requestID, prior := range pending {
+		request, ok := state.request(threadID, requestID)
+		if !ok || request.owner == requestPending {
+			continue
+		}
+		event := "evidence"
+		if request.owner == requestHuman && prior.redPublishedAt.IsZero() {
+			event = "red_published"
+		} else if !prior.redPublishedAt.IsZero() && request.owner == requestAutomatic {
+			event = "red_cleared"
+		}
+		diagnostics = append(diagnostics, requestDiagnostic(event, request, source, now))
+	}
+	return diagnostics
+}
+
+func requestStartDiagnostics(request requestEvidence, now time.Time) []WaitClassificationDiagnostic {
+	diagnostics := []WaitClassificationDiagnostic{requestDiagnostic("started", request, "request_received", now)}
+	switch request.owner {
+	case requestHuman:
+		diagnostics = append(diagnostics, requestDiagnostic("red_published", request, request.ownerEvidence, now))
+	case requestAutomatic, requestIgnored:
+		diagnostics = append(diagnostics, requestDiagnostic("evidence", request, request.ownerEvidence, now))
+	}
+	return diagnostics
+}
+
+func requestDiagnostic(event string, request requestEvidence, source string, now time.Time) WaitClassificationDiagnostic {
+	evidence := request.ownerEvidence
+	if evidence == "" {
+		evidence = "unknown"
+	}
+	redPublished := !request.redPublishedAt.IsZero()
+	humanEvidence := request.owner == requestHuman && evidence != "timeout_fallback"
+	diagnostic := WaitClassificationDiagnostic{
+		Event: event, Episode: request.episode, RequestKind: request.kind,
+		Ownership: requestOwnerLabel(request.owner), Evidence: evidence, Source: source,
+		Duration: elapsedSince(request.startedAt, now), RedPublished: redPublished,
+		HumanEvidence: humanEvidence,
+		ClearedWithoutHumanEvidence: event == "red_cleared" && redPublished && !humanEvidence ||
+			(event == "resolved" && redPublished && request.redClearedAt.IsZero() && !humanEvidence),
+		SuppressedFalseRed:    request.owner == requestAutomatic && !redPublished,
+		LegacyWouldPublishRed: request.ambiguousAtStart && elapsedSince(request.startedAt, now) >= legacyWaitClassification,
+	}
+	if redPublished {
+		redEnd := now
+		if !request.redClearedAt.IsZero() {
+			redEnd = request.redClearedAt
+		}
+		diagnostic.RedDuration = elapsedSince(request.redPublishedAt, redEnd)
+	}
+	return diagnostic
+}
+
+func requestOwnerLabel(owner requestOwner) string {
+	switch owner {
+	case requestHuman:
+		return "human"
+	case requestAutomatic:
+		return "automatic"
+	case requestIgnored:
+		return "ignored"
+	default:
+		return "unknown"
+	}
+}
+
+func classificationDiagnostic(event string, episode uint64, kind, source string, duration time.Duration, suppressed bool) WaitClassificationDiagnostic {
+	ownership := "unknown"
+	humanEvidence := false
+	redPublished := false
+	switch source {
+	case "reviewer_auto", "auto_review_event", "guardian_source":
+		ownership = "automatic"
+	case "reviewer_user":
+		ownership, humanEvidence, redPublished = "human", true, true
+	case "request_timeout", "timeout_fallback":
+		ownership, redPublished = "human", true
+	}
+	return WaitClassificationDiagnostic{
+		Event: event, Episode: episode, RequestKind: kind, Ownership: ownership,
+		Evidence: source, Source: source, Duration: duration, RedPublished: redPublished,
+		HumanEvidence: humanEvidence, SuppressedFalseRed: suppressed,
+		LegacyWouldPublishRed: duration >= legacyWaitClassification,
+	}
 }
 
 func (o *Observer) emitClassificationDiagnostics(diagnostics []WaitClassificationDiagnostic) {

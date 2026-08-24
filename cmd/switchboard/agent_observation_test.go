@@ -218,7 +218,7 @@ func TestCodexLaterLifecycleHookSelfHealsExactBindingAfterSessionStartRace(t *te
 	}
 	sess, _ = sessionForKey(store.Snapshot(), ref.Key())
 	if sess.AgentGraph == nil || sess.AgentGraph.Source != agentgraph.SourceHook ||
-		sess.AgentGraph.Summary.Status != state.StatusPermission {
+		sess.AgentGraph.Summary.Status != state.StatusWorking {
 		t.Fatalf("later Codex hook fallback graph = %#v", sess.AgentGraph)
 	}
 }
@@ -246,7 +246,7 @@ func TestCodexHookFallbackFreshnessIsBoundedByState(t *testing.T) {
 		want  time.Duration
 	}{
 		{name: "active", event: "UserPromptSubmit", want: codexHookActiveFreshness},
-		{name: "approval", event: "PermissionRequest", tool: "Bash", want: codexHookAttentionFreshness},
+		{name: "ambiguous approval", event: "PermissionRequest", tool: "Bash", want: codexHookActiveFreshness},
 		{name: "user input", event: "PermissionRequest", tool: "AskUserQuestion", want: codexHookAttentionFreshness},
 		{name: "idle", event: "Stop", want: codexHookIdleFreshness},
 	}

@@ -236,7 +236,7 @@ func TestBlockedProviderLeavesRPCSubscriptionAndGraphHookResponsive(t *testing.T
 		t.Fatalf("subscription update = %+v", update)
 	}
 	graph := update.Snapshot.Sessions[0].AgentGraph
-	if graph == nil || graph.Source != agentgraph.SourceHook || graph.Summary.Status != state.StatusPermission {
+	if graph == nil || graph.Source != agentgraph.SourceHook || graph.Summary.Status != state.StatusWorking {
 		t.Fatalf("subscription did not publish graph-aware hook fallback: %#v", graph)
 	}
 	select {
