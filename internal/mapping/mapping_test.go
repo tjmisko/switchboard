@@ -11,8 +11,9 @@ import (
 	"github.com/tjmisko/switchboard/internal/wm"
 )
 
-// §3.2 matchUniqueClient — the terminal<->WM join requires BOTH the mux pid and
-// the window title, and returns nil on zero or ambiguous matches.
+// §3.2 matchUniqueClient — without a Switchboard window marker, the legacy
+// terminal<->WM join requires BOTH the mux pid and the window title, and
+// returns nil on zero or ambiguous matches.
 func TestMatchUniqueClient(t *testing.T) {
 	clients := []wm.Window{
 		{Address: "0xA", PID: 10, Title: "A"},
@@ -20,17 +21,17 @@ func TestMatchUniqueClient(t *testing.T) {
 		{Address: "0xC", PID: 20, Title: "A"},
 	}
 
-	if got := matchUniqueClient(clients, 10, "A"); got == nil || got.Address != "0xA" {
+	if got := matchUniqueClient(clients, 10, 0, "A"); got == nil || got.Address != "0xA" {
 		t.Errorf("unique match = %v, want 0xA", got)
 	}
-	if got := matchUniqueClient(clients, 99, "A"); got != nil {
+	if got := matchUniqueClient(clients, 99, 0, "A"); got != nil {
 		t.Errorf("no pid match = %v, want nil", got)
 	}
 	// Both keys required: pid matches but title doesn't, and vice versa.
-	if got := matchUniqueClient(clients, 10, "Z"); got != nil {
+	if got := matchUniqueClient(clients, 10, 0, "Z"); got != nil {
 		t.Errorf("pid-only match = %v, want nil", got)
 	}
-	if got := matchUniqueClient(clients, 30, "A"); got != nil {
+	if got := matchUniqueClient(clients, 30, 0, "A"); got != nil {
 		t.Errorf("title-only match = %v, want nil", got)
 	}
 
@@ -39,8 +40,42 @@ func TestMatchUniqueClient(t *testing.T) {
 		{Address: "0xA", PID: 10, Title: "A"},
 		{Address: "0xB", PID: 10, Title: "A"},
 	}
-	if got := matchUniqueClient(ambiguous, 10, "A"); got != nil {
+	if got := matchUniqueClient(ambiguous, 10, 0, "A"); got != nil {
 		t.Errorf("ambiguous match = %v, want nil", got)
+	}
+}
+
+// The WezTerm formatter changes only the compositor-visible title; `wezterm
+// cli list` continues to report the base title. A fresh daemon must therefore
+// consume the stable marker rather than requiring those two strings to be
+// equal. This is the login-only regression which otherwise leaves every
+// session's Hyprland block nil until an old mapping happens to exist.
+func TestMatchUniqueClientUsesSwitchboardWindowMarker(t *testing.T) {
+	clients := []wm.Window{
+		{Address: "0xA", PID: 10, Title: "same title [sbw:10:3]"},
+		{Address: "0xB", PID: 10, Title: "same title [sbw:10:4]"},
+		{Address: "0xC", PID: 99, Title: "same title [sbw:10:4]"},
+	}
+
+	got := matchUniqueClient(clients, 10, 4, "same title")
+	if got == nil || got.Address != "0xB" {
+		t.Fatalf("marked match = %v, want 0xB", got)
+	}
+
+	// The exact marker, not mutable presentation text, owns the join.
+	got = matchUniqueClient(clients, 10, 3, "a spinner or title sampled later")
+	if got == nil || got.Address != "0xA" {
+		t.Fatalf("marked match with changed base title = %v, want 0xA", got)
+	}
+}
+
+func TestMatchUniqueClientFailsClosedOnDuplicateWindowMarker(t *testing.T) {
+	clients := []wm.Window{
+		{Address: "0xA", PID: 10, Title: "one [sbw:10:4]"},
+		{Address: "0xB", PID: 10, Title: "two [sbw:10:4]"},
+	}
+	if got := matchUniqueClient(clients, 10, 4, "one"); got != nil {
+		t.Fatalf("duplicate marked match = %v, want nil", got)
 	}
 }
 
@@ -49,7 +84,7 @@ func TestMatchUniqueClientNormalizesActivitySpinners(t *testing.T) {
 	for _, terminalSpinner := range spinners {
 		for _, wmSpinner := range spinners {
 			clients := []wm.Window{{Address: "win", PID: 10, Title: string(wmSpinner) + " Build Polybar"}}
-			got := matchUniqueClient(clients, 10, string(terminalSpinner)+" Build Polybar")
+			got := matchUniqueClient(clients, 10, 0, string(terminalSpinner)+" Build Polybar")
 			if got == nil || got.Address != "win" {
 				t.Fatalf("terminal spinner %q, WM spinner %q did not match", terminalSpinner, wmSpinner)
 			}
@@ -57,7 +92,7 @@ func TestMatchUniqueClientNormalizesActivitySpinners(t *testing.T) {
 	}
 
 	clients := []wm.Window{{Address: "win", PID: 10, Title: "◐ Build Polybar"}}
-	if got := matchUniqueClient(clients, 10, "◑ Different task"); got != nil {
+	if got := matchUniqueClient(clients, 10, 0, "◑ Different task"); got != nil {
 		t.Fatalf("normalization matched genuinely different titles: %+v", got)
 	}
 }
@@ -193,6 +228,17 @@ func TestReconcileFromMatchesReconcile(t *testing.T) {
 			clients: []wm.Window{
 				{Address: "0xAAA", PID: 4242, Title: "switchboard", Workspace: "3", WorkspaceID: 3},
 				{Address: "0xBBB", PID: 9999, Title: "switchboard", Workspace: "1", WorkspaceID: 1},
+			},
+		},
+		{
+			name: "should fill a fresh hyprland mapping from the formatted window marker",
+			seed: func() state.Session {
+				return state.Session{PID: 107, TTY: "/dev/pts/5", CWD: "/home/u", StartedAt: started}
+			},
+			panes: map[string]terminal.PaneRef{"/dev/pts/5": weztermPane},
+			clients: []wm.Window{
+				{Address: "0xAAA", PID: 4242, Title: "switchboard [sbw:4242:1]", Workspace: "3", WorkspaceID: 3},
+				{Address: "0xBBB", PID: 4242, Title: "switchboard [sbw:4242:2]", Workspace: "4", WorkspaceID: 4},
 			},
 		},
 		{

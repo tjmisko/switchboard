@@ -3,10 +3,10 @@
 // (pane/window IDs), and the window manager (address, workspace).
 //
 // The match keys are:
-//   - claude.tty == terminal pane tty   (kernel-controlled, bulletproof)
-//   - pane.mux == wm.client.pid AND pane.window_title == wm.client.title
-//     (titles agree by construction because the terminal pushes its title to
-//     the WM)
+//   - claude.tty == terminal pane tty (kernel-controlled, bulletproof)
+//   - pane mux/window IDs == the stable marker on the matching WM client; or,
+//     without the optional marker integration, pane.mux == wm.client.pid AND
+//     pane.window_title == wm.client.title
 package mapping
 
 import (
@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/tjmisko/switchboard/internal/osproc"
+	"github.com/tjmisko/switchboard/internal/panebind"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/terminal"
 	"github.com/tjmisko/switchboard/internal/wm"
@@ -65,7 +66,7 @@ func (r *Resolver) Resolve(ctx context.Context, info osproc.Info) state.Session 
 	// (e.g. tmux, whose pane pid is the in-pane process) leave Mux 0 and the
 	// session stays Observe-only on the WM axis.
 	if pane.Mux != 0 {
-		if win := r.findWindow(resolveCtx, pane.Mux, pane.WindowTitle); win != nil {
+		if win := r.findWindow(resolveCtx, pane.Mux, pane.WindowID, pane.WindowTitle); win != nil {
 			sess.Hyprland = &state.HyprlandInfo{
 				Address:     win.Address,
 				Workspace:   win.Workspace,
@@ -95,7 +96,7 @@ func (r *Resolver) Reconcile(ctx context.Context, sess *state.Session) {
 	}
 
 	if pane.Mux != 0 {
-		if win := r.findWindow(resolveCtx, pane.Mux, pane.WindowTitle); win != nil {
+		if win := r.findWindow(resolveCtx, pane.Mux, pane.WindowID, pane.WindowTitle); win != nil {
 			if sess.Hyprland == nil {
 				sess.Hyprland = &state.HyprlandInfo{}
 			}
@@ -190,7 +191,7 @@ func (*Resolver) ReconcileFrom(sess *state.Session, panes map[string]terminal.Pa
 	// (e.g. tmux, whose pane pid is the in-pane process) leave Mux 0 and the
 	// session stays Observe-only on the WM axis.
 	if pane.Mux != 0 {
-		if win := matchUniqueClient(clients, pane.Mux, pane.WindowTitle); win != nil {
+		if win := matchUniqueClient(clients, pane.Mux, pane.WindowID, pane.WindowTitle); win != nil {
 			if sess.Hyprland == nil {
 				sess.Hyprland = &state.HyprlandInfo{}
 			}
@@ -217,36 +218,58 @@ func weztermInfo(pane *terminal.PaneRef, now time.Time) *state.WeztermInfo {
 	}
 }
 
-func (r *Resolver) findWindow(ctx context.Context, muxPID int, windowTitle string) *wm.Window {
+func (r *Resolver) findWindow(ctx context.Context, muxPID, windowID int, windowTitle string) *wm.Window {
 	clients, err := r.wm.Clients(ctx)
 	if err != nil {
 		return nil
 	}
-	return matchUniqueClient(clients, muxPID, windowTitle)
+	return matchUniqueClient(clients, muxPID, windowID, windowTitle)
 }
 
-// matchUniqueClient returns the single window matching BOTH the mux pid and the
-// window title, or nil if zero or more than one match. An ambiguous match
-// returns nil rather than guessing — the next reconcile tick retries (the
-// "retry next tick" contract, decisions.md #4). Pure, so the join logic is
-// testable without a live WM.
-func matchUniqueClient(clients []wm.Window, muxPID int, windowTitle string) *wm.Window {
+// matchUniqueClient returns the one OS window owned by the terminal pane.
+//
+// The Switchboard WezTerm integration appends [sbw:<gui-pid>:<window-id>] to
+// the compositor-visible title. `wezterm cli list`, however, reports the base
+// window_title without that formatter suffix. Prefer the marker: it is a stable
+// exact join even when two windows share the same user-facing title. Fall back
+// to the legacy mux-pid + title join for terminals which have not installed the
+// integration. Either path fails closed on ambiguity and retries next tick
+// rather than guessing (decisions.md #4).
+func matchUniqueClient(clients []wm.Window, muxPID, windowID int, windowTitle string) *wm.Window {
+	marker := panebind.WindowMarker(panebind.LocalPaneRef{GUIPID: muxPID, WindowID: windowID})
+	marked := uniqueClient(clients, func(c wm.Window) bool {
+		return c.PID == muxPID && strings.HasSuffix(strings.TrimSpace(c.Title), marker)
+	})
+	if marked.count > 0 {
+		return marked.one // nil when a duplicate marker makes the exact join ambiguous
+	}
+
 	wantTitle := normalizeTitle(windowTitle)
-	var matches []*wm.Window
+	legacy := uniqueClient(clients, func(c wm.Window) bool {
+		return c.PID == muxPID && normalizeTitle(c.Title) == wantTitle
+	})
+	return legacy.one
+}
+
+type clientMatch struct {
+	one   *wm.Window
+	count int
+}
+
+func uniqueClient(clients []wm.Window, matches func(wm.Window) bool) clientMatch {
+	var result clientMatch
 	for i := range clients {
-		c := &clients[i]
-		if c.PID != muxPID {
+		if !matches(clients[i]) {
 			continue
 		}
-		if normalizeTitle(c.Title) != wantTitle {
-			continue
+		result.count++
+		if result.count == 1 {
+			result.one = &clients[i]
+		} else {
+			result.one = nil
 		}
-		matches = append(matches, c)
 	}
-	if len(matches) == 1 {
-		return matches[0]
-	}
-	return nil // zero or ambiguous — let the next reconcile try again
+	return result
 }
 
 // spinnerPrefixes contains the leading activity glyphs coding agents place in
