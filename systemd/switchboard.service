@@ -7,6 +7,12 @@ After=graphical-session.target
 
 [Service]
 Type=simple
+# Machine-local drop-ins may override these values without replacing ExecStart.
+# Keeping backend discovery in this shared unit means a local binary path or a
+# remote-host list cannot accidentally pin one machine to another machine's WM
+# startup logic. See docs/machine-configuration.md.
+Environment=SWITCHBOARD_BIN=%h/go/bin/switchboard
+Environment=SWITCHBOARD_ARGS=
 # Bind the WM backend even when the user manager never inherited the graphical
 # session env (login race, OOM restart, or a bare `systemctl --user restart`).
 # Hyprland is discovered from its live lock file; i3 is discovered from its live
@@ -14,7 +20,7 @@ Type=simple
 # Without this, detection reports wm=none and the daemon silently drops to the
 # Observe tier — chips render but focus is a no-op.
 # `exec` hands the PID to the daemon so Type=simple/Restart tracking stays exact.
-ExecStart=/bin/sh -c 'if [ -z "$$HYPRLAND_INSTANCE_SIGNATURE" ]; then for d in "$$XDG_RUNTIME_DIR"/hypr/*/; do [ -r "$$d/hyprland.lock" ] || continue; read -r p _ < "$$d/hyprland.lock"; [ -e "/proc/$$p" ] || continue; s=$${d%%/}; HYPRLAND_INSTANCE_SIGNATURE=$${s##*/}; export HYPRLAND_INSTANCE_SIGNATURE; break; done; fi; if [ -z "$$SWAYSOCK" ] && [ -z "$$I3SOCK" ]; then for s in "$$XDG_RUNTIME_DIR"/i3/ipc-socket.*; do [ -S "$$s" ] || continue; p=$${s##*.}; [ -e "/proc/$$p" ] || continue; I3SOCK=$$s; export I3SOCK; break; done; fi; if [ -n "$$I3SOCK" ] && [ -z "$$DISPLAY" ]; then DISPLAY=:0; export DISPLAY; fi; exec %h/go/bin/switchboard'
+ExecStart=/bin/sh -c 'if [ -z "$$HYPRLAND_INSTANCE_SIGNATURE" ]; then for d in "$$XDG_RUNTIME_DIR"/hypr/*/; do [ -r "$$d/hyprland.lock" ] || continue; read -r p _ < "$$d/hyprland.lock"; [ -e "/proc/$$p" ] || continue; s=$${d%%/}; HYPRLAND_INSTANCE_SIGNATURE=$${s##*/}; export HYPRLAND_INSTANCE_SIGNATURE; break; done; fi; if [ -z "$$SWAYSOCK" ] && [ -z "$$I3SOCK" ]; then for s in "$$XDG_RUNTIME_DIR"/i3/ipc-socket.*; do [ -S "$$s" ] || continue; p=$${s##*.}; [ -e "/proc/$$p" ] || continue; I3SOCK=$$s; export I3SOCK; break; done; fi; if [ -n "$$I3SOCK" ] && [ -z "$$DISPLAY" ]; then DISPLAY=:0; export DISPLAY; fi; exec "$$0" "$$@"' ${SWITCHBOARD_BIN} $SWITCHBOARD_ARGS
 Restart=always
 RestartSec=2
 # Fast path: the compositor/WM may import these into the user-manager

@@ -1,0 +1,19 @@
+[Unit]
+Description=Switchboard — Waybar bottom renderer
+PartOf=graphical-session.target
+After=switchboard.service
+Wants=switchboard.service
+ConditionPathExists=%h/.config/waybar/claude.jsonc
+
+[Service]
+Type=simple
+# Override SWITCHBOARD_CTL in a machine-local drop-in when this host runs a
+# development build. Do not replace ExecStart just to change the binary path.
+Environment=SWITCHBOARD_CTL=%h/go/bin/switchboard-ctl
+ExecStart=/bin/sh -c 'exec "$$0" bottombar watch' ${SWITCHBOARD_CTL}
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+
+[Install]
+WantedBy=graphical-session.target

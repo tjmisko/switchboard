@@ -10,6 +10,11 @@ it or watch it for modifications.
 The eww and i3blocks snippets below consume the contract directly with `jq` and
 remain reference recipes.
 
+Renderer activation is machine-local. If the same configuration repository is
+used on more than one computer, follow the
+[machine-specific configuration](../machine-configuration.md) rules and opt in
+to exactly one renderer unit per graphical host.
+
 The one-line summary most bars want — `<count> <worst-status>`:
 
 ```bash
@@ -42,14 +47,19 @@ cp polybar/switchboard.ini ~/.config/polybar/switchboard.ini
 polybar -c ~/.config/polybar/switchboard.ini switchboard
 ```
 
-For i3 startup—and to give the daemon the graphical environment required for
-navigation—add:
+For a direct i3 launch—and to give the daemon the graphical environment
+required for navigation—add:
 
 ```i3
 exec_always --no-startup-id systemctl --user import-environment DISPLAY XAUTHORITY I3SOCK
 exec_always --no-startup-id systemctl --user restart switchboard.service
 exec --no-startup-id polybar -c ~/.config/polybar/switchboard.ini switchboard
 ```
+
+For a systemd-owned renderer with visible status and restart behavior, use
+`systemd/switchboard-polybar.service` instead of the last line. The
+machine-configuration guide shows the corresponding host activation; do not
+use both owners at once.
 
 To embed the module in an existing Polybar instead, copy the
 `[module/switchboard]` section from

@@ -220,6 +220,11 @@ systemctl --user daemon-reload
 systemctl --user enable --now switchboard.service
 ```
 
+The daemon and desktop renderer are deliberately separate. Select Waybar or
+Polybar per host; installing or pulling one integration never activates it on
+another machine. See [machine-specific configuration](docs/machine-configuration.md)
+for the renderer units, host-local drop-ins, and shared-dotfiles rules.
+
 Force a backend (e.g. to test degradation) with the daemon flags
 `-wm auto|hyprland|sway|i3|x11|none` and `-terminal auto|wezterm|tmux|none`.
 The Codex observer separately accepts `-codex-observer auto|off` (default
@@ -259,10 +264,12 @@ See its adjacent README for the small `setup` and sole `format-window-title`
 composition. Until its OSC binding is present and unique, a remote row remains
 visible but is marked observe-only and navigation controls skip it.
 
-For the checked-in systemd unit, append repeatable `-remote <destination>`
-arguments to the final `exec %h/go/bin/switchboard` command, then reload and
-restart the user unit. Remote tmux attachment and duplicate-hostname topologies
-are intentionally outside this first implementation.
+For the checked-in systemd unit, set repeatable `-remote <destination>`
+arguments through the host-local `SWITCHBOARD_ARGS` drop-in described in
+[machine-specific configuration](docs/machine-configuration.md), then reload
+and restart the user unit. Do not replace the shared `ExecStart` just to add a
+remote. Remote tmux attachment and duplicate-hostname topologies are
+intentionally outside this first implementation.
 
 ## Claude Code hooks (optional status enrichment)
 

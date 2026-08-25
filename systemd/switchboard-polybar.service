@@ -1,0 +1,19 @@
+[Unit]
+Description=Switchboard — Polybar renderer
+PartOf=graphical-session.target
+After=switchboard.service
+Wants=switchboard.service
+ConditionPathExists=%h/.config/polybar/switchboard.ini
+
+[Service]
+Type=simple
+# Both values are data-only override seams for machine-local drop-ins.
+Environment=SWITCHBOARD_POLYBAR_BIN=/usr/bin/polybar
+Environment=SWITCHBOARD_POLYBAR_CONFIG=%h/.config/polybar/switchboard.ini
+ExecStart=/bin/sh -c 'exec "$$0" -c "$$1" switchboard' ${SWITCHBOARD_POLYBAR_BIN} ${SWITCHBOARD_POLYBAR_CONFIG}
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+
+[Install]
+WantedBy=graphical-session.target
