@@ -2,11 +2,84 @@ package main
 
 import (
 	"bytes"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/tjmisko/switchboard/internal/state"
 )
+
+func TestShippedConfigExecExpandsHomeAndPalette(t *testing.T) {
+	config, err := os.ReadFile("../../polybar/switchboard.ini")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	text := string(config)
+	for _, setting := range []string{
+		"env-SWITCHBOARD_WORKING_COLOR = ${colors.working}",
+		"env-SWITCHBOARD_IDLE_COLOR = ${colors.idle}",
+		"env-SWITCHBOARD_PERMISSION_COLOR = ${colors.permission}",
+		"env-SWITCHBOARD_UNKNOWN_COLOR = ${colors.disabled}",
+	} {
+		if !strings.Contains(text, setting) {
+			t.Errorf("shipped config is missing %q", setting)
+		}
+	}
+
+	var execLine string
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(line, "exec = ") {
+			execLine = strings.TrimPrefix(line, "exec = ")
+			break
+		}
+	}
+	if execLine == "" {
+		t.Fatal("shipped config has no exec command")
+	}
+	if strings.Contains(execLine, "${env:") || strings.Contains(execLine, "${colors.") {
+		t.Fatalf("exec embeds a Polybar reference that cannot be dereferenced: %q", execLine)
+	}
+
+	home := t.TempDir()
+	binDir := filepath.Join(home, "go", "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	renderer := filepath.Join(binDir, "switchboard-polybar")
+	if err := os.WriteFile(renderer, []byte("#!/bin/sh\nprintf '%s\\n' \"$0\" \"$@\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command("/bin/sh", "-c", execLine)
+	cmd.Env = []string{
+		"HOME=" + home,
+		"SWITCHBOARD_WORKING_COLOR=#8ABEB7",
+		"SWITCHBOARD_IDLE_COLOR=#F0C674",
+		"SWITCHBOARD_PERMISSION_COLOR=#A54242",
+		"SWITCHBOARD_UNKNOWN_COLOR=#707880",
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("shipped exec command failed: %v", err)
+	}
+	got := strings.Split(strings.TrimSpace(string(out)), "\n")
+	want := []string{
+		renderer,
+		"--ctl", filepath.Join(binDir, "switchboard-ctl"),
+		"--max-sessions", "10",
+		"--working-color", "#8ABEB7",
+		"--idle-color", "#F0C674",
+		"--permission-color", "#A54242",
+		"--unknown-color", "#707880",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("shipped exec argv = %#v, want %#v", got, want)
+	}
+}
 
 var testOptions = renderOptions{
 	maxSessions: 10,
