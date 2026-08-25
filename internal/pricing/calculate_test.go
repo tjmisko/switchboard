@@ -197,6 +197,40 @@ func TestMergeEstimatesMissingProvenanceIsNotMixed(t *testing.T) {
 	}
 }
 
+func TestMergeEstimatesNonAPIAmtKnownPlusUnknownIsPartial(t *testing.T) {
+	credits := CreditsFromMicros(2_000_000)
+	billed := USDFromMicros(3_000_000)
+	tests := []struct {
+		name  string
+		known Estimate
+		check func(Estimate) bool
+	}{
+		{
+			name:  "plan credits",
+			known: Estimate{PlanCredits: &credits, Status: CostEstimated, Coverage: 1},
+			check: func(got Estimate) bool {
+				return got.PlanCredits != nil && got.PlanCredits.Micros() == credits.Micros()
+			},
+		},
+		{
+			name:  "estimated billed USD",
+			known: Estimate{EstimatedBilledUSD: &billed, Status: CostEstimated, Coverage: 1},
+			check: func(got Estimate) bool {
+				return got.EstimatedBilledUSD != nil && got.EstimatedBilledUSD.Micros() == billed.Micros()
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			unknown := Estimate{Status: CostUnknown, UnpricedEvents: 1, UnpricedTokens: 100}
+			got := MergeEstimates(test.known, unknown)
+			if !test.check(got) || got.Status != CostPartial {
+				t.Fatalf("non-API amount merge = %+v", got)
+			}
+		})
+	}
+}
+
 func TestMergeEstimatesRetainsEveryOfficialSourceURL(t *testing.T) {
 	anthropic := Estimate{PricingProvider: ProviderAnthropic, PricingSource: AnthropicPricingURL, PricingSources: []string{AnthropicPricingURL}, PricingVersion: "a", PricingVersions: []string{"a"}}
 	openai := Estimate{PricingProvider: ProviderOpenAI, PricingSource: OpenAIPricingURL, PricingSources: []string{OpenAIPricingURL}, PricingVersion: "b", PricingVersions: []string{"b"}}

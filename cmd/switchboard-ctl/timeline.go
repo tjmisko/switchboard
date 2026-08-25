@@ -153,6 +153,9 @@ func cmdTimeline(args []string) {
 		fmt.Fprintf(os.Stdout, "\nplan window (last %gh)\n", planWin.Hours)
 		renderCostLine(os.Stdout, "cost (API-equivalent)", planWin.Cost)
 		fmt.Fprintf(os.Stdout, "  %-12s %s\n", "tokens", humanCount(planWin.TokIn+planWin.TokOut+planWin.TokCacheRead+planWin.TokCacheCreate))
+		if planWin.VendorUsageOmittedReason != "" {
+			fmt.Fprintf(os.Stdout, "  %-26s %s\n", "vendor snapshot omitted", planWin.VendorUsageOmittedReason)
+		}
 	}
 }
 
@@ -710,6 +713,9 @@ func renderSwimlanes(w *os.File, label string, lanes []history.Swimlane, s histo
 	if totals.Cost != nil {
 		renderCostLine(w, "cost (API-equivalent)", totals.Cost)
 	}
+	if totals.VendorUsage != nil {
+		renderVendorUsageLine(w, totals.VendorUsage)
+	}
 	renderSuspect(w, lanes, s, suspect)
 }
 
@@ -726,6 +732,24 @@ func renderCostLine(w io.Writer, label string, cost *history.CostEstimate) {
 		fmt.Fprintf(w, "; %d event%s unpriced", cost.UnpricedEvents, plural(int(cost.UnpricedEvents)))
 	}
 	_, _ = fmt.Fprintln(w)
+}
+
+func renderVendorUsageLine(w io.Writer, aggregate *history.VendorUsageAggregate) {
+	if aggregate == nil {
+		return
+	}
+	fmt.Fprintf(w, "  %-26s ", "vendor snapshot (cumulative)")
+	parts := make([]string, 0, 2)
+	if aggregate.Cost.VendorEstimatedUSD != nil {
+		parts = append(parts, fmt.Sprintf("$%.2f vendor estimate", aggregate.Cost.VendorEstimatedUSD.Float64()))
+	}
+	if aggregate.Cost.PlanCredits != nil {
+		parts = append(parts, fmt.Sprintf("%.6g credits", aggregate.Cost.PlanCredits.Float64()))
+	}
+	if len(parts) == 0 {
+		parts = append(parts, "amount unavailable")
+	}
+	fmt.Fprintf(w, "%s (%s; %s)\n", strings.Join(parts, " · "), aggregate.Cost.Status, aggregate.Scope)
 }
 
 // renderSuspect prints the post-check's findings under the summary: what was left

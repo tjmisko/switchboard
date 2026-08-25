@@ -392,7 +392,8 @@ func MergeEstimates(estimates ...Estimate) Estimate {
 		for _, reason := range estimate.UnpricedReasons {
 			out.UnpricedReasons = appendUnique(out.UnpricedReasons, reason)
 		}
-		anyCompleteAmount = anyCompleteAmount || estimate.APIEquivalentUSD != nil || estimate.VendorEstimatedUSD != nil
+		anyCompleteAmount = anyCompleteAmount || estimate.APIEquivalentUSD != nil || estimate.VendorEstimatedUSD != nil ||
+			estimate.PlanCredits != nil || estimate.EstimatedBilledUSD != nil
 		switch estimate.Status {
 		case CostIncluded:
 		case CostStale:

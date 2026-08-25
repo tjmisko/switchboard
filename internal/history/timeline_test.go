@@ -868,6 +868,93 @@ func TestCreditsOnlyVendorEstimateIsNotWhollyUnknown(t *testing.T) {
 	}
 }
 
+func TestVendorCumulativeSnapshotsUseLatestScopeAndStaySeparateFromRawCost(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	usd1, usd2, usd3 := pricing.USDFromMicros(1_000_000), pricing.USDFromMicros(2_000_000), pricing.USDFromMicros(3_000_000)
+	vendor := func(sec int, id string, revision int64, amount *pricing.USD) Event {
+		credits := pricing.CreditsFromMicros(int64(sec) * 1_000_000)
+		return Event{
+			Ts: ts(sec), Type: EventVendorUsageSnapshot, PID: 1, SessionID: "root", ThreadID: "thread-1",
+			Agent: "codex", ExecutionProvider: pricing.ProviderOpenAI, BillingRoute: "chatgpt_subscription",
+			UsageEventID: id, UsageRevision: revision, UsageSourceID: "codex_app_server",
+			VendorUsage: &VendorUsageSnapshot{
+				ThreadID: "thread-1", EstimatedUsageCredits: credits,
+				EstimatedUsageUSD: amount, ObservedAt: ts(sec),
+			},
+		}
+	}
+	raw := Event{
+		Ts: ts(6), Type: EventUsageSample, PID: 1, SessionID: "root", Agent: "codex",
+		ExecutionProvider: pricing.ProviderOpenAI, BillingRoute: "api", Model: "gpt-5.6-sol",
+		Usage: &UsageDelta{InputTokens: 100_000},
+	}
+	events := []Event{
+		{Ts: ts(0), Type: EventSessionStart, PID: 1, SessionID: "root", Agent: "codex"},
+		vendor(5, "vendor-snapshot-1", 1, &usd1),
+		raw,
+		// Higher revision wins even with an older provider timestamp.
+		vendor(4, "vendor-snapshot-1", 2, &usd2),
+		// A delayed lower-revision retry cannot replace that winner even though it
+		// is later in the log and carries a newer provider timestamp.
+		vendor(11, "vendor-snapshot-1", 1, &usd1),
+		// A later poll has a new logical ID but the same cumulative thread scope;
+		// it replaces rather than adds to the prior $2 snapshot.
+		vendor(12, "vendor-snapshot-2", 1, &usd3),
+		{Ts: ts(20), Type: EventSessionEnd, PID: 1, SessionID: "root"},
+	}
+	revisionOnly := foldVendorUsage(latestVendorSnapshotEvents(events[:5]))
+	if revisionOnly == nil || revisionOnly.Cost.VendorEstimatedUSD == nil ||
+		revisionOnly.Cost.VendorEstimatedUSD.Micros() != usd2.Micros() || len(revisionOnly.Snapshots) != 1 {
+		t.Fatalf("out-of-order vendor revision = %+v", revisionOnly)
+	}
+
+	lanes := BuildSwimlanesWithCatalogs(events, ts(30), pricing.BootstrapCatalogs(), now)
+	if len(lanes) != 1 || lanes[0].VendorUsage == nil {
+		t.Fatalf("lane vendor usage missing: %+v", lanes)
+	}
+	lane := lanes[0]
+	if lane.TokIn != 100_000 || lane.Cost == nil || lane.Cost.APIEquivalentUSD == nil || lane.Cost.VendorEstimatedUSD != nil {
+		t.Fatalf("raw API cost was conflated with vendor snapshot: usage=%d cost=%+v", lane.TokIn, lane.Cost)
+	}
+	if got := lane.VendorUsage; got.Scope != vendorUsageScopeLatestThread || len(got.Snapshots) != 1 ||
+		got.Snapshots[0].ThreadID != "thread-1" || got.Cost.VendorEstimatedUSD == nil ||
+		got.Cost.VendorEstimatedUSD.Micros() != usd3.Micros() || got.Cost.APIEquivalentUSD != nil ||
+		got.Cost.PlanCredits == nil || got.Cost.PlanCredits.Micros() != 12_000_000 {
+		t.Fatalf("lane latest vendor snapshot = %+v", got)
+	}
+
+	totals := AggregateTotalsWithCatalogs(events, pricing.BootstrapCatalogs(), now)
+	if totals.VendorUsage == nil || len(totals.VendorUsage.Snapshots) != 1 ||
+		totals.VendorUsage.Cost.VendorEstimatedUSD == nil || totals.VendorUsage.Cost.VendorEstimatedUSD.Micros() != usd3.Micros() {
+		t.Fatalf("totals vendor snapshot = %+v", totals.VendorUsage)
+	}
+	if totals.Cost == nil || totals.Cost.VendorEstimatedUSD != nil || totals.TokIn != 100_000 {
+		t.Fatalf("bounded totals cost included cumulative vendor snapshot: %+v", totals)
+	}
+
+	plan := AggregatePlanWindowWithCatalogs(events, ts(0), ts(30), pricing.BootstrapCatalogs(), now)
+	if plan.VendorUsageOmittedReason == "" || plan.Cost == nil || plan.Cost.VendorEstimatedUSD != nil {
+		t.Fatalf("plan window did not explicitly omit cumulative snapshot: %+v", plan)
+	}
+}
+
+func TestVendorSnapshotNullableUSDAndStaleStatusSurviveFold(t *testing.T) {
+	zeroCredits := pricing.CreditsFromMicros(0)
+	event := Event{
+		Ts: ts(5), Type: EventVendorUsageSnapshot, SessionID: "root", ThreadID: "thread-1",
+		ExecutionProvider: pricing.ProviderOpenAI, UsageEventID: "snapshot", UsageRevision: 1,
+		VendorUsage: &VendorUsageSnapshot{
+			ThreadID: "thread-1", EstimatedUsageCredits: zeroCredits,
+			EstimatedUsageUSD: nil, ObservedAt: ts(5), Stale: true,
+		},
+	}
+	folded := foldVendorUsage(latestVendorSnapshotEvents([]Event{event}))
+	if folded == nil || folded.Cost.VendorEstimatedUSD != nil || folded.Cost.PlanCredits == nil ||
+		folded.Cost.PlanCredits.Micros() != 0 || folded.Cost.Status != pricing.CostStale {
+		t.Fatalf("stale nullable vendor snapshot = %+v", folded)
+	}
+}
+
 // --- A4 plan window ------------------------------------------------------
 
 func TestAggregatePlanWindow(t *testing.T) {
