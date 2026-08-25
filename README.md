@@ -75,8 +75,8 @@ terminal targets or Switchboard sessions; they appear as indented, non-focusable
 rows in the TUI and as bounded detail in Waybar tooltips.
 
 Prefer your own UI? Read `~/.cache/switchboard/state.json` directly — see the
-[schema](docs/state-schema.md) and [bar recipes](docs/bars/README.md) for
-polybar / eww / i3blocks. Every chip's tooltip also shows how long the session
+[schema](docs/state-schema.md) and [bar integrations](docs/bars/README.md) for
+Polybar / Waybar / eww / i3blocks. Every Waybar chip's tooltip also shows how long the session
 has held its current status (`idle · 3m`, `permission · 45s`), from the
 additive `status_since` field.
 
@@ -165,6 +165,7 @@ cmd/
   switchboard/        daemon — fans the signal sources into one store
   switchboard-ctl/    CLI — list / focus / cycle / pick / hook / bottombar
   claude-tui/         reference TUI renderer (subscribe → live list)
+  switchboard-polybar/ Polybar stream renderer — all sessions, inline actions
   switchboard-waybar/ waybar exec module — one process per slot (Hyprland extra)
 
 internal/
@@ -362,11 +363,11 @@ conformance contract; Hyprland + sway/i3 + X11/EWMH WM backends; wezterm + tmux
 terminal backends with per-session locator chaining; capability reporting;
 `claude-tui` reference renderer; provider-neutral root/child agent graphs;
 Codex app-server observation with bounded degradation; Claude compatibility
-projection; canonical agent history/timeline output; the Hyprland + waybar
-two-bar appliance (appendix).
+projection; canonical agent history/timeline output; a provider-neutral i3 +
+Polybar bottom bar; the Hyprland + Waybar two-bar appliance (appendix).
 
-Next: macOS OS backend (`libproc` + `kqueue`); verified polybar/eww recipes;
-the tmux→WM-window focus bridge.
+Next: macOS OS backend (`libproc` + `kqueue`); verified eww recipes; the
+tmux→WM-window focus bridge.
 
 ---
 

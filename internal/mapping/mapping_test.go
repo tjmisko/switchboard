@@ -44,6 +44,24 @@ func TestMatchUniqueClient(t *testing.T) {
 	}
 }
 
+func TestMatchUniqueClientNormalizesActivitySpinners(t *testing.T) {
+	const spinners = "◐◑◒◓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✳⠂⠐⠁⠈⠠⠄⡀⢀"
+	for _, terminalSpinner := range spinners {
+		for _, wmSpinner := range spinners {
+			clients := []wm.Window{{Address: "win", PID: 10, Title: string(wmSpinner) + " Build Polybar"}}
+			got := matchUniqueClient(clients, 10, string(terminalSpinner)+" Build Polybar")
+			if got == nil || got.Address != "win" {
+				t.Fatalf("terminal spinner %q, WM spinner %q did not match", terminalSpinner, wmSpinner)
+			}
+		}
+	}
+
+	clients := []wm.Window{{Address: "win", PID: 10, Title: "◐ Build Polybar"}}
+	if got := matchUniqueClient(clients, 10, "◑ Different task"); got != nil {
+		t.Fatalf("normalization matched genuinely different titles: %+v", got)
+	}
+}
+
 // mapLocator serves a pre-built pane table the same way a live locator serves
 // the terminal: an unowned tty resolves to no pane, without error (the
 // terminal.Locator contract, behavior-spec §13.3). It exists so the equivalence

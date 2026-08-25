@@ -84,6 +84,41 @@ func TestParseI3Tree(t *testing.T) {
 	}
 }
 
+func TestHydrateI3PIDsFromX11WindowIDs(t *testing.T) {
+	root, err := parseI3TreeRoot([]byte(sampleTree))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	hydrateI3PIDs(&root, map[int64]int{12582913: 1054})
+	got := windowsFromI3Tree(&root)
+	if got[0].PID != 4790 {
+		t.Errorf("sway pid = %d, want authoritative tree pid 4790", got[0].PID)
+	}
+	if got[1].PID != 1054 {
+		t.Errorf("i3 pid = %d, want hydrated _NET_WM_PID 1054", got[1].PID)
+	}
+	ids := collectI3WindowIDs(&root)
+	if len(ids) != 0 {
+		t.Errorf("already hydrated tree requested more X11 ids: %v", ids)
+	}
+}
+
+func TestHydrateI3PIDsLeavesMissingAndSwayClientsUntouched(t *testing.T) {
+	root, err := parseI3TreeRoot([]byte(sampleTree))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	hydrateI3PIDs(&root, map[int64]int{12582913: 0})
+	got := windowsFromI3Tree(&root)
+	if got[0].PID != 4790 || got[1].PID != 0 {
+		t.Fatalf("pids after empty lookup = %d/%d, want 4790/0", got[0].PID, got[1].PID)
+	}
+	ids := collectI3WindowIDs(&root)
+	if len(ids) != 1 || ids[0] != 12582913 {
+		t.Errorf("X11 lookup ids = %v, want [12582913]", ids)
+	}
+}
+
 func TestParseI3Active(t *testing.T) {
 	addr, err := parseI3Active([]byte(sampleTree))
 	if err != nil {
