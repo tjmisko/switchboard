@@ -122,7 +122,7 @@ func TestTimelineEndToEnd(t *testing.T) {
 	if lane.TokIn != 2_000_000 {
 		t.Errorf("lane.tok_in = %d, want 2_000_000", lane.TokIn)
 	}
-	if !approxF(env.Totals.CostUSD, 10.50) {
+	if env.Totals.CostUSD == nil || !approxF(env.Totals.CostUSD.Float64(), 10.50) {
 		t.Errorf("totals.cost_usd = %v, want ~10.50", env.Totals.CostUSD)
 	}
 
@@ -155,7 +155,7 @@ func TestTimelineEndToEnd(t *testing.T) {
 	if env.PlanWindow == nil {
 		t.Fatalf("plan_window absent with --plan-window\n%s", out)
 	}
-	if !approxF(env.PlanWindow.CostUSD, 10.50) {
+	if env.PlanWindow.CostUSD == nil || !approxF(env.PlanWindow.CostUSD.Float64(), 10.50) {
 		t.Errorf("plan_window.cost_usd = %v, want ~10.50", env.PlanWindow.CostUSD)
 	}
 }

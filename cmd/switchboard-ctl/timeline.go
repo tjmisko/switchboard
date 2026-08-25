@@ -14,6 +14,7 @@ import (
 	"github.com/tjmisko/switchboard/internal/agentgraph"
 	"github.com/tjmisko/switchboard/internal/durfmt"
 	"github.com/tjmisko/switchboard/internal/history"
+	"github.com/tjmisko/switchboard/internal/pricing"
 	"github.com/tjmisko/switchboard/internal/projectname"
 )
 
@@ -70,7 +71,10 @@ func cmdTimeline(args []string) {
 	} else if seed != "" {
 		events = append(events, history.Event{Ts: from, Type: history.EventActivity, To: seed})
 	}
-	lanes := history.BuildSwimlanes(events, end)
+	// Use one immutable price snapshot for every aggregate in this response so a
+	// concurrent atomic cache refresh cannot mix catalog versions.
+	catalogs := pricing.CachedOrBootstrapCatalogs("", now)
+	lanes := history.BuildSwimlanesWithCatalogs(events, end, catalogs, now)
 	// A `/name` is recorded once, when it is set, so a session named before this
 	// window opened (yesterday evening, for one still running this morning) has no
 	// label event inside it and would render as never-named. Back-fill each such
@@ -98,7 +102,7 @@ func cmdTimeline(args []string) {
 	// so the swimlanes, by_status, and attention metrics all agree.
 	history.MarkDelegationDormant(lanes)
 	summary := history.Summarize(lanes, events)
-	totals := history.AggregateTotals(events)
+	totals := history.AggregateTotalsWithCatalogs(events, catalogs, now)
 	// The global user-activity timeline (idle/active), bounded to the lanes' span,
 	// is surfaced top-level for the dashboard's idle-dim + focus∧active overlay.
 	// nil (no activity events) marshals away under omitempty.
@@ -113,7 +117,7 @@ func cmdTimeline(args []string) {
 		if err != nil {
 			fail("read plan window %s: %v", *dir, err)
 		}
-		pw := history.AggregatePlanWindow(pwEvents, pwFrom, pwTo)
+		pw := history.AggregatePlanWindowWithCatalogs(pwEvents, pwFrom, pwTo, catalogs, now)
 		planWin = &pw
 	}
 
@@ -147,7 +151,7 @@ func cmdTimeline(args []string) {
 	renderAgentTimeline(os.Stdout, agents)
 	if planWin != nil {
 		fmt.Fprintf(os.Stdout, "\nplan window (last %gh)\n", planWin.Hours)
-		fmt.Fprintf(os.Stdout, "  %-12s $%.2f\n", "cost", planWin.CostUSD)
+		renderCostLine(os.Stdout, "cost (API-equivalent)", planWin.Cost)
 		fmt.Fprintf(os.Stdout, "  %-12s %s\n", "tokens", humanCount(planWin.TokIn+planWin.TokOut+planWin.TokCacheRead+planWin.TokCacheCreate))
 	}
 }
@@ -703,10 +707,25 @@ func renderSwimlanes(w *os.File, label string, lanes []history.Swimlane, s histo
 		fmt.Fprintf(w, "  %-26s %s  (in %s · out %s · cache %s)\n", "tokens used", humanCount(tok),
 			humanCount(totals.TokIn), humanCount(totals.TokOut), humanCount(totals.TokCacheRead+totals.TokCacheCreate))
 	}
-	if totals.CostUSD > 0 {
-		fmt.Fprintf(w, "  %-26s $%.2f\n", "cost (recomputed)", totals.CostUSD)
+	if totals.Cost != nil {
+		renderCostLine(w, "cost (API-equivalent)", totals.Cost)
 	}
 	renderSuspect(w, lanes, s, suspect)
+}
+
+func renderCostLine(w io.Writer, label string, cost *history.CostEstimate) {
+	if cost == nil || cost.APIEquivalentUSD == nil {
+		fmt.Fprintf(w, "  %-26s unavailable", label)
+	} else {
+		fmt.Fprintf(w, "  %-26s $%.2f", label, cost.APIEquivalentUSD.Float64())
+	}
+	if cost != nil && cost.Status != "" {
+		fmt.Fprintf(w, " (%s)", cost.Status)
+	}
+	if cost != nil && cost.UnpricedEvents > 0 {
+		fmt.Fprintf(w, "; %d event%s unpriced", cost.UnpricedEvents, plural(int(cost.UnpricedEvents)))
+	}
+	_, _ = fmt.Fprintln(w)
 }
 
 // renderSuspect prints the post-check's findings under the summary: what was left

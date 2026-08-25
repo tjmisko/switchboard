@@ -26,6 +26,7 @@ import (
 	"github.com/tjmisko/switchboard/internal/history"
 	"github.com/tjmisko/switchboard/internal/mapping"
 	"github.com/tjmisko/switchboard/internal/osproc"
+	"github.com/tjmisko/switchboard/internal/pricing"
 	"github.com/tjmisko/switchboard/internal/proc"
 	"github.com/tjmisko/switchboard/internal/projectname"
 	claudeprovider "github.com/tjmisko/switchboard/internal/provider/claude"
@@ -92,6 +93,21 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	// Keep the public, credential-free spot-rate cache current during normal
+	// operation. Timeline reads stay deterministic and network-free: they only
+	// consume the atomically replaced last-known-good snapshot this owns.
+	priceManager := pricing.NewManager("")
+	go priceManager.RunRefreshLoop(ctx, func(diagnostics []pricing.Diagnostic, err error) {
+		for _, diagnostic := range diagnostics {
+			log.Printf("pricing: provider=%s freshness=%s models=%d fallback=%t refresh_error=%t hash=%s",
+				diagnostic.Provider, diagnostic.Freshness, diagnostic.ModelCount,
+				diagnostic.UsedFallback, diagnostic.RefreshError != "", diagnostic.VersionHash)
+		}
+		if err != nil {
+			log.Printf("pricing: category=refresh_failed count=1")
+		}
+	})
 
 	// Activity log (opt-in via $XDG_CONFIG_HOME/switchboard/history.json). The sink
 	// is best-effort and asynchronous, so recording an event never blocks the

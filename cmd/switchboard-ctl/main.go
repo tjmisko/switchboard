@@ -71,6 +71,14 @@ func main() {
 		cmdMemory(args[1:])
 		return
 	}
+	// pricing inspects or refreshes the public spot-rate cache. It needs no
+	// daemon and never reads provider credentials.
+	if args[0] == "pricing" {
+		if err := cmdPricing(args[1:], *jsonOut, os.Stdout); err != nil {
+			fail("pricing: %v", err)
+		}
+		return
+	}
 
 	c, err := rpc.Dial(*socketPath)
 	if err != nil {
@@ -930,6 +938,8 @@ commands:
   memory [flags]          per-session memory (agent vs whole process tree) plus
                             machine-wide pressure, e.g. memory --day 2026-08-03.
                             Its own surface, not part of timeline; needs no daemon.
+  pricing <sub> [flags]   public spot-rate cache: status or refresh; reports
+                            source, age, version hash, model count, and fallback.
 
 flags:
   --socket <path>         daemon socket (default: $XDG_RUNTIME_DIR/switchboard.sock)

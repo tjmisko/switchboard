@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/tjmisko/switchboard/internal/pricing"
 )
 
 // Status strings as they appear in events (kept as local literals so this stays
@@ -110,6 +112,16 @@ type FocusSpan struct {
 	End   time.Time `json:"end"`
 }
 
+// PricingGroup retains the request-level dimensions that selected a rate. The
+// aggregate Cost is convenient, while these groups keep two exact models or
+// tiers in one session auditable instead of flattening their billing identity.
+type PricingGroup struct {
+	Identity BillingIdentity `json:"identity"`
+	Usage    UsageDelta      `json:"usage"`
+	Cost     CostEstimate    `json:"cost"`
+	Events   int64           `json:"events"`
+}
+
 // Swimlane is one session's lane on the timeline: its identity plus the ordered
 // intervals it passed through. Stacking swimlanes (each keyed by a distinct
 // session) is the parallel-sessions timeline. The v2 enrichments add the
@@ -147,11 +159,14 @@ type Swimlane struct {
 	Subagents []SubagentSpan `json:"subagents,omitempty"`
 	Focus     []FocusSpan    `json:"focus,omitempty"`
 
-	CostUSD        float64 `json:"cost_usd,omitempty"`
-	TokIn          int64   `json:"tok_in,omitempty"`
-	TokOut         int64   `json:"tok_out,omitempty"`
-	TokCacheRead   int64   `json:"tok_cache_read,omitempty"`
-	TokCacheCreate int64   `json:"tok_cache_create,omitempty"`
+	CostUSD        *pricing.USD   `json:"cost_usd"`
+	Cost           *CostEstimate  `json:"cost,omitempty"`
+	Usage          *UsageDelta    `json:"usage,omitempty"`
+	PricingGroups  []PricingGroup `json:"pricing_groups,omitempty"`
+	TokIn          int64          `json:"tok_in,omitempty"`
+	TokOut         int64          `json:"tok_out,omitempty"`
+	TokCacheRead   int64          `json:"tok_cache_read,omitempty"`
+	TokCacheCreate int64          `json:"tok_cache_create,omitempty"`
 
 	// Suspect and friends are the trailing-interval plausibility post-check
 	// (suspect.go). Suspect means this lane's length is an artifact of the end
@@ -313,6 +328,14 @@ func (b *laneBuilder) closeLabel(t time.Time) {
 // token usage + recomputed cost (usage_sample), and the spans the session held
 // window focus (the global focus stream).
 func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
+	return BuildSwimlanesWithCatalogs(events, end, priceBook(time.Now()), time.Now())
+}
+
+// BuildSwimlanesWithCatalogs is BuildSwimlanes with an injected, immutable
+// catalog snapshot. Tests and CLI callers can guarantee every lane uses one
+// coherent pricing version even if a background refresh lands mid-fold.
+func BuildSwimlanesWithCatalogs(events []Event, end time.Time, catalogs pricing.CatalogSet, pricingNow time.Time) []Swimlane {
+	events = latestUsageSnapshots(events)
 	evs := append([]Event(nil), events...)
 	sort.SliceStable(evs, func(i, j int) bool { return evs[i].Ts.Before(evs[j].Ts) })
 
@@ -477,11 +500,16 @@ func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
 				b = newLaneBuilder(ev)
 				open[key] = b
 			}
-			b.lane.TokIn += ev.TokIn
-			b.lane.TokOut += ev.TokOut
-			b.lane.TokCacheRead += ev.TokCacheRead
-			b.lane.TokCacheCreate += ev.TokCacheCreate
-			b.lane.CostUSD += CostUSD(ev.Model, ev.TokIn, ev.TokOut, ev.TokCacheRead, ev.TokCacheCreate)
+			usage := ev.CanonicalUsage()
+			accumulateUsage(&b.lane.Usage, usage)
+			b.lane.TokIn += usage.InputTokens
+			b.lane.TokOut += usage.OutputTokens
+			b.lane.TokCacheRead += usage.CachedInputTokens
+			b.lane.TokCacheCreate += usage.CacheWriteInputTokens + usage.CacheWrite5mInputTokens + usage.CacheWrite1hInputTokens
+			estimate := EstimateEvent(ev, catalogs, pricingNow)
+			b.lane.Cost = mergeCost(b.lane.Cost, estimate)
+			accumulatePricingGroup(&b.lane.PricingGroups, ev.PricingIdentity(), usage, estimate)
+			b.lane.CostUSD = legacyCostAlias(b.lane.Cost)
 			b.absorb(ev)
 		case EventSubagentSpawn:
 			if b == nil {
@@ -1162,12 +1190,15 @@ func Summarize(lanes []Swimlane, events []Event) Summary {
 // events) and the number of subagents launched (subagent_spawn events). It
 // complements Summary, which is interval-derived.
 type Totals struct {
-	TokIn          int64   `json:"tok_in"`
-	TokOut         int64   `json:"tok_out"`
-	TokCacheRead   int64   `json:"tok_cache_read"`
-	TokCacheCreate int64   `json:"tok_cache_create"`
-	Subagents      int     `json:"subagents"` // subagent_spawn count
-	CostUSD        float64 `json:"cost_usd"`  // recomputed window total ($)
+	TokIn          int64          `json:"tok_in"`
+	TokOut         int64          `json:"tok_out"`
+	TokCacheRead   int64          `json:"tok_cache_read"`
+	TokCacheCreate int64          `json:"tok_cache_create"`
+	Subagents      int            `json:"subagents"` // subagent_spawn count
+	Usage          *UsageDelta    `json:"usage,omitempty"`
+	PricingGroups  []PricingGroup `json:"pricing_groups,omitempty"`
+	Cost           *CostEstimate  `json:"cost,omitempty"`
+	CostUSD        *pricing.USD   `json:"cost_usd"` // nullable API-equivalent compatibility alias
 }
 
 // TotalTokens is the grand total across all four token classes.
@@ -1178,15 +1209,24 @@ func (t Totals) TotalTokens() int64 {
 // AggregateTotals sums the usage_sample tokens, recomputes their dollar cost
 // (per-sample, per-model), and counts the subagent_spawn events in a stream.
 func AggregateTotals(events []Event) Totals {
+	return AggregateTotalsWithCatalogs(events, priceBook(time.Now()), time.Now())
+}
+
+func AggregateTotalsWithCatalogs(events []Event, catalogs pricing.CatalogSet, pricingNow time.Time) Totals {
 	var t Totals
-	for _, ev := range events {
+	for _, ev := range latestUsageSnapshots(events) {
 		switch ev.Type {
 		case EventUsageSample:
-			t.TokIn += ev.TokIn
-			t.TokOut += ev.TokOut
-			t.TokCacheRead += ev.TokCacheRead
-			t.TokCacheCreate += ev.TokCacheCreate
-			t.CostUSD += CostUSD(ev.Model, ev.TokIn, ev.TokOut, ev.TokCacheRead, ev.TokCacheCreate)
+			usage := ev.CanonicalUsage()
+			accumulateUsage(&t.Usage, usage)
+			t.TokIn += usage.InputTokens
+			t.TokOut += usage.OutputTokens
+			t.TokCacheRead += usage.CachedInputTokens
+			t.TokCacheCreate += usage.CacheWriteInputTokens + usage.CacheWrite5mInputTokens + usage.CacheWrite1hInputTokens
+			estimate := EstimateEvent(ev, catalogs, pricingNow)
+			t.Cost = mergeCost(t.Cost, estimate)
+			accumulatePricingGroup(&t.PricingGroups, ev.PricingIdentity(), usage, estimate)
+			t.CostUSD = legacyCostAlias(t.Cost)
 		case EventSubagentSpawn:
 			t.Subagents++
 		}
@@ -1199,14 +1239,17 @@ func AggregateTotals(events []Event) Totals {
 // dollar half of the dashboard's plan gauge; the official utilization % comes
 // from a separate cached file the dashboard reads. (A4.)
 type PlanWindow struct {
-	Hours          float64   `json:"hours"`
-	From           time.Time `json:"from"`
-	To             time.Time `json:"to"`
-	CostUSD        float64   `json:"cost_usd"`
-	TokIn          int64     `json:"tok_in"`
-	TokOut         int64     `json:"tok_out"`
-	TokCacheRead   int64     `json:"tok_cache_read"`
-	TokCacheCreate int64     `json:"tok_cache_create"`
+	Hours          float64        `json:"hours"`
+	From           time.Time      `json:"from"`
+	To             time.Time      `json:"to"`
+	CostUSD        *pricing.USD   `json:"cost_usd"`
+	Cost           *CostEstimate  `json:"cost,omitempty"`
+	Usage          *UsageDelta    `json:"usage,omitempty"`
+	PricingGroups  []PricingGroup `json:"pricing_groups,omitempty"`
+	TokIn          int64          `json:"tok_in"`
+	TokOut         int64          `json:"tok_out"`
+	TokCacheRead   int64          `json:"tok_cache_read"`
+	TokCacheCreate int64          `json:"tok_cache_create"`
 }
 
 // AggregatePlanWindow sums the usage_sample tokens and recomputes the dollar cost
@@ -1214,18 +1257,113 @@ type PlanWindow struct {
 // window width in hours. The producer owns this pricing so the dashboard never
 // duplicates it. Pass the events from ReadRange(from, to).
 func AggregatePlanWindow(events []Event, from, to time.Time) PlanWindow {
+	return AggregatePlanWindowWithCatalogs(events, from, to, priceBook(time.Now()), time.Now())
+}
+
+func AggregatePlanWindowWithCatalogs(events []Event, from, to time.Time, catalogs pricing.CatalogSet, pricingNow time.Time) PlanWindow {
 	pw := PlanWindow{Hours: to.Sub(from).Hours(), From: from, To: to}
-	for _, ev := range events {
+	for _, ev := range latestUsageSnapshots(events) {
 		if ev.Type != EventUsageSample {
 			continue
 		}
-		pw.TokIn += ev.TokIn
-		pw.TokOut += ev.TokOut
-		pw.TokCacheRead += ev.TokCacheRead
-		pw.TokCacheCreate += ev.TokCacheCreate
-		pw.CostUSD += CostUSD(ev.Model, ev.TokIn, ev.TokOut, ev.TokCacheRead, ev.TokCacheCreate)
+		if ev.Ts.Before(from) || ev.Ts.After(to) {
+			continue
+		}
+		usage := ev.CanonicalUsage()
+		accumulateUsage(&pw.Usage, usage)
+		pw.TokIn += usage.InputTokens
+		pw.TokOut += usage.OutputTokens
+		pw.TokCacheRead += usage.CachedInputTokens
+		pw.TokCacheCreate += usage.CacheWriteInputTokens + usage.CacheWrite5mInputTokens + usage.CacheWrite1hInputTokens
+		estimate := EstimateEvent(ev, catalogs, pricingNow)
+		pw.Cost = mergeCost(pw.Cost, estimate)
+		accumulatePricingGroup(&pw.PricingGroups, ev.PricingIdentity(), usage, estimate)
+		pw.CostUSD = legacyCostAlias(pw.Cost)
 	}
 	return pw
+}
+
+// latestUsageSnapshots applies the v2 usage upsert contract without changing
+// legacy history: usage events with no stable ID remain additive; for a shared
+// UsageEventID, the highest explicit revision wins, then the newest timestamp
+// (and the later record wins ties).
+// The function is intentionally applied before range filtering so a revision
+// cannot leave both an old in-range snapshot and a newer out-of-range snapshot
+// counted as distinct usage.
+func latestUsageSnapshots(events []Event) []Event {
+	winner := make(map[string]int)
+	for i, ev := range events {
+		if ev.Type != EventUsageSample || ev.UsageEventID == "" {
+			continue
+		}
+		prev, ok := winner[ev.UsageEventID]
+		if !ok || ev.UsageRevision > events[prev].UsageRevision ||
+			(ev.UsageRevision == events[prev].UsageRevision &&
+				(ev.Ts.After(events[prev].Ts) || ev.Ts.Equal(events[prev].Ts))) {
+			winner[ev.UsageEventID] = i
+		}
+	}
+	if len(winner) == 0 {
+		return events
+	}
+	out := make([]Event, 0, len(events))
+	for i, ev := range events {
+		if ev.Type == EventUsageSample && ev.UsageEventID != "" && winner[ev.UsageEventID] != i {
+			continue
+		}
+		out = append(out, ev)
+	}
+	return out
+}
+
+func accumulateUsage(total **UsageDelta, delta UsageDelta) {
+	if *total == nil {
+		copy := delta
+		*total = &copy
+		return
+	}
+	(*total).InputTokens += delta.InputTokens
+	(*total).CachedInputTokens += delta.CachedInputTokens
+	(*total).CacheWriteInputTokens += delta.CacheWriteInputTokens
+	(*total).CacheWrite5mInputTokens += delta.CacheWrite5mInputTokens
+	(*total).CacheWrite1hInputTokens += delta.CacheWrite1hInputTokens
+	(*total).OutputTokens += delta.OutputTokens
+	(*total).ReasoningOutputTokens += delta.ReasoningOutputTokens
+	(*total).TotalTokens += delta.TotalTokens
+	(*total).WebSearchRequests += delta.WebSearchRequests
+	(*total).WebFetchRequests += delta.WebFetchRequests
+	if delta.ModelContextWindow > (*total).ModelContextWindow {
+		(*total).ModelContextWindow = delta.ModelContextWindow
+	}
+}
+
+func accumulatePricingGroup(groups *[]PricingGroup, identity BillingIdentity, usage UsageDelta, estimate CostEstimate) {
+	for i := range *groups {
+		if (*groups)[i].Identity != identity {
+			continue
+		}
+		accumulateUsageValue(&(*groups)[i].Usage, usage)
+		(*groups)[i].Cost = pricing.MergeEstimates((*groups)[i].Cost, estimate)
+		(*groups)[i].Events++
+		return
+	}
+	*groups = append(*groups, PricingGroup{Identity: identity, Usage: usage, Cost: estimate, Events: 1})
+}
+
+func accumulateUsageValue(total *UsageDelta, delta UsageDelta) {
+	total.InputTokens += delta.InputTokens
+	total.CachedInputTokens += delta.CachedInputTokens
+	total.CacheWriteInputTokens += delta.CacheWriteInputTokens
+	total.CacheWrite5mInputTokens += delta.CacheWrite5mInputTokens
+	total.CacheWrite1hInputTokens += delta.CacheWrite1hInputTokens
+	total.OutputTokens += delta.OutputTokens
+	total.ReasoningOutputTokens += delta.ReasoningOutputTokens
+	total.TotalTokens += delta.TotalTokens
+	total.WebSearchRequests += delta.WebSearchRequests
+	total.WebFetchRequests += delta.WebFetchRequests
+	if delta.ModelContextWindow > total.ModelContextWindow {
+		total.ModelContextWindow = delta.ModelContextWindow
+	}
 }
 
 // span is a half-open [start, end) time interval, the unit of the interval

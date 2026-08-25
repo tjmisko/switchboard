@@ -198,13 +198,13 @@ func TestTimelineJSONPlanWindowFlag(t *testing.T) {
 	if env.PlanWindow.Hours != planWindowHours {
 		t.Errorf("plan_window.hours = %v, want %d", env.PlanWindow.Hours, planWindowHours)
 	}
-	if env.PlanWindow.CostUSD < 4.99 || env.PlanWindow.CostUSD > 5.01 {
+	if env.PlanWindow.CostUSD == nil || env.PlanWindow.CostUSD.Float64() < 4.99 || env.PlanWindow.CostUSD.Float64() > 5.01 {
 		t.Errorf("plan_window.cost_usd = %v, want ~5.00", env.PlanWindow.CostUSD)
 	}
-	if env.Totals.CostUSD < 4.99 || env.Totals.CostUSD > 5.01 {
+	if env.Totals.CostUSD == nil || env.Totals.CostUSD.Float64() < 4.99 || env.Totals.CostUSD.Float64() > 5.01 {
 		t.Errorf("totals.cost_usd = %v, want ~5.00", env.Totals.CostUSD)
 	}
-	if len(env.Lanes) != 1 || env.Lanes[0].CostUSD < 4.99 {
+	if len(env.Lanes) != 1 || env.Lanes[0].CostUSD == nil || env.Lanes[0].CostUSD.Float64() < 4.99 {
 		t.Errorf("lane cost_usd not carried: %+v", env.Lanes)
 	}
 }

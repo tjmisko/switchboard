@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/agentgraph"
+	"github.com/tjmisko/switchboard/internal/pricing"
 )
 
 // Event types. A transition closes one colored interval and opens the next; the
@@ -37,9 +38,11 @@ const (
 	EventSuspend      = "suspend"
 	EventResume       = "resume"
 	// Phase 4 — fanout & plan usage.
-	EventSubagentSpawn = "subagent_spawn" // a Task/Agent subagent was launched
-	EventSubagentStop  = "subagent_stop"  // its result landed (it finished)
-	EventUsageSample   = "usage_sample"   // token usage accrued since the last sample
+	EventSubagentSpawn       = "subagent_spawn"        // a Task/Agent subagent was launched
+	EventSubagentStop        = "subagent_stop"         // its result landed (it finished)
+	EventUsageSample         = "usage_sample"          // token usage accrued since the last sample
+	EventUsageCutover        = "usage_cutover"         // collector source/coverage boundary; carries UsageCoverage
+	EventVendorUsageSnapshot = "vendor_usage_snapshot" // cumulative vendor LKG; never an additive token delta
 	// v2 — session names, model/cost, focus & attention.
 	EventSessionLabel = "session_label" // the session's name/label changed (Label set)
 	EventFocus        = "focus"         // window focus moved (SessionID = focused agent, empty = focus left all agents)
@@ -56,6 +59,17 @@ const (
 	EventAgentState = "agent_state"
 )
 
+// HistorySchemaVersion marks records that carry canonical provider identity,
+// usage, and cost semantics. A missing/zero value remains the legacy v1 shape.
+const HistorySchemaVersion = 2
+
+// Shared aliases keep collector code phrased in history concepts while the
+// provider-independent pricing package owns their arithmetic and wire format.
+type BillingIdentity = pricing.Identity
+type UsageDelta = pricing.Usage
+type CostEstimate = pricing.Estimate
+type VendorUsageSnapshot = pricing.VendorUsageSnapshot
+
 // Detail tiers. Minimal records only what a timeline needs (ids, status, timing,
 // the project abbreviation) and omits anything that reveals *what* you are doing
 // (the raw cwd, the tool a prompt was for). Full adds those back.
@@ -70,12 +84,13 @@ const (
 // reader can group a session's events by session_id (stable across PID reuse)
 // and fall back to pid for the pre-hook lifecycle events that have no id yet.
 type Event struct {
-	Ts        time.Time `json:"ts"`                   // the event instant (marshals RFC3339)
-	Type      string    `json:"type"`                 // one of the Event* constants
-	SessionID string    `json:"session_id,omitempty"` // agent session UUID, when known
-	PID       int       `json:"pid,omitempty"`        // OS pid (always set in practice)
-	Agent     string    `json:"agent,omitempty"`      // claude | codex
-	Project   string    `json:"project,omitempty"`    // project abbreviation (resolved from cwd)
+	SchemaVersion int       `json:"schema_version,omitempty"`
+	Ts            time.Time `json:"ts"`                   // the event instant (marshals RFC3339)
+	Type          string    `json:"type"`                 // one of the Event* constants
+	SessionID     string    `json:"session_id,omitempty"` // agent session UUID, when known
+	PID           int       `json:"pid,omitempty"`        // OS pid (always set in practice)
+	Agent         string    `json:"agent,omitempty"`      // claude | codex
+	Project       string    `json:"project,omitempty"`    // project abbreviation (resolved from cwd)
 
 	// Transition payload.
 	From      string `json:"from,omitempty"`        // status before the edge
@@ -131,6 +146,49 @@ type Event struct {
 	TokCacheCreate int64  `json:"tok_cache_create,omitempty"`
 	Model          string `json:"model,omitempty"`
 
+	// v2 canonical usage and billing identity. Legacy Tok* fields remain readable
+	// and are projected by CanonicalUsage. Expanded flat fields ease a staged
+	// collector rollout; Usage is authoritative when present.
+	TokCacheCreate5m   int64 `json:"tok_cache_create_5m,omitempty"`
+	TokCacheCreate1h   int64 `json:"tok_cache_create_1h,omitempty"`
+	TokCacheWrite      int64 `json:"tok_cache_write,omitempty"`
+	TokReasoningOut    int64 `json:"tok_reasoning_out,omitempty"`
+	TokTotal           int64 `json:"tok_total,omitempty"`
+	ModelContextWindow int64 `json:"model_context_window,omitempty"`
+	WebSearchRequests  int64 `json:"web_search_requests,omitempty"`
+	WebFetchRequests   int64 `json:"web_fetch_requests,omitempty"`
+
+	ExecutionProvider string `json:"execution_provider,omitempty"`
+	BillingRoute      string `json:"billing_route,omitempty"`
+	AccountKind       string `json:"account_kind,omitempty"`
+	AuthMode          string `json:"auth_mode,omitempty"`
+	ServiceTier       string `json:"service_tier,omitempty"`
+	Speed             string `json:"speed,omitempty"`
+	InferenceGeo      string `json:"inference_geo,omitempty"`
+	ReasoningEffort   string `json:"reasoning_effort,omitempty"`
+	TurnID            string `json:"turn_id,omitempty"`
+	// UsageEventID is the stable identity of one provider usage snapshot. Writers
+	// must namespace it by provider, root session, and source so revisions are
+	// only comparable inside one monotonic stream. A
+	// later usage_sample carrying the same ID replaces the earlier snapshot;
+	// this makes retries and metadata/TTL refinements idempotent. Legacy events
+	// without an ID retain their historical additive-delta semantics.
+	UsageEventID string `json:"usage_event_id,omitempty"`
+	// UsageSnapshot explains that ordinary usage fields are a replacement
+	// snapshot for this ID. Readers still upsert every non-empty ID so a missing
+	// marker from an early v2 writer cannot double count.
+	UsageSnapshot     bool        `json:"usage_snapshot,omitempty"`
+	UsageRevision     int64       `json:"usage_revision,omitempty"`
+	UsageCoverage     string      `json:"usage_coverage,omitempty"`
+	ProviderMessageID string      `json:"provider_message_id,omitempty"`
+	UsageSourceID     string      `json:"usage_source_id,omitempty"`
+	Usage             *UsageDelta `json:"usage,omitempty"`
+	// UsageTotal preserves a provider's cumulative snapshot for audit and
+	// reconciliation. Aggregators sum Usage (the request/update delta) only.
+	UsageTotal  *UsageDelta          `json:"usage_total,omitempty"`
+	VendorUsage *VendorUsageSnapshot `json:"vendor_usage,omitempty"`
+	Cost        *CostEstimate        `json:"cost,omitempty"`
+
 	// Memory payload (memory_sample): an instantaneous gauge, not an accrual —
 	// unlike the token counters above, these do not sum across samples. Bytes
 	// throughout, PSS + SwapPss: PSS charges each shared page to its sharers in
@@ -182,6 +240,42 @@ type Event struct {
 	Reason      string `json:"reason,omitempty"`      // human detail behind a rule
 	Description string `json:"description,omitempty"` // a subagent's task description
 	Label       string `json:"label,omitempty"`       // a session's current name (session_label) — can name your work, so scrubbed
+}
+
+// CanonicalUsage returns the v2 usage object or losslessly projects the legacy
+// top-level token fields. When distinct Claude TTL buckets are present, the
+// legacy combined TokCacheCreate mirror is not counted a second time.
+func (e Event) CanonicalUsage() UsageDelta {
+	if e.Usage != nil {
+		return *e.Usage
+	}
+	usage := UsageDelta{
+		InputTokens:             e.TokIn,
+		CachedInputTokens:       e.TokCacheRead,
+		CacheWriteInputTokens:   e.TokCacheWrite,
+		CacheWrite5mInputTokens: e.TokCacheCreate5m,
+		CacheWrite1hInputTokens: e.TokCacheCreate1h,
+		OutputTokens:            e.TokOut,
+		ReasoningOutputTokens:   e.TokReasoningOut,
+		TotalTokens:             e.TokTotal,
+		ModelContextWindow:      e.ModelContextWindow,
+		WebSearchRequests:       e.WebSearchRequests,
+		WebFetchRequests:        e.WebFetchRequests,
+	}
+	if e.TokCacheCreate5m == 0 && e.TokCacheCreate1h == 0 {
+		usage.CacheWriteInputTokens += e.TokCacheCreate
+	}
+	return usage
+}
+
+// PricingIdentity separates Agent (the client) from the provider and route.
+func (e Event) PricingIdentity() BillingIdentity {
+	return BillingIdentity{
+		AgentClient: e.Agent, ExecutionProvider: e.ExecutionProvider,
+		BillingRoute: e.BillingRoute, AccountKind: e.AccountKind, AuthMode: e.AuthMode, Model: e.Model,
+		ServiceTier: e.ServiceTier, Speed: e.Speed, InferenceGeo: e.InferenceGeo,
+		ReasoningEffort: e.ReasoningEffort,
+	}
 }
 
 // DefaultDir is where the activity log lives: $XDG_STATE_HOME/switchboard/history,

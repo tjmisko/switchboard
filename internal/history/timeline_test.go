@@ -3,6 +3,8 @@ package history
 import (
 	"testing"
 	"time"
+
+	"github.com/tjmisko/switchboard/internal/pricing"
 )
 
 func ts(sec int) time.Time {
@@ -435,7 +437,9 @@ func TestAggregateTotalsSumsTokensAndCountsSpawns(t *testing.T) {
 	}
 	got := AggregateTotals(evs)
 	want := Totals{TokIn: 105, TokOut: 57, TokCacheRead: 1030, TokCacheCreate: 203, Subagents: 2}
-	if got != want {
+	if got.TokIn != want.TokIn || got.TokOut != want.TokOut ||
+		got.TokCacheRead != want.TokCacheRead || got.TokCacheCreate != want.TokCacheCreate ||
+		got.Subagents != want.Subagents {
 		t.Errorf("AggregateTotals = %+v, want %+v", got, want)
 	}
 	if total := got.TotalTokens(); total != 1395 { // 105+57+1030+203
@@ -765,19 +769,102 @@ func TestBuildSwimlanesPerLaneCostAndTokens(t *testing.T) {
 	if lane.TokCacheRead != 0 || lane.TokCacheCreate != 0 {
 		t.Errorf("per-lane cache tokens = %d/%d, want 0/0", lane.TokCacheRead, lane.TokCacheCreate)
 	}
-	if !approx(lane.CostUSD, 5.0) {
-		t.Errorf("per-lane cost = $%.4f, want $5.00 (2 opus + 3 sonnet)", lane.CostUSD)
+	if len(lane.PricingGroups) != 2 || lane.PricingGroups[0].Identity.Model != "claude-opus-4-8" ||
+		lane.PricingGroups[1].Identity.Model != "claude-sonnet-4-6" {
+		t.Errorf("exact models were flattened: %+v", lane.PricingGroups)
+	}
+	if !approxUSD(lane.CostUSD, 5.0) {
+		t.Errorf("per-lane cost = %v, want $5.00 (2 opus + 3 sonnet)", lane.CostUSD)
 	}
 }
 
 func TestAggregateTotalsCostUSD(t *testing.T) {
 	evs := []Event{
 		usageEv(1, 5, "claude-opus-4-8", 1_000_000, 0, 0, 0), // input 5/MTok → $5.00
-		usageEv(1, 6, "unknown-model", 9_999_999, 0, 0, 0),   // unpriced → $0
+		usageEv(1, 6, "unknown-model", 9_999_999, 0, 0, 0),   // explicitly unpriced
 	}
 	tot := AggregateTotals(evs)
-	if !approx(tot.CostUSD, 5.0) {
-		t.Errorf("totals cost = $%.4f, want $5.00 (unknown model contributes nothing)", tot.CostUSD)
+	if !approxUSD(tot.CostUSD, 5.0) {
+		t.Errorf("totals priced portion = %v, want $5.00", tot.CostUSD)
+	}
+	if tot.Cost == nil || tot.Cost.Status != pricing.CostPartial || tot.Cost.UnpricedEvents == 0 {
+		t.Errorf("unknown model must be visible as partial, got %+v", tot.Cost)
+	}
+}
+
+func TestUsageEventIDUsesLatestSnapshotWhileLegacyRemainsAdditive(t *testing.T) {
+	first := usageEv(1, 5, "claude-opus-4-8", 1_000_000, 0, 0, 0)
+	first.SessionID, first.UsageEventID, first.UsageRevision = "s1", "message-1", 1
+	revised := usageEv(1, 4, "claude-opus-4-8", 2_000_000, 0, 0, 0)
+	revised.SessionID, revised.UsageEventID, revised.UsageRevision = "s1", "message-1", 2
+	revised.UsageTotal = &UsageDelta{InputTokens: 99_000_000}
+	legacy := usageEv(1, 6, "claude-opus-4-8", 3_000_000, 0, 0, 0)
+	legacy.SessionID = "s1"
+	events := []Event{first, legacy, revised}
+
+	totals := AggregateTotals(events)
+	if totals.TokIn != 5_000_000 {
+		t.Fatalf("totals input = %d, want latest 2m + legacy 3m", totals.TokIn)
+	}
+	if totals.Usage == nil || totals.Usage.InputTokens != 5_000_000 {
+		t.Fatalf("canonical totals usage = %+v", totals.Usage)
+	}
+	lane := BuildSwimlanes(events, ts(10))[0]
+	if lane.TokIn != 5_000_000 {
+		t.Fatalf("lane input = %d, want latest 2m + legacy 3m", lane.TokIn)
+	}
+	// UsageTotal is reconciliation context, not another delta to add.
+	if lane.TokIn == 104_000_000 {
+		t.Fatal("provider cumulative total was double-counted")
+	}
+}
+
+func TestUsageMetadataRevisionReplacesIdentityWithoutAddingTokens(t *testing.T) {
+	original := Event{
+		Ts: ts(5), Type: EventUsageSample, SessionID: "s1", UsageEventID: "turn-1", UsageRevision: 1,
+		ExecutionProvider: pricing.ProviderOpenAI, Model: "unknown-model",
+		Usage: &UsageDelta{InputTokens: 1_000_000},
+	}
+	revised := original
+	// Revisions retain the provider event timestamp/day. A later record at the
+	// same timestamp carries corrected safe metadata and the same full snapshot.
+	revised.UsageRevision = 2
+	revised.Model = "gpt-5.6-sol"
+	totals := AggregateTotals([]Event{original, revised})
+	if totals.TokIn != 1_000_000 {
+		t.Fatalf("revision doubled tokens: %d", totals.TokIn)
+	}
+	if totals.Cost == nil || totals.Cost.APIEquivalentUSD == nil || totals.Cost.UnpricedEvents != 0 {
+		t.Fatalf("latest identity/cost did not replace original: %+v", totals.Cost)
+	}
+}
+
+func TestUnsupportedTierKeepsVendorEstimateSeparate(t *testing.T) {
+	vendor := pricing.USDFromMicros(123_000)
+	event := Event{
+		Ts: ts(5), Type: EventUsageSample, Agent: "codex",
+		ExecutionProvider: pricing.ProviderOpenAI, Model: "gpt-5.6-sol", ServiceTier: "ultrafast",
+		Usage: &UsageDelta{InputTokens: 100_000},
+		Cost:  &CostEstimate{VendorEstimatedUSD: &vendor},
+	}
+	estimate := EstimateEvent(event, pricing.BootstrapCatalogs(), ts(5))
+	if estimate.APIEquivalentUSD != nil || estimate.VendorEstimatedUSD == nil ||
+		estimate.VendorEstimatedUSD.Micros() != vendor.Micros() || estimate.Status != pricing.CostEstimated {
+		t.Fatalf("vendor estimate semantics = %+v", estimate)
+	}
+}
+
+func TestCreditsOnlyVendorEstimateIsNotWhollyUnknown(t *testing.T) {
+	credits := pricing.CreditsFromMicros(42_000_000)
+	event := Event{
+		Ts: ts(5), Type: EventUsageSample, Agent: "codex",
+		ExecutionProvider: "custom-openai-compatible", Model: "private-model",
+		Usage: &UsageDelta{InputTokens: 100_000},
+		Cost:  &CostEstimate{PlanCredits: &credits, Status: pricing.CostEstimated},
+	}
+	estimate := EstimateEvent(event, pricing.BootstrapCatalogs(), ts(5))
+	if estimate.APIEquivalentUSD != nil || estimate.PlanCredits == nil || estimate.Status != pricing.CostEstimated {
+		t.Fatalf("credits-only estimate semantics = %+v", estimate)
 	}
 }
 
@@ -799,8 +886,8 @@ func TestAggregatePlanWindow(t *testing.T) {
 	if pw.TokIn != 1_000_000 || pw.TokCacheRead != 200_000 {
 		t.Errorf("tokens = in %d cacheRead %d, want 1000000/200000", pw.TokIn, pw.TokCacheRead)
 	}
-	if !approx(pw.CostUSD, 5.10) { // 5.00 input + 0.10 cacheRead (0.5/MTok × 0.2M)
-		t.Errorf("plan-window cost = $%.4f, want $5.10", pw.CostUSD)
+	if !approxUSD(pw.CostUSD, 5.10) { // 5.00 input + 0.10 cacheRead (0.5/MTok × 0.2M)
+		t.Errorf("plan-window cost = %v, want $5.10", pw.CostUSD)
 	}
 }
 
@@ -1040,6 +1127,10 @@ func approx(a, b float64) bool {
 		d = -d
 	}
 	return d < 1e-9
+}
+
+func approxUSD(a *pricing.USD, b float64) bool {
+	return a != nil && approx(a.Float64(), b)
 }
 
 func equalFocus(got, want []FocusSpan) bool {
