@@ -29,10 +29,10 @@ func TestRenderSnapshotRendersProviderNeutralClickableChips(t *testing.T) {
 
 	got := renderSnapshot(snap, []string{"sb-build", "sb-review", "sb-prompt", "sb-agents"}, testOptions)
 	want := strings.Join([]string{
-		"%{A1:'/opt/switchboard/bin/switchboard-ctl' focus pid:41:}%{F#8ABEB7}● sb-build%{F-}%{A}",
-		"%{A1:'/opt/switchboard/bin/switchboard-ctl' focus pid:42:}%{F#F0C674}● sb-review%{F-}%{A}",
-		"%{A1:'/opt/switchboard/bin/switchboard-ctl' focus pid:43:}%{F#A54242}● sb-prompt%{F-}%{A}",
-		"%{A1:'/opt/switchboard/bin/switchboard-ctl' focus pid:44:}%{F#8ABEB7}● sb-agents%{F-}%{A}",
+		"%{A1:'/opt/switchboard/bin/switchboard-ctl' focus pid\\:41:}%{F#8ABEB7}● sb-build%{F-}%{A}",
+		"%{A1:'/opt/switchboard/bin/switchboard-ctl' focus pid\\:42:}%{F#F0C674}● sb-review%{F-}%{A}",
+		"%{A1:'/opt/switchboard/bin/switchboard-ctl' focus pid\\:43:}%{F#A54242}● sb-prompt%{F-}%{A}",
+		"%{A1:'/opt/switchboard/bin/switchboard-ctl' focus pid\\:44:}%{F#8ABEB7}● sb-agents%{F-}%{A}",
 	}, "  ")
 	if got != want {
 		t.Fatalf("renderSnapshot() =\n%s\nwant:\n%s", got, want)
@@ -44,7 +44,7 @@ func TestRenderSnapshotBoundsSessionsAndShowsOverflow(t *testing.T) {
 	options.maxSessions = 2
 	snap := state.Snapshot{Sessions: []state.Session{{PID: 1}, {PID: 2}, {PID: 3}, {PID: 4}}}
 	got := renderSnapshot(snap, []string{"one", "two"}, options)
-	if strings.Contains(got, "pid:3") || !strings.HasSuffix(got, "%{F#707880}+2%{F-}") {
+	if strings.Contains(got, `pid\:3`) || !strings.HasSuffix(got, "%{F#707880}+2%{F-}") {
 		t.Fatalf("bounded render = %q", got)
 	}
 }
@@ -54,7 +54,7 @@ func TestRenderSnapshotUnlimitedWhenMaxIsZero(t *testing.T) {
 	options.maxSessions = 0
 	snap := state.Snapshot{Sessions: []state.Session{{PID: 1}, {PID: 2}, {PID: 3}}}
 	got := renderSnapshot(snap, []string{"one", "two", "three"}, options)
-	if !strings.Contains(got, "pid:3") || strings.Contains(got, "+1") {
+	if !strings.Contains(got, `pid\:3`) || strings.Contains(got, "+1") {
 		t.Fatalf("unlimited render = %q", got)
 	}
 }
@@ -69,8 +69,16 @@ func TestRenderSnapshotHeadlessAndSuspendedAreMuted(t *testing.T) {
 		t.Fatalf("headless chip must not be clickable: %q", got)
 	}
 	if !strings.Contains(got, "%{F#707880}● headless%{F-}") ||
-		!strings.Contains(got, "pid:8:}%{F#707880}● stopped") {
+		!strings.Contains(got, `pid\:8:}%{F#707880}● stopped`) {
 		t.Fatalf("muted render = %q", got)
+	}
+}
+
+func TestEscapeActionCommandEscapesEveryColon(t *testing.T) {
+	got := escapeActionCommand("'/opt/with:colon/ctl' focus pid:42")
+	want := `'/opt/with\:colon/ctl' focus pid\:42`
+	if got != want {
+		t.Fatalf("escapeActionCommand() = %q, want %q", got, want)
 	}
 }
 

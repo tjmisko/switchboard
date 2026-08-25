@@ -157,7 +157,14 @@ func renderSession(session state.Session, label string, options renderOptions) s
 		return chip
 	}
 	command := shellQuote(options.ctlPath) + " focus pid:" + fmt.Sprint(session.PID)
-	return "%{A1:" + command + ":}" + chip + "%{A}"
+	return "%{A1:" + escapeActionCommand(command) + ":}" + chip + "%{A}"
+}
+
+// Polybar uses an unescaped colon as the action-command delimiter, even when
+// that colon sits inside shell quotes. Escape every colon before embedding the
+// command so selectors such as pid:4821 reach switchboard-ctl intact.
+func escapeActionCommand(command string) string {
+	return strings.ReplaceAll(command, ":", `\:`)
 }
 
 func renderUnavailable(colors palette) string {
