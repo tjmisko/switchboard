@@ -140,11 +140,71 @@ func TestObserveUsagePreservesClaudePricingDimensions(t *testing.T) {
 		sample.Source != agentgraph.SourceClaudeTranscript {
 		t.Errorf("sample correlation = %+v", sample)
 	}
+	if sample.SchemaVersion != history.HistorySchemaVersion || sample.ExecutionProvider != "anthropic" ||
+		sample.BillingRoute != "" || sample.AccountKind != "" || sample.AuthMode != "" {
+		t.Errorf("sample billing identity = %+v", sample)
+	}
 	if sample.TokCacheCreate != 29 || sample.TokCacheCreate5m != 14 || sample.TokCacheCreate1h != 15 {
 		t.Errorf("cache dimensions = %+v", sample)
 	}
+	if sample.Usage == nil || sample.Usage.InputTokens != 11 || sample.Usage.OutputTokens != 12 ||
+		sample.Usage.CachedInputTokens != 13 || sample.Usage.CacheWriteInputTokens != 0 ||
+		sample.Usage.CacheWrite5mInputTokens != 14 || sample.Usage.CacheWrite1hInputTokens != 15 ||
+		sample.Usage.WebSearchRequests != 2 || sample.Usage.WebFetchRequests != 3 {
+		t.Errorf("canonical usage = %+v", sample.Usage)
+	}
 	if sample.ServiceTier != "priority" || sample.Speed != "fast" || sample.InferenceGeo != "us" || sample.WebSearchRequests != 2 || sample.WebFetchRequests != 3 {
 		t.Errorf("pricing dimensions = %+v", sample)
+	}
+}
+
+func TestObserveUsageMapsCombinedCacheWriteOnlyWhenTTLUnknown(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "session.jsonl")
+	writeLines(t, root, `{"type":"assistant","timestamp":"2026-08-25T10:00:00Z","uuid":"row-1","message":{"id":"msg-1","role":"assistant","model":"claude-opus-4-8","content":[],"usage":{"input_tokens":11,"output_tokens":12,"cache_creation_input_tokens":29}}}`)
+	histDir := t.TempDir()
+	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+	sess := &state.Session{PID: 7, Agent: "claude", CWD: "/home/u/proj",
+		Claude: &state.AgentInfo{SessionID: "session-combined", Transcript: root}}
+	rs.observe(sink, sess, sess.Claude, time.Now())
+	sink.Close()
+
+	samples := eventsOfType(readEvents(t, histDir), history.EventUsageSample)
+	if len(samples) != 1 || samples[0].Usage == nil {
+		t.Fatalf("combined cache sample = %+v", samples)
+	}
+	u := samples[0].Usage
+	if u.CacheWriteInputTokens != 29 || u.CacheWrite5mInputTokens != 0 || u.CacheWrite1hInputTokens != 0 || samples[0].TokCacheCreate != 29 {
+		t.Fatalf("unknown-TTL cache mapping = canonical %+v legacy %+v", u, samples[0])
+	}
+}
+
+func TestObserveUsageLegacyCutoverCarriesCanonicalIdentity(t *testing.T) {
+	histDir := t.TempDir()
+	day := time.Now().Local().Format("2006-01-02")
+	legacy := fmt.Sprintf(`{"ts":%q,"type":"usage_sample","agent":"claude","session_id":"session-old","tok_in":10}`, time.Now().UTC().Format(time.RFC3339Nano)) + "\n"
+	if err := os.WriteFile(filepath.Join(histDir, day+".jsonl"), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(t.TempDir(), "session.jsonl")
+	writeLines(t, root, `{"type":"assistant","timestamp":"2026-08-25T10:00:00Z","uuid":"row-1","message":{"id":"msg-old","role":"assistant","model":"claude-opus-4-8","content":[],"usage":{"input_tokens":10,"output_tokens":2}}}`)
+	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+	sess := &state.Session{PID: 7, Agent: "claude", CWD: "/home/u/proj",
+		Claude: &state.AgentInfo{SessionID: "session-old", Transcript: root}}
+	rs.observe(sink, sess, sess.Claude, time.Now())
+	sink.Close()
+
+	markers := eventsOfType(readEvents(t, histDir), history.EventUsageCutover)
+	if len(markers) != 1 {
+		t.Fatalf("cutover markers = %+v", markers)
+	}
+	marker := markers[0]
+	if marker.SchemaVersion != history.HistorySchemaVersion || marker.ExecutionProvider != "anthropic" ||
+		marker.BillingRoute != "" || marker.AccountKind != "" || marker.AuthMode != "" ||
+		marker.UsageCoverage != "partial_legacy_cutover" || marker.Usage != nil ||
+		!marker.UsageSnapshot || marker.UsageRevision <= 0 || !strings.HasPrefix(marker.UsageEventID, "cuev_") {
+		t.Fatalf("canonical cutover marker = %+v", marker)
 	}
 }
 
