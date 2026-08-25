@@ -250,6 +250,18 @@ aggregate immediately. The remote machine needs `switchboard` running and a
 compatible `switchboard-ctl` on its SSH `PATH`; ordinary SSH host-key checking
 and batch authentication must already work.
 
+That `PATH` is the one used by a **noninteractive SSH command**, not necessarily
+the one in an interactive terminal. A `SWITCHBOARD_BIN` systemd override also
+selects only the daemon; it does not make the adjacent `switchboard-ctl`
+discoverable to SSH. If the client journal repeatedly reports
+`destination=<host> host= category=disconnected` and the command above exits 127
+with `switchboard-ctl: command not found`, install a stable command link in a
+directory on that exact noninteractive path as described in
+[machine-specific configuration](docs/machine-configuration.md#remote-command-path-for-ssh-federation).
+If the command resolves but prints usage which omits `remote-stream` and exits
+2, the remote `switchboard-ctl` predates federation; deploy the daemon and
+control binary from the same current revision.
+
 Sessions are live-namespaced by `(hostname,pid)`. Actions also carry
 `started_at`, Switchboard's discovery timestamp, as a best-effort stale-action
 fence. It rejects PID replacement observed while the daemon stays up; because

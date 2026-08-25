@@ -60,6 +60,139 @@ Environment="SWITCHBOARD_ARGS=-remote buildbox -remote user@gpu-box"
 individual argument containing whitespace inside the value. Most hosts need no
 override at all.
 
+## Remote command path for SSH federation
+
+For every `-remote <destination>`, the client daemon starts a separate,
+noninteractive command equivalent to:
+
+```text
+ssh -n -T <destination> switchboard-ctl remote-stream
+```
+
+The remote `switchboard-ctl` must therefore resolve by its bare name in the
+login shell's **noninteractive SSH path**. An interactive shell finding the
+binary is not sufficient. Neither is a remote systemd override such as
+`SWITCHBOARD_BIN=/home/alice/.config/switchboard/bin/switchboard`: that setting
+selects the daemon executable only and does not change the SSH command's path.
+
+First inspect the actual command environment from the client host. The printed
+path, not an already-open remote terminal, is authoritative:
+
+```bash
+ssh -n -T buildbox 'printf "%s\n" "$PATH"; command -v switchboard-ctl'
+```
+
+Do not assume that editing `~/.bashrc` changes this result. SSH servers, login
+shells, and shell startup files differ; an interactive shell may add
+`~/.local/bin` while an SSH command session does not read that setup at all.
+
+When `~/.local/bin` is present in the printed path, a user-owned symlink is a
+durable rootless installation. It keeps following future binary replacements at
+the target path, unlike a copied helper. Run this once on the remote host; the
+existing-path check deliberately refuses to overwrite an unrelated command:
+
+```bash
+(
+    switchboard_ctl_target="$HOME/.config/switchboard/bin/switchboard-ctl"
+    switchboard_ctl_link="$HOME/.local/bin/switchboard-ctl"
+
+    if [ ! -x "$switchboard_ctl_target" ]; then
+        echo "missing executable $switchboard_ctl_target" >&2
+        exit 1
+    fi
+    install -d -m 0755 "$HOME/.local/bin"
+    if [ ! -e "$switchboard_ctl_link" ] && [ ! -L "$switchboard_ctl_link" ]; then
+        ln -sT "$switchboard_ctl_target" "$switchboard_ctl_link"
+    elif [ "$(readlink -f -- "$switchboard_ctl_link")" != \
+           "$(readlink -f -- "$switchboard_ctl_target")" ]; then
+        echo "refusing to replace existing $switchboard_ctl_link" >&2
+        exit 1
+    fi
+)
+```
+
+If `~/.local/bin` is absent, place the command in a directory which is actually
+present in the printed path. `/usr/local/bin` is the usual administrator-owned
+choice on a personal development host. After confirming that directory appears
+in the probe, run this on the remote host; `ln` has no force option here and
+therefore refuses to replace an existing command:
+
+```bash
+(
+    switchboard_ctl_target="$HOME/.config/switchboard/bin/switchboard-ctl"
+    if [ ! -x "$switchboard_ctl_target" ]; then
+        echo "missing executable $switchboard_ctl_target" >&2
+        exit 1
+    fi
+    sudo ln -sT -- "$switchboard_ctl_target" /usr/local/bin/switchboard-ctl
+)
+```
+
+The system-path symlink deliberately delegates that command name to the owning
+user's development binary. On a multi-user host, prefer a root-owned packaged
+copy and update it as part of every Switchboard deployment instead. In either
+case, verify from the client host:
+
+```bash
+ssh -n -T buildbox 'command -v switchboard-ctl'
+
+timeout 5s ssh -n -T \
+    -o BatchMode=yes \
+    -o StrictHostKeyChecking=yes \
+    buildbox switchboard-ctl remote-stream >/dev/null
+test "$?" -eq 124
+```
+
+Exit 124 is expected in the second probe: `timeout` stopped a healthy,
+long-lived stream. Exit 127 means the remote command is still absent from the
+noninteractive path; exit 255 points instead to SSH resolution, host-key, or
+batch-authentication failure. Exit 2 accompanied by usage text which omits
+`remote-stream` means the remote `switchboard-ctl` is older than the federation
+feature or otherwise mismatched with the daemon.
+
+For a private development install, build both remote binaries from the same
+checkout and replace their stable targets atomically. Staging inside the target
+directory keeps each final rename on one filesystem, so existing symlinks remain
+valid and no running executable is truncated in place:
+
+```bash
+(
+    set -eu
+    switchboard_repo="$HOME/Projects/switchboard"
+    switchboard_bin_dir="$HOME/.config/switchboard/bin"
+
+    if [ ! -f "$switchboard_repo/cmd/switchboard-ctl/remote_stream.go" ]; then
+        echo "checkout predates SSH federation: $switchboard_repo" >&2
+        exit 1
+    fi
+
+    install -d -m 0755 "$switchboard_bin_dir"
+    switchboard_stage="$(mktemp -d "$switchboard_bin_dir/.deploy.XXXXXX")"
+    cd "$switchboard_repo"
+    go build -o "$switchboard_stage/switchboard" ./cmd/switchboard
+    go build -o "$switchboard_stage/switchboard-ctl" ./cmd/switchboard-ctl
+    chmod 0755 "$switchboard_stage/switchboard" \
+        "$switchboard_stage/switchboard-ctl"
+    mv -T "$switchboard_stage/switchboard" "$switchboard_bin_dir/switchboard"
+    mv -T "$switchboard_stage/switchboard-ctl" \
+        "$switchboard_bin_dir/switchboard-ctl"
+    rmdir "$switchboard_stage"
+)
+```
+
+Restart the remote daemon after both renames:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user restart switchboard.service
+```
+
+The client-side SSH worker needs no restart: its next retry executes the new
+control binary. Before a first frame arrives, the client journal shows repeated
+entries such as
+`remote-state: destination=<host> host= category=disconnected`. Once the command
+resolves, its two-second retry loop reconnects automatically.
+
 ## Hyprland + Waybar host
 
 Install the Waybar renderer unit and enable it only on the Waybar host:
