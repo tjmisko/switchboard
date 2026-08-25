@@ -416,6 +416,11 @@ type Usage struct {
 	ModelContextWindow      int64 `json:"model_context_window,omitempty"`
 	WebSearchRequests       int64 `json:"web_search_requests,omitempty"`
 	WebFetchRequests        int64 `json:"web_fetch_requests,omitempty"`
+	CodeExecutionRequests   int64 `json:"code_execution_requests,omitempty"`
+	// UnclassifiedServerToolUnits counts non-zero provider server-tool counters
+	// whose billing semantics this build does not yet understand. It deliberately
+	// retains only the count, never a provider field name or tool content.
+	UnclassifiedServerToolUnits int64 `json:"unclassified_server_tool_units,omitempty"`
 }
 
 func (u Usage) IsZero() bool { return u == (Usage{}) }

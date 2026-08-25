@@ -42,6 +42,15 @@ func TestParseAnthropicMarkdownFailsClosedWithoutStandardLongContextMarker(t *te
 	}
 }
 
+func TestParseAnthropicMarkdownFailsClosedWithoutCodeExecutionFreeMarker(t *testing.T) {
+	body := strings.ReplaceAll(string(readFixture(t, "anthropic-pricing.md")),
+		"Code execution is free when used with web search or web fetch.",
+		"Code execution pricing is unspecified.")
+	if _, err := ParseAnthropicMarkdown([]byte(body), time.Now()); err == nil {
+		t.Fatal("parser accepted a source whose code-execution billing semantics changed")
+	}
+}
+
 func TestOpenAISourceParsesEveryExactModelFixture(t *testing.T) {
 	documents := map[string][]byte{
 		"pricing":       readFixture(t, "openai-pricing.md"),

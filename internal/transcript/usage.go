@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"math"
 	"time"
 )
 
@@ -30,12 +31,59 @@ type usageWire struct {
 	Speed        string `json:"speed"`
 	InferenceGeo string `json:"inference_geo"`
 
-	WebSearchRequests int64 `json:"web_search_requests"`
-	WebFetchRequests  int64 `json:"web_fetch_requests"`
-	ServerToolUse     struct {
-		WebSearchRequests int64 `json:"web_search_requests"`
-		WebFetchRequests  int64 `json:"web_fetch_requests"`
-	} `json:"server_tool_use"`
+	WebSearchRequests           int64             `json:"web_search_requests"`
+	WebFetchRequests            int64             `json:"web_fetch_requests"`
+	CodeExecutionRequests       int64             `json:"code_execution_requests"`
+	UnclassifiedServerToolUnits int64             `json:"unclassified_server_tool_units"`
+	ServerToolUse               serverToolUseWire `json:"server_tool_use"`
+}
+
+type serverToolUseWire struct {
+	WebSearchRequests           int64
+	WebFetchRequests            int64
+	CodeExecutionRequests       int64
+	UnclassifiedServerToolUnits int64
+}
+
+// UnmarshalJSON retains only documented numeric counters. Future non-zero
+// counters are collapsed into a content-free count so pricing fails partial
+// instead of silently ignoring a newly billable server tool.
+func (s *serverToolUseWire) UnmarshalJSON(data []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	for name, raw := range fields {
+		var count int64
+		if err := json.Unmarshal(raw, &count); err != nil {
+			// A future non-numeric shape is still evidence that this build cannot
+			// establish full billing coverage.
+			if s.UnclassifiedServerToolUnits == 0 {
+				s.UnclassifiedServerToolUnits = 1
+			}
+			continue
+		}
+		switch name {
+		case "web_search_requests":
+			s.WebSearchRequests = count
+		case "web_fetch_requests":
+			s.WebFetchRequests = count
+		case "code_execution_requests":
+			s.CodeExecutionRequests = count
+		default:
+			if count == 0 {
+				continue
+			}
+			if count < 0 || s.UnclassifiedServerToolUnits > math.MaxInt64-count {
+				if s.UnclassifiedServerToolUnits == 0 {
+					s.UnclassifiedServerToolUnits = 1
+				}
+				continue
+			}
+			s.UnclassifiedServerToolUnits += count
+		}
+	}
+	return nil
 }
 
 // UnmarshalJSON preserves Claude's nested cache-TTL and server-tool fields.
@@ -65,9 +113,19 @@ func (u *Usage) UnmarshalJSON(data []byte) error {
 	u.InferenceGeo = wire.InferenceGeo
 	u.WebSearchRequests = wire.WebSearchRequests
 	u.WebFetchRequests = wire.WebFetchRequests
-	if wire.ServerToolUse.WebSearchRequests != 0 || wire.ServerToolUse.WebFetchRequests != 0 {
+	u.CodeExecutionRequests = wire.CodeExecutionRequests
+	u.UnclassifiedServerToolUnits = wire.UnclassifiedServerToolUnits
+	if wire.ServerToolUse.WebSearchRequests != 0 {
 		u.WebSearchRequests = wire.ServerToolUse.WebSearchRequests
+	}
+	if wire.ServerToolUse.WebFetchRequests != 0 {
 		u.WebFetchRequests = wire.ServerToolUse.WebFetchRequests
+	}
+	if wire.ServerToolUse.CodeExecutionRequests != 0 {
+		u.CodeExecutionRequests = wire.ServerToolUse.CodeExecutionRequests
+	}
+	if wire.ServerToolUse.UnclassifiedServerToolUnits != 0 {
+		u.UnclassifiedServerToolUnits = wire.ServerToolUse.UnclassifiedServerToolUnits
 	}
 	return nil
 }
@@ -192,6 +250,12 @@ func maxUsage(a, b Usage) Usage {
 	}
 	if b.WebFetchRequests > a.WebFetchRequests {
 		a.WebFetchRequests = b.WebFetchRequests
+	}
+	if b.CodeExecutionRequests > a.CodeExecutionRequests {
+		a.CodeExecutionRequests = b.CodeExecutionRequests
+	}
+	if b.UnclassifiedServerToolUnits > a.UnclassifiedServerToolUnits {
+		a.UnclassifiedServerToolUnits = b.UnclassifiedServerToolUnits
 	}
 	if b.ServiceTier != "" {
 		a.ServiceTier = b.ServiceTier

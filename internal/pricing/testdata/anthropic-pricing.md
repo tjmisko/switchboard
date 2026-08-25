@@ -23,3 +23,7 @@ For Claude 4.6 and later models, using US-only inference applies a 1.1x pricing 
 ## Web search tool
 
 Web search is available on the Claude API for $10 per 1,000 searches.
+
+## Code execution tool
+
+Code execution is free when used with web search or web fetch.

@@ -698,25 +698,28 @@ func InFlightTasks(path string, maxBytes int64) (int, error) {
 // buckets, request dimensions, and metered server tools remain distinct for
 // accurate pricing. Cache reads typically dominate Claude Code sessions.
 type Usage struct {
-	InputTokens         int64  `json:"input_tokens"`
-	OutputTokens        int64  `json:"output_tokens"`
-	CacheReadTokens     int64  `json:"cache_read_input_tokens"`
-	CacheCreationTokens int64  `json:"cache_creation_input_tokens"`
-	CacheWrite5mTokens  int64  `json:"cache_write_5m_input_tokens,omitempty"`
-	CacheWrite1hTokens  int64  `json:"cache_write_1h_input_tokens,omitempty"`
-	CacheCreationDetail bool   `json:"cache_creation_detail,omitempty"`
-	ServiceTier         string `json:"service_tier,omitempty"`
-	Speed               string `json:"speed,omitempty"`
-	InferenceGeo        string `json:"inference_geo,omitempty"`
-	WebSearchRequests   int64  `json:"web_search_requests,omitempty"`
-	WebFetchRequests    int64  `json:"web_fetch_requests,omitempty"`
+	InputTokens                 int64  `json:"input_tokens"`
+	OutputTokens                int64  `json:"output_tokens"`
+	CacheReadTokens             int64  `json:"cache_read_input_tokens"`
+	CacheCreationTokens         int64  `json:"cache_creation_input_tokens"`
+	CacheWrite5mTokens          int64  `json:"cache_write_5m_input_tokens,omitempty"`
+	CacheWrite1hTokens          int64  `json:"cache_write_1h_input_tokens,omitempty"`
+	CacheCreationDetail         bool   `json:"cache_creation_detail,omitempty"`
+	ServiceTier                 string `json:"service_tier,omitempty"`
+	Speed                       string `json:"speed,omitempty"`
+	InferenceGeo                string `json:"inference_geo,omitempty"`
+	WebSearchRequests           int64  `json:"web_search_requests,omitempty"`
+	WebFetchRequests            int64  `json:"web_fetch_requests,omitempty"`
+	CodeExecutionRequests       int64  `json:"code_execution_requests,omitempty"`
+	UnclassifiedServerToolUnits int64  `json:"unclassified_server_tool_units,omitempty"`
 }
 
 // IsZero reports whether no tokens were counted.
 func (u Usage) IsZero() bool {
 	return u.InputTokens == 0 && u.OutputTokens == 0 && u.CacheReadTokens == 0 &&
 		u.CacheCreationTokens == 0 && u.CacheWrite5mTokens == 0 &&
-		u.CacheWrite1hTokens == 0 && u.WebSearchRequests == 0 && u.WebFetchRequests == 0
+		u.CacheWrite1hTokens == 0 && u.WebSearchRequests == 0 && u.WebFetchRequests == 0 &&
+		u.CodeExecutionRequests == 0 && u.UnclassifiedServerToolUnits == 0
 }
 
 func (u *Usage) add(o Usage) {
@@ -729,6 +732,8 @@ func (u *Usage) add(o Usage) {
 	u.CacheCreationDetail = u.CacheCreationDetail || o.CacheCreationDetail
 	u.WebSearchRequests += o.WebSearchRequests
 	u.WebFetchRequests += o.WebFetchRequests
+	u.CodeExecutionRequests += o.CodeExecutionRequests
+	u.UnclassifiedServerToolUnits += o.UnclassifiedServerToolUnits
 	if o.ServiceTier != "" {
 		u.ServiceTier = o.ServiceTier
 	}

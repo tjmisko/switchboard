@@ -133,6 +133,23 @@ func EstimateRequest(catalogs CatalogSet, identity Identity, usage Usage, now ti
 	}
 	addTool(usage.WebSearchRequests, "web_search")
 	addTool(usage.WebFetchRequests, "web_fetch")
+	if usage.CodeExecutionRequests > 0 {
+		if catalog.Provider == ProviderAnthropic &&
+			(usage.WebSearchRequests > 0 || usage.WebFetchRequests > 0) {
+			// Anthropic documents server-side code execution as free when used
+			// with web search or web fetch in the same request.
+			estimate.PricedToolUnits += usage.CodeExecutionRequests
+		} else {
+			estimate.UnpricedToolUnits += usage.CodeExecutionRequests
+			estimate.UnpricedReasons = appendUnique(estimate.UnpricedReasons,
+				"code-execution container duration and organization allowance are unavailable")
+		}
+	}
+	if usage.UnclassifiedServerToolUnits > 0 {
+		estimate.UnpricedToolUnits += usage.UnclassifiedServerToolUnits
+		estimate.UnpricedReasons = appendUnique(estimate.UnpricedReasons,
+			"unrecognized server-tool billing units are present")
+	}
 
 	priced := estimate.PricedTokens + estimate.PricedToolUnits
 	unpriced := estimate.UnpricedTokens + estimate.UnpricedToolUnits
@@ -275,14 +292,16 @@ func usageBillableUnits(usage Usage) billableUnits {
 	if usage.CacheWriteInputTokens > usage.InputTokens {
 		tokens += usage.CacheWriteInputTokens
 	}
-	return billableUnits{tokens: tokens, tools: usage.WebSearchRequests + usage.WebFetchRequests}
+	return billableUnits{tokens: tokens, tools: usage.WebSearchRequests + usage.WebFetchRequests +
+		usage.CodeExecutionRequests + usage.UnclassifiedServerToolUnits}
 }
 
 func invalidUsage(u Usage) bool {
 	return u.InputTokens < 0 || u.CachedInputTokens < 0 || u.CacheWriteInputTokens < 0 ||
 		u.CacheWrite5mInputTokens < 0 || u.CacheWrite1hInputTokens < 0 || u.OutputTokens < 0 ||
 		u.ReasoningOutputTokens < 0 || u.TotalTokens < 0 || u.ModelContextWindow < 0 ||
-		u.WebSearchRequests < 0 || u.WebFetchRequests < 0
+		u.WebSearchRequests < 0 || u.WebFetchRequests < 0 || u.CodeExecutionRequests < 0 ||
+		u.UnclassifiedServerToolUnits < 0
 }
 
 func chargeTokens(tokens int64, rate USD) (USD, error) {

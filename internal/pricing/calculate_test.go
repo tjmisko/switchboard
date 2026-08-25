@@ -45,6 +45,38 @@ func TestEstimateClaudeCombinedCacheWriteIsPartial(t *testing.T) {
 	}
 }
 
+func TestEstimateClaudeCodeExecutionBillingFailsClosedUnlessWebMakesItFree(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	identity := Identity{ExecutionProvider: ProviderAnthropic, Model: "claude-opus-4-8"}
+
+	partial := EstimateRequest(freshCatalogs(now), identity, Usage{
+		InputTokens: 1_000_000, CodeExecutionRequests: 1,
+	}, now)
+	assertUSD(t, partial.APIEquivalentUSD, 5)
+	if partial.Status != CostPartial || partial.UnpricedToolUnits != 1 || len(partial.UnpricedReasons) != 1 {
+		t.Fatalf("container-hour uncertainty = %+v", partial)
+	}
+
+	freeWithWeb := EstimateRequest(freshCatalogs(now), identity, Usage{
+		InputTokens: 1_000_000, WebFetchRequests: 1, CodeExecutionRequests: 1,
+	}, now)
+	assertUSD(t, freeWithWeb.APIEquivalentUSD, 5)
+	if freeWithWeb.Status != CostEstimated || freeWithWeb.UnpricedToolUnits != 0 || freeWithWeb.Coverage != 1 {
+		t.Fatalf("code execution with web fetch = %+v", freeWithWeb)
+	}
+}
+
+func TestEstimateClaudeUnknownServerToolFailsClosed(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	estimate := EstimateRequest(freshCatalogs(now), Identity{
+		ExecutionProvider: ProviderAnthropic, Model: "claude-opus-4-8",
+	}, Usage{InputTokens: 1_000_000, UnclassifiedServerToolUnits: 3}, now)
+	assertUSD(t, estimate.APIEquivalentUSD, 5)
+	if estimate.Status != CostPartial || estimate.UnpricedToolUnits != 3 || len(estimate.UnpricedReasons) != 1 {
+		t.Fatalf("unknown server tool = %+v", estimate)
+	}
+}
+
 func TestEstimateClaudePriorityKeepsSpotEquivalentButNotContractBill(t *testing.T) {
 	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
 	estimate := EstimateRequest(freshCatalogs(now), Identity{

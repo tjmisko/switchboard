@@ -1609,6 +1609,8 @@ func accumulateUsage(total **UsageDelta, delta UsageDelta) {
 	(*total).TotalTokens += delta.TotalTokens
 	(*total).WebSearchRequests += delta.WebSearchRequests
 	(*total).WebFetchRequests += delta.WebFetchRequests
+	(*total).CodeExecutionRequests += delta.CodeExecutionRequests
+	(*total).UnclassifiedServerToolUnits += delta.UnclassifiedServerToolUnits
 	if delta.ModelContextWindow > (*total).ModelContextWindow {
 		(*total).ModelContextWindow = delta.ModelContextWindow
 	}
@@ -1638,6 +1640,8 @@ func accumulateUsageValue(total *UsageDelta, delta UsageDelta) {
 	total.TotalTokens += delta.TotalTokens
 	total.WebSearchRequests += delta.WebSearchRequests
 	total.WebFetchRequests += delta.WebFetchRequests
+	total.CodeExecutionRequests += delta.CodeExecutionRequests
+	total.UnclassifiedServerToolUnits += delta.UnclassifiedServerToolUnits
 	if delta.ModelContextWindow > total.ModelContextWindow {
 		total.ModelContextWindow = delta.ModelContextWindow
 	}

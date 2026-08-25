@@ -239,7 +239,7 @@ func TestUsageTrackerReplacementRescansWithoutReplayingKnownMessages(t *testing.
 func TestUsageTrackerPreservesPricingDimensionsAndProviderTimestamp(t *testing.T) {
 	dir := t.TempDir()
 	root := filepath.Join(dir, "session.jsonl")
-	line := `{"type":"assistant","timestamp":"2026-08-25T10:11:12.123Z","uuid":"row-1","message":{"id":"msg-rich","role":"assistant","model":"claude-opus-4-8","content":[],"usage":{"input_tokens":11,"output_tokens":12,"cache_read_input_tokens":13,"cache_creation_input_tokens":999,"cache_creation":{"ephemeral_5m_input_tokens":14,"ephemeral_1h_input_tokens":15},"service_tier":"priority","speed":"fast","inference_geo":"us","server_tool_use":{"web_search_requests":2,"web_fetch_requests":3}}}}`
+	line := `{"type":"assistant","timestamp":"2026-08-25T10:11:12.123Z","uuid":"row-1","message":{"id":"msg-rich","role":"assistant","model":"claude-opus-4-8","content":[],"usage":{"input_tokens":11,"output_tokens":12,"cache_read_input_tokens":13,"cache_creation_input_tokens":999,"cache_creation":{"ephemeral_5m_input_tokens":14,"ephemeral_1h_input_tokens":15},"service_tier":"priority","speed":"fast","inference_geo":"us","server_tool_use":{"web_search_requests":2,"web_fetch_requests":3,"code_execution_requests":1,"future_server_tool_requests":4}}}}`
 	appendUsageLines(t, root, line)
 	tracker, err := NewUsageTracker(t.TempDir())
 	if err != nil {
@@ -260,7 +260,8 @@ func TestUsageTrackerPreservesPricingDimensionsAndProviderTimestamp(t *testing.T
 	if u.CacheWrite5mTokens != 14 || u.CacheWrite1hTokens != 15 || u.CacheCreationTokens != 29 {
 		t.Errorf("cache dimensions = %+v, want 14/15 and combined 29", u)
 	}
-	if u.ServiceTier != "priority" || u.Speed != "fast" || u.InferenceGeo != "us" || u.WebSearchRequests != 2 || u.WebFetchRequests != 3 {
+	if u.ServiceTier != "priority" || u.Speed != "fast" || u.InferenceGeo != "us" || u.WebSearchRequests != 2 ||
+		u.WebFetchRequests != 3 || u.CodeExecutionRequests != 1 || u.UnclassifiedServerToolUnits != 4 {
 		t.Errorf("pricing dimensions = %+v", u)
 	}
 }

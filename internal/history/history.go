@@ -149,14 +149,16 @@ type Event struct {
 	// v2 canonical usage and billing identity. Legacy Tok* fields remain readable
 	// and are projected by CanonicalUsage. Expanded flat fields ease a staged
 	// collector rollout; Usage is authoritative when present.
-	TokCacheCreate5m   int64 `json:"tok_cache_create_5m,omitempty"`
-	TokCacheCreate1h   int64 `json:"tok_cache_create_1h,omitempty"`
-	TokCacheWrite      int64 `json:"tok_cache_write,omitempty"`
-	TokReasoningOut    int64 `json:"tok_reasoning_out,omitempty"`
-	TokTotal           int64 `json:"tok_total,omitempty"`
-	ModelContextWindow int64 `json:"model_context_window,omitempty"`
-	WebSearchRequests  int64 `json:"web_search_requests,omitempty"`
-	WebFetchRequests   int64 `json:"web_fetch_requests,omitempty"`
+	TokCacheCreate5m            int64 `json:"tok_cache_create_5m,omitempty"`
+	TokCacheCreate1h            int64 `json:"tok_cache_create_1h,omitempty"`
+	TokCacheWrite               int64 `json:"tok_cache_write,omitempty"`
+	TokReasoningOut             int64 `json:"tok_reasoning_out,omitempty"`
+	TokTotal                    int64 `json:"tok_total,omitempty"`
+	ModelContextWindow          int64 `json:"model_context_window,omitempty"`
+	WebSearchRequests           int64 `json:"web_search_requests,omitempty"`
+	WebFetchRequests            int64 `json:"web_fetch_requests,omitempty"`
+	CodeExecutionRequests       int64 `json:"code_execution_requests,omitempty"`
+	UnclassifiedServerToolUnits int64 `json:"unclassified_server_tool_units,omitempty"`
 
 	ExecutionProvider string `json:"execution_provider,omitempty"`
 	BillingRoute      string `json:"billing_route,omitempty"`
@@ -250,17 +252,19 @@ func (e Event) CanonicalUsage() UsageDelta {
 		return *e.Usage
 	}
 	usage := UsageDelta{
-		InputTokens:             e.TokIn,
-		CachedInputTokens:       e.TokCacheRead,
-		CacheWriteInputTokens:   e.TokCacheWrite,
-		CacheWrite5mInputTokens: e.TokCacheCreate5m,
-		CacheWrite1hInputTokens: e.TokCacheCreate1h,
-		OutputTokens:            e.TokOut,
-		ReasoningOutputTokens:   e.TokReasoningOut,
-		TotalTokens:             e.TokTotal,
-		ModelContextWindow:      e.ModelContextWindow,
-		WebSearchRequests:       e.WebSearchRequests,
-		WebFetchRequests:        e.WebFetchRequests,
+		InputTokens:                 e.TokIn,
+		CachedInputTokens:           e.TokCacheRead,
+		CacheWriteInputTokens:       e.TokCacheWrite,
+		CacheWrite5mInputTokens:     e.TokCacheCreate5m,
+		CacheWrite1hInputTokens:     e.TokCacheCreate1h,
+		OutputTokens:                e.TokOut,
+		ReasoningOutputTokens:       e.TokReasoningOut,
+		TotalTokens:                 e.TokTotal,
+		ModelContextWindow:          e.ModelContextWindow,
+		WebSearchRequests:           e.WebSearchRequests,
+		WebFetchRequests:            e.WebFetchRequests,
+		CodeExecutionRequests:       e.CodeExecutionRequests,
+		UnclassifiedServerToolUnits: e.UnclassifiedServerToolUnits,
 	}
 	if e.TokCacheCreate5m == 0 && e.TokCacheCreate1h == 0 {
 		usage.CacheWriteInputTokens += e.TokCacheCreate

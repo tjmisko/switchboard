@@ -176,7 +176,8 @@ func (rs *reconcileState) observeUsage(sink *history.Sink, sess *state.Session, 
 			canonical := history.UsageDelta{
 				InputTokens: u.InputTokens, CachedInputTokens: u.CacheReadTokens,
 				OutputTokens: u.OutputTokens, WebSearchRequests: u.WebSearchRequests,
-				WebFetchRequests: u.WebFetchRequests,
+				WebFetchRequests: u.WebFetchRequests, CodeExecutionRequests: u.CodeExecutionRequests,
+				UnclassifiedServerToolUnits: u.UnclassifiedServerToolUnits,
 			}
 			if u.CacheCreationDetail {
 				canonical.CacheWrite5mInputTokens = u.CacheWrite5mTokens
@@ -192,6 +193,8 @@ func (rs *reconcileState) observeUsage(sink *history.Sink, sess *state.Session, 
 			ev.TokCacheCreate5m, ev.TokCacheCreate1h = u.CacheWrite5mTokens, u.CacheWrite1hTokens
 			ev.ServiceTier, ev.Speed, ev.InferenceGeo = u.ServiceTier, u.Speed, u.InferenceGeo
 			ev.WebSearchRequests, ev.WebFetchRequests = u.WebSearchRequests, u.WebFetchRequests
+			ev.CodeExecutionRequests = u.CodeExecutionRequests
+			ev.UnclassifiedServerToolUnits = u.UnclassifiedServerToolUnits
 			ev.ProviderMessageID, ev.UsageSourceID = snapshot.ProviderMessageID, snapshot.SourceID
 			events = append(events, ev)
 		}

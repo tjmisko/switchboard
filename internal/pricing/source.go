@@ -179,6 +179,9 @@ func ParseAnthropicMarkdown(body []byte, retrievedAt time.Time) (Catalog, error)
 	if !regexp.MustCompile(`1\.1\s*x\s+pricing multiplier`).MatchString(normalized) {
 		return Catalog{}, errors.New("US inference 1.1x multiplier marker is missing")
 	}
+	if !regexp.MustCompile(`(?s)code execution is free.{0,160}web search.{0,120}web fetch`).MatchString(normalized) {
+		return Catalog{}, errors.New("code-execution-with-web free-pricing marker is missing")
+	}
 	for id, price := range models {
 		if anthropicSupportsUSGeo(id) {
 			price.Multipliers = map[string]Multiplier{"inference_geo=us": {Numerator: 11, Denominator: 10}}

@@ -117,7 +117,7 @@ func TestObserveUsageEmitsOneSamplePerLogicalMessage(t *testing.T) {
 func TestObserveUsagePreservesClaudePricingDimensions(t *testing.T) {
 	dir := t.TempDir()
 	tpath := filepath.Join(dir, "session.jsonl")
-	writeLines(t, tpath, `{"type":"assistant","timestamp":"2026-08-25T10:11:12.123Z","uuid":"row-rich","message":{"id":"msg-rich","role":"assistant","model":"claude-opus-4-8","content":[],"usage":{"input_tokens":11,"output_tokens":12,"cache_read_input_tokens":13,"cache_creation_input_tokens":29,"cache_creation":{"ephemeral_5m_input_tokens":14,"ephemeral_1h_input_tokens":15},"service_tier":"priority","speed":"fast","inference_geo":"us","server_tool_use":{"web_search_requests":2,"web_fetch_requests":3}}}}`)
+	writeLines(t, tpath, `{"type":"assistant","timestamp":"2026-08-25T10:11:12.123Z","uuid":"row-rich","message":{"id":"msg-rich","role":"assistant","model":"claude-opus-4-8","content":[],"usage":{"input_tokens":11,"output_tokens":12,"cache_read_input_tokens":13,"cache_creation_input_tokens":29,"cache_creation":{"ephemeral_5m_input_tokens":14,"ephemeral_1h_input_tokens":15},"service_tier":"priority","speed":"fast","inference_geo":"us","server_tool_use":{"web_search_requests":2,"web_fetch_requests":3,"code_execution_requests":1,"future_server_tool_requests":4}}}}`)
 
 	histDir := t.TempDir()
 	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
@@ -150,7 +150,8 @@ func TestObserveUsagePreservesClaudePricingDimensions(t *testing.T) {
 	if sample.Usage == nil || sample.Usage.InputTokens != 11 || sample.Usage.OutputTokens != 12 ||
 		sample.Usage.CachedInputTokens != 13 || sample.Usage.CacheWriteInputTokens != 0 ||
 		sample.Usage.CacheWrite5mInputTokens != 14 || sample.Usage.CacheWrite1hInputTokens != 15 ||
-		sample.Usage.WebSearchRequests != 2 || sample.Usage.WebFetchRequests != 3 {
+		sample.Usage.WebSearchRequests != 2 || sample.Usage.WebFetchRequests != 3 ||
+		sample.Usage.CodeExecutionRequests != 1 || sample.Usage.UnclassifiedServerToolUnits != 4 {
 		t.Errorf("canonical usage = %+v", sample.Usage)
 	}
 	if sample.ServiceTier != "priority" || sample.Speed != "fast" || sample.InferenceGeo != "us" || sample.WebSearchRequests != 2 || sample.WebFetchRequests != 3 {
