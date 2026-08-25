@@ -839,6 +839,59 @@ func TestUsageMetadataRevisionReplacesIdentityWithoutAddingTokens(t *testing.T) 
 	}
 }
 
+func TestPartialCollectorCoverageMakesSubtotalExplicitAndDeduplicatesGap(t *testing.T) {
+	cutover := Event{
+		SchemaVersion: HistorySchemaVersion, Ts: ts(4), Type: EventUsageCutover,
+		SessionID: "s1", PID: 1, Agent: "claude", ExecutionProvider: pricing.ProviderAnthropic,
+		UsageEventID: "cutover-1", UsageRevision: 1, UsageCoverage: "partial_legacy_cutover",
+	}
+	duplicateCutover := cutover
+	sample := usageEv(1, 5, "claude-opus-4-8", 1_000_000, 0, 0, 0)
+	sample.SchemaVersion = HistorySchemaVersion
+	sample.SessionID = "s1"
+	sample.Agent = "claude"
+	sample.ExecutionProvider = pricing.ProviderAnthropic
+	sample.UsageEventID = "message-1"
+	sample.UsageRevision = 1
+	sample.UsageCoverage = "partial_legacy_cutover"
+
+	events := []Event{cutover, duplicateCutover, sample}
+	totals := AggregateTotalsWithCatalogs(events, pricing.BootstrapCatalogs(), ts(6))
+	if totals.Cost == nil || totals.Cost.APIEquivalentUSD == nil || totals.Cost.Status != pricing.CostPartial {
+		t.Fatalf("coverage gap did not make known subtotal partial: %+v", totals.Cost)
+	}
+	if totals.Cost.UnpricedEvents != 1 {
+		t.Fatalf("one logical collector gap counted %d times", totals.Cost.UnpricedEvents)
+	}
+	if len(totals.Cost.UnpricedReasons) != 1 || totals.Cost.UnpricedReasons[0] !=
+		"usage collector coverage is incomplete: partial_legacy_cutover" {
+		t.Fatalf("coverage reason = %+v", totals.Cost.UnpricedReasons)
+	}
+	lanes := BuildSwimlanesWithCatalogs(events, ts(10), pricing.BootstrapCatalogs(), ts(6))
+	if len(lanes) != 1 || lanes[0].Cost == nil || lanes[0].Cost.Status != pricing.CostPartial ||
+		lanes[0].Cost.UnpricedEvents != 1 {
+		t.Fatalf("lane coverage semantics = %+v", lanes)
+	}
+	plan := AggregatePlanWindowWithCatalogs(events, ts(0), ts(10), pricing.BootstrapCatalogs(), ts(6))
+	if plan.Cost == nil || plan.Cost.Status != pricing.CostPartial || plan.Cost.UnpricedEvents != 1 {
+		t.Fatalf("plan coverage semantics = %+v", plan.Cost)
+	}
+}
+
+func TestPartialCoverageOnPostCutoverSampleSurvivesBoundedRead(t *testing.T) {
+	sample := usageEv(1, 8, "claude-opus-4-8", 1_000_000, 0, 0, 0)
+	sample.SessionID = "s1"
+	sample.Agent = "claude"
+	sample.ExecutionProvider = pricing.ProviderAnthropic
+	sample.UsageEventID = "message-1"
+	sample.UsageRevision = 1
+	sample.UsageCoverage = "partial_legacy_cutover"
+	plan := AggregatePlanWindowWithCatalogs([]Event{sample}, ts(7), ts(9), pricing.BootstrapCatalogs(), ts(9))
+	if plan.Cost == nil || plan.Cost.Status != pricing.CostPartial || plan.Cost.UnpricedEvents != 1 {
+		t.Fatalf("bounded read lost propagated coverage: %+v", plan.Cost)
+	}
+}
+
 func TestUnsupportedTierKeepsVendorEstimateSeparate(t *testing.T) {
 	vendor := pricing.USDFromMicros(123_000)
 	event := Event{

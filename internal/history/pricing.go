@@ -20,7 +20,7 @@ func priceBook(now time.Time) pricing.CatalogSet {
 func EstimateEvent(ev Event, catalogs pricing.CatalogSet, now time.Time) CostEstimate {
 	estimate := pricing.EstimateRequest(catalogs, ev.PricingIdentity(), ev.CanonicalUsage(), now)
 	if ev.Cost == nil {
-		return estimate
+		return applyUsageCoverage(estimate, ev.UsageCoverage)
 	}
 	reported := *ev.Cost
 	if reported.VendorEstimatedUSD != nil {
@@ -61,6 +61,54 @@ func EstimateEvent(ev Event, catalogs pricing.CatalogSet, now time.Time) CostEst
 	if reported.Status == pricing.CostIncluded && ev.BillingRoute == "chatgpt_subscription" &&
 		estimate.EstimatedBilledUSD == nil {
 		estimate.Status = pricing.CostIncluded
+	}
+	return applyUsageCoverage(estimate, ev.UsageCoverage)
+}
+
+// EstimateCoverageGap turns a durable collector cutover/gap marker into an
+// explicit unknown component. This prevents a priced post-cutover subtotal from
+// looking complete merely because the amount of missing historical usage is
+// unknowable.
+func EstimateCoverageGap(ev Event) CostEstimate {
+	reason := "usage collector coverage is incomplete"
+	if ev.UsageCoverage != "" {
+		reason += ": " + ev.UsageCoverage
+	}
+	return CostEstimate{
+		Status: pricing.CostUnknown, Coverage: 0, UnpricedEvents: 1,
+		UnpricedReasons: []string{reason}, PricingKind: "coverage_gap",
+	}
+}
+
+// estimateObservedUsage prices only the usage present on an event. Timeline
+// folds merge the session-scoped collector gap separately and exactly once,
+// even when every subsequent snapshot repeats the same coverage marker.
+func estimateObservedUsage(ev Event, catalogs pricing.CatalogSet, now time.Time) CostEstimate {
+	ev.UsageCoverage = ""
+	return EstimateEvent(ev, catalogs, now)
+}
+
+func applyUsageCoverage(estimate CostEstimate, coverage string) CostEstimate {
+	if coverage == "" || coverage == "complete" || coverage == "full" {
+		return estimate
+	}
+	reason := "usage collector coverage is incomplete: " + coverage
+	seen := false
+	for _, existing := range estimate.UnpricedReasons {
+		if existing == reason {
+			seen = true
+			break
+		}
+	}
+	if !seen {
+		estimate.UnpricedReasons = append(estimate.UnpricedReasons, reason)
+	}
+	estimate.UnpricedEvents++
+	if estimate.APIEquivalentUSD != nil || estimate.VendorEstimatedUSD != nil ||
+		estimate.PlanCredits != nil || estimate.EstimatedBilledUSD != nil {
+		estimate.Status = pricing.CostPartial
+	} else {
+		estimate.Status = pricing.CostUnknown
 	}
 	return estimate
 }

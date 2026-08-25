@@ -366,6 +366,7 @@ func BuildSwimlanesWithCatalogs(events []Event, end time.Time, catalogs pricing.
 
 	open := map[string]*laneBuilder{}
 	pidLane := map[int]string{} // pid → the lane key it currently feeds
+	coverageSeen := map[string]bool{}
 	var done []Swimlane
 	finish := func(b *laneBuilder, t time.Time) {
 		b.closeInterval(t)
@@ -521,6 +522,19 @@ func BuildSwimlanesWithCatalogs(events []Event, end time.Time, catalogs pricing.
 			b.closeLabel(ev.Ts)
 			b.curLabel = ev.Label
 			b.absorb(ev)
+		case EventUsageCutover:
+			if b == nil {
+				b = newLaneBuilder(ev)
+				open[key] = b
+			}
+			if coverageKey := usageCoverageGapKey(ev); coverageKey != "" && !coverageSeen[coverageKey] {
+				estimate := EstimateCoverageGap(ev)
+				b.lane.Cost = mergeCost(b.lane.Cost, estimate)
+				accumulatePricingGroup(&b.lane.PricingGroups, ev.PricingIdentity(), UsageDelta{}, estimate)
+				coverageSeen[coverageKey] = true
+			}
+			b.lane.CostUSD = legacyCostAlias(b.lane.Cost)
+			b.absorb(ev)
 		case EventUsageSample:
 			if b == nil {
 				b = newLaneBuilder(ev)
@@ -532,9 +546,15 @@ func BuildSwimlanesWithCatalogs(events []Event, end time.Time, catalogs pricing.
 			b.lane.TokOut += usage.OutputTokens
 			b.lane.TokCacheRead += usage.CachedInputTokens
 			b.lane.TokCacheCreate += usage.CacheWriteInputTokens + usage.CacheWrite5mInputTokens + usage.CacheWrite1hInputTokens
-			estimate := EstimateEvent(ev, catalogs, pricingNow)
+			estimate := estimateObservedUsage(ev, catalogs, pricingNow)
 			b.lane.Cost = mergeCost(b.lane.Cost, estimate)
 			accumulatePricingGroup(&b.lane.PricingGroups, ev.PricingIdentity(), usage, estimate)
+			if coverageKey := usageCoverageGapKey(ev); coverageKey != "" && !coverageSeen[coverageKey] {
+				gap := EstimateCoverageGap(ev)
+				b.lane.Cost = mergeCost(b.lane.Cost, gap)
+				accumulatePricingGroup(&b.lane.PricingGroups, ev.PricingIdentity(), UsageDelta{}, gap)
+				coverageSeen[coverageKey] = true
+			}
 			b.lane.CostUSD = legacyCostAlias(b.lane.Cost)
 			b.absorb(ev)
 		case EventSubagentSpawn:
@@ -1243,8 +1263,17 @@ func AggregateTotals(events []Event) Totals {
 
 func AggregateTotalsWithCatalogs(events []Event, catalogs pricing.CatalogSet, pricingNow time.Time) Totals {
 	t := Totals{VendorUsage: foldVendorUsage(latestVendorSnapshotEvents(events))}
+	coverageSeen := map[string]bool{}
 	for _, ev := range latestUsageSnapshots(events) {
 		switch ev.Type {
+		case EventUsageCutover:
+			if coverageKey := usageCoverageGapKey(ev); coverageKey != "" && !coverageSeen[coverageKey] {
+				estimate := EstimateCoverageGap(ev)
+				t.Cost = mergeCost(t.Cost, estimate)
+				accumulatePricingGroup(&t.PricingGroups, ev.PricingIdentity(), UsageDelta{}, estimate)
+				coverageSeen[coverageKey] = true
+			}
+			t.CostUSD = legacyCostAlias(t.Cost)
 		case EventUsageSample:
 			usage := ev.CanonicalUsage()
 			accumulateUsage(&t.Usage, usage)
@@ -1252,9 +1281,15 @@ func AggregateTotalsWithCatalogs(events []Event, catalogs pricing.CatalogSet, pr
 			t.TokOut += usage.OutputTokens
 			t.TokCacheRead += usage.CachedInputTokens
 			t.TokCacheCreate += usage.CacheWriteInputTokens + usage.CacheWrite5mInputTokens + usage.CacheWrite1hInputTokens
-			estimate := EstimateEvent(ev, catalogs, pricingNow)
+			estimate := estimateObservedUsage(ev, catalogs, pricingNow)
 			t.Cost = mergeCost(t.Cost, estimate)
 			accumulatePricingGroup(&t.PricingGroups, ev.PricingIdentity(), usage, estimate)
+			if coverageKey := usageCoverageGapKey(ev); coverageKey != "" && !coverageSeen[coverageKey] {
+				gap := EstimateCoverageGap(ev)
+				t.Cost = mergeCost(t.Cost, gap)
+				accumulatePricingGroup(&t.PricingGroups, ev.PricingIdentity(), UsageDelta{}, gap)
+				coverageSeen[coverageKey] = true
+			}
 			t.CostUSD = legacyCostAlias(t.Cost)
 		case EventSubagentSpawn:
 			t.Subagents++
@@ -1294,14 +1329,25 @@ func AggregatePlanWindow(events []Event, from, to time.Time) PlanWindow {
 
 func AggregatePlanWindowWithCatalogs(events []Event, from, to time.Time, catalogs pricing.CatalogSet, pricingNow time.Time) PlanWindow {
 	pw := PlanWindow{Hours: to.Sub(from).Hours(), From: from, To: to}
+	coverageSeen := map[string]bool{}
 	if len(latestVendorSnapshotEvents(events)) > 0 {
 		pw.VendorUsageOmittedReason = "cumulative thread snapshots lack a window baseline; excluded from bounded plan cost"
 	}
 	for _, ev := range latestUsageSnapshots(events) {
-		if ev.Type != EventUsageSample {
+		if ev.Type != EventUsageSample && ev.Type != EventUsageCutover {
 			continue
 		}
 		if ev.Ts.Before(from) || ev.Ts.After(to) {
+			continue
+		}
+		if ev.Type == EventUsageCutover {
+			if coverageKey := usageCoverageGapKey(ev); coverageKey != "" && !coverageSeen[coverageKey] {
+				estimate := EstimateCoverageGap(ev)
+				pw.Cost = mergeCost(pw.Cost, estimate)
+				accumulatePricingGroup(&pw.PricingGroups, ev.PricingIdentity(), UsageDelta{}, estimate)
+				coverageSeen[coverageKey] = true
+			}
+			pw.CostUSD = legacyCostAlias(pw.Cost)
 			continue
 		}
 		usage := ev.CanonicalUsage()
@@ -1310,9 +1356,15 @@ func AggregatePlanWindowWithCatalogs(events []Event, from, to time.Time, catalog
 		pw.TokOut += usage.OutputTokens
 		pw.TokCacheRead += usage.CachedInputTokens
 		pw.TokCacheCreate += usage.CacheWriteInputTokens + usage.CacheWrite5mInputTokens + usage.CacheWrite1hInputTokens
-		estimate := EstimateEvent(ev, catalogs, pricingNow)
+		estimate := estimateObservedUsage(ev, catalogs, pricingNow)
 		pw.Cost = mergeCost(pw.Cost, estimate)
 		accumulatePricingGroup(&pw.PricingGroups, ev.PricingIdentity(), usage, estimate)
+		if coverageKey := usageCoverageGapKey(ev); coverageKey != "" && !coverageSeen[coverageKey] {
+			gap := EstimateCoverageGap(ev)
+			pw.Cost = mergeCost(pw.Cost, gap)
+			accumulatePricingGroup(&pw.PricingGroups, ev.PricingIdentity(), UsageDelta{}, gap)
+			coverageSeen[coverageKey] = true
+		}
 		pw.CostUSD = legacyCostAlias(pw.Cost)
 	}
 	return pw
@@ -1328,7 +1380,7 @@ func AggregatePlanWindowWithCatalogs(events []Event, from, to time.Time, catalog
 func latestUsageSnapshots(events []Event) []Event {
 	winner := make(map[string]int)
 	for i, ev := range events {
-		if ev.Type != EventUsageSample || ev.UsageEventID == "" {
+		if !isUsageUpsertEvent(ev) || ev.UsageEventID == "" {
 			continue
 		}
 		prev, ok := winner[ev.UsageEventID]
@@ -1343,12 +1395,27 @@ func latestUsageSnapshots(events []Event) []Event {
 	}
 	out := make([]Event, 0, len(events))
 	for i, ev := range events {
-		if ev.Type == EventUsageSample && ev.UsageEventID != "" && winner[ev.UsageEventID] != i {
+		if isUsageUpsertEvent(ev) && ev.UsageEventID != "" && winner[ev.UsageEventID] != i {
 			continue
 		}
 		out = append(out, ev)
 	}
 	return out
+}
+
+func isUsageUpsertEvent(ev Event) bool {
+	return ev.Type == EventUsageSample || ev.Type == EventUsageCutover
+}
+
+func usageCoverageGapKey(ev Event) string {
+	if ev.UsageCoverage == "" || ev.UsageCoverage == "complete" || ev.UsageCoverage == "full" {
+		return ""
+	}
+	scope := ev.SessionID
+	if scope == "" {
+		scope = "pid:" + strconv.Itoa(ev.PID)
+	}
+	return ev.Agent + "\x00" + ev.ExecutionProvider + "\x00" + scope + "\x00" + ev.UsageCoverage
 }
 
 // latestVendorSnapshotEvents first resolves revisions of one logical snapshot,
