@@ -136,7 +136,7 @@ func TestObserveUsagePreservesClaudePricingDimensions(t *testing.T) {
 		t.Errorf("sample timestamp = %q, want provider timestamp", got)
 	}
 	if sample.ProviderMessageID != "msg-rich" || !strings.HasPrefix(sample.UsageSourceID, "cusrc_") ||
-		!strings.HasPrefix(sample.UsageEventID, "cuev_") || !sample.UsageSnapshot || sample.UsageRevision != 1 ||
+		!strings.HasPrefix(sample.UsageEventID, "cuev_") || !sample.UsageSnapshot || sample.UsageRevision <= 0 ||
 		sample.Source != agentgraph.SourceClaudeTranscript {
 		t.Errorf("sample correlation = %+v", sample)
 	}

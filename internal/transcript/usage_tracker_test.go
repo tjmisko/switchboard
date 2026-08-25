@@ -51,6 +51,10 @@ func TestUsageTrackerDeduplicatesAndCountsOnlyPositiveRevisionsAcrossPolls(t *te
 		t.Fatalf("first snapshot = %+v, want one 100/20 message", snapshots)
 	}
 	firstEventID := snapshots[0].UsageEventID
+	firstRevision := snapshots[0].UsageRevision
+	if firstRevision <= 0 {
+		t.Fatalf("first revision = %d, want positive", firstRevision)
+	}
 
 	// An identical streamed fragment arriving in a later poll is not a second
 	// provider response.
@@ -70,8 +74,8 @@ func TestUsageTrackerDeduplicatesAndCountsOnlyPositiveRevisionsAcrossPolls(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(snapshots) != 1 || snapshots[0].UsageEventID != firstEventID || snapshots[0].UsageRevision != 2 || snapshots[0].Usage.InputTokens != 125 || snapshots[0].Usage.OutputTokens != 31 {
-		t.Fatalf("revision snapshot = %+v, want revision 2 full 125/31 under %q", snapshots, firstEventID)
+	if len(snapshots) != 1 || snapshots[0].UsageEventID != firstEventID || snapshots[0].UsageRevision <= firstRevision || snapshots[0].Usage.InputTokens != 125 || snapshots[0].Usage.OutputTokens != 31 {
+		t.Fatalf("revision snapshot = %+v, want an increasing revision with full 125/31 under %q", snapshots, firstEventID)
 	}
 
 	// A counter regression is ignored rather than producing a negative sample or
@@ -320,7 +324,7 @@ func TestUsageTrackerAppendFailureDoesNotAdvanceCursor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(failed) != 1 || len(retried) != 2 || retried[0].UsageEventID != failed[0].UsageEventID || retried[0].UsageRevision != failed[0].UsageRevision {
+	if len(failed) != 1 || len(retried) != 2 || retried[0].UsageEventID != failed[0].UsageEventID || retried[0].UsageRevision < failed[0].UsageRevision {
 		t.Fatalf("retry snapshots = %+v after failed batch %+v; cursor advanced or ids changed", retried, failed)
 	}
 }
@@ -359,8 +363,8 @@ func TestUsageTrackerAppendBeforePersistCrashRetriesSameSnapshotID(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if replay.UsageEventID != durable.UsageEventID || replay.UsageRevision != durable.UsageRevision || replay.Usage != durable.Usage {
-		t.Fatalf("crash retry = %+v, want same authoritative upsert as %+v", replay, durable)
+	if replay.UsageEventID != durable.UsageEventID || replay.UsageRevision < durable.UsageRevision || replay.Usage != durable.Usage {
+		t.Fatalf("crash retry = %+v, want same authoritative upsert id/value and nondecreasing revision as %+v", replay, durable)
 	}
 }
 
@@ -464,13 +468,13 @@ func TestUsageTrackerTTLAndMetadataRevisionsReplaceSnapshot(t *testing.T) {
 		t.Fatalf("TTL reclassification snapshot = %+v, %v", second, err)
 	}
 	u := second[0].Usage
-	if second[0].UsageEventID != first[0].UsageEventID || second[0].UsageRevision != 2 || u.CacheCreationTokens != 100 || u.CacheWrite5mTokens != 25 || u.CacheWrite1hTokens != 75 {
+	if second[0].UsageEventID != first[0].UsageEventID || second[0].UsageRevision <= first[0].UsageRevision || u.CacheCreationTokens != 100 || u.CacheWrite5mTokens != 25 || u.CacheWrite1hTokens != 75 {
 		t.Fatalf("TTL revision = %+v, want full replacement 25/75 with combined 100", second[0])
 	}
 
 	appendUsageLines(t, root, `{"type":"assistant","timestamp":"2026-08-25T10:00:02Z","uuid":"row-3","message":{"id":"msg-1","role":"assistant","model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":2,"cache_creation":{"ephemeral_5m_input_tokens":25,"ephemeral_1h_input_tokens":75},"service_tier":"priority","speed":"fast","inference_geo":"us"}}}`)
 	third, err := syncUsageSnapshots(tracker, "session-1", root, time.Now())
-	if err != nil || len(third) != 1 || third[0].UsageRevision != 3 {
+	if err != nil || len(third) != 1 || third[0].UsageRevision <= second[0].UsageRevision {
 		t.Fatalf("metadata-only revision = %+v, %v", third, err)
 	}
 	if third[0].Usage.ServiceTier != "priority" || third[0].Usage.Speed != "fast" || third[0].Usage.InferenceGeo != "us" || third[0].Usage.CacheCreationTokens != 100 {
@@ -574,7 +578,7 @@ func TestUsageTrackerEvictionReplayRetainsStableEventID(t *testing.T) {
 	if err != nil || len(replayed) != 1 {
 		t.Fatalf("eviction replay = %+v, %v", replayed, err)
 	}
-	if replayed[0].UsageEventID != first[0].UsageEventID || replayed[0].Usage != first[0].Usage {
+	if replayed[0].UsageEventID != first[0].UsageEventID || replayed[0].Usage != first[0].Usage || replayed[0].UsageRevision <= first[0].UsageRevision {
 		t.Fatalf("evicted message changed id/value: first=%+v replay=%+v", first[0], replayed[0])
 	}
 }

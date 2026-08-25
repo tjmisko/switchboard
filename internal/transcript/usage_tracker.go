@@ -52,6 +52,7 @@ type UsageBatchAppender func([]UsageSnapshot) error
 
 type usageTrackerState struct {
 	Version              int                           `json:"version"`
+	RevisionClock        int64                         `json:"revision_clock,omitempty"`
 	LegacyCutoverAt      time.Time                     `json:"legacy_cutover_at,omitempty"`
 	LegacySessions       map[string]bool               `json:"legacy_sessions,omitempty"`
 	LegacyUnknownSession bool                          `json:"legacy_unknown_session,omitempty"`
@@ -194,6 +195,7 @@ func (t *UsageTracker) SyncSession(sessionID, rootTranscript string, observedAt 
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	revision := nextUsageRevision(t.state.RevisionClock, observedAt)
 
 	priorSession := t.state.Sessions[sessionID]
 	session := cloneUsageSessionState(priorSession)
@@ -246,11 +248,11 @@ func (t *UsageTracker) SyncSession(sessionID, rootTranscript string, observedAt 
 	if session.UsageCoverage == UsageCoveragePartialLegacy {
 		suppressBefore = t.state.LegacyCutoverAt
 	}
-	snapshots, messagesChanged := applyUsageRecords(sessionID, session, records, suppressBefore)
+	snapshots, messagesChanged := applyUsageRecords(sessionID, session, records, suppressBefore, revision)
 	changed = changed || messagesChanged
 	if needsCutover {
 		marker := UsageSnapshot{
-			UsageEventID: stableUsageEventID(sessionID, "legacy-cutover"), UsageRevision: 1,
+			UsageEventID: stableUsageEventID(sessionID, "legacy-cutover"), UsageRevision: revision,
 			Timestamp: observedAt, Cutover: true, Coverage: UsageCoveragePartialLegacy,
 		}
 		snapshots = append([]UsageSnapshot{marker}, snapshots...)
@@ -264,7 +266,7 @@ func (t *UsageTracker) SyncSession(sessionID, rootTranscript string, observedAt 
 			return nil, safeTrackerError("append usage batch", err)
 		}
 	}
-	nextState := t.nextState(sessionID, session, observedAt)
+	nextState := t.nextState(sessionID, session, observedAt, revision)
 	if err := t.persist(nextState); err != nil {
 		return nil, err
 	}
@@ -277,12 +279,30 @@ type sourcedUsageRecord struct {
 	sourceID string
 }
 
-func (t *UsageTracker) nextState(sessionID string, session *usageSessionState, observedAt time.Time) usageTrackerState {
+func (t *UsageTracker) nextState(sessionID string, session *usageSessionState, observedAt time.Time, revision int64) usageTrackerState {
 	session.LastSeen = observedAt
 	next := cloneUsageTrackerState(t.state)
 	next.Version = usageCursorVersion
+	if revision > next.RevisionClock {
+		next.RevisionClock = revision
+	}
 	next.Sessions[sessionID] = session
 	boundUsageSessions(&next, sessionID)
+	return next
+}
+
+// nextUsageRevision is a restart-safe, tracker-global Lamport clock seeded by
+// observation time. Per-message counters can reset when bounded state evicts a
+// message; a global monotonic revision guarantees that a later replay of the
+// same stable UsageEventID still supersedes its older history snapshot.
+func nextUsageRevision(prior int64, observedAt time.Time) int64 {
+	next := observedAt.UTC().UnixNano()
+	if next <= 0 {
+		next = 1
+	}
+	if next <= prior {
+		next = prior + 1
+	}
 	return next
 }
 
@@ -293,7 +313,7 @@ func (t *UsageTracker) needsLegacyCutover(sessionID string) bool {
 	return t.state.LegacyUnknownSession || t.state.LegacySessions[sessionID]
 }
 
-func applyUsageRecords(sessionID string, session *usageSessionState, records []sourcedUsageRecord, suppressBefore time.Time) ([]UsageSnapshot, bool) {
+func applyUsageRecords(sessionID string, session *usageSessionState, records []sourcedUsageRecord, suppressBefore time.Time, revision int64) ([]UsageSnapshot, bool) {
 	proposed := map[string]usageMessageState{}
 	var order []string
 	for _, sourced := range records {
@@ -332,7 +352,7 @@ func applyUsageRecords(sessionID string, session *usageSessionState, records []s
 		prior, existed := session.Messages[key]
 		substantive := !existed || usageMessageChanged(prior, next)
 		if substantive {
-			next.Revision = prior.Revision + 1
+			next.Revision = revision
 			session.Messages[key] = next
 			changed = true
 		}
@@ -641,7 +661,7 @@ func cloneUsageSessionState(source *usageSessionState) *usageSessionState {
 
 func cloneUsageTrackerState(source usageTrackerState) usageTrackerState {
 	clone := usageTrackerState{
-		Version: usageCursorVersion, LegacyCutoverAt: source.LegacyCutoverAt,
+		Version: usageCursorVersion, RevisionClock: source.RevisionClock, LegacyCutoverAt: source.LegacyCutoverAt,
 		LegacyUnknownSession: source.LegacyUnknownSession,
 		LegacySessions:       make(map[string]bool, len(source.LegacySessions)),
 		Sessions:             make(map[string]*usageSessionState, len(source.Sessions)+1),
