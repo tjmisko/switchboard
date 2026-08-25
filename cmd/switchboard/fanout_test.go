@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -134,7 +135,9 @@ func TestObserveUsagePreservesClaudePricingDimensions(t *testing.T) {
 	if got := sample.Ts.Format(time.RFC3339Nano); got != "2026-08-25T10:11:12.123Z" {
 		t.Errorf("sample timestamp = %q, want provider timestamp", got)
 	}
-	if sample.ProviderMessageID != "msg-rich" || sample.UsageSourceID != "root" || sample.Source != agentgraph.SourceClaudeTranscript {
+	if sample.ProviderMessageID != "msg-rich" || !strings.HasPrefix(sample.UsageSourceID, "cusrc_") ||
+		!strings.HasPrefix(sample.UsageEventID, "cuev_") || !sample.UsageSnapshot || sample.UsageRevision != 1 ||
+		sample.Source != agentgraph.SourceClaudeTranscript {
 		t.Errorf("sample correlation = %+v", sample)
 	}
 	if sample.TokCacheCreate != 29 || sample.TokCacheCreate5m != 14 || sample.TokCacheCreate1h != 15 {
@@ -142,6 +145,88 @@ func TestObserveUsagePreservesClaudePricingDimensions(t *testing.T) {
 	}
 	if sample.ServiceTier != "priority" || sample.Speed != "fast" || sample.InferenceGeo != "us" || sample.WebSearchRequests != 2 || sample.WebFetchRequests != 3 {
 		t.Errorf("pricing dimensions = %+v", sample)
+	}
+}
+
+func TestObserveUsageDurablyBackfillsMoreThanAsyncBuffer(t *testing.T) {
+	dir := t.TempDir()
+	tPath := filepath.Join(dir, "session.jsonl")
+	const messages = 700
+	lines := make([]string, messages)
+	for i := range lines {
+		lines[i] = fmt.Sprintf(`{"type":"assistant","timestamp":"2026-08-25T10:00:00Z","uuid":"row-%d","message":{"id":"msg-%d","role":"assistant","model":"claude-sonnet-5","content":[],"usage":{"input_tokens":%d,"output_tokens":1}}}`, i, i, i+1)
+	}
+	writeLines(t, tPath, lines...)
+
+	histDir := t.TempDir()
+	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+	sess := &state.Session{PID: 7, Agent: "claude", CWD: "/home/u/proj",
+		Claude: &state.AgentInfo{SessionID: "session-large", Transcript: tPath}}
+	rs.observe(sink, sess, sess.Claude, time.Now())
+	sink.Close()
+
+	samples := eventsOfType(readEvents(t, histDir), history.EventUsageSample)
+	if len(samples) != messages {
+		t.Fatalf("durable backfill samples = %d, want %d", len(samples), messages)
+	}
+}
+
+func TestObserveUsageRetriesTransientTrackerInitialization(t *testing.T) {
+	dir := t.TempDir()
+	tPath := filepath.Join(dir, "session.jsonl")
+	writeLines(t, tPath, `{"type":"assistant","timestamp":"2026-08-25T10:00:00Z","uuid":"row-1","message":{"id":"msg-1","role":"assistant","model":"claude-sonnet-5","content":[],"usage":{"input_tokens":10,"output_tokens":2}}}`)
+
+	histDir := t.TempDir()
+	cursorPath := filepath.Join(histDir, "claude-usage-cursors-v1.json")
+	if err := os.WriteFile(cursorPath, []byte("not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+	sess := &state.Session{PID: 7, Agent: "claude", CWD: "/home/u/proj",
+		Claude: &state.AgentInfo{SessionID: "session-retry", Transcript: tPath}}
+
+	rs.observe(sink, sess, sess.Claude, time.Now())
+	if rs.usage != nil {
+		t.Fatal("invalid cursor unexpectedly initialized tracker")
+	}
+	if err := os.WriteFile(cursorPath, []byte(`{"version":2,"sessions":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rs.observe(sink, sess, sess.Claude, time.Now())
+	if rs.usage == nil {
+		t.Fatal("tracker initialization was not retried after transient failure")
+	}
+	sink.Close()
+
+	samples := eventsOfType(readEvents(t, histDir), history.EventUsageSample)
+	if len(samples) != 1 || samples[0].ProviderMessageID != "msg-1" {
+		t.Fatalf("usage after initialization retry = %+v", samples)
+	}
+}
+
+func TestObserveUsageDisabledHistoryDoesNotAdvanceCursor(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "session.jsonl")
+	writeLines(t, root, `{"type":"assistant","timestamp":"2026-08-25T10:00:00Z","uuid":"row-1","message":{"id":"msg-1","role":"assistant","model":"claude-sonnet-5","content":[],"usage":{"input_tokens":10,"output_tokens":2}}}`)
+	histDir := t.TempDir()
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+	sess := &state.Session{PID: 7, Agent: "claude", CWD: "/home/u/proj",
+		Claude: &state.AgentInfo{SessionID: "session-disabled", Transcript: root}}
+
+	disabled := history.NewSink(history.Config{Enabled: false, Detail: history.DetailFull, Dir: histDir})
+	rs.observe(disabled, sess, sess.Claude, time.Now())
+	disabled.Close()
+	if rs.usage != nil {
+		t.Fatal("disabled history initialized or advanced a usage tracker")
+	}
+
+	enabled := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
+	rs.observe(enabled, sess, sess.Claude, time.Now())
+	enabled.Close()
+	samples := eventsOfType(readEvents(t, histDir), history.EventUsageSample)
+	if len(samples) != 1 || samples[0].ProviderMessageID != "msg-1" {
+		t.Fatalf("usage was not backfilled after enabling history: %+v", samples)
 	}
 }
 

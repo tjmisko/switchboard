@@ -25,13 +25,12 @@ import (
 // inside the loop below, because its /proc reads are milliseconds rather than
 // microseconds (see memorySampler). nil when memory sampling is off.
 type reconcileState struct {
-	fanout    *fanout.Observer
-	memory    *memorySampler
-	usage     *transcript.UsageTracker
-	usageInit bool
-	usageErr  string                 // last reported content-free cursor error; suppresses per-tick log spam
-	labels    map[string]labelCursor // labelKey -> last-emitted session label (change dedup)
-	names     *label.NameCache       // pid -> Claude session name, memoized against the file's stamp
+	fanout   *fanout.Observer
+	memory   *memorySampler
+	usage    *transcript.UsageTracker
+	usageErr string                 // last reported content-free cursor error; suppresses per-tick log spam
+	labels   map[string]labelCursor // labelKey -> last-emitted session label (change dedup)
+	names    *label.NameCache       // pid -> Claude session name, memoized against the file's stamp
 }
 
 // labelCursor is the last name emitted for one session, plus the pid hosting it.
@@ -132,15 +131,14 @@ func (rs *reconcileState) observeFanout(sink *history.Sink, sess *state.Session,
 
 // observeUsage backfills and incrementally reads the root plus every child
 // transcript through a durable, session-keyed UsageTracker. One event is emitted
-// per logical provider-message delta so exact model/tier/tool dimensions and the
+// per logical provider-message snapshot so exact model/tier/tool dimensions and the
 // provider timestamp survive until pricing. Streamed duplicates and revisions
 // are resolved before emission. Cost is deliberately NOT computed here.
 func (rs *reconcileState) observeUsage(sink *history.Sink, sess *state.Session, c *state.AgentInfo, now time.Time) {
 	if sink == nil || !sink.Enabled() || c.SessionID == "" {
 		return
 	}
-	if !rs.usageInit {
-		rs.usageInit = true
+	if rs.usage == nil {
 		tracker, err := transcript.NewUsageTracker(sink.Dir())
 		if err != nil {
 			rs.reportUsageError(err)
@@ -151,34 +149,42 @@ func (rs *reconcileState) observeUsage(sink *history.Sink, sess *state.Session, 
 	if rs.usage == nil {
 		return
 	}
-	deltas, err := rs.usage.ObserveSession(c.SessionID, c.Transcript, now)
+	_, err := rs.usage.SyncSession(c.SessionID, c.Transcript, now, func(snapshots []transcript.UsageSnapshot) error {
+		events := make([]history.Event, 0, len(snapshots))
+		for _, snapshot := range snapshots {
+			ts := snapshot.Timestamp
+			if ts.IsZero() {
+				ts = now
+			}
+			ev := history.Event{
+				Ts: ts, SessionID: c.SessionID, PID: sess.PID, Agent: sess.Agent, CWD: sess.CWD,
+				Source:       agentgraph.SourceClaudeTranscript,
+				UsageEventID: snapshot.UsageEventID, UsageSnapshot: true, UsageRevision: snapshot.UsageRevision,
+				UsageCoverage: snapshot.Coverage,
+			}
+			if snapshot.Cutover {
+				ev.Type = history.EventUsageCutover
+				events = append(events, ev)
+				continue
+			}
+			u := snapshot.Usage
+			ev.Type = history.EventUsageSample
+			ev.Model = snapshot.Model
+			ev.TokIn, ev.TokOut = u.InputTokens, u.OutputTokens
+			ev.TokCacheRead, ev.TokCacheCreate = u.CacheReadTokens, u.CacheCreationTokens
+			ev.TokCacheCreate5m, ev.TokCacheCreate1h = u.CacheWrite5mTokens, u.CacheWrite1hTokens
+			ev.ServiceTier, ev.Speed, ev.InferenceGeo = u.ServiceTier, u.Speed, u.InferenceGeo
+			ev.WebSearchRequests, ev.WebFetchRequests = u.WebSearchRequests, u.WebFetchRequests
+			ev.ProviderMessageID, ev.UsageSourceID = snapshot.ProviderMessageID, snapshot.SourceID
+			events = append(events, ev)
+		}
+		return sink.AppendDurable(events)
+	})
 	if err != nil {
 		rs.reportUsageError(err)
 		return
 	}
 	rs.usageErr = ""
-	for _, delta := range deltas {
-		u := delta.Usage
-		if u.IsZero() {
-			continue
-		}
-		ts := delta.Timestamp
-		if ts.IsZero() {
-			ts = now
-		}
-		sink.Record(history.Event{
-			Ts: ts, Type: history.EventUsageSample,
-			SessionID: c.SessionID, PID: sess.PID, Agent: sess.Agent, CWD: sess.CWD,
-			Source: agentgraph.SourceClaudeTranscript,
-			Model:  delta.Model,
-			TokIn:  u.InputTokens, TokOut: u.OutputTokens,
-			TokCacheRead: u.CacheReadTokens, TokCacheCreate: u.CacheCreationTokens,
-			TokCacheCreate5m: u.CacheWrite5mTokens, TokCacheCreate1h: u.CacheWrite1hTokens,
-			ServiceTier: u.ServiceTier, Speed: u.Speed, InferenceGeo: u.InferenceGeo,
-			WebSearchRequests: u.WebSearchRequests, WebFetchRequests: u.WebFetchRequests,
-			ProviderMessageID: delta.ProviderMessageID, UsageSourceID: delta.SourceID,
-		})
-	}
 }
 
 func (rs *reconcileState) reportUsageError(err error) {

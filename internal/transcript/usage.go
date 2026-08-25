@@ -18,9 +18,10 @@ type usageWire struct {
 	CacheReadTokens     int64 `json:"cache_read_input_tokens"`
 	CacheCreationTokens int64 `json:"cache_creation_input_tokens"`
 
-	CacheWrite5mTokens int64 `json:"cache_write_5m_input_tokens"`
-	CacheWrite1hTokens int64 `json:"cache_write_1h_input_tokens"`
-	CacheCreation      struct {
+	CacheWrite5mTokens  int64 `json:"cache_write_5m_input_tokens"`
+	CacheWrite1hTokens  int64 `json:"cache_write_1h_input_tokens"`
+	CacheCreationDetail bool  `json:"cache_creation_detail"`
+	CacheCreation       *struct {
 		Ephemeral5mInputTokens int64 `json:"ephemeral_5m_input_tokens"`
 		Ephemeral1hInputTokens int64 `json:"ephemeral_1h_input_tokens"`
 	} `json:"cache_creation"`
@@ -52,7 +53,9 @@ func (u *Usage) UnmarshalJSON(data []byte) error {
 	u.CacheCreationTokens = wire.CacheCreationTokens
 	u.CacheWrite5mTokens = wire.CacheWrite5mTokens
 	u.CacheWrite1hTokens = wire.CacheWrite1hTokens
-	if wire.CacheCreation.Ephemeral5mInputTokens != 0 || wire.CacheCreation.Ephemeral1hInputTokens != 0 {
+	u.CacheCreationDetail = wire.CacheCreationDetail
+	if wire.CacheCreation != nil {
+		u.CacheCreationDetail = true
 		u.CacheWrite5mTokens = wire.CacheCreation.Ephemeral5mInputTokens
 		u.CacheWrite1hTokens = wire.CacheCreation.Ephemeral1hInputTokens
 		u.CacheCreationTokens = u.CacheWrite5mTokens + u.CacheWrite1hTokens
@@ -160,7 +163,7 @@ func mergeUsageMetadata(prior, next UsageRecord) UsageRecord {
 	if next.Usage.InferenceGeo != "" {
 		prior.Usage.InferenceGeo = next.Usage.InferenceGeo
 	}
-	if !next.Timestamp.IsZero() && (prior.Timestamp.IsZero() || next.Timestamp.After(prior.Timestamp)) {
+	if !next.Timestamp.IsZero() && (prior.Timestamp.IsZero() || next.Timestamp.Before(prior.Timestamp)) {
 		prior.Timestamp = next.Timestamp
 	}
 	return prior
@@ -176,14 +179,13 @@ func maxUsage(a, b Usage) Usage {
 	if b.CacheReadTokens > a.CacheReadTokens {
 		a.CacheReadTokens = b.CacheReadTokens
 	}
-	if b.CacheCreationTokens > a.CacheCreationTokens {
-		a.CacheCreationTokens = b.CacheCreationTokens
-	}
-	if b.CacheWrite5mTokens > a.CacheWrite5mTokens {
+	if b.CacheCreationDetail {
+		a.CacheCreationDetail = true
 		a.CacheWrite5mTokens = b.CacheWrite5mTokens
-	}
-	if b.CacheWrite1hTokens > a.CacheWrite1hTokens {
 		a.CacheWrite1hTokens = b.CacheWrite1hTokens
+		a.CacheCreationTokens = b.CacheWrite5mTokens + b.CacheWrite1hTokens
+	} else if !a.CacheCreationDetail && b.CacheCreationTokens > a.CacheCreationTokens {
+		a.CacheCreationTokens = b.CacheCreationTokens
 	}
 	if b.WebSearchRequests > a.WebSearchRequests {
 		a.WebSearchRequests = b.WebSearchRequests
@@ -201,26 +203,4 @@ func maxUsage(a, b Usage) Usage {
 		a.InferenceGeo = b.InferenceGeo
 	}
 	return a
-}
-
-func positiveUsageDelta(next, prior Usage) Usage {
-	positive := func(n, p int64) int64 {
-		if n > p {
-			return n - p
-		}
-		return 0
-	}
-	return Usage{
-		InputTokens:         positive(next.InputTokens, prior.InputTokens),
-		OutputTokens:        positive(next.OutputTokens, prior.OutputTokens),
-		CacheReadTokens:     positive(next.CacheReadTokens, prior.CacheReadTokens),
-		CacheCreationTokens: positive(next.CacheCreationTokens, prior.CacheCreationTokens),
-		CacheWrite5mTokens:  positive(next.CacheWrite5mTokens, prior.CacheWrite5mTokens),
-		CacheWrite1hTokens:  positive(next.CacheWrite1hTokens, prior.CacheWrite1hTokens),
-		ServiceTier:         next.ServiceTier,
-		Speed:               next.Speed,
-		InferenceGeo:        next.InferenceGeo,
-		WebSearchRequests:   positive(next.WebSearchRequests, prior.WebSearchRequests),
-		WebFetchRequests:    positive(next.WebFetchRequests, prior.WebFetchRequests),
-	}
 }

@@ -704,6 +704,7 @@ type Usage struct {
 	CacheCreationTokens int64  `json:"cache_creation_input_tokens"`
 	CacheWrite5mTokens  int64  `json:"cache_write_5m_input_tokens,omitempty"`
 	CacheWrite1hTokens  int64  `json:"cache_write_1h_input_tokens,omitempty"`
+	CacheCreationDetail bool   `json:"cache_creation_detail,omitempty"`
 	ServiceTier         string `json:"service_tier,omitempty"`
 	Speed               string `json:"speed,omitempty"`
 	InferenceGeo        string `json:"inference_geo,omitempty"`
@@ -725,6 +726,7 @@ func (u *Usage) add(o Usage) {
 	u.CacheCreationTokens += o.CacheCreationTokens
 	u.CacheWrite5mTokens += o.CacheWrite5mTokens
 	u.CacheWrite1hTokens += o.CacheWrite1hTokens
+	u.CacheCreationDetail = u.CacheCreationDetail || o.CacheCreationDetail
 	u.WebSearchRequests += o.WebSearchRequests
 	u.WebFetchRequests += o.WebFetchRequests
 	if o.ServiceTier != "" {
