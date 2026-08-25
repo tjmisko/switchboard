@@ -460,6 +460,8 @@ type fakeProxy struct {
 	root               rpcThread
 	descendants        []rpcThread
 	readOverride       rpcThread
+	account            *rpcAccount
+	threadUsage        *ThreadUsageEstimate
 	server             net.Conn
 	encoder            *json.Encoder
 	methods            []string
@@ -481,6 +483,7 @@ type fakeListRequest struct {
 func newFakeProxy() *fakeProxy {
 	return &fakeProxy{
 		available:   true,
+		account:     &rpcAccount{Type: "apiKey"},
 		listEntered: make(chan struct{}), listRelease: make(chan struct{}), listDisconnected: make(chan struct{}),
 		root: rpcThread{ID: "root", Status: rpcStatus{Type: "idle"}, Turns: []rpcTurn{{
 			ID: "root-turn", Items: []rpcItem{{
@@ -527,6 +530,10 @@ func (p *fakeProxy) serve(connection net.Conn) {
 		switch envelope.Method {
 		case "initialize":
 			result = initializeResult{UserAgent: "codex_app_server/0.149.0"}
+		case "account/read":
+			result = accountReadResult{Account: p.account, RequiresOpenAIAuth: true}
+		case "account/usage/read":
+			result = accountUsageReadResult{ThreadUsage: p.threadUsage}
 		case "thread/read":
 			result = threadReadResult{Thread: root}
 		case "thread/turns/list":

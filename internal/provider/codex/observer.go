@@ -17,15 +17,19 @@ import (
 )
 
 const (
-	DefaultFreshness          = 15 * time.Second
-	DefaultActiveResnapshot   = 1 * time.Second
-	DefaultIdleResnapshot     = 10 * time.Second
-	DefaultRequestTimeout     = 5 * time.Second
-	DefaultReconnectMinimum   = 100 * time.Millisecond
-	DefaultReconnectMaximum   = 5 * time.Second
-	DefaultTerminalLimit      = 32
-	DefaultWaitClassification = 30 * time.Second
-	legacyWaitClassification  = 500 * time.Millisecond
+	DefaultFreshness            = 15 * time.Second
+	DefaultActiveResnapshot     = 1 * time.Second
+	DefaultIdleResnapshot       = 10 * time.Second
+	DefaultRequestTimeout       = 5 * time.Second
+	DefaultReconnectMinimum     = 100 * time.Millisecond
+	DefaultReconnectMaximum     = 5 * time.Second
+	DefaultTerminalLimit        = 32
+	DefaultWaitClassification   = 30 * time.Second
+	DefaultUsageUpdateBuffer    = 256
+	DefaultUsageDedupLimit      = 2048
+	DefaultUsageRequestTimeout  = 2 * time.Second
+	DefaultUsageRefreshInterval = time.Minute
+	legacyWaitClassification    = 500 * time.Millisecond
 
 	DiagnosticUnknownProtocolEnum     = "unknown_protocol_enum"
 	DiagnosticSnapshotThreadRead      = "snapshot_thread_read_error"
@@ -65,19 +69,23 @@ var descendantSourceKinds = []string{
 // production defaults. Connector is injectable so tests never touch an
 // installed Codex binary or live app-server process.
 type Config struct {
-	Connector           Connector
-	Freshness           time.Duration
-	ResnapshotInterval  time.Duration
-	ActivePollInterval  time.Duration
-	IdlePollInterval    time.Duration
-	RequestTimeout      time.Duration
-	ReconnectMinimum    time.Duration
-	ReconnectMaximum    time.Duration
-	UpdateBuffer        int
-	RecentTerminalLimit int
-	WaitClassification  time.Duration
-	Now                 func() time.Time
-	Jitter              func(time.Duration) time.Duration
+	Connector            Connector
+	Freshness            time.Duration
+	ResnapshotInterval   time.Duration
+	ActivePollInterval   time.Duration
+	IdlePollInterval     time.Duration
+	RequestTimeout       time.Duration
+	ReconnectMinimum     time.Duration
+	ReconnectMaximum     time.Duration
+	UpdateBuffer         int
+	RecentTerminalLimit  int
+	WaitClassification   time.Duration
+	UsageUpdateBuffer    int
+	UsageDedupLimit      int
+	UsageRequestTimeout  time.Duration
+	UsageRefreshInterval time.Duration
+	Now                  func() time.Time
+	Jitter               func(time.Duration) time.Duration
 	// Diagnostic receives finite categories only; raw protocol errors and
 	// payloads never cross this callback.
 	Diagnostic     func(string)
@@ -105,12 +113,15 @@ type WaitClassificationDiagnostic struct {
 }
 
 type rootRecord struct {
-	threadID    string
-	binding     BindingSource
-	graph       *graphState
-	observation agentgraph.Observation
-	generation  uint64
-	expiry      *time.Timer
+	threadID        string
+	binding         BindingSource
+	graph           *graphState
+	observation     agentgraph.Observation
+	generation      uint64
+	expiry          *time.Timer
+	usageReadAt     time.Time
+	usageRefreshDue bool
+	vendorEstimate  *ThreadUsageEstimate
 }
 
 // Observer is a supervised provider.Observer. NewObserver starts its standalone
@@ -126,17 +137,23 @@ type Observer struct {
 	wg     sync.WaitGroup
 	once   sync.Once
 
-	mu              sync.Mutex
-	roots           map[provider.RootKey]*rootRecord
-	generation      uint64
-	connected       bool
-	syncing         bool
-	queued          []rpcNotification
-	pendingStatuses map[string]rpcStatus
-	pendingWaits    map[string][]rpcNotification
-	waitEpisode     uint64
-	closed          bool
-	lastDiagnostics map[string]time.Time
+	mu                    sync.Mutex
+	roots                 map[provider.RootKey]*rootRecord
+	generation            uint64
+	connected             bool
+	syncing               bool
+	queued                []rpcNotification
+	pendingStatuses       map[string]rpcStatus
+	pendingWaits          map[string][]rpcNotification
+	pendingUsage          map[string][]rpcNotification
+	waitEpisode           uint64
+	account               accountMetadata
+	usageUpdates          chan UsageUpdate
+	usageTotals           map[string]agentgraph.Usage
+	usageFingerprints     map[string]struct{}
+	usageFingerprintOrder []string
+	closed                bool
+	lastDiagnostics       map[string]time.Time
 
 	refresh chan struct{}
 	cadence chan struct{}
@@ -152,10 +169,14 @@ func NewObserver(config Config) *Observer {
 		config: config, bindings: newBindingRegistry(),
 		queue: provider.NewInvalidationQueue(config.UpdateBuffer), ctx: ctx, cancel: cancel,
 		roots: make(map[provider.RootKey]*rootRecord), pendingStatuses: make(map[string]rpcStatus),
-		pendingWaits:    make(map[string][]rpcNotification),
-		lastDiagnostics: make(map[string]time.Time),
-		refresh:         make(chan struct{}, 1),
-		cadence:         make(chan struct{}, 1),
+		pendingWaits:      make(map[string][]rpcNotification),
+		pendingUsage:      make(map[string][]rpcNotification),
+		lastDiagnostics:   make(map[string]time.Time),
+		usageUpdates:      make(chan UsageUpdate, config.UsageUpdateBuffer),
+		usageTotals:       make(map[string]agentgraph.Usage),
+		usageFingerprints: make(map[string]struct{}),
+		refresh:           make(chan struct{}, 1),
+		cadence:           make(chan struct{}, 1),
 	}
 	observer.wg.Add(1)
 	go observer.run()
@@ -200,6 +221,18 @@ func withDefaults(config Config) Config {
 	}
 	if config.WaitClassification <= 0 {
 		config.WaitClassification = DefaultWaitClassification
+	}
+	if config.UsageUpdateBuffer <= 0 {
+		config.UsageUpdateBuffer = DefaultUsageUpdateBuffer
+	}
+	if config.UsageDedupLimit <= 0 {
+		config.UsageDedupLimit = DefaultUsageDedupLimit
+	}
+	if config.UsageRequestTimeout <= 0 {
+		config.UsageRequestTimeout = DefaultUsageRequestTimeout
+	}
+	if config.UsageRefreshInterval <= 0 {
+		config.UsageRefreshInterval = DefaultUsageRefreshInterval
 	}
 	if config.Now == nil {
 		config.Now = time.Now
@@ -297,6 +330,10 @@ func (o *Observer) Forget(key provider.RootKey) {
 		}
 		if record.graph != nil {
 			record.graph.stopClassifications()
+			for threadID := range record.graph.nodes {
+				delete(o.usageTotals, threadID)
+				delete(o.pendingUsage, threadID)
+			}
 		}
 	}
 	delete(o.roots, key)
@@ -351,6 +388,8 @@ func (o *Observer) run() {
 		o.queued = nil
 		o.pendingStatuses = make(map[string]rpcStatus)
 		o.pendingWaits = make(map[string][]rpcNotification)
+		o.pendingUsage = make(map[string][]rpcNotification)
+		o.account = accountMetadata{}
 		for _, record := range o.roots {
 			if record.graph != nil {
 				record.graph.resetWaitOwnership()
@@ -369,6 +408,12 @@ func (o *Observer) run() {
 			continue
 		}
 		o.emitDiagnostic(DiagnosticObserverInitialized)
+		account := o.readAccount(client)
+		o.mu.Lock()
+		if o.generation == generation && o.connected {
+			o.account = account
+		}
+		o.mu.Unlock()
 		o.resnapshotAll(client, generation)
 		o.finishSync(generation)
 
@@ -449,13 +494,16 @@ func checkAppServerVersion(userAgent string) error {
 
 func (o *Observer) resnapshotAll(client *rpcClient, generation uint64) {
 	type target struct {
-		key provider.RootKey
-		id  string
+		key       provider.RootKey
+		id        string
+		readUsage bool
 	}
+	now := o.config.Now()
 	o.mu.Lock()
 	targets := make([]target, 0, len(o.roots))
 	for key, record := range o.roots {
-		targets = append(targets, target{key: key, id: record.threadID})
+		readUsage := record.usageRefreshDue || record.usageReadAt.IsZero() || now.Sub(record.usageReadAt) >= o.config.UsageRefreshInterval
+		targets = append(targets, target{key: key, id: record.threadID, readUsage: readUsage})
 	}
 	o.mu.Unlock()
 	if len(targets) == 0 {
@@ -472,7 +520,11 @@ func (o *Observer) resnapshotAll(client *rpcClient, generation uint64) {
 			o.emitDiagnostic(snapshotDiagnosticCategory(err))
 			continue
 		}
-		o.installSnapshot(generation, target.key, target.id, state)
+		var estimate *ThreadUsageEstimate
+		if target.readUsage {
+			estimate, _ = o.readThreadUsage(client, target.id)
+		}
+		o.installSnapshot(generation, target.key, target.id, state, estimate, target.readUsage)
 	}
 }
 
@@ -546,15 +598,18 @@ func (o *Observer) snapshot(client *rpcClient, rootID string) (*graphState, erro
 	return state, nil
 }
 
-func (o *Observer) installSnapshot(generation uint64, key provider.RootKey, threadID string, state *graphState) {
+func (o *Observer) installSnapshot(generation uint64, key provider.RootKey, threadID string, state *graphState, estimate *ThreadUsageEstimate, usageRead bool) {
 	now := o.config.Now()
-	observation, err := state.observation(now, o.config.Freshness)
-	if err != nil {
-		return
-	}
 	o.mu.Lock()
 	record := o.roots[key]
 	if o.generation != generation || record == nil || record.threadID != threadID {
+		o.mu.Unlock()
+		return
+	}
+	state.mergeTelemetryFrom(record.graph)
+	state.applyAccountMetadata(o.account)
+	observation, err := state.observation(now, o.config.Freshness)
+	if err != nil {
 		o.mu.Unlock()
 		return
 	}
@@ -563,6 +618,14 @@ func (o *Observer) installSnapshot(generation uint64, key provider.RootKey, thre
 	}
 	record.graph = state
 	record.generation = generation
+	if usageRead {
+		record.usageReadAt = now
+		record.usageRefreshDue = false
+		record.vendorEstimate = nil
+	}
+	if estimate != nil {
+		o.installVendorEstimateLocked(key, record, estimate, now)
+	}
 	diagnostics := o.reconcileClassificationsLocked(key, record, "snapshot")
 	publish := !state.hasPendingClassification() || state.hasHumanAttention()
 	if publish {
@@ -729,6 +792,8 @@ func (o *Observer) disconnect(generation uint64) {
 	o.queued = nil
 	o.pendingStatuses = make(map[string]rpcStatus)
 	o.pendingWaits = make(map[string][]rpcNotification)
+	o.pendingUsage = make(map[string][]rpcNotification)
+	o.account = accountMetadata{}
 	keys := make([]provider.RootKey, 0, len(o.roots))
 	for key, record := range o.roots {
 		if record.graph != nil {
@@ -764,6 +829,9 @@ func (o *Observer) handleNotification(notification rpcNotification) {
 	}
 	keys, unknown, diagnostics := o.applyNotificationLocked(notification)
 	o.mu.Unlock()
+	if notification.Method == "turn/completed" && len(keys) > 0 {
+		o.signalRefresh()
+	}
 	if evidenceCategory != "" {
 		if len(keys) > 0 {
 			o.emitDiagnostic(evidenceCategory + "_matched")
@@ -831,26 +899,33 @@ func notificationEvidenceCategory(notification rpcNotification) string {
 }
 
 type notificationParams struct {
-	ThreadID       string            `json:"threadId"`
-	ConversationID string            `json:"conversationId"`
-	ThreadName     *string           `json:"threadName"`
-	TurnID         string            `json:"turnId"`
-	ItemID         string            `json:"itemId"`
-	CallID         string            `json:"callId"`
-	ReviewID       string            `json:"reviewId"`
-	TargetItemID   string            `json:"targetItemId"`
-	RequestID      json.RawMessage   `json:"requestId"`
-	IsBlocking     bool              `json:"isBlocking"`
-	AutoResolution *uint64           `json:"autoResolutionMs"`
-	Thread         rpcThread         `json:"thread"`
-	Status         rpcStatus         `json:"status"`
-	Turn           rpcTurn           `json:"turn"`
-	Item           rpcItem           `json:"item"`
-	ThreadSettings rpcThreadSettings `json:"threadSettings"`
+	ThreadID       string              `json:"threadId"`
+	ConversationID string              `json:"conversationId"`
+	ThreadName     *string             `json:"threadName"`
+	TurnID         string              `json:"turnId"`
+	ItemID         string              `json:"itemId"`
+	CallID         string              `json:"callId"`
+	ReviewID       string              `json:"reviewId"`
+	TargetItemID   string              `json:"targetItemId"`
+	RequestID      json.RawMessage     `json:"requestId"`
+	IsBlocking     bool                `json:"isBlocking"`
+	AutoResolution *uint64             `json:"autoResolutionMs"`
+	Thread         rpcThread           `json:"thread"`
+	Status         rpcStatus           `json:"status"`
+	Turn           rpcTurn             `json:"turn"`
+	Item           rpcItem             `json:"item"`
+	ThreadSettings rpcThreadSettings   `json:"threadSettings"`
+	TokenUsage     rpcThreadTokenUsage `json:"tokenUsage"`
+	AuthMode       *string             `json:"authMode"`
+	PlanType       *string             `json:"planType"`
 }
 
 type rpcThreadSettings struct {
 	ApprovalsReviewer string `json:"approvalsReviewer"`
+	Model             string `json:"model"`
+	ModelProvider     string `json:"modelProvider"`
+	ServiceTier       string `json:"serviceTier"`
+	Effort            string `json:"effort"`
 }
 
 func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]provider.RootKey, bool, []WaitClassificationDiagnostic) {
@@ -864,12 +939,24 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 	unknown := false
 	statusMatched := false
 	eventMatched := false
+	if notification.Method == "account/updated" {
+		planType := ""
+		if params.PlanType != nil {
+			planType = *params.PlanType
+		}
+		if params.AuthMode == nil {
+			o.account = accountMetadataFromType("")
+		} else {
+			o.account = accountMetadataFromAuthMode(*params.AuthMode, planType)
+		}
+	}
 	for key, record := range o.roots {
 		if record.graph == nil || record.generation != notification.Generation {
 			continue
 		}
 		state := record.graph
 		touches := false
+		matchedWithoutChange := false
 		forcePublish := false
 		classificationSource := "protocol_event"
 		switch notification.Method {
@@ -881,6 +968,7 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 			if thread.ID == state.rootID || state.nodes[thread.ParentThreadID] != nil || state.nodes[thread.ID] != nil {
 				pending := state.pendingRequests(thread.ParentThreadID)
 				state.upsertThread(thread, thread.ID == state.rootID)
+				state.applyAccountMetadata(o.account)
 				if pending, exists := o.pendingStatuses[thread.ID]; exists {
 					state.applyStatus(state.nodes[thread.ID], pending)
 					delete(o.pendingStatuses, thread.ID)
@@ -917,9 +1005,18 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 				touches = true
 			}
 		case "turn/completed":
+			if state.nodes[params.ThreadID] != nil {
+				record.usageRefreshDue = true
+				touches = true
+			}
 			if state.clearThreadWait(params.ThreadID) {
 				classificationSource = "turn_completed"
 				touches = true
+			}
+		case "thread/tokenUsage/updated":
+			if state.nodes[params.ThreadID] != nil {
+				matchedWithoutChange = true
+				touches = o.applyTokenUsageLocked(key, record, params, eventAt)
 			}
 		case "item/started", "item/completed":
 			if state.nodes[params.ThreadID] != nil || state.nodes[params.Item.SenderThreadID] != nil {
@@ -940,12 +1037,16 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 				touches = true
 			} else if state.nodes[params.ThreadID] != nil {
 				state.deleteThread(params.ThreadID)
+				delete(o.usageTotals, params.ThreadID)
+				delete(o.pendingUsage, params.ThreadID)
 				classificationSource = "thread_completed"
 				touches = true
 			}
 		case "thread/settings/updated":
 			pending := state.pendingRequests(params.ThreadID)
-			if state.setReviewer(params.ThreadID, params.ThreadSettings.ApprovalsReviewer, eventAt) {
+			settingsChanged := state.applyThreadSettings(params.ThreadID, params.ThreadSettings)
+			reviewerChanged := state.setReviewer(params.ThreadID, params.ThreadSettings.ApprovalsReviewer, eventAt)
+			if reviewerChanged {
 				if state.effectiveReviewer(params.ThreadID) == reviewerAuto {
 					classificationSource = "reviewer_auto"
 				} else if state.effectiveReviewer(params.ThreadID) == reviewerUser {
@@ -955,8 +1056,10 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 					classificationSource = "reviewer_unknown"
 				}
 				diagnostics = append(diagnostics, classifiedRequestDiagnostics(state, params.ThreadID, pending, classificationSource, eventAt)...)
-				touches = true
 			}
+			touches = settingsChanged || reviewerChanged
+		case "account/updated":
+			touches = state.applyAccountMetadata(o.account)
 		case "item/autoApprovalReview/started", "item/autoApprovalReview/completed":
 			pending := state.pendingRequests(params.ThreadID)
 			if state.addAutoReview(params.ThreadID, params.ReviewID, params.TargetItemID, notification.Method == "item/autoApprovalReview/completed", eventAt) {
@@ -1028,6 +1131,9 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 			}
 		}
 		if !touches {
+			if matchedWithoutChange {
+				eventMatched = true
+			}
 			continue
 		}
 		eventMatched = true
@@ -1063,6 +1169,9 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 	if (notification.Method == "turn/completed" || notification.Method == "thread/archived" || notification.Method == "thread/deleted") && params.ThreadID != "" {
 		delete(o.pendingWaits, params.ThreadID)
 		if notification.Method != "turn/completed" {
+			delete(o.pendingUsage, params.ThreadID)
+		}
+		if notification.Method != "turn/completed" {
 			delete(o.pendingStatuses, params.ThreadID)
 		}
 	}
@@ -1070,11 +1179,24 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 		if threadID := pendingWaitThread(notification.Method, params); threadID != "" {
 			o.retainPendingWaitLocked(threadID, notification)
 		}
+		if notification.Method == "thread/tokenUsage/updated" && params.ThreadID != "" {
+			o.retainPendingUsageLocked(params.ThreadID, notification)
+		}
 	}
 	if (notification.Method == "thread/started" || notification.Method == "thread/updated") && params.Thread.ID != "" {
 		pending := o.pendingWaits[params.Thread.ID]
 		delete(o.pendingWaits, params.Thread.ID)
 		for _, retained := range pending {
+			retainedChanged, retainedUnknown, retainedDiagnostics := o.applyNotificationLocked(retained)
+			for _, key := range retainedChanged {
+				changed = appendUniqueRootKey(changed, key)
+			}
+			unknown = unknown || retainedUnknown
+			diagnostics = append(diagnostics, retainedDiagnostics...)
+		}
+		usage := o.pendingUsage[params.Thread.ID]
+		delete(o.pendingUsage, params.Thread.ID)
+		for _, retained := range usage {
 			retainedChanged, retainedUnknown, retainedDiagnostics := o.applyNotificationLocked(retained)
 			for _, key := range retainedChanged {
 				changed = appendUniqueRootKey(changed, key)
@@ -1129,6 +1251,29 @@ func (o *Observer) retainPendingWaitLocked(threadID string, notification rpcNoti
 	notification.ID = append(json.RawMessage(nil), notification.ID...)
 	notification.Params = append(json.RawMessage(nil), notification.Params...)
 	o.pendingWaits[threadID] = append(o.pendingWaits[threadID], notification)
+}
+
+func (o *Observer) retainPendingUsageLocked(threadID string, notification rpcNotification) {
+	if o.pendingUsage == nil {
+		o.pendingUsage = make(map[string][]rpcNotification)
+	}
+	count := 0
+	for _, pending := range o.pendingUsage {
+		count += len(pending)
+	}
+	if count >= 256 {
+		for id, pending := range o.pendingUsage {
+			if len(pending) <= 1 {
+				delete(o.pendingUsage, id)
+			} else {
+				o.pendingUsage[id] = pending[1:]
+			}
+			break
+		}
+	}
+	notification.ID = append(json.RawMessage(nil), notification.ID...)
+	notification.Params = append(json.RawMessage(nil), notification.Params...)
+	o.pendingUsage[threadID] = append(o.pendingUsage[threadID], notification)
 }
 
 func appendUniqueRootKey(keys []provider.RootKey, candidate provider.RootKey) []provider.RootKey {

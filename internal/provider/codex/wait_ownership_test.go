@@ -398,7 +398,7 @@ func TestReconnectSnapshotUsesGuardianEvidenceAndDoesNotFlashRed(t *testing.T) {
 	observer.mu.Lock()
 	observer.generation = 2
 	observer.mu.Unlock()
-	observer.installSnapshot(2, key, "root", snapshot)
+	observer.installSnapshot(2, key, "root", snapshot, nil, false)
 	time.Sleep(40 * time.Millisecond)
 	node := waitNode(t, observer, key)
 	if node.Attention != agentgraph.AttentionNone || node.Runtime != agentgraph.RuntimeActive {
@@ -416,7 +416,7 @@ func TestAuthoritativeSnapshotRemovalClearsOutstandingHumanRequest(t *testing.T)
 	assertWaitAttention(t, observer, key, agentgraph.AttentionApproval)
 
 	snapshot := newGraphState(rpcThread{ID: "root", Status: rpcStatus{Type: "active"}}, nil, 32)
-	observer.installSnapshot(1, key, "root", snapshot)
+	observer.installSnapshot(1, key, "root", snapshot, nil, false)
 	node := waitNode(t, observer, key)
 	if node.Attention != agentgraph.AttentionNone || node.Runtime != agentgraph.RuntimeActive {
 		t.Fatalf("authoritative omission retained request state: %#v", node)

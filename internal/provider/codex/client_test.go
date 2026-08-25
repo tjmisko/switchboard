@@ -15,6 +15,11 @@ func TestRPCMethodAllowlistRejectsEveryMutation(t *testing.T) {
 	defer serverSide.Close()
 	client := newRPCClient(clientSide, 1, nil)
 	defer client.Close()
+	for _, method := range []string{"initialize", "account/read", "account/usage/read", "thread/read", "thread/list", "thread/turns/list"} {
+		if _, allowed := allowedRequests[method]; !allowed {
+			t.Errorf("read-only method %q is not allowlisted", method)
+		}
+	}
 
 	mutations := []string{
 		"thread/start", "thread/resume", "thread/fork", "thread/archive", "thread/delete",

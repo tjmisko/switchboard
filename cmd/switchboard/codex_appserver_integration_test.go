@@ -128,6 +128,12 @@ func (s *integrationCodexAppServer) serve(connection *integrationCodexConnection
 			result = integrationMustJSON(map[string]string{"userAgent": "codex_app_server/0.149.0"})
 		case "initialized":
 			continue
+		case "account/read":
+			result = integrationMustJSON(map[string]any{
+				"account": map[string]string{"type": "apiKey"}, "requiresOpenaiAuth": true,
+			})
+		case "account/usage/read":
+			result = integrationMustJSON(map[string]any{"summary": map[string]any{}, "threadUsage": nil})
 		case "thread/read":
 			var params struct {
 				ThreadID string `json:"threadId"`
@@ -364,7 +370,7 @@ func TestStandardCodexHooksGenerateDisplayNameAndNativeRenameOverridesIt(t *test
 	}
 	for _, method := range appServer.requestMethods() {
 		switch method {
-		case "initialize", "initialized", "thread/read", "thread/turns/list", "thread/list":
+		case "initialize", "initialized", "account/read", "account/usage/read", "thread/read", "thread/turns/list", "thread/list":
 		default:
 			t.Fatalf("observer attempted a non-read request; methods=%v", appServer.requestMethods())
 		}

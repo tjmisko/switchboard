@@ -31,10 +31,12 @@ type threadTurnsListResult struct {
 
 type rpcThread struct {
 	ID             string          `json:"id"`
+	SessionID      string          `json:"sessionId"`
 	ParentThreadID string          `json:"parentThreadId"`
 	Name           string          `json:"name"`
 	AgentNickname  string          `json:"agentNickname"`
 	AgentRole      string          `json:"agentRole"`
+	ModelProvider  string          `json:"modelProvider"`
 	CreatedAt      int64           `json:"createdAt"`
 	UpdatedAt      int64           `json:"updatedAt"`
 	Status         rpcStatus       `json:"status"`
@@ -60,6 +62,8 @@ type rpcItem struct {
 	Type              string                   `json:"type"`
 	Tool              string                   `json:"tool"`
 	Status            string                   `json:"status"`
+	Model             string                   `json:"model"`
+	ReasoningEffort   string                   `json:"reasoningEffort"`
 	SenderThreadID    string                   `json:"senderThreadId"`
 	ReceiverThreadIDs []string                 `json:"receiverThreadIds"`
 	AgentsStates      map[string]rpcAgentState `json:"agentsStates"`
@@ -190,6 +194,10 @@ func (s *graphState) upsertThread(thread rpcThread, root bool) {
 		state.node.Nickname = strings.TrimSpace(thread.Name)
 	}
 	state.node.Role = thread.AgentRole
+	state.node.Billing.AgentClient = string(agentgraph.ProviderCodex)
+	if provider := strings.TrimSpace(thread.ModelProvider); provider != "" {
+		state.node.Billing.ExecutionProvider = provider
+	}
 	if len(thread.Source) > 0 {
 		state.guardian = isGuardianSource(thread.Source)
 	}
@@ -271,12 +279,26 @@ func (s *graphState) applyCollaboration(turnID string, item rpcItem) {
 	parentID := item.SenderThreadID
 	for _, id := range item.ReceiverThreadIDs {
 		state := s.ensureNode(id, parentID)
+		state.node.Billing.AgentClient = string(agentgraph.ProviderCodex)
+		if item.Model != "" {
+			state.node.Billing.Model = strings.TrimSpace(item.Model)
+		}
+		if item.ReasoningEffort != "" {
+			state.node.Billing.ReasoningEffort = strings.TrimSpace(item.ReasoningEffort)
+		}
 		if turnID != "" && parentID == s.rootID {
 			state.cohort = turnID
 		}
 	}
 	for id, agentState := range item.AgentsStates {
 		state := s.ensureNode(id, parentID)
+		state.node.Billing.AgentClient = string(agentgraph.ProviderCodex)
+		if item.Model != "" {
+			state.node.Billing.Model = strings.TrimSpace(item.Model)
+		}
+		if item.ReasoningEffort != "" {
+			state.node.Billing.ReasoningEffort = strings.TrimSpace(item.ReasoningEffort)
+		}
 		state.node.Lifecycle = mapLifecycle(agentState.Status)
 		if state.node.Lifecycle == agentgraph.LifecycleUnknown && agentState.Status != "" && agentState.Status != "unknown" {
 			s.unknownEnum = true
