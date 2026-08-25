@@ -45,6 +45,36 @@ func TestEstimateClaudeCombinedCacheWriteIsPartial(t *testing.T) {
 	}
 }
 
+func TestEstimateClaudePriorityKeepsSpotEquivalentButNotContractBill(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	estimate := EstimateRequest(freshCatalogs(now), Identity{
+		ExecutionProvider: ProviderAnthropic, BillingRoute: "api", Model: "claude-opus-4-8", ServiceTier: "priority",
+	}, Usage{InputTokens: 1_000_000}, now)
+	assertUSD(t, estimate.APIEquivalentUSD, 5)
+	if estimate.EstimatedBilledUSD != nil || estimate.Status != CostPartial || estimate.UnpricedEvents != 1 ||
+		len(estimate.UnpricedReasons) != 1 {
+		t.Fatalf("priority capacity semantics = %+v", estimate)
+	}
+
+	fast := EstimateRequest(freshCatalogs(now), Identity{
+		ExecutionProvider: ProviderAnthropic, Model: "claude-opus-4-8", ServiceTier: "priority", Speed: "fast",
+	}, Usage{InputTokens: 1_000_000}, now)
+	assertUSD(t, fast.APIEquivalentUSD, 10)
+	if fast.Status != CostPartial {
+		t.Fatalf("fast priority comparator = %+v", fast)
+	}
+}
+
+func TestEstimateClaudeUnsupportedBatchTierFailsClosed(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	estimate := EstimateRequest(freshCatalogs(now), Identity{
+		ExecutionProvider: ProviderAnthropic, Model: "claude-opus-4-8", ServiceTier: "batch",
+	}, Usage{InputTokens: 1_000_000}, now)
+	if estimate.APIEquivalentUSD != nil || estimate.Status != CostUnknown || len(estimate.UnpricedReasons) == 0 {
+		t.Fatalf("unsupported batch estimate = %+v", estimate)
+	}
+}
+
 func TestEstimateOpenAIDoesNotDoubleChargeCachedWriteOrReasoning(t *testing.T) {
 	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
 	estimate := EstimateRequest(freshCatalogs(now), Identity{

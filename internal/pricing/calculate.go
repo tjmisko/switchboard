@@ -41,7 +41,7 @@ func EstimateRequest(catalogs CatalogSet, identity Identity, usage Usage, now ti
 		return unknownEstimate(estimate, usage, "price catalog is older than seven days")
 	}
 
-	rates, modifier, dimensionReason := selectRates(model, identity, usage)
+	rates, modifier, dimensionReason := selectRates(catalog.Provider, model, identity, usage)
 	if dimensionReason != "" {
 		return unknownEstimate(estimate, usage, dimensionReason)
 	}
@@ -173,14 +173,21 @@ func EstimateRequest(catalogs CatalogSet, identity Identity, usage Usage, now ti
 		estimate.UnpricedReasons = appendUnique(estimate.UnpricedReasons,
 			"execution provider inferred from exact model; billing route is unconfirmed")
 	}
-	if identity.BillingRoute == "api" && !providerInferred && estimate.APIEquivalentUSD != nil {
+	anthropicPriority := catalog.Provider == ProviderAnthropic && strings.EqualFold(strings.TrimSpace(identity.ServiceTier), "priority")
+	if anthropicPriority {
+		estimate.Status = CostPartial
+		estimate.UnpricedEvents++
+		estimate.UnpricedReasons = appendUnique(estimate.UnpricedReasons,
+			"Anthropic priority capacity uses contract pricing; amount is standard API spot equivalent")
+	}
+	if identity.BillingRoute == "api" && !providerInferred && !anthropicPriority && estimate.APIEquivalentUSD != nil {
 		value := *estimate.APIEquivalentUSD
 		estimate.EstimatedBilledUSD = &value
 	}
 	return estimate
 }
 
-func selectRates(model ModelPrice, identity Identity, usage Usage) (RateCard, Multiplier, string) {
+func selectRates(provider string, model ModelPrice, identity Identity, usage Usage) (RateCard, Multiplier, string) {
 	rates := model.Base
 	contextBand := false
 	for _, band := range model.ContextBands {
@@ -195,16 +202,22 @@ func selectRates(model ModelPrice, identity Identity, usage Usage) (RateCard, Mu
 		variant = "speed=" + speed
 	}
 	if tier := strings.ToLower(strings.TrimSpace(identity.ServiceTier)); tier != "" && tier != "standard" && tier != "default" && tier != "auto" {
-		tierVariant := "service_tier=" + tier
-		if variant != "" {
-			// Duplicate evidence for the same OpenAI fast route is safe; all other
-			// combinations need an explicit compound card.
-			if !(variant == "speed=fast" && (tierVariant == "service_tier=fast" || tierVariant == "service_tier=priority")) {
-				return RateCard{}, Multiplier{}, "combined speed and service tier price is unavailable"
+		// Anthropic response usage reports "priority" for a capacity commitment,
+		// whose negotiated dollars are not a public token-rate variant. Standard
+		// spot rates remain a valid API-equivalent comparator. standard_only is a
+		// request policy rather than the assigned response tier.
+		if !(provider == ProviderAnthropic && (tier == "priority" || tier == "standard_only")) {
+			tierVariant := "service_tier=" + tier
+			if variant != "" {
+				// Duplicate evidence for the same OpenAI fast route is safe; all other
+				// combinations need an explicit compound card.
+				if !(variant == "speed=fast" && (tierVariant == "service_tier=fast" || tierVariant == "service_tier=priority")) {
+					return RateCard{}, Multiplier{}, "combined speed and service tier price is unavailable"
+				}
+				variant = tierVariant
+			} else {
+				variant = tierVariant
 			}
-			variant = tierVariant
-		} else {
-			variant = tierVariant
 		}
 	}
 	if variant != "" {
