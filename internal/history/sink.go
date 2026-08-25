@@ -2,12 +2,14 @@ package history
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,12 +23,26 @@ import (
 // A disabled Sink (history opt-out) is a valid zero-cost value: Record/Close are
 // no-ops and no goroutine or file is created.
 type Sink struct {
-	enabled bool
-	cfg     Config
-	dir     string
-	ch      chan Event
-	done    chan struct{}
+	enabled   bool
+	cfg       Config
+	dir       string
+	ch        chan Event
+	batchCh   chan durableBatch
+	done      chan struct{}
+	lifeMu    sync.RWMutex
+	closed    bool
+	closeOnce sync.Once
 }
+
+type durableBatch struct {
+	events []Event
+	ack    chan error
+}
+
+var (
+	ErrSinkDisabled = errors.New("history: sink disabled")
+	ErrSinkClosed   = errors.New("history: sink closed")
+)
 
 // sinkBuffer bounds in-flight events; transitions are infrequent (low hundreds a
 // day) so this is generous headroom — it only fills if the disk stalls, which is
@@ -45,6 +61,7 @@ func NewSink(cfg Config) *Sink {
 		return s
 	}
 	s.ch = make(chan Event, sinkBuffer)
+	s.batchCh = make(chan durableBatch)
 	s.done = make(chan struct{})
 	go s.run()
 	return s
@@ -68,10 +85,43 @@ func (s *Sink) Record(ev Event) {
 	if s == nil || !s.enabled {
 		return
 	}
+	s.lifeMu.RLock()
+	defer s.lifeMu.RUnlock()
+	if s.closed {
+		return
+	}
 	select {
 	case s.ch <- ev:
 	default: // buffer full — drop rather than block the daemon
 	}
+}
+
+// AppendDurable appends a batch through the sink's single writer, fsyncs every
+// touched day file and the history directory, and reports failures to the
+// caller. Unlike Record it may block: it is reserved for idempotent usage
+// snapshots whose cursor must advance only after durable acknowledgement. A
+// retry can append part or all of the batch again; UsageEventID latest-wins
+// semantics make that safe.
+func (s *Sink) AppendDurable(events []Event) error {
+	if s == nil || !s.enabled {
+		return ErrSinkDisabled
+	}
+	s.lifeMu.RLock()
+	if s.closed {
+		s.lifeMu.RUnlock()
+		return ErrSinkClosed
+	}
+	if len(events) == 0 {
+		s.lifeMu.RUnlock()
+		return nil
+	}
+	batch := durableBatch{events: append([]Event(nil), events...), ack: make(chan error, 1)}
+	// batchCh is deliberately unbuffered. Once this send completes the writer
+	// owns the request and must acknowledge it; Close cannot close the ordinary
+	// event channel until this read lock is released.
+	s.batchCh <- batch
+	s.lifeMu.RUnlock()
+	return <-batch.ack
 }
 
 // Close flushes and stops the writer. Safe on a nil/disabled sink.
@@ -79,8 +129,13 @@ func (s *Sink) Close() {
 	if s == nil || !s.enabled {
 		return
 	}
-	close(s.ch)
-	<-s.done
+	s.closeOnce.Do(func() {
+		s.lifeMu.Lock()
+		s.closed = true
+		close(s.ch)
+		s.lifeMu.Unlock()
+		<-s.done
+	})
 }
 
 func (s *Sink) run() {
@@ -89,34 +144,84 @@ func (s *Sink) run() {
 		curDay string
 		f      *os.File
 	)
-	closeFile := func() {
+	closeFile := func() error {
 		if f != nil {
-			f.Close()
+			err := f.Close()
 			f = nil
+			return err
 		}
+		return nil
 	}
-	defer closeFile()
+	defer func() { _ = closeFile() }()
 
-	s.prune(time.Now()) // bound the store at startup
-	for ev := range s.ch {
+	writeEvent := func(ev Event, durable bool) error {
 		day := dayKey(ev.Ts)
 		if day != curDay {
-			closeFile()
+			if durable && f != nil {
+				if err := f.Sync(); err != nil {
+					return fmt.Errorf("sync history day %s: %w", curDay, err)
+				}
+			}
+			if err := closeFile(); err != nil {
+				return fmt.Errorf("close history day %s: %w", curDay, err)
+			}
 			nf, err := s.openDay(day)
 			if err != nil {
-				log.Printf("history: open %s: %v (dropping events)", day, err)
-				continue
+				return fmt.Errorf("open history day %s: %w", day, err)
 			}
 			f, curDay = nf, day
-			s.prune(ev.Ts) // rotation is the natural moment to age out old files
+			s.prune(ev.Ts)
 		}
 		s.project(&ev)
 		s.scrub(&ev)
 		line, err := json.Marshal(ev)
 		if err != nil {
-			continue
+			return fmt.Errorf("encode history event: %w", err)
 		}
-		_, _ = f.Write(append(line, '\n'))
+		if _, err := f.Write(append(line, '\n')); err != nil {
+			return fmt.Errorf("append history day %s: %w", day, err)
+		}
+		return nil
+	}
+
+	writeDurableBatch := func(events []Event) error {
+		for _, ev := range events {
+			if err := writeEvent(ev, true); err != nil {
+				return err
+			}
+		}
+		if f != nil {
+			if err := f.Sync(); err != nil {
+				return fmt.Errorf("sync history day %s: %w", curDay, err)
+			}
+		}
+		dir, err := os.Open(s.dir)
+		if err != nil {
+			return fmt.Errorf("open history directory for sync: %w", err)
+		}
+		if err := dir.Sync(); err != nil {
+			_ = dir.Close()
+			return fmt.Errorf("sync history directory: %w", err)
+		}
+		if err := dir.Close(); err != nil {
+			return fmt.Errorf("close history directory: %w", err)
+		}
+		return nil
+	}
+
+	s.prune(time.Now()) // bound the store at startup
+	for {
+		select {
+		case ev, ok := <-s.ch:
+			if !ok {
+				return
+			}
+			if err := writeEvent(ev, false); err != nil {
+				log.Printf("history: %v (dropping event)", err)
+			}
+		case batch := <-s.batchCh:
+			batch.ack <- writeDurableBatch(batch.events)
+		}
 	}
 }
 

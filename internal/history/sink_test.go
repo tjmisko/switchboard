@@ -3,11 +3,95 @@ package history
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
+
+func TestAppendDurableWritesBatchesLargerThanAsyncBuffer(t *testing.T) {
+	dir := t.TempDir()
+	sink := NewSink(Config{Enabled: true, Detail: DetailFull, Dir: dir})
+	at := time.Date(2026, 8, 25, 12, 0, 0, 0, time.Local)
+	events := make([]Event, sinkBuffer+200)
+	for i := range events {
+		events[i] = Event{
+			Ts: at, Type: EventUsageSample, Agent: "claude", SessionID: "session-1",
+			UsageEventID: fmt.Sprintf("usage-%04d", i), UsageSnapshot: true, TokIn: int64(i + 1),
+		}
+	}
+	if err := sink.AppendDurable(events); err != nil {
+		t.Fatal(err)
+	}
+	sink.Close()
+	if got := len(readDay(t, dir, dayKey(at))); got != len(events) {
+		t.Fatalf("durable event count = %d, want %d", got, len(events))
+	}
+}
+
+func TestAppendDurableReportsFailureAndDisabledSink(t *testing.T) {
+	disabled := NewSink(Config{Enabled: false, Dir: t.TempDir()})
+	if err := disabled.AppendDurable([]Event{{Ts: time.Now(), Type: EventUsageSample}}); !errors.Is(err, ErrSinkDisabled) {
+		t.Fatalf("disabled append error = %v, want ErrSinkDisabled", err)
+	}
+
+	parent := t.TempDir()
+	notDir := filepath.Join(parent, "not-a-directory")
+	if err := os.WriteFile(notDir, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sink := NewSink(Config{Enabled: true, Detail: DetailFull, Dir: notDir})
+	err := sink.AppendDurable([]Event{{Ts: time.Now(), Type: EventUsageSample, UsageEventID: "usage-1", UsageSnapshot: true}})
+	if err == nil {
+		t.Fatal("durable append unexpectedly succeeded against a non-directory")
+	}
+	sink.Close()
+}
+
+func TestAppendDurableConcurrentCloseAlwaysAcknowledgesOrRejects(t *testing.T) {
+	sink := NewSink(Config{Enabled: true, Detail: DetailFull, Dir: t.TempDir()})
+	const calls = 64
+	start := make(chan struct{})
+	results := make(chan error, calls)
+	var wg sync.WaitGroup
+	for i := 0; i < calls; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			results <- sink.AppendDurable([]Event{{
+				Ts: time.Now(), Type: EventUsageSample, Agent: "claude",
+				UsageEventID: fmt.Sprintf("usage-%d", i), UsageSnapshot: true,
+			}})
+		}(i)
+	}
+	close(start)
+	closed := make(chan struct{})
+	go func() {
+		sink.Close()
+		close(closed)
+	}()
+	wg.Wait()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close or a durable append blocked without acknowledgement")
+	}
+	close(results)
+	for err := range results {
+		if err != nil && !errors.Is(err, ErrSinkClosed) {
+			t.Fatalf("concurrent append error = %v, want nil or ErrSinkClosed", err)
+		}
+	}
+	if err := sink.AppendDurable([]Event{{Ts: time.Now(), Type: EventUsageSample}}); !errors.Is(err, ErrSinkClosed) {
+		t.Fatalf("post-close append error = %v, want ErrSinkClosed", err)
+	}
+	// Close remains idempotent.
+	sink.Close()
+}
 
 // readDay reads and decodes every event in a day-file.
 func readDay(t *testing.T, dir, day string) []Event {

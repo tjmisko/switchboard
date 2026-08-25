@@ -447,6 +447,42 @@ func TestAggregateTotalsSumsTokensAndCountsSpawns(t *testing.T) {
 	}
 }
 
+func TestUsageSnapshotsAreLatestWinsAcrossTimelineConsumers(t *testing.T) {
+	evs := []Event{
+		{Ts: ts(0), Type: EventSessionStart, PID: 1, SessionID: "s1", Agent: "claude"},
+		// Legacy samples remain additive during migration.
+		{Ts: ts(1), Type: EventUsageSample, PID: 1, SessionID: "s1", TokIn: 10},
+		{Ts: ts(2), Type: EventUsageSample, PID: 1, SessionID: "s1", Model: "claude-opus-4-8",
+			UsageEventID: "usage-1", UsageSnapshot: true, UsageRevision: 1,
+			TokIn: 100, TokCacheCreate: 90, TokCacheCreate5m: 90},
+		// The detailed TTL reclassification replaces the entire prior message;
+		// neither the old message total nor its old 5m bucket remains additive.
+		{Ts: ts(3), Type: EventUsageSample, PID: 1, SessionID: "s1", Model: "claude-opus-4-8",
+			UsageEventID: "usage-1", UsageSnapshot: true, UsageRevision: 2,
+			TokIn: 125, TokCacheCreate: 90, TokCacheCreate5m: 30, TokCacheCreate1h: 60,
+			UsageCoverage: "partial_legacy_cutover"},
+		{Ts: ts(4), Type: EventUsageCutover, PID: 1, SessionID: "s1",
+			UsageEventID: "usage-cutover", UsageSnapshot: true, UsageRevision: 1,
+			UsageCoverage: "partial_legacy_cutover"},
+	}
+
+	totals := AggregateTotals(evs)
+	if totals.TokIn != 135 || totals.TokCacheCreate != 90 {
+		t.Fatalf("latest-wins totals = %+v, want legacy 10 + revised 125 and one 90 cache-write total", totals)
+	}
+	if totals.UsageCoverage != "partial_legacy_cutover" {
+		t.Errorf("totals coverage = %q", totals.UsageCoverage)
+	}
+	window := AggregatePlanWindow(evs, ts(0), ts(10))
+	if window.TokIn != 135 || window.TokCacheCreate != 90 || window.UsageCoverage != "partial_legacy_cutover" {
+		t.Errorf("latest-wins plan window = %+v", window)
+	}
+	lanes := BuildSwimlanes(evs, ts(10))
+	if len(lanes) != 1 || lanes[0].TokIn != 135 || lanes[0].TokCacheCreate != 90 || lanes[0].UsageCoverage != "partial_legacy_cutover" {
+		t.Errorf("latest-wins lane = %+v", lanes)
+	}
+}
+
 func TestBuildSwimlanesAutoCreatesLaneFromTransition(t *testing.T) {
 	// A bare transition (no preceding session_start) must still open a lane.
 	evs := []Event{tr(1, "s1", 5, "idle", "working", 0)}
