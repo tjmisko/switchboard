@@ -178,7 +178,10 @@ internal/
   wezterm/     wezterm multi-mux cli client (wrapped by terminal/wezterm)
   mapping/     orchestrates proc → pane → window
   state/       in-memory store + atomic state.json mirror
-  rpc/         Unix socket: list / focus / subscribe / hook
+  rpc/         Unix socket: local + aggregate views, exact focus, hooks
+  remotestate/ bounded local-only JSONL stream + one SSH worker per host
+  federation/  detached aggregate view + exact route/action controller
+  panebind/    bounded OSC payload, live route registry, local validation
   agentgraph/  provider-neutral root/child graph + status reducer
   provider/    Claude and Codex graph observers
   conformance/ backend-agnostic contract suites reused by every backend
@@ -194,13 +197,13 @@ The portability design and phase plan live in
 switchboard-ctl list                # human-friendly snapshot
 switchboard-ctl --json list         # raw JSON
 switchboard-ctl status              # one-line count
-switchboard-ctl focus active        # jump to the focused session
-switchboard-ctl focus pid:<n>       # jump to a specific PID (unambiguous)
-switchboard-ctl focus idx:<n>       # jump to the Nth session (unambiguous)
-switchboard-ctl focus <n>           # PID n if present, else index n (back-compat)
+switchboard-ctl focus active                    # jump to the focused session
+switchboard-ctl focus pid:<n>                   # PID, if unique across hosts
+switchboard-ctl focus idx:<n>                   # Nth aggregate session
+switchboard-ctl focus host:<host>:pid:<n>        # exact host namespace
 switchboard-ctl cycle next|prev     # focus next/prev session, wrapping
 switchboard-ctl attention           # first permission, else first idle, else cycle green if all green (repeat to cycle the tier)
-switchboard-ctl pick                # pid<TAB>label<TAB>ws<TAB>cwd lines (for fzf)
+switchboard-ctl pick                # exact-token<TAB>label<TAB>ws<TAB>cwd (for fzf)
 switchboard-ctl diagnose --observer # content-free binding/freshness/graph health
 ```
 
@@ -220,6 +223,45 @@ Force a backend (e.g. to test degradation) with the daemon flags
 `-wm auto|hyprland|sway|i3|x11|none` and `-terminal auto|wezterm|tmux|none`.
 The Codex observer separately accepts `-codex-observer auto|off` (default
 `auto`).
+
+## SSH federation
+
+Add one repeatable daemon flag per remote machine:
+
+```bash
+switchboard -remote buildbox -remote user@gpu-box
+```
+
+Each destination runs one hardened, noninteractive command:
+
+```text
+ssh -n -T … <destination> switchboard-ctl remote-stream
+```
+
+The remote command exports only that machine's complete local snapshots. It
+does not expose an action channel, and a disconnected host disappears from the
+aggregate immediately. The remote machine needs `switchboard` running and a
+compatible `switchboard-ctl` on its SSH `PATH`; ordinary SSH host-key checking
+and batch authentication must already work.
+
+Sessions are live-namespaced by `(hostname,pid)`. Actions also carry
+`started_at`, Switchboard's discovery timestamp, as a best-effort stale-action
+fence. It rejects PID replacement observed while the daemon stays up; because
+hydrated survivors retain it, it is not a kernel birth token across daemon
+downtime. `list`, Waybar, the TUI, cycle, attention and the picker use the
+aggregate view; the transport itself stays on the original host-local
+`subscribe` endpoint so two federating clients cannot recurse.
+
+Exact remote focus requires the WezTerm module in
+[`integrations/wezterm/switchboard.lua`](integrations/wezterm/switchboard.lua).
+See its adjacent README for the small `setup` and sole `format-window-title`
+composition. Until its OSC binding is present and unique, a remote row remains
+visible but is marked observe-only and navigation controls skip it.
+
+For the checked-in systemd unit, append repeatable `-remote <destination>`
+arguments to the final `exec %h/go/bin/switchboard` command, then reload and
+restart the user unit. Remote tmux attachment and duplicate-hostname topologies
+are intentionally outside this first implementation.
 
 ## Claude Code hooks (optional status enrichment)
 

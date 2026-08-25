@@ -15,30 +15,6 @@ import (
 	"github.com/tjmisko/switchboard/internal/wm"
 )
 
-// wireSnapshot is a deliberately awkward snapshot for the byte-identity checks:
-// every optional block populated, and a window title carrying the three
-// characters encoding/json escapes ('<', '>', '&'). Those are the ones that would
-// expose a double-escape if the pre-encoded body were run through an escaping
-// pass a second time on its way into the envelope.
-func wireSnapshot() state.Snapshot {
-	since := time.Date(2026, 5, 28, 9, 1, 0, 0, time.UTC)
-	return state.Snapshot{
-		Sessions: []state.Session{{
-			PID: 4821, CWD: "/home/u/p", TTY: "/dev/pts/3",
-			StartedAt: time.Date(2026, 5, 28, 9, 0, 0, 0, time.UTC),
-			Focused:   true, Agent: state.AgentKindClaude, MemTreeBytes: 674234368,
-			Wezterm:  &state.WeztermInfo{MuxPID: 4790, PaneID: 12, WindowTitle: "claude <a & b> — switchboard"},
-			Hyprland: &state.HyprlandInfo{Address: "0x5640f1a2b3c0", Workspace: "4", WorkspaceID: 4},
-			Claude: &state.AgentInfo{
-				SessionID: "e0b4b21f", Status: state.StatusWorking,
-				StatusSinceWire: &since, InFlightSubagents: 2,
-			},
-		}},
-		UpdatedAt:    time.Date(2026, 5, 28, 9, 5, 30, 0, time.UTC),
-		Capabilities: &state.Capabilities{Observe: true, Navigate: true, WM: "hyprland", Terminal: "wezterm"},
-	}
-}
-
 // encodeFrame renders one response exactly as the server writes it: a single
 // json.Encoder line, trailing newline included.
 func encodeFrame(t *testing.T, v any) []byte {
@@ -48,32 +24,6 @@ func encodeFrame(t *testing.T, v any) []byte {
 		t.Fatalf("encode frame: %v", err)
 	}
 	return buf.Bytes()
-}
-
-// The subscribe stream now sends a pre-encoded body through a mirrored envelope
-// (rawResponse) instead of re-marshaling the snapshot per subscriber. That is a
-// pure performance change, so the frame must stay byte-identical to what
-// Response produced — this is the test rpc.snapshotFrame's comment names, and the
-// one that fails if rawResponse and Response ever drift apart.
-func TestSubscribeFrameMatchesResponseEncoding(t *testing.T) {
-	snap := wireSnapshot()
-	body, err := json.Marshal(snap)
-	if err != nil {
-		t.Fatalf("marshal snapshot: %v", err)
-	}
-
-	want := encodeFrame(t, Response{Snapshot: &snap})
-	got := encodeFrame(t, snapshotFrame(state.Broadcast{Snapshot: snap, JSON: body}))
-	if !bytes.Equal(got, want) {
-		t.Errorf("pre-encoded frame differs from Response.\n--- got ---\n%s--- want ---\n%s", got, want)
-	}
-
-	// A nil body means the upstream encode failed; the fallback must still produce
-	// a valid, identical frame rather than a truncated one.
-	fallback := encodeFrame(t, snapshotFrame(state.Broadcast{Snapshot: snap}))
-	if !bytes.Equal(fallback, want) {
-		t.Errorf("fallback frame differs from Response.\n--- got ---\n%s--- want ---\n%s", fallback, want)
-	}
 }
 
 // serveTestSocket starts a Server on a throwaway socket and returns its path,
@@ -124,11 +74,57 @@ func nextFrame(t *testing.T, r *bufio.Reader) []byte {
 	return line
 }
 
-// End to end over the real socket: every subscriber must receive the same frame,
-// that frame must still be the documented wire document, and — the constraint the
-// shared-encoding change must not break — a brand-new connection must still get a
-// full snapshot immediately, before any mutation happens.
-func TestSubscribe_deliversTheSameWireFrameToEverySubscriber(t *testing.T) {
+func TestLocalSubscribeTreatsQueuedBroadcastsAsNotifications(t *testing.T) {
+	store := state.New("")
+	updates, cancelUpdates := store.Subscribe()
+	defer cancelUpdates()
+
+	// Queue A, then advance the authoritative Store to B before the stream reads
+	// its initial snapshot. A raw-forwarding subscriber would emit B, A, B.
+	store.Apply(func(sessions map[int]*state.Session) {
+		sessions[1] = &state.Session{PID: 1, CWD: "/stale-a", StartedAt: time.Unix(1, 0)}
+	})
+	store.Apply(func(sessions map[int]*state.Session) {
+		delete(sessions, 1)
+		sessions[2] = &state.Session{PID: 2, CWD: "/current-b", StartedAt: time.Unix(2, 0)}
+	})
+
+	server := New(store, "", terminal.NewNone(), wm.NewNone())
+	client, daemon := net.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer daemon.Close()
+		server.streamLocalSnapshots(ctx, daemon, json.NewEncoder(daemon), updates)
+	}()
+
+	decoder := json.NewDecoder(client)
+	for frame := 0; frame < 3; frame++ {
+		var response Response
+		if err := decoder.Decode(&response); err != nil {
+			t.Fatalf("decode frame %d: %v", frame, err)
+		}
+		if response.Snapshot == nil || len(response.Snapshot.Sessions) != 1 ||
+			response.Snapshot.Sessions[0].PID != 2 {
+			t.Fatalf("frame %d rolled back from B: %+v", frame, response.Snapshot)
+		}
+	}
+	_ = client.Close()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("local snapshot stream did not stop")
+	}
+}
+
+// End to end over the real socket: every subscriber must receive the current
+// documented wire document, and a brand-new connection must still get a full
+// snapshot immediately before any mutation happens. UpdatedAt is stamped by
+// each current Snapshot read, so separate subscribers need not receive
+// byte-identical timestamps.
+func TestSubscribe_deliversCurrentWireFrameToEverySubscriber(t *testing.T) {
 	store := state.New("")
 	store.Apply(func(m map[int]*state.Session) {
 		m[4821] = &state.Session{PID: 4821, CWD: "/home/u/p", TTY: "/dev/pts/3", StartedAt: time.Unix(1000, 0)}
@@ -154,17 +150,10 @@ func TestSubscribe_deliversTheSameWireFrameToEverySubscriber(t *testing.T) {
 
 	store.Apply(func(m map[int]*state.Session) { m[4821].Focused = true })
 
-	var first []byte
 	for i, r := range readers {
 		frame := nextFrame(t, r)
-		if i == 0 {
-			first = frame
-		} else if !bytes.Equal(frame, first) {
-			t.Errorf("subscriber %d received a different frame.\n--- got ---\n%s--- want ---\n%s", i, frame, first)
-		}
-
-		// Re-encoding through Response must reproduce the frame byte-for-byte: the
-		// shared buffer is the same wire document rpc has always written.
+		// Re-encoding through Response must reproduce each frame byte-for-byte:
+		// notification/re-read changes ordering, not the public JSON shape.
 		var resp Response
 		if err := json.Unmarshal(frame, &resp); err != nil {
 			t.Fatalf("subscriber %d: decode frame: %v", i, err)

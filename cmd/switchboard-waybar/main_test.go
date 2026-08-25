@@ -72,6 +72,45 @@ func TestRenderSlotCodexExplicitNameReplacesShortID(t *testing.T) {
 	}
 }
 
+func TestRenderSlotMarksUnboundAggregateRowObserveOnly(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	session := state.Session{
+		PID: 4, Hostname: "remote", Remote: true, CWD: "/work", Agent: state.AgentKindClaude,
+		Claude: &state.AgentInfo{Status: state.StatusIdle},
+	}
+	out := renderSlot(state.Snapshot{Sessions: []state.Session{session}}, 0, testAvail, testMetrics, &nameConfig{}, &sblabel.NameCache{})
+	if !slices.Contains(out.Class, "unnavigable") {
+		t.Fatalf("classes = %v", out.Class)
+	}
+	if !strings.Contains(out.Tooltip, "observe only (pane not bound)") {
+		t.Fatalf("tooltip = %q", out.Tooltip)
+	}
+}
+
+func TestRemoteTooltipDoesNotResolveCWDOnLocalFilesystem(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	if err := os.Mkdir(filepath.Join(root, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	remoteDir := filepath.Join(root, "nested", "switchboard")
+	if err := os.MkdirAll(remoteDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := state.Session{
+		PID: 4, Hostname: "buildbox", Remote: true, CWD: remoteDir,
+		Agent: state.AgentKindClaude, Claude: &state.AgentInfo{Status: state.StatusIdle},
+	}
+	tip := sessionTooltip(projectname.DefaultConfig(), &sblabel.NameCache{}, s, time.Now())
+	if !strings.Contains(tip, "<b>sb</b>") || !strings.Contains(tip, "buildbox/4") {
+		t.Fatalf("remote tooltip did not use lexical remote project/identity:\n%s", tip)
+	}
+	if !strings.Contains(tip, remoteDir) || strings.Contains(tip, "~/nested") {
+		t.Fatalf("remote tooltip contracted source-host cwd as local HOME:\n%s", tip)
+	}
+}
+
 func TestAgentTooltipPrioritizesWaitsAndFoldsWithoutAddingSlots(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())

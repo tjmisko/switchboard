@@ -72,6 +72,13 @@ func (c Config) ruleForRoot(root, base string) ProjectRule {
 			}
 		}
 	}
+	return c.RuleForBase(base)
+}
+
+// RuleForBase resolves only basename-matched rules and never inspects a path.
+// Federated renderers use it for a remote CWD: that path belongs to another
+// machine, so walking or applying local path overrides would be incorrect.
+func (c Config) RuleForBase(base string) ProjectRule {
 	lowerBase := strings.ToLower(base)
 	for _, r := range c.Rules {
 		for _, m := range r.Match {

@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -80,6 +81,12 @@ func main() {
 	switch args[0] {
 	case "list":
 		cmdList(c, *jsonOut)
+	case "remote-stream":
+		cmdRemoteStream(c)
+	case "pane-bind":
+		cmdPaneBind(c, args[1:])
+	case "pane-state":
+		cmdPaneState(c, args[1:])
 	case "focus":
 		selector := "active"
 		if len(args) > 1 {
@@ -130,7 +137,7 @@ func cmdList(c *rpc.Client, jsonOut bool) {
 		return
 	}
 	if len(snap.Sessions) == 0 {
-		fmt.Println("no claude sessions")
+		fmt.Println("no agent sessions")
 		return
 	}
 	for i, s := range snap.Sessions {
@@ -138,7 +145,11 @@ func cmdList(c *rpc.Client, jsonOut bool) {
 		if s.Focused {
 			marker = "*"
 		}
-		fmt.Printf("%s [%d] pid=%d cwd=%s\n", marker, i, s.PID, s.CWD)
+		identity := fmt.Sprintf("pid=%d", s.PID)
+		if s.Hostname != "" {
+			identity = fmt.Sprintf("host=%s pid=%d", s.Hostname, s.PID)
+		}
+		fmt.Printf("%s [%d] %s cwd=%s\n", marker, i, identity, s.CWD)
 		if s.Wezterm != nil {
 			fmt.Printf("       wezterm: mux=%d pane=%d title=%q\n", s.Wezterm.MuxPID, s.Wezterm.PaneID, s.Wezterm.WindowTitle)
 		}
@@ -184,7 +195,20 @@ func renderAgentDiagnostics(w io.Writer, diagnostics []rpc.AgentDiagnostic) {
 }
 
 func cmdFocus(c *rpc.Client, selector string) {
-	if err := c.Send(rpc.Request{Cmd: "focus", Selector: selector}); err != nil {
+	target, err := resolveFocusSelector(mustList(c).Sessions, selector)
+	if err != nil {
+		fail("%v", err)
+	}
+	focusSession(c, *target)
+}
+
+func focusSession(c *rpc.Client, target state.Session) {
+	if target.Hostname == "" || target.PID <= 0 || target.StartedAt.IsZero() {
+		fail("selected session has no exact federated identity")
+	}
+	if err := c.Send(rpc.Request{
+		Cmd: "focus-session", Hostname: target.Hostname, PID: target.PID, StartedAt: target.StartedAt,
+	}); err != nil {
 		fail("send: %v", err)
 	}
 	var resp rpc.Response
@@ -193,6 +217,150 @@ func cmdFocus(c *rpc.Client, selector string) {
 	}
 	if resp.Error != "" {
 		fail("%s", resp.Error)
+	}
+}
+
+func resolveFocusSelector(sessions []state.Session, selector string) (*state.Session, error) {
+	if len(sessions) == 0 {
+		return nil, fmt.Errorf("no sessions")
+	}
+	if selector == "" || selector == "active" {
+		for i := range sessions {
+			if sessions[i].Focused {
+				return &sessions[i], nil
+			}
+		}
+		return &sessions[0], nil
+	}
+	if rest, ok := strings.CutPrefix(selector, "idx:"); ok {
+		index, err := strconv.Atoi(rest)
+		if err != nil || index < 0 || index >= len(sessions) {
+			return nil, fmt.Errorf("no session matches %q", selector)
+		}
+		return &sessions[index], nil
+	}
+	if rest, ok := strings.CutPrefix(selector, "host:"); ok {
+		host, identity, ok := strings.Cut(rest, ":pid:")
+		pidText := identity
+		startedText := ""
+		if before, after, hasStarted := strings.Cut(identity, ":started:"); hasStarted {
+			pidText, startedText = before, after
+		}
+		pid, err := strconv.Atoi(pidText)
+		if !ok || host == "" || err != nil {
+			return nil, fmt.Errorf("invalid host selector %q", selector)
+		}
+		var startedAt time.Time
+		if startedText != "" {
+			startedAt, err = time.Parse(time.RFC3339Nano, startedText)
+			if err != nil {
+				return nil, fmt.Errorf("invalid started_at in selector %q", selector)
+			}
+		}
+		for i := range sessions {
+			if sessions[i].Hostname == host && sessions[i].PID == pid &&
+				(startedAt.IsZero() || sessions[i].StartedAt.Equal(startedAt)) {
+				return &sessions[i], nil
+			}
+		}
+		return nil, fmt.Errorf("no session matches %q", selector)
+	}
+	if rest, ok := strings.CutPrefix(selector, "pid:"); ok {
+		pid, err := strconv.Atoi(rest)
+		if err != nil {
+			return nil, fmt.Errorf("invalid PID selector %q", selector)
+		}
+		return uniquePID(sessions, pid, selector)
+	}
+	if host, pidText, ok := strings.Cut(selector, ":"); ok {
+		pid, err := strconv.Atoi(pidText)
+		if err == nil {
+			return resolveFocusSelector(sessions, fmt.Sprintf("host:%s:pid:%d", host, pid))
+		}
+	}
+	if value, err := strconv.Atoi(selector); err == nil {
+		target, pidErr := uniquePID(sessions, value, selector)
+		if pidErr == nil {
+			return target, nil
+		}
+		if !errorsIsNoPID(pidErr) {
+			return nil, pidErr
+		}
+		if value >= 0 && value < len(sessions) {
+			return &sessions[value], nil
+		}
+	}
+	return nil, fmt.Errorf("no session matches %q", selector)
+}
+
+type noPIDError struct{ selector string }
+
+func (e noPIDError) Error() string { return fmt.Sprintf("no PID matches %q", e.selector) }
+func errorsIsNoPID(err error) bool {
+	_, ok := err.(noPIDError)
+	return ok
+}
+
+func uniquePID(sessions []state.Session, pid int, selector string) (*state.Session, error) {
+	var target *state.Session
+	for i := range sessions {
+		if sessions[i].PID != pid {
+			continue
+		}
+		if target != nil {
+			return nil, fmt.Errorf("PID %d is ambiguous across hosts; use host:<hostname>:pid:%d", pid, pid)
+		}
+		target = &sessions[i]
+	}
+	if target == nil {
+		return nil, noPIDError{selector: selector}
+	}
+	return target, nil
+}
+
+func cmdPaneBind(c *rpc.Client, args []string) {
+	if len(args) != 4 {
+		fail("pane-bind requires payload gui-pid window-id pane-id")
+	}
+	guiPID := mustIntArg("gui-pid", args[1])
+	windowID := mustIntArg("window-id", args[2])
+	paneID := mustIntArg("pane-id", args[3])
+	sendOK(c, rpc.Request{Cmd: "pane-bind", Binding: args[0], GUIPID: guiPID, WindowID: windowID, PaneID: paneID})
+}
+
+func cmdPaneState(c *rpc.Client, args []string) {
+	if len(args) != 4 {
+		fail("pane-state requires gui-pid window-id active-pane-id window-focused")
+	}
+	windowFocused, err := strconv.ParseBool(args[3])
+	if err != nil {
+		fail("window-focused must be true or false")
+	}
+	sendOK(c, rpc.Request{
+		Cmd: "pane-state", GUIPID: mustIntArg("gui-pid", args[0]),
+		WindowID: mustIntArg("window-id", args[1]), PaneID: mustIntArg("active-pane-id", args[2]),
+		WindowFocused: windowFocused,
+	})
+}
+
+func mustIntArg(name, value string) int {
+	n, err := strconv.Atoi(value)
+	if err != nil {
+		fail("%s must be an integer", name)
+	}
+	return n
+}
+
+func sendOK(c *rpc.Client, request rpc.Request) {
+	if err := c.Send(request); err != nil {
+		fail("send: %v", err)
+	}
+	var response rpc.Response
+	if err := c.Recv(&response); err != nil {
+		fail("recv: %v", err)
+	}
+	if response.Error != "" {
+		fail("%s", response.Error)
 	}
 }
 
@@ -220,7 +388,7 @@ func cmdStatus(c *rpc.Client) {
 }
 
 // cmdPick emits one tab-separated line per session, ordered as the snapshot.
-// Format: PID \t LABEL \t CWD \t WORKSPACE
+// Format: EXACT-TOKEN \t LABEL \t WORKSPACE \t CWD
 // LABEL is the project-prefixed, de-duplicated session name (see
 // internal/label). Intended to be piped into fzf with `--with-nth=2..` so the
 // user sees the label but the PID stays in the selected line for the focus call.
@@ -230,10 +398,13 @@ func cmdPick(c *rpc.Client) {
 	for _, s := range snap.Sessions {
 		// Headless runs (claude -p) have no window to jump to; offering them in
 		// the picker would only produce a failed focus.
-		if s.Headless {
+		if !sessionNavigable(s) {
 			continue
 		}
 		label := sblabel.Chip(cfg, s)
+		if s.Remote {
+			label = s.Hostname + ":" + label
+		}
 		ws := "-"
 		if s.Hyprland != nil && s.Hyprland.Workspace != "" {
 			ws = s.Hyprland.Workspace
@@ -242,7 +413,8 @@ func cmdPick(c *rpc.Client) {
 		if s.Focused {
 			focusMark = "*"
 		}
-		fmt.Printf("%d\t%s %s\tws %s\t%s\n", s.PID, focusMark, label, ws, s.CWD)
+		fmt.Printf("host:%s:pid:%d:started:%s\t%s %s\tws %s\t%s\n",
+			s.Hostname, s.PID, s.StartedAt.UTC().Format(time.RFC3339Nano), focusMark, label, ws, s.CWD)
 	}
 }
 
@@ -254,11 +426,49 @@ func cmdCycle(c *rpc.Client, direction string) {
 		fail("cycle direction must be next|prev (got %q)", direction)
 	}
 	snap := mustList(c)
-	pid, ok := cycleTargetPID(snap.Sessions, direction)
+	target, ok := cycleTargetSession(snap.Sessions, direction)
 	if !ok {
 		return
 	}
-	cmdFocus(c, fmt.Sprintf("%d", pid))
+	focusSession(c, target)
+}
+
+func cycleTargetSession(sessions []state.Session, direction string) (state.Session, bool) {
+	var ring []state.Session
+	for _, session := range sessions {
+		if sessionNavigable(session) {
+			ring = append(ring, session)
+		}
+	}
+	if len(ring) == 0 {
+		return state.Session{}, false
+	}
+	index := -1
+	for i := range ring {
+		if ring[i].Focused {
+			index = i
+			break
+		}
+	}
+	if direction == "next" || direction == "up" {
+		if index < 0 {
+			return ring[0], true
+		}
+		return ring[(index+1)%len(ring)], true
+	}
+	if index < 0 {
+		return ring[len(ring)-1], true
+	}
+	return ring[(index-1+len(ring))%len(ring)], true
+}
+
+func sessionNavigable(session state.Session) bool {
+	if session.Headless {
+		return false
+	}
+	// Hostname is absent in host-local snapshots and in legacy unit fixtures;
+	// aggregate rows always carry it and therefore require the explicit hint.
+	return session.Hostname == "" || session.Navigable
 }
 
 // cycleTargetPID picks the session the cycle lands on. The ring is the
@@ -266,39 +476,8 @@ func cmdCycle(c *rpc.Client, direction string) {
 // runs sit in the bar for visibility but have no window, so scrolling skips
 // them. Returns false when the ring is empty.
 func cycleTargetPID(sessions []state.Session, direction string) (int, bool) {
-	var ring []state.Session
-	for _, s := range sessions {
-		if !s.Headless {
-			ring = append(ring, s)
-		}
-	}
-	if len(ring) == 0 {
-		return 0, false
-	}
-	idx := -1
-	for i, s := range ring {
-		if s.Focused {
-			idx = i
-			break
-		}
-	}
-	n := len(ring)
-	var target int
-	switch direction {
-	case "next", "up":
-		if idx < 0 {
-			target = 0
-		} else {
-			target = (idx + 1) % n
-		}
-	default: // "prev", "down"
-		if idx < 0 {
-			target = n - 1
-		} else {
-			target = (idx - 1 + n) % n
-		}
-	}
-	return ring[target].PID, true
+	target, ok := cycleTargetSession(sessions, direction)
+	return target.PID, ok
 }
 
 // cmdAttention jumps to a session that needs the user. Priority mirrors the
@@ -317,19 +496,37 @@ func cmdAttention(c *rpc.Client) {
 	// The focused session anchors the cycle, so a repeat press steps to the
 	// next member of the tier instead of re-focusing the same one. 0 (no PID)
 	// when nothing is focused, which pickAttention treats as "outside the tier".
-	focusedPID := 0
+	var focused *state.Session
 	for _, s := range snap.Sessions {
 		if s.Focused {
-			focusedPID = s.PID
+			copy := s
+			focused = &copy
 			break
 		}
 	}
 
-	target := pickAttention(snap.Sessions, focusedPID)
+	target := pickAttentionExact(snap.Sessions, focused)
 	if target == nil {
 		return
 	}
-	cmdFocus(c, fmt.Sprintf("%d", target.PID))
+	focusSession(c, *target)
+}
+
+func pickAttentionExact(sessions []state.Session, focused *state.Session) *state.Session {
+	tier := topAttentionTier(sessions)
+	if len(tier) == 0 {
+		return nil
+	}
+	for i, session := range tier {
+		if focused != nil && sameExactSession(*session, *focused) {
+			return tier[(i+1)%len(tier)]
+		}
+	}
+	return tier[0]
+}
+
+func sameExactSession(a, b state.Session) bool {
+	return a.Hostname == b.Hostname && a.PID == b.PID && a.StartedAt.Equal(b.StartedAt)
 }
 
 // pickAttention returns the next session needing attention, cycling within the
@@ -376,7 +573,7 @@ func topAttentionTier(sessions []state.Session) []*state.Session {
 	// and do not count against the all-green fallback's denominator.
 	considered := 0
 	for i := range sessions {
-		if sessions[i].Headless {
+		if !sessionNavigable(sessions[i]) {
 			continue
 		}
 		considered++
@@ -674,7 +871,7 @@ func dirOrCwd(dir string) string {
 }
 
 func mustList(c *rpc.Client) state.Snapshot {
-	if err := c.Send(rpc.Request{Cmd: "list"}); err != nil {
+	if err := c.Send(rpc.Request{Cmd: "list-all"}); err != nil {
 		fail("send: %v", err)
 	}
 	var resp rpc.Response
@@ -696,10 +893,12 @@ usage: switchboard-ctl [flags] <cmd> [args]
 
 commands:
   list                    show session list (human-friendly; --json for raw)
-  focus [selector]        focus session: "active" (default), <pid>, <index>,
-                            or the unambiguous pid:<n> / idx:<n> forms
+  remote-stream           stream bounded local-daemon snapshots as host JSONL;
+                            intended for ssh -T <host> switchboard-ctl remote-stream
+  focus [selector]        focus exact session: active, idx:<n>, pid:<n>, or
+                            host:<hostname>:pid:<n> (required for duplicate PIDs)
   status                  one-line summary
-  pick                    emit pid<TAB>label<TAB>ws<TAB>cwd lines for fzf
+  pick                    emit exact-token<TAB>label<TAB>ws<TAB>cwd for fzf
   cycle next|prev         focus the next/previous session, wrapping
   attention               jump to a session needing attention, cycling within
                             the top tier: permission (red), else idle (orange),

@@ -100,7 +100,7 @@ func runOnce(socketPath string, slot int, availPx float64, metrics barlayout.Met
 		return
 	}
 	defer c.Close()
-	if err := c.Send(rpc.Request{Cmd: "subscribe"}); err != nil {
+	if err := c.Send(rpc.Request{Cmd: "subscribe-all"}); err != nil {
 		return
 	}
 	// A fresh subscription means the daemon restarted (or we just started), and
@@ -221,6 +221,9 @@ func renderSlot(snap state.Snapshot, slot int, availPx float64, metrics barlayou
 	if s.Headless {
 		classes = append(classes, "headless")
 	}
+	if s.Hostname != "" && !s.Navigable {
+		classes = append(classes, "unnavigable")
+	}
 	return waybarOutput{
 		Text:    labels[slot],
 		Tooltip: sessionTooltip(cfg, cache, s, time.Now()),
@@ -281,8 +284,19 @@ func sessionStatus(s state.Session) string {
 // task name (the project prefix stripped, since the abbrev already shows it);
 // line 3 is dimmed metadata.
 func sessionTooltip(cfg projectname.Config, cache *sblabel.NameCache, s state.Session, now time.Time) string {
-	abbrev := projectname.CanonicalForDir(cfg, s.CWD)
-	task := projectname.TaskForDir(cfg, s.CWD, cache.RawName(s))
+	var abbrev, task string
+	if s.Remote {
+		base := strings.TrimSpace(s.CWD)
+		if base != "" {
+			base = filepath.Base(filepath.Clean(base))
+		}
+		rule := cfg.RuleForBase(base)
+		abbrev = rule.Canonical
+		task = rule.StripKnownPrefix(cache.RawName(s))
+	} else {
+		abbrev = projectname.CanonicalForDir(cfg, s.CWD)
+		task = projectname.TaskForDir(cfg, s.CWD, cache.RawName(s))
+	}
 	status := sessionStatus(s)
 	hasAgentTree := len(barlayout.AgentRows(s.AgentGraph)) > 0
 
@@ -328,6 +342,10 @@ func sessionTooltip(cfg projectname.Config, cache *sblabel.NameCache, s state.Se
 	}
 	if s.Headless {
 		statusText += " · headless (claude -p)"
+	} else if s.Remote && !s.Navigable {
+		statusText += " · observe only (pane not bound)"
+	} else if s.Hostname != "" && !s.Navigable {
+		statusText += " · observe only (navigation unavailable)"
 	}
 
 	ws := "-"
@@ -335,7 +353,15 @@ func sessionTooltip(cfg projectname.Config, cache *sblabel.NameCache, s state.Se
 		ws = s.Hyprland.Workspace
 	}
 	dot := fmt.Sprintf("<span foreground='%s'>●</span>", statusColor(status))
-	meta := fmt.Sprintf("%s · ws %s · pid %d", contractHome(s.CWD), ws, s.PID)
+	process := fmt.Sprintf("pid %d", s.PID)
+	if s.Hostname != "" {
+		process = fmt.Sprintf("%s/%d", s.Hostname, s.PID)
+	}
+	displayCWD := s.CWD
+	if !s.Remote {
+		displayCWD = contractHome(displayCWD)
+	}
+	meta := fmt.Sprintf("%s · ws %s · %s", displayCWD, ws, process)
 	tip := fmt.Sprintf(
 		"<b>%s</b>   %s %s\n%s\n<span foreground='#6c7086' size='smaller'>%s</span>",
 		pangoEscape(abbrev), dot, pangoEscape(statusText),

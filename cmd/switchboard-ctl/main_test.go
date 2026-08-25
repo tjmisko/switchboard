@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,6 +18,45 @@ func TestRenderAgentDiagnostics(t *testing.T) {
 	want := "codex hook_client_identity_unique count=2 last_at=2026-08-24T03:00:00Z\n"
 	if got := output.String(); got != want {
 		t.Fatalf("output = %q, want %q", got, want)
+	}
+}
+
+func TestResolveFocusSelectorNamespacesDuplicatePIDs(t *testing.T) {
+	startedA := time.Unix(10, 0).UTC()
+	startedB := time.Unix(20, 0).UTC()
+	sessions := []state.Session{
+		{Hostname: "alpha", PID: 42, StartedAt: startedA, Navigable: true},
+		{Hostname: "beta", PID: 42, StartedAt: startedB, Navigable: true},
+	}
+	if _, err := resolveFocusSelector(sessions, "pid:42"); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("duplicate PID error = %v", err)
+	}
+	token := "host:beta:pid:42:started:" + startedB.Format(time.RFC3339Nano)
+	target, err := resolveFocusSelector(sessions, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target.Hostname != "beta" || !target.StartedAt.Equal(startedB) {
+		t.Fatalf("target = %+v", target)
+	}
+	stale := "host:beta:pid:42:started:" + startedA.Format(time.RFC3339Nano)
+	if _, err := resolveFocusSelector(sessions, stale); err == nil {
+		t.Fatal("stale exact token selected a replacement lifetime")
+	}
+}
+
+func TestAggregateNavigationSkipsUnboundRemoteRows(t *testing.T) {
+	local := sess(1, "working")
+	local.Hostname, local.Navigable, local.Focused = "local", true, true
+	remote := sess(2, "permission")
+	remote.Hostname, remote.Navigable = "remote", false
+
+	target, ok := cycleTargetSession([]state.Session{local, remote}, "next")
+	if !ok || target.Hostname != "local" {
+		t.Fatalf("cycle target = %+v, ok=%t", target, ok)
+	}
+	if got := pickAttentionExact([]state.Session{local, remote}, &local); got == nil || got.Hostname != "local" {
+		t.Fatalf("attention target = %+v", got)
 	}
 }
 

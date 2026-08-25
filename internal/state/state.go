@@ -15,11 +15,25 @@ import (
 )
 
 type Session struct {
-	PID       int       `json:"pid"`
+	PID int `json:"pid"`
+	// Hostname is populated only on detached copies in the federated client
+	// view. The host-local Store deliberately leaves it empty: local discovery,
+	// liveness, persistence, and navigation remain keyed exactly as before.
+	// Together with PID it namespaces a live aggregate row; StartedAt is the
+	// daemon's discovery-lifetime fence for actions and bindings. It rejects
+	// stale observations while daemon continuity is intact, but is not a kernel
+	// process-birth token. Omitted from ordinary local snapshots, so the frozen
+	// host-local state.json shape is unchanged.
+	Hostname  string    `json:"hostname,omitempty"`
 	CWD       string    `json:"cwd"`
 	TTY       string    `json:"tty"`
 	StartedAt time.Time `json:"started_at"`
 	Focused   bool      `json:"focused"`
+	// Remote is populated only on detached aggregate copies. Renderers use it
+	// to avoid treating remote CWD, transcript, and PID values as paths or
+	// process identities on this machine. Like Hostname and Navigable, it is
+	// omitted from ordinary host-local snapshots and durable state.
+	Remote bool `json:"remote,omitempty"`
 	// Suspended is true when the agent process is job-control-stopped (Ctrl-Z /
 	// SIGSTOP). Renderers grey such chips out. Omitted when false so the common
 	// case stays off the wire.
@@ -29,6 +43,11 @@ type Session struct {
 	// to navigate to, so renderers style it inert and focus/cycle/pick skip
 	// it. Omitted when false.
 	Headless bool `json:"headless,omitempty"`
+	// Navigable is populated only on detached aggregate copies. It says an
+	// exact local route candidate exists now; every action still revalidates the
+	// pane, window, liveness, and StartedAt before acting. Host-local snapshots
+	// leave it false/omitted, preserving the durable schema.
+	Navigable bool `json:"navigable,omitempty"`
 
 	// Agent names the coding-agent CLI that owns this session: "claude" or
 	// "codex" (the AgentKind* constants). Set at discovery from the process. It
@@ -439,25 +458,17 @@ type Capabilities struct {
 	Terminal string `json:"terminal"`
 }
 
-// Broadcast is one fan-out unit: a snapshot plus the JSON body every subscriber
-// is about to send. It exists because the encode is per-BROADCAST work that used
-// to be done per-SUBSCRIBER. The live bar declares ten waybar slot modules, each
-// a separate `switchboard-waybar --slot N` process holding its own subscription,
-// so a single state mutation serialized the identical snapshot ten times inside
-// the daemon — ten allocations and ten encodes of the same bytes.
-//
-// The alternative was to keep the marshal in rpc behind a cache keyed on snapshot
-// identity. Snapshot has no identity of its own, so that needs a synthetic one (a
-// sequence number) plus a cache that still re-encodes for any subscriber running
-// a beat behind the others, and it puts a shared mutable cache on the RPC
-// goroutines. Encoding at the single point where the fan-out already happens is
-// both cheaper and impossible to get wrong.
+// Broadcast is one fan-out unit: a snapshot plus a shared JSON body for consumers
+// that can forward that exact generation. Federation-facing subscriptions use
+// these values only as wakeups and re-read Store.Snapshot, because a value queued
+// before their independent initial read may be older than it.
 type Broadcast struct {
 	Snapshot Snapshot
 	// JSON is the COMPACT encoding of Snapshot: exactly what json.Encoder writes,
-	// minus the trailing newline. rpc splices it into the response envelope
-	// verbatim (json.RawMessage), so these bytes ARE the public wire document —
-	// see docs/state-schema.md and the golden tests that pin them.
+	// minus the trailing newline. It is paired with this particular broadcast;
+	// consumers which also take an independent initial Snapshot must treat the
+	// channel as a notification and re-read current state, because a queued value
+	// can predate that initial read. The RPC subscription does exactly that.
 	//
 	// It is nil when the encode failed. A subscriber must then encode Snapshot
 	// itself rather than send a truncated frame.
@@ -482,6 +493,11 @@ type Store struct {
 	// without clobbering one a later Apply made in the meantime. See
 	// invalidatePublished.
 	publishedGen uint64
+	// broadcastGen serializes post-unlock fanout by the Apply generation. Two
+	// concurrent Apply calls may reach broadcast out of order; an older one must
+	// never overwrite the newer full replacement in subscriber queues.
+	broadcastMu  sync.Mutex
+	broadcastGen uint64
 }
 
 func New(statePath string) *Store {
@@ -550,7 +566,7 @@ func (s *Store) Apply(fn func(map[int]*Session)) {
 	if !changed {
 		return
 	}
-	s.broadcast(snap)
+	s.broadcast(snap, gen)
 	if err := s.persist(snap); err != nil {
 		fmt.Fprintf(os.Stderr, "state: persist failed: %v\n", err)
 		// The reference was adopted before the write was attempted, so leaving it
@@ -572,11 +588,11 @@ func (s *Store) Apply(fn func(map[int]*Session)) {
 // It deliberately runs under the SAME write lock as the mutation that produced
 // snap. That is what makes suppression safe: the reference advances in mutation
 // order, so a change can never be compared against a reference stamped by a
-// LATER mutation and dropped as a no-op. (The broadcast and the persist still
-// happen after the unlock and can still race each other on the wire, exactly as
-// they always have — that ordering is unchanged by this check.) The cost is one
-// encode inside the write lock, which is microseconds against the milliseconds of
-// terminal/WM I/O the reconciler used to hold it for.
+// LATER mutation and dropped as a no-op. Broadcast generation ordering is
+// serialized separately after the unlock; persistence may still overlap, but it
+// is not a live subscription source. The cost is one encode inside the write
+// lock, which is microseconds against the milliseconds of terminal/WM I/O the
+// reconciler used to hold it for.
 func (s *Store) adoptPublishedLocked(snap Snapshot) (gen uint64, changed bool) {
 	key := snapshotChangeKey(snap)
 	if key != nil && bytes.Equal(key, s.publishedKey) {
@@ -759,10 +775,12 @@ func workspaceID(s Session) (int, bool) {
 	return s.Hyprland.WorkspaceID, true
 }
 
-// Subscribe returns a channel that receives every snapshot after a mutation that
-// changed it, each paired with the shared encoding of that snapshot (Broadcast).
-// The channel is buffered (cap=4) and drops if the receiver lags. Close the
-// returned cancel func to unsubscribe.
+// Subscribe returns a channel that receives snapshots after mutations which
+// changed them, paired with their shared encoding. The channel is buffered and
+// coalesces toward the newest complete replacement if the receiver lags. A
+// subscriber that also performs an independent initial Snapshot read must treat
+// channel values as notifications and re-read current state. Close the returned
+// cancel func to unsubscribe.
 func (s *Store) Subscribe() (<-chan Broadcast, func()) {
 	ch := make(chan Broadcast, 4)
 	s.mu.Lock()
@@ -778,7 +796,13 @@ func (s *Store) Subscribe() (<-chan Broadcast, func()) {
 	return ch, cancel
 }
 
-func (s *Store) broadcast(snap Snapshot) {
+func (s *Store) broadcast(snap Snapshot, gen uint64) {
+	s.broadcastMu.Lock()
+	defer s.broadcastMu.Unlock()
+	if gen <= s.broadcastGen {
+		return
+	}
+	s.broadcastGen = gen
 	// Peek the subscriber count before paying for the encode. A daemon with no bar
 	// attached — headless box, bar mid-restart — should not serialize into the void.
 	s.mu.RLock()
@@ -808,10 +832,17 @@ func (s *Store) broadcast(snap Snapshot) {
 		select {
 		case ch <- b:
 		default:
-			// Deliberate back-pressure: a subscriber that cannot keep up drops
-			// snapshots rather than stalling every other subscriber (and the next
-			// Apply) behind it. A drop costs latency and never correctness — the next
-			// broadcast carries the whole state, not a delta.
+			// Coalesce to the latest full snapshot without blocking the writer.
+			// Keeping the old frame would be incorrect when this is the final
+			// mutation: there may be no later broadcast to repair the subscriber.
+			select {
+			case <-ch:
+			default:
+			}
+			select {
+			case ch <- b:
+			default:
+			}
 		}
 	}
 }

@@ -73,6 +73,7 @@ func codexObserverModeCategory(mode codexObserverMode) string {
 }
 
 func main() {
+	var remoteFlags remoteDestinations
 	statePath := flag.String("state", defaultStatePath(), "path to state.json mirror")
 	socketPath := flag.String("socket", defaultSocketPath(), "path to RPC unix socket")
 	scanInterval := flag.Duration("scan-interval", 1*time.Second, "/proc scan interval")
@@ -82,6 +83,7 @@ func main() {
 	historyDir := flag.String("history-dir", "", "activity-log directory (default $XDG_STATE_HOME/switchboard/history)")
 	codexObserverFlag := flag.String("codex-observer", string(defaultCodexObserverMode), "Codex app-server observer: auto|off")
 	codexDisplayNameModel := flag.String("codex-autoname-model", codexprovider.DefaultDisplayNameModel, "model for isolated Codex display-name generation")
+	flag.Var(&remoteFlags, "remote", "SSH destination to observe (repeatable)")
 	flag.Parse()
 	codexMode, err := parseCodexObserverMode(*codexObserverFlag)
 	if err != nil {
@@ -142,6 +144,10 @@ func main() {
 	scanner := discovery.New(procSrc)
 	dropStaleSessions(store, procSrc, sink, scanner.Forget, tun.TailBytes)
 	resolver := mapping.NewResolver(term, manager)
+	federated, err := newFederationRuntime(store, manager, remoteFlags)
+	if err != nil {
+		log.Fatalf("federation: %v", err)
+	}
 
 	// Provider observation is process-wide and graph-authoritative. Both periodic
 	// and app-server/hook invalidations land through agentRuntime's generation
@@ -188,10 +194,11 @@ func main() {
 		sess.Agent = string(kind)
 		sess.Headless = headless
 		store.Apply(func(m map[int]*state.Session) {
-			// A surviving hydrated root keeps its process-lifetime key and last-known
-			// provider projection while discovery refreshes only live process/window
-			// fields. This is what lets restored graphs remain authoritative until
-			// their explicit freshness deadline instead of being erased on scan one.
+			// A surviving hydrated root keeps its discovery-lifetime timestamp and
+			// last-known provider projection while discovery refreshes only live
+			// process/window fields. This is what lets restored graphs remain
+			// authoritative until their explicit freshness deadline instead of being
+			// erased on scan one. StartedAt is therefore not a kernel birth token.
 			if prior := m[sess.PID]; prior != nil && prior.Agent == sess.Agent {
 				sess.StartedAt = prior.StartedAt
 				sess.DisplayName = prior.DisplayName
@@ -200,6 +207,7 @@ func main() {
 			}
 			m[sess.PID] = &sess
 		})
+		federated.AnnounceSession(ctx, sess)
 		agentRuntime.Request(providerRootKey(sess))
 		// session_start bounds the session's first interval. The session id is not
 		// known until the first hook fires, so this event carries only pid/agent/cwd.
@@ -244,11 +252,34 @@ func main() {
 				diagnostic.Category, diagnostic.MatchedPID)
 		}
 	})
+	federated.ConfigureServer(server)
 	if err := os.MkdirAll(filepath.Dir(*socketPath), 0o755); err != nil {
 		log.Fatalf("mkdir socket dir: %v", err)
 	}
+	if err := federated.StartViews(ctx); err != nil {
+		cancel()
+		federated.Wait()
+		log.Fatalf("federation startup: %v", err)
+	}
+	ready := make(chan struct{})
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- server.ServeReady(ctx, ready) }()
+	select {
+	case err := <-serverErr:
+		cancel()
+		federated.Wait()
+		if err != nil {
+			log.Fatalf("rpc: %v", err)
+		}
+		return
+	case <-ready:
+	}
 	log.Printf("switchboard listening on %s", *socketPath)
-	if err := server.Serve(ctx); err != nil {
+	federated.StartRemotes(ctx)
+	err = <-serverErr
+	cancel()
+	federated.Wait()
+	if err != nil {
 		log.Fatalf("rpc: %v", err)
 	}
 }

@@ -1,9 +1,11 @@
 // Package rpc exposes the daemon over a Unix socket. Protocol is one JSON
-// request per line, with JSON responses streamed back. Commands:
+// request per line, with JSON responses streamed back. Core commands:
 //
-//	{"cmd":"list"}                              -> {"snapshot":{...}}
-//	{"cmd":"focus","selector":"active"|"<pid>"|"<index>"|"pid:<n>"|"idx:<n>"} -> {"ok":true}
-//	{"cmd":"subscribe"}                          -> stream of {"snapshot":{...}}
+//	{"cmd":"list"|"list-all"}             -> {"snapshot":{...}}
+//	{"cmd":"subscribe"|"subscribe-all"}   -> stream of {"snapshot":{...}}
+//	{"cmd":"focus","selector":"..."}     -> {"ok":true}
+//	{"cmd":"focus-session",...exact key...} -> {"ok":true}
+//	{"cmd":"pane-bind"|"pane-state",...}   -> {"ok":true}
 package rpc
 
 import (
@@ -46,6 +48,21 @@ var ErrHeadlessSession = errors.New("headless session (claude -p) has no window 
 type Request struct {
 	Cmd      string `json:"cmd"`
 	Selector string `json:"selector,omitempty"`
+
+	// Exact federated focus identity. Hostname+PID names a live row; StartedAt
+	// is the daemon's best-effort discovery-lifetime fence between observation
+	// and action.
+	Hostname  string    `json:"hostname,omitempty"`
+	StartedAt time.Time `json:"started_at,omitzero"`
+
+	// WezTerm's local Lua callbacks report a versioned binding payload and the
+	// exact GUI/window/pane identity which received it. pane-state reports the
+	// window's current active pane plus whether that OS window is focused.
+	Binding       string `json:"binding,omitempty"`
+	GUIPID        int    `json:"gui_pid,omitempty"`
+	WindowID      int    `json:"window_id,omitempty"`
+	PaneID        int    `json:"pane_id,omitempty"`
+	WindowFocused bool   `json:"window_focused,omitempty"`
 
 	// hook fields — set when Cmd == "hook"
 	Event      string    `json:"event,omitempty"`
@@ -153,20 +170,6 @@ type Response struct {
 	Error       string            `json:"error,omitempty"`
 }
 
-// rawResponse mirrors Response field-for-field — same names, same order, same
-// omitempty — except the snapshot arrives already encoded. It is the envelope for
-// the subscribe stream, where state.Store has marshaled the snapshot once for all
-// subscribers (see snapshotFrame).
-//
-// ⚠ The two structs must be edited together: their encodings are required to be
-// byte-identical, which TestSubscribeFrameMatchesResponseEncoding pins.
-type rawResponse struct {
-	Snapshot    json.RawMessage   `json:"snapshot,omitempty"`
-	Diagnostics []AgentDiagnostic `json:"diagnostics,omitempty"`
-	OK          bool              `json:"ok,omitempty"`
-	Error       string            `json:"error,omitempty"`
-}
-
 // AgentDiagnostic is a bounded, content-free health counter for provider
 // observation. Categories are finite implementation labels; messages, paths,
 // prompts, commands, and raw provider payloads never cross this RPC surface.
@@ -194,6 +197,19 @@ type AgentHookHandler func(Request, state.Session)
 // AgentDiagnosticSource supplies the content-free provider health snapshot.
 type AgentDiagnosticSource func() []AgentDiagnostic
 
+// SnapshotView is the read-only aggregate exposed to local UI clients. The
+// host-local Store remains separate and continues to back list/subscribe and
+// the remote-stream source, preventing federation loops.
+type SnapshotView interface {
+	Snapshot() state.Snapshot
+	Subscribe() (<-chan state.Snapshot, func())
+}
+
+type ExactFocusHandler func(context.Context, string, int, time.Time) error
+type PaneBindHandler func(context.Context, string, int, int, int) error
+type PaneStateHandler func(context.Context, int, int, int, bool) error
+type BindingAnnouncer func(context.Context) error
+
 type Server struct {
 	store       *state.Store
 	socketPath  string
@@ -204,6 +220,11 @@ type Server struct {
 	fanout      *fanout.Observer
 	agentHook   AgentHookHandler
 	diagnostics AgentDiagnosticSource
+	view        SnapshotView
+	exactFocus  ExactFocusHandler
+	paneBind    PaneBindHandler
+	paneState   PaneStateHandler
+	announce    BindingAnnouncer
 	// hookAttributionDiagnostic receives finite labels and, for a unique match,
 	// the already-discovered root PID. It observes whether an otherwise-
 	// unattributable plain-Codex hook carried a terminal identity matching zero,
@@ -244,6 +265,21 @@ func (s *Server) SetAgentHookHandler(handler AgentHookHandler) { s.agentHook = h
 // SetAgentDiagnosticSource installs the additive, content-free diagnostics RPC.
 func (s *Server) SetAgentDiagnosticSource(source AgentDiagnosticSource) { s.diagnostics = source }
 
+// SetFederation installs the detached aggregate view and its exact action
+// resolver. Local-only list/subscribe remain unchanged.
+func (s *Server) SetFederation(view SnapshotView, focus ExactFocusHandler) {
+	s.view = view
+	s.exactFocus = focus
+}
+
+// SetPaneBinding installs the three tiny integration edges used by WezTerm Lua
+// and by remote-stream attach. Nil handlers simply leave the commands disabled.
+func (s *Server) SetPaneBinding(bind PaneBindHandler, state PaneStateHandler, announce BindingAnnouncer) {
+	s.paneBind = bind
+	s.paneState = state
+	s.announce = announce
+}
+
 // SetHookAttributionDiagnostic installs the diagnostic-only no-wrapper probe.
 // The callback receives finite implementation labels, an optional discovered
 // root PID, and no hint values.
@@ -255,12 +291,30 @@ func (s *Server) SetHookAttributionDiagnostic(handler func(HookAttributionDiagno
 // The socket file is removed on startup (in case of unclean shutdown) and on
 // exit.
 func (s *Server) Serve(ctx context.Context) error {
+	return s.serve(ctx, nil)
+}
+
+// ServeReady is Serve with a one-shot readiness signal. It closes ready after
+// the Unix listener exists, allowing transport workers to attach only once the
+// local RPC endpoint they need is accepting connections.
+func (s *Server) ServeReady(ctx context.Context, ready chan<- struct{}) error {
+	return s.serve(ctx, ready)
+}
+
+func (s *Server) serve(ctx context.Context, ready chan<- struct{}) error {
 	_ = os.Remove(s.socketPath)
 	l, err := net.Listen("unix", s.socketPath)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", s.socketPath, err)
 	}
 	defer os.Remove(s.socketPath)
+	if err := os.Chmod(s.socketPath, 0o600); err != nil {
+		_ = l.Close()
+		return fmt.Errorf("chmod %s: %w", s.socketPath, err)
+	}
+	if ready != nil {
+		close(ready)
+	}
 
 	go func() {
 		<-ctx.Done()
@@ -289,6 +343,15 @@ func (s *Server) ServeConnection(ctx context.Context, conn net.Conn) {
 
 func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
+	stopClose := make(chan struct{})
+	defer close(stopClose)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-stopClose:
+		}
+	}()
 	dec := json.NewDecoder(conn)
 	enc := json.NewEncoder(conn)
 	for {
@@ -303,6 +366,9 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		case "list":
 			snap := s.store.Snapshot()
 			_ = enc.Encode(Response{Snapshot: &snap})
+		case "list-all":
+			snap := s.aggregateSnapshot()
+			_ = enc.Encode(Response{Snapshot: &snap})
 		case "focus":
 			err := s.focus(ctx, req.Selector)
 			if err != nil {
@@ -313,6 +379,57 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		case "subscribe":
 			s.subscribe(ctx, conn, enc)
 			return
+		case "subscribe-all":
+			s.subscribeAll(ctx, conn, enc)
+			return
+		case "focus-session":
+			var err error
+			if s.exactFocus == nil {
+				err = errors.New("federated focus is not configured")
+			} else {
+				err = s.exactFocus(ctx, req.Hostname, req.PID, req.StartedAt)
+			}
+			if err != nil {
+				_ = enc.Encode(Response{Error: err.Error()})
+			} else {
+				_ = enc.Encode(Response{OK: true})
+			}
+		case "pane-bind":
+			var err error
+			if s.paneBind == nil {
+				err = errors.New("pane binding is not configured")
+			} else {
+				err = s.paneBind(ctx, req.Binding, req.GUIPID, req.WindowID, req.PaneID)
+			}
+			if err != nil {
+				_ = enc.Encode(Response{Error: err.Error()})
+			} else {
+				_ = enc.Encode(Response{OK: true})
+			}
+		case "pane-state":
+			var err error
+			if s.paneState == nil {
+				err = errors.New("pane activity is not configured")
+			} else {
+				err = s.paneState(ctx, req.GUIPID, req.WindowID, req.PaneID, req.WindowFocused)
+			}
+			if err != nil {
+				_ = enc.Encode(Response{Error: err.Error()})
+			} else {
+				_ = enc.Encode(Response{OK: true})
+			}
+		case "announce-bindings":
+			var err error
+			if s.announce == nil {
+				err = errors.New("pane binding is not configured")
+			} else {
+				err = s.announce(ctx)
+			}
+			if err != nil {
+				_ = enc.Encode(Response{Error: err.Error()})
+			} else {
+				_ = enc.Encode(Response{OK: true})
+			}
 		case "hook":
 			s.handleHook(req)
 			_ = enc.Encode(Response{OK: true})
@@ -335,9 +452,63 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	}
 }
 
+func (s *Server) aggregateSnapshot() state.Snapshot {
+	if s.view != nil {
+		return s.view.Snapshot()
+	}
+	return s.store.Snapshot()
+}
+
+func (s *Server) subscribeAll(ctx context.Context, conn net.Conn, enc *json.Encoder) {
+	if s.view == nil {
+		s.subscribe(ctx, conn, enc)
+		return
+	}
+	ch, cancel := s.view.Subscribe()
+	defer cancel()
+	disconnected := connectionClosed(conn)
+	snapshot := s.view.Snapshot()
+	if err := enc.Encode(Response{Snapshot: &snapshot}); err != nil {
+		return
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-disconnected:
+			return
+		case _, ok := <-ch:
+			if !ok {
+				return
+			}
+			// Aggregate publications span independent local, remote, focus, and
+			// route sources. A value queued before the initial Snapshot above can
+			// therefore be older than that initial frame. Treat the channel as a
+			// notification and re-read the current complete replacement so a quiet
+			// disconnect cannot be followed by—and strand the client on—a stale
+			// queued live snapshot.
+			snapshot := s.view.Snapshot()
+			if err := enc.Encode(Response{Snapshot: &snapshot}); err != nil {
+				return
+			}
+		}
+	}
+}
+
 func (s *Server) subscribe(ctx context.Context, conn net.Conn, enc *json.Encoder) {
 	ch, cancel := s.store.Subscribe()
 	defer cancel()
+	s.streamLocalSnapshots(ctx, conn, enc, ch)
+}
+
+// streamLocalSnapshots treats Store broadcasts as edge notifications and
+// re-reads the current full replacement for every edge. A broadcast may have
+// been queued after Subscribe but before the independent initial Snapshot; its
+// value can therefore be older than that initial frame. Forwarding the queued
+// value would let the host-local stream run B -> A, which in turn can roll a
+// federating client's liveness and pane routes backward until another mutation.
+func (s *Server) streamLocalSnapshots(ctx context.Context, conn net.Conn, enc *json.Encoder, ch <-chan state.Broadcast) {
+	disconnected := connectionClosed(conn)
 	snap := s.store.Snapshot()
 	if err := enc.Encode(Response{Snapshot: &snap}); err != nil {
 		return
@@ -346,37 +517,35 @@ func (s *Server) subscribe(ctx context.Context, conn net.Conn, enc *json.Encoder
 		select {
 		case <-ctx.Done():
 			return
-		case b, ok := <-ch:
+		case <-disconnected:
+			return
+		case _, ok := <-ch:
 			if !ok {
 				return
 			}
-			if err := enc.Encode(snapshotFrame(b)); err != nil {
+			// The queued value is not a revision. Re-read after receiving the
+			// notification so an edge queued before the initial Snapshot cannot
+			// replay stale state after it.
+			snap := s.store.Snapshot()
+			if err := enc.Encode(Response{Snapshot: &snap}); err != nil {
 				return
 			}
 		}
 	}
 }
 
-// snapshotFrame wraps a broadcast in the response envelope WITHOUT re-encoding
-// the snapshot. This connection is one of many — the live bar declares ten waybar
-// slot modules, each a separate process holding its own subscription — and every
-// one of them was serializing the identical snapshot on its own goroutine after
-// every mutation. state.Store.broadcast now encodes it once and shares the bytes;
-// json.RawMessage carries them through the envelope verbatim.
-//
-// Byte-identity with enc.Encode(Response{Snapshot:&snap}) holds because
-// rawResponse mirrors Response exactly and encoding/json emits a RawMessage
-// through compact(), which is a no-op on already-compact bytes and whose HTML
-// escaping is idempotent here: state.Broadcast.JSON was produced with escaping
-// on, so no '<', '>' or '&' survives to be escaped a second time.
-//
-// A nil JSON means the encode failed upstream; fall back to encoding the snapshot
-// so this subscriber gets a valid frame rather than a truncated one.
-func snapshotFrame(b state.Broadcast) any {
-	if b.JSON == nil {
-		return Response{Snapshot: &b.Snapshot}
-	}
-	return rawResponse{Snapshot: b.JSON}
+// A subscription is the final request on its connection, so reading one byte
+// concurrently is only a disconnect detector; any further client input is a
+// protocol violation and ends the stream. Without this watcher, a quiet final
+// snapshot could leave a dead client's subscription registered forever.
+func connectionClosed(conn net.Conn) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		var one [1]byte
+		_, _ = conn.Read(one[:])
+		close(done)
+	}()
+	return done
 }
 
 func (s *Server) focus(ctx context.Context, selector string) error {
@@ -393,6 +562,32 @@ func (s *Server) focus(ctx context.Context, selector string) error {
 	target := pickSession(snap.Sessions, selector)
 	if target == nil {
 		return fmt.Errorf("no session matches %q", selector)
+	}
+	return s.focusLocalTarget(ctx, target)
+}
+
+// FocusLocalSession focuses one exact discovery lifetime from the host-local
+// store. Federated dispatch uses it for local aggregate rows after resolving a
+// host-qualified selector; the StartedAt check rejects an older client snapshot
+// when the running daemon has already observed a replacement.
+func (s *Server) FocusLocalSession(ctx context.Context, pid int, startedAt time.Time) error {
+	if pid <= 0 || startedAt.IsZero() {
+		return errors.New("invalid local session identity")
+	}
+	snapshot := s.store.Snapshot()
+	for i := range snapshot.Sessions {
+		if snapshot.Sessions[i].PID == pid && snapshot.Sessions[i].StartedAt.Equal(startedAt) {
+			return s.focusLocalTarget(ctx, &snapshot.Sessions[i])
+		}
+	}
+	return fmt.Errorf("local session %d is no longer live", pid)
+}
+
+func (s *Server) focusLocalTarget(ctx context.Context, target *state.Session) error {
+	// Repeat the capability guard here because exact federated dispatch calls
+	// this method directly rather than passing through selector resolution.
+	if s.wm.Name() == "none" && s.term.Name() == "none" {
+		return ErrNavigateUnsupported
 	}
 	if target.Headless {
 		return ErrHeadlessSession

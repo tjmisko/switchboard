@@ -44,6 +44,9 @@ func RawName(s state.Session) string {
 
 // Chip returns the project-prefixed, de-duplicated label for a session's chip.
 func Chip(cfg projectname.Config, s state.Session) string {
+	if s.Remote {
+		return cfg.RuleForBase(remoteProjectBase(s.CWD)).Prefix(RawName(s))
+	}
 	return projectname.ResolveForDir(cfg, s.CWD, RawName(s))
 }
 
@@ -70,6 +73,13 @@ func rawName(s state.Session, claudeName func(pid int) string) string {
 		if info := s.Enrichment(); info != nil && info.SessionID != "" {
 			return shortCodexSessionID(info.SessionID)
 		}
+	} else if s.Remote {
+		// A remote PID is not a process namespace on this machine. Use only
+		// names already carried by the snapshot; in particular, never read the
+		// local ~/.claude/sessions/<pid>.json for it.
+		if n := graphRootName(s.AgentGraph); n != "" {
+			return n
+		}
 	} else {
 		if n := claudeName(s.PID); n != "" {
 			return n
@@ -89,6 +99,14 @@ func rawName(s state.Session, claudeName func(pid int) string) string {
 		return filepath.Base(s.CWD)
 	}
 	return fmt.Sprintf("pid %d", s.PID)
+}
+
+func remoteProjectBase(dir string) string {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return ""
+	}
+	return filepath.Base(filepath.Clean(dir))
 }
 
 func codexConversationID(s state.Session) string {
@@ -185,7 +203,14 @@ func blockedWriters(s state.Session, displayName func(metaPath string) string) s
 		if i == maxNamedBlockedWriters {
 			return strings.Join(named, ", ") + fmt.Sprintf(" +%d", len(info.PendingWriters)-i)
 		}
-		named = append(named, writerName(info.Transcript, w, displayName))
+		if s.Remote {
+			// Transcript paths are meaningful only on the source host. Preserve
+			// the exact blocked set with stable short IDs instead of following a
+			// coincidentally matching path on this machine.
+			named = append(named, writerName("", w, func(string) string { return "" }))
+		} else {
+			named = append(named, writerName(info.Transcript, w, displayName))
+		}
 	}
 	return strings.Join(named, ", ")
 }
@@ -363,6 +388,9 @@ func (c *NameCache) RawName(s state.Session) string {
 
 // Chip is Chip with the disk lookup memoized.
 func (c *NameCache) Chip(cfg projectname.Config, s state.Session) string {
+	if s.Remote {
+		return cfg.RuleForBase(remoteProjectBase(s.CWD)).Prefix(c.RawName(s))
+	}
 	return projectname.ResolveForDir(cfg, s.CWD, c.RawName(s))
 }
 

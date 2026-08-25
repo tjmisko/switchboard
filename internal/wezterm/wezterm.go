@@ -8,6 +8,7 @@ package wezterm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -16,6 +17,8 @@ import (
 	"strings"
 	"time"
 )
+
+var ErrGUISocketPeer = errors.New("wezterm: gui socket peer does not match pid")
 
 // Pane is one row from `wezterm cli list --format json` from a specific mux.
 type Pane struct {
@@ -101,12 +104,50 @@ func List(ctx context.Context) ([]Pane, error) {
 	return out, nil
 }
 
+// ListGUI enumerates exactly one local gui-sock-<guiPID>. A missing live socket
+// returns a nil slice without falling back to another mux; pane bindings must
+// never cross GUI process namespaces.
+func ListGUI(ctx context.Context, guiPID int) ([]Pane, error) {
+	return listGUI(ctx, guiPID, guiSocketPeerPID)
+}
+
+type socketPeerPIDFunc func(context.Context, string) (int, error)
+
+func listGUI(ctx context.Context, guiPID int, peer socketPeerPIDFunc) ([]Pane, error) {
+	muxes, err := Muxes()
+	if err != nil {
+		return nil, err
+	}
+	for _, m := range muxes {
+		if m.PID == guiPID {
+			peerPID, err := peer(ctx, m.Socket)
+			if err != nil {
+				// Preserve timeouts and permission/transient dial errors so callers
+				// do not mistake them for definitive stale-route evidence.
+				return nil, fmt.Errorf("wezterm: inspect gui socket peer: %w", err)
+			}
+			if peerPID != guiPID {
+				return nil, ErrGUISocketPeer
+			}
+			return ListMux(ctx, m)
+		}
+	}
+	return nil, nil
+}
+
+// ListMux runs one bounded CLI enumeration against the supplied local mux.
+// Callers should normally obtain m from Muxes rather than construct a socket
+// path from remote input.
+func ListMux(ctx context.Context, m Mux) ([]Pane, error) {
+	return listOne(ctx, m)
+}
+
 func listOne(ctx context.Context, m Mux) ([]Pane, error) {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "wezterm", "cli", "list", "--format", "json")
-	cmd.Env = append(os.Environ(), "WEZTERM_UNIX_SOCKET="+m.Socket)
+	cmd.Env = replaceEnv(os.Environ(), "WEZTERM_UNIX_SOCKET", m.Socket)
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, err
@@ -156,12 +197,27 @@ func ActivatePane(ctx context.Context, muxSocket string, paneID int) error {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "wezterm", "cli", "activate-pane", "--pane-id", strconv.Itoa(paneID))
-	cmd.Env = append(os.Environ(), "WEZTERM_UNIX_SOCKET="+muxSocket)
+	cmd.Env = replaceEnv(os.Environ(), "WEZTERM_UNIX_SOCKET", muxSocket)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("activate-pane %d: %w (%s)", paneID, err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// replaceEnv guarantees the child receives exactly one value for key. Merely
+// appending can leave an inherited WEZTERM_UNIX_SOCKET first in the environment;
+// clients which resolve the first duplicate would then enumerate or activate a
+// different GUI while the caller believes it validated the requested one.
+func replaceEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		if !strings.HasPrefix(entry, prefix) {
+			out = append(out, entry)
+		}
+	}
+	return append(out, prefix+value)
 }
 
 func socketDir() string {

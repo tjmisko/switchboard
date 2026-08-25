@@ -3,7 +3,7 @@ package main
 // The bottombar subcommand owns the lifecycle of the bottom ("claude") waybar
 // process. It enforces a single invariant:
 //
-//	bottom bar runs  <=>  (top bar visible)  AND  (>=1 claude session)
+//	bottom bar runs  <=>  (top bar visible)  AND  (>=1 aggregate agent session)
 //
 // The bottom bar's visibility primitive is process existence — we literally
 // start and stop the `waybar -c claude.jsonc` process — so there is no toggle
@@ -14,7 +14,7 @@ package main
 //
 //	top visible : the F8 master toggle, recorded as the presence/absence of a
 //	              marker file (absent => visible). Owned by hypr-float-center.
-//	sessions    : the switchboard daemon's session count.
+//	sessions    : the switchboard daemon's aggregate session count.
 //
 // `bottombar watch` reacts to session changes (subscribe stream + safety
 // ticker). `bottombar reconcile` is the one-shot the F8 script calls after it
@@ -103,7 +103,7 @@ func cmdBottombar(args []string, socketPath string) {
 }
 
 // shouldRun is the bottom-bar invariant, distilled to a pure decision: the
-// bottom bar runs iff the top bar is visible AND at least one claude session
+// bottom bar runs iff the top bar is visible AND at least one agent session
 // exists. Both reconcile paths route their final start/stop decision through
 // it, so the F8 truth table has exactly one source of truth.
 func shouldRun(topVisible bool, count int) bool {
@@ -183,7 +183,7 @@ func streamSnapshots(cfg bottomBarConfig) {
 		return
 	}
 	defer c.Close()
-	if err := c.Send(rpc.Request{Cmd: "subscribe"}); err != nil {
+	if err := c.Send(rpc.Request{Cmd: "subscribe-all"}); err != nil {
 		return
 	}
 	for {
@@ -213,7 +213,7 @@ func sessionCount(socketPath string) (int, bool) {
 		return 0, false
 	}
 	defer c.Close()
-	if err := c.Send(rpc.Request{Cmd: "list"}); err != nil {
+	if err := c.Send(rpc.Request{Cmd: "list-all"}); err != nil {
 		return 0, false
 	}
 	var resp rpc.Response

@@ -174,6 +174,44 @@ func TestRawName_CodexDoesNotReadClaudePidName(t *testing.T) {
 	}
 }
 
+func TestRemoteClaudeNameNeverUsesLocalPIDNamespace(t *testing.T) {
+	writeSessionFile(t, 4247, "unrelated-local-name")
+	remote := state.Session{
+		PID: 4247, Hostname: "buildbox", Remote: true,
+		Agent: state.AgentKindClaude, CWD: "/srv/remote-project",
+	}
+	if got := RawName(remote); got != "remote-project" {
+		t.Fatalf("remote RawName = %q, want remote-project", got)
+	}
+
+	cache := &NameCache{}
+	local := state.Session{PID: 4247, Agent: state.AgentKindClaude, CWD: "/srv/local-project"}
+	if got := cache.RawName(local); got != "unrelated-local-name" {
+		t.Fatalf("local cached RawName = %q", got)
+	}
+	if got := cache.RawName(remote); got != "remote-project" {
+		t.Fatalf("same-PID remote cached RawName = %q, want remote-project", got)
+	}
+}
+
+func TestRemoteChipUsesRemoteCWDLexically(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	remoteDir := filepath.Join(root, "nested", "switchboard")
+	if err := os.MkdirAll(remoteDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := state.Session{
+		PID: 8, Hostname: "buildbox", Remote: true, Agent: state.AgentKindClaude, CWD: remoteDir,
+		AgentGraph: &state.AgentGraph{RootID: "root", Nodes: []state.AgentNode{{ID: "root", Nickname: "task"}}},
+	}
+	if got := Chip(projectname.DefaultConfig(), s); got != "sb-task" {
+		t.Fatalf("remote Chip = %q, want lexical basename rule sb-task", got)
+	}
+}
+
 // backdate rewrites path with body while restoring its original mtime, so the
 // file's (mtime, size) stamp is unchanged even though its contents are not. That
 // is the one edit a stamp-keyed cache is entitled to miss, and it is how a test
@@ -612,6 +650,20 @@ func TestBlockedWriters_fallsBackToAShortIDWhenTheMetaCannotBeRead(t *testing.T)
 	s, _ := blockedFixture(t, []string{"af5bd126402ac16c7"}, 1, nil)
 	if got := BlockedWriters(s); got != "af5bd126…" {
 		t.Errorf("BlockedWriters = %q, want the truncated id", got)
+	}
+}
+
+func TestRemoteBlockedWritersNeverFollowsLocalTranscriptPath(t *testing.T) {
+	s, _ := blockedFixture(t, []string{"af5bd126402ac16c7"}, 1, map[string]string{
+		"af5bd126402ac16c7": teammateMeta("local-collision", ""),
+	})
+	s.Hostname = "buildbox"
+	s.Remote = true
+	if got := BlockedWriters(s); got != "af5bd126…" {
+		t.Fatalf("remote BlockedWriters = %q, want wire ID fallback", got)
+	}
+	if got := (&NameCache{}).BlockedWriters(s); got != "af5bd126…" {
+		t.Fatalf("cached remote BlockedWriters = %q, want wire ID fallback", got)
 	}
 }
 

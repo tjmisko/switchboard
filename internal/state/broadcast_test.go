@@ -3,6 +3,7 @@ package state_test
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -25,6 +26,29 @@ func recvBroadcast(t *testing.T, ch <-chan state.Broadcast) state.Broadcast {
 		t.Fatal("no broadcast arrived")
 	}
 	return state.Broadcast{}
+}
+
+func TestBroadcastSaturationKeepsFinalReplacement(t *testing.T) {
+	store := state.New("")
+	ch, cancel := store.Subscribe()
+	defer cancel()
+
+	for i := 1; i <= 9; i++ {
+		i := i
+		store.Apply(func(sessions map[int]*state.Session) {
+			sessions[1] = &state.Session{
+				PID: 1, CWD: fmt.Sprintf("/revision/%d", i), TTY: "/dev/pts/1", StartedAt: time.Unix(1, 0),
+			}
+		})
+	}
+
+	var last state.Broadcast
+	for len(ch) > 0 {
+		last = <-ch
+	}
+	if len(last.Snapshot.Sessions) != 1 || last.Snapshot.Sessions[0].CWD != "/revision/9" {
+		t.Fatalf("last queued replacement = %+v", last.Snapshot.Sessions)
+	}
 }
 
 // requireQuiet asserts nothing was published. Store.broadcast sends synchronously

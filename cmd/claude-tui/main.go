@@ -1,6 +1,6 @@
 // Command claude-tui is the reference renderer: a zero-desktop-dependency live
 // view of every Claude Code session, driven entirely by the daemon's RPC
-// `subscribe` stream. It needs no window manager, no bar, and no terminal
+// `subscribe-all` stream. It needs no window manager, no bar, and no terminal
 // integration — it works in any terminal, including over SSH — so it is the
 // canonical demo of the Observe tier.
 //
@@ -58,7 +58,7 @@ func fetchOnce(socketPath string) (state.Snapshot, error) {
 		return state.Snapshot{}, err
 	}
 	defer c.Close()
-	if err := c.Send(rpc.Request{Cmd: "subscribe"}); err != nil {
+	if err := c.Send(rpc.Request{Cmd: "subscribe-all"}); err != nil {
 		return state.Snapshot{}, err
 	}
 	var resp rpc.Response
@@ -112,7 +112,7 @@ func streamInto(ctx context.Context, socketPath, home string, writers *sblabel.N
 		<-ctx.Done()
 		c.Close()
 	}()
-	if err := c.Send(rpc.Request{Cmd: "subscribe"}); err != nil {
+	if err := c.Send(rpc.Request{Cmd: "subscribe-all"}); err != nil {
 		return err
 	}
 	for {
@@ -216,7 +216,11 @@ func renderSnapshot(snap state.Snapshot, home string, color bool, now time.Time,
 		}
 		// Pad before coloring: ANSI escapes are zero-width on screen but count
 		// against %-40s, so wrapping a pre-padded string keeps columns aligned.
-		cwd := fmt.Sprintf("%-40s", abbrevHome(s.CWD, home))
+		displayCWD := s.CWD
+		if !s.Remote {
+			displayCWD = abbrevHome(displayCWD, home)
+		}
+		cwd := fmt.Sprintf("%-40s", displayCWD)
 		if s.Suspended {
 			cwd = c(colGrey, cwd)
 		}
@@ -240,9 +244,13 @@ func renderSnapshot(snap state.Snapshot, home string, color bool, now time.Time,
 				blocked = "  blocked: " + w
 			}
 		}
+		process := fmt.Sprintf("pid %d", s.PID)
+		if s.Hostname != "" {
+			process = fmt.Sprintf("%s/%d", s.Hostname, s.PID)
+		}
 		fmt.Fprintf(&b, "%s %s %s %s %s%s%s%s\r\n",
 			focus, c(gcol, glyph), label, cwd,
-			c(colGrey, fmt.Sprintf("pid %d", s.PID)), c(colGrey, ws), c(colGrey, dur), c(gcol, blocked))
+			c(colGrey, process), c(colGrey, ws), c(colGrey, dur), c(gcol, blocked))
 		renderAgentTree(&b, s, now, c)
 	}
 	return b.String()
