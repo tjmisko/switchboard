@@ -49,6 +49,28 @@ func assistantUsageModel(ts, model string, in, out, cacheRead, cacheCreate int64
 		ts, model, in, out, cacheRead, cacheCreate)
 }
 
+func assistantUsageModelID(ts, id, model string, in, out, cacheRead, cacheCreate int64) string {
+	return fmt.Sprintf(`{"type":"assistant","timestamp":%q,"uuid":%q,"message":{"id":%q,"role":"assistant","model":%q,"content":[],"usage":{"input_tokens":%d,"output_tokens":%d,"cache_read_input_tokens":%d,"cache_creation_input_tokens":%d}}}`,
+		ts, "row-"+id, id, model, in, out, cacheRead, cacheCreate)
+}
+
+func TestUsageSinceByModelCollapsesRepeatedAndRevisedFragments(t *testing.T) {
+	path := writeTranscript(t,
+		assistantUsageModelID("2026-08-25T10:00:00Z", "msg-1", "claude-sonnet-5", 100, 20, 30, 40),
+		assistantUsageModelID("2026-08-25T10:00:01Z", "msg-1", "claude-sonnet-5", 100, 20, 30, 40),
+		assistantUsageModelID("2026-08-25T10:00:02Z", "msg-1", "claude-sonnet-5", 125, 25, 35, 42),
+		assistantUsageModelID("2026-08-25T10:00:03Z", "msg-2", "claude-sonnet-5", 7, 3, 0, 0),
+	)
+	byModel, _, err := UsageSinceByModel(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := byModel["claude-sonnet-5"]
+	if u.InputTokens != 132 || u.OutputTokens != 28 || u.CacheReadTokens != 35 || u.CacheCreationTokens != 42 {
+		t.Fatalf("deduplicated usage = %+v, want msg-1 final plus msg-2", u)
+	}
+}
+
 func TestUsageSinceByModelBucketsPerModel(t *testing.T) {
 	path := writeTranscript(t,
 		assistantUsageModel("2026-06-01T21:39:00Z", "claude-opus-4-8", 100, 50, 9000, 200),

@@ -143,7 +143,11 @@ const DefaultTailBytes = 128 * 1024
 // user entries, as a bare string — blocks() reconciles both.
 type entry struct {
 	Timestamp string `json:"timestamp"`
-	Message   struct {
+	// UUID identifies the transcript row. Current assistant rows also carry the
+	// provider message id below; UUID is a content-free fallback for older rows.
+	UUID    string `json:"uuid"`
+	Message struct {
+		ID      string          `json:"id"`
 		Role    string          `json:"role"`
 		Content json.RawMessage `json:"content"`
 		// Model names the model that produced an assistant message (e.g.
@@ -689,19 +693,29 @@ func InFlightTasks(path string, maxBytes int64) (int, error) {
 	return n, nil
 }
 
-// Usage is the token accounting summed from a transcript's assistant messages —
-// the raw signal behind plan-usage tracking. The four fields mirror Claude
-// Code's per-message usage block; cache reads typically dominate.
+// Usage is the billable accounting carried by one Claude assistant message.
+// The legacy combined cache-creation total is retained while the two TTL
+// buckets, request dimensions, and metered server tools remain distinct for
+// accurate pricing. Cache reads typically dominate Claude Code sessions.
 type Usage struct {
-	InputTokens         int64 `json:"input_tokens"`
-	OutputTokens        int64 `json:"output_tokens"`
-	CacheReadTokens     int64 `json:"cache_read_input_tokens"`
-	CacheCreationTokens int64 `json:"cache_creation_input_tokens"`
+	InputTokens         int64  `json:"input_tokens"`
+	OutputTokens        int64  `json:"output_tokens"`
+	CacheReadTokens     int64  `json:"cache_read_input_tokens"`
+	CacheCreationTokens int64  `json:"cache_creation_input_tokens"`
+	CacheWrite5mTokens  int64  `json:"cache_write_5m_input_tokens,omitempty"`
+	CacheWrite1hTokens  int64  `json:"cache_write_1h_input_tokens,omitempty"`
+	ServiceTier         string `json:"service_tier,omitempty"`
+	Speed               string `json:"speed,omitempty"`
+	InferenceGeo        string `json:"inference_geo,omitempty"`
+	WebSearchRequests   int64  `json:"web_search_requests,omitempty"`
+	WebFetchRequests    int64  `json:"web_fetch_requests,omitempty"`
 }
 
 // IsZero reports whether no tokens were counted.
 func (u Usage) IsZero() bool {
-	return u.InputTokens == 0 && u.OutputTokens == 0 && u.CacheReadTokens == 0 && u.CacheCreationTokens == 0
+	return u.InputTokens == 0 && u.OutputTokens == 0 && u.CacheReadTokens == 0 &&
+		u.CacheCreationTokens == 0 && u.CacheWrite5mTokens == 0 &&
+		u.CacheWrite1hTokens == 0 && u.WebSearchRequests == 0 && u.WebFetchRequests == 0
 }
 
 func (u *Usage) add(o Usage) {
@@ -709,6 +723,19 @@ func (u *Usage) add(o Usage) {
 	u.OutputTokens += o.OutputTokens
 	u.CacheReadTokens += o.CacheReadTokens
 	u.CacheCreationTokens += o.CacheCreationTokens
+	u.CacheWrite5mTokens += o.CacheWrite5mTokens
+	u.CacheWrite1hTokens += o.CacheWrite1hTokens
+	u.WebSearchRequests += o.WebSearchRequests
+	u.WebFetchRequests += o.WebFetchRequests
+	if o.ServiceTier != "" {
+		u.ServiceTier = o.ServiceTier
+	}
+	if o.Speed != "" {
+		u.Speed = o.Speed
+	}
+	if o.InferenceGeo != "" {
+		u.InferenceGeo = o.InferenceGeo
+	}
 }
 
 // UsageSince sums the token usage of assistant messages appended to the
@@ -721,22 +748,13 @@ func (u *Usage) add(o Usage) {
 // emits a usage_sample history event from each non-zero delta and persists the
 // returned offset per session.
 func UsageSince(path string, byteOffset int64) (Usage, int64, error) {
-	complete, newOffset, err := readNewLines(path, byteOffset)
-	if err != nil || len(complete) == 0 {
+	records, newOffset, err := UsageRecordsSince(path, byteOffset)
+	if err != nil {
 		return Usage{}, newOffset, err
 	}
 	var total Usage
-	for _, raw := range bytes.Split(complete, []byte{'\n'}) {
-		if len(bytes.TrimSpace(raw)) == 0 {
-			continue
-		}
-		var e entry
-		if json.Unmarshal(raw, &e) != nil {
-			continue
-		}
-		if e.Message.Role == "assistant" && e.Message.Usage != nil {
-			total.add(*e.Message.Usage)
-		}
+	for _, record := range collapseUsageRecords(records) {
+		total.add(record.Usage)
 	}
 	return total, newOffset, nil
 }
@@ -749,24 +767,15 @@ func UsageSince(path string, byteOffset int64) (Usage, int64, error) {
 // share readNewLines), so either may be driven off the same per-session cursor.
 // Returns a nil map when nothing new was appended.
 func UsageSinceByModel(path string, byteOffset int64) (map[string]Usage, int64, error) {
-	complete, newOffset, err := readNewLines(path, byteOffset)
-	if err != nil || len(complete) == 0 {
+	records, newOffset, err := UsageRecordsSince(path, byteOffset)
+	if err != nil || len(records) == 0 {
 		return nil, newOffset, err
 	}
 	byModel := map[string]Usage{}
-	for _, raw := range bytes.Split(complete, []byte{'\n'}) {
-		if len(bytes.TrimSpace(raw)) == 0 {
-			continue
-		}
-		var e entry
-		if json.Unmarshal(raw, &e) != nil {
-			continue
-		}
-		if e.Message.Role == "assistant" && e.Message.Usage != nil {
-			u := byModel[e.Message.Model]
-			u.add(*e.Message.Usage)
-			byModel[e.Message.Model] = u
-		}
+	for _, record := range collapseUsageRecords(records) {
+		u := byModel[record.Model]
+		u.add(record.Usage)
+		byModel[record.Model] = u
 	}
 	return byModel, newOffset, nil
 }

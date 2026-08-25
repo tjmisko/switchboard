@@ -1,10 +1,11 @@
 package main
 
 import (
-	"os"
+	"log"
 	"strconv"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/agentgraph"
 	"github.com/tjmisko/switchboard/internal/fanout"
 	"github.com/tjmisko/switchboard/internal/history"
 	"github.com/tjmisko/switchboard/internal/label"
@@ -13,10 +14,10 @@ import (
 )
 
 // reconcileState is the per-session bookkeeping the reconciler carries ACROSS
-// ticks. The usage cursor is daemon-internal and keyed by pid; the label cursor
-// is keyed by session id (see observeLabel) and carries the pid it belongs to, so
-// both are pruned when the process they track dies. Subagent fanout detection is
-// delegated to the
+// ticks. Claude usage is tracked by stable session/transcript/message identity
+// in a durable cursor under the history directory, while the label cursor is
+// keyed by session id (see observeLabel) and carries the pid it belongs to.
+// Subagent fanout detection is delegated to the
 // Observer, which owns InFlightSubagents and the subagent_spawn/stop events and
 // keys its own durable state by session-id (so it survives a daemon restart or a
 // `claude --resume` rather than re-emitting historical spawns).
@@ -24,11 +25,13 @@ import (
 // inside the loop below, because its /proc reads are milliseconds rather than
 // microseconds (see memorySampler). nil when memory sampling is off.
 type reconcileState struct {
-	fanout      *fanout.Observer
-	memory      *memorySampler
-	usageOffset map[int]int64          // pid -> transcript bytes already summed for usage
-	labels      map[string]labelCursor // labelKey -> last-emitted session label (change dedup)
-	names       *label.NameCache       // pid -> Claude session name, memoized against the file's stamp
+	fanout    *fanout.Observer
+	memory    *memorySampler
+	usage     *transcript.UsageTracker
+	usageInit bool
+	usageErr  string                 // last reported content-free cursor error; suppresses per-tick log spam
+	labels    map[string]labelCursor // labelKey -> last-emitted session label (change dedup)
+	names     *label.NameCache       // pid -> Claude session name, memoized against the file's stamp
 }
 
 // labelCursor is the last name emitted for one session, plus the pid hosting it.
@@ -42,11 +45,10 @@ type labelCursor struct {
 
 func newReconcileState(obs *fanout.Observer, mem *memorySampler) *reconcileState {
 	return &reconcileState{
-		fanout:      obs,
-		memory:      mem,
-		usageOffset: map[int]int64{},
-		labels:      map[string]labelCursor{},
-		names:       &label.NameCache{},
+		fanout: obs,
+		memory: mem,
+		labels: map[string]labelCursor{},
+		names:  &label.NameCache{},
 	}
 }
 
@@ -128,40 +130,64 @@ func (rs *reconcileState) observeFanout(sink *history.Sink, sess *state.Session,
 	}
 }
 
-// observeUsage samples the token delta since the last offset and emits one
-// usage_sample per model the delta touched, each tagged with Event.Model so the
-// deriver can price it at that model's rate. On first sight of a session it
-// primes the cursor to the current file size WITHOUT emitting, so a pre-existing
-// transcript's backlog is not dumped as one spike dated at daemon start — only
-// usage accrued while we are watching is recorded. Cost is deliberately NOT
-// computed here; the sample only carries the model name and raw token counts.
+// observeUsage backfills and incrementally reads the root plus every child
+// transcript through a durable, session-keyed UsageTracker. One event is emitted
+// per logical provider-message delta so exact model/tier/tool dimensions and the
+// provider timestamp survive until pricing. Streamed duplicates and revisions
+// are resolved before emission. Cost is deliberately NOT computed here.
 func (rs *reconcileState) observeUsage(sink *history.Sink, sess *state.Session, c *state.AgentInfo, now time.Time) {
-	off, primed := rs.usageOffset[sess.PID]
-	if !primed {
-		if fi, err := os.Stat(c.Transcript); err == nil {
-			rs.usageOffset[sess.PID] = fi.Size()
-		} else {
-			rs.usageOffset[sess.PID] = 0
+	if sink == nil || !sink.Enabled() || c.SessionID == "" {
+		return
+	}
+	if !rs.usageInit {
+		rs.usageInit = true
+		tracker, err := transcript.NewUsageTracker(sink.Dir())
+		if err != nil {
+			rs.reportUsageError(err)
+			return
 		}
+		rs.usage = tracker
+	}
+	if rs.usage == nil {
 		return
 	}
-	byModel, newOff, err := transcript.UsageSinceByModel(c.Transcript, off)
+	deltas, err := rs.usage.ObserveSession(c.SessionID, c.Transcript, now)
 	if err != nil {
+		rs.reportUsageError(err)
 		return
 	}
-	rs.usageOffset[sess.PID] = newOff
-	for model, u := range byModel {
+	rs.usageErr = ""
+	for _, delta := range deltas {
+		u := delta.Usage
 		if u.IsZero() {
 			continue
 		}
+		ts := delta.Timestamp
+		if ts.IsZero() {
+			ts = now
+		}
 		sink.Record(history.Event{
-			Ts: now, Type: history.EventUsageSample,
+			Ts: ts, Type: history.EventUsageSample,
 			SessionID: c.SessionID, PID: sess.PID, Agent: sess.Agent, CWD: sess.CWD,
-			Model: model,
-			TokIn: u.InputTokens, TokOut: u.OutputTokens,
+			Source: agentgraph.SourceClaudeTranscript,
+			Model:  delta.Model,
+			TokIn:  u.InputTokens, TokOut: u.OutputTokens,
 			TokCacheRead: u.CacheReadTokens, TokCacheCreate: u.CacheCreationTokens,
+			TokCacheCreate5m: u.CacheWrite5mTokens, TokCacheCreate1h: u.CacheWrite1hTokens,
+			ServiceTier: u.ServiceTier, Speed: u.Speed, InferenceGeo: u.InferenceGeo,
+			WebSearchRequests: u.WebSearchRequests, WebFetchRequests: u.WebFetchRequests,
+			ProviderMessageID: delta.ProviderMessageID, UsageSourceID: delta.SourceID,
 		})
 	}
+}
+
+func (rs *reconcileState) reportUsageError(err error) {
+	message := err.Error()
+	if message == rs.usageErr {
+		return
+	}
+	rs.usageErr = message
+	log.Printf("claude-usage: %v", err)
 }
 
 // labelKey identifies the thing a label cursor is about: the session, once a hook
@@ -184,11 +210,6 @@ func labelKey(pid int, c *state.AgentInfo) string {
 // against a duplicate event per blip. The Observer's per-session state is pruned
 // against the set of live session-ids (it is keyed by session-id, not pid).
 func (rs *reconcileState) prune(m map[int]*state.Session) {
-	for pid := range rs.usageOffset {
-		if _, ok := m[pid]; !ok {
-			delete(rs.usageOffset, pid)
-		}
-	}
 	for key, cur := range rs.labels {
 		if _, ok := m[cur.pid]; !ok {
 			delete(rs.labels, key)

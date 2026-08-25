@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/agentgraph"
 	"github.com/tjmisko/switchboard/internal/fanout"
 	"github.com/tjmisko/switchboard/internal/history"
 	"github.com/tjmisko/switchboard/internal/state"
@@ -68,7 +69,7 @@ func assistantUsageModelLine(model string, in, out int64) string {
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }
 
-func TestObserveUsageEmitsOneSamplePerModel(t *testing.T) {
+func TestObserveUsageEmitsOneSamplePerLogicalMessage(t *testing.T) {
 	dir := t.TempDir()
 	tpath := filepath.Join(dir, "t.jsonl")
 	writeLines(t, tpath, `{"type":"system"}`) // a baseline line so priming has something to skip past
@@ -93,18 +94,54 @@ func TestObserveUsageEmitsOneSamplePerModel(t *testing.T) {
 	sink.Close()
 
 	samples := eventsOfType(readEvents(t, histDir), history.EventUsageSample)
-	if len(samples) != 2 {
-		t.Fatalf("got %d usage samples, want one per distinct model: %+v", len(samples), samples)
+	if len(samples) != 3 {
+		t.Fatalf("got %d usage samples, want one per logical message: %+v", len(samples), samples)
 	}
 	byModel := map[string]history.Event{}
 	for _, s := range samples {
-		byModel[s.Model] = s
+		total := byModel[s.Model]
+		total.Model = s.Model
+		total.TokIn += s.TokIn
+		total.TokOut += s.TokOut
+		byModel[s.Model] = total
 	}
 	if o := byModel["claude-opus-4-8"]; o.TokIn != 120 || o.TokOut != 48 {
 		t.Errorf("opus sample = %+v, want summed 120/48", o)
 	}
 	if h := byModel["claude-haiku-4-5"]; h.TokIn != 10 || h.TokOut != 5 {
 		t.Errorf("haiku sample = %+v, want 10/5", h)
+	}
+}
+
+func TestObserveUsagePreservesClaudePricingDimensions(t *testing.T) {
+	dir := t.TempDir()
+	tpath := filepath.Join(dir, "session.jsonl")
+	writeLines(t, tpath, `{"type":"assistant","timestamp":"2026-08-25T10:11:12.123Z","uuid":"row-rich","message":{"id":"msg-rich","role":"assistant","model":"claude-opus-4-8","content":[],"usage":{"input_tokens":11,"output_tokens":12,"cache_read_input_tokens":13,"cache_creation_input_tokens":29,"cache_creation":{"ephemeral_5m_input_tokens":14,"ephemeral_1h_input_tokens":15},"service_tier":"priority","speed":"fast","inference_geo":"us","server_tool_use":{"web_search_requests":2,"web_fetch_requests":3}}}}`)
+
+	histDir := t.TempDir()
+	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+	sess := &state.Session{PID: 7, Agent: "claude", CWD: "/home/u/proj",
+		Claude: &state.AgentInfo{SessionID: "s7", Transcript: tpath}}
+	rs.observe(sink, sess, sess.Claude, time.Now())
+	sink.Close()
+
+	samples := eventsOfType(readEvents(t, histDir), history.EventUsageSample)
+	if len(samples) != 1 {
+		t.Fatalf("got %d usage samples, want 1: %+v", len(samples), samples)
+	}
+	sample := samples[0]
+	if got := sample.Ts.Format(time.RFC3339Nano); got != "2026-08-25T10:11:12.123Z" {
+		t.Errorf("sample timestamp = %q, want provider timestamp", got)
+	}
+	if sample.ProviderMessageID != "msg-rich" || sample.UsageSourceID != "root" || sample.Source != agentgraph.SourceClaudeTranscript {
+		t.Errorf("sample correlation = %+v", sample)
+	}
+	if sample.TokCacheCreate != 29 || sample.TokCacheCreate5m != 14 || sample.TokCacheCreate1h != 15 {
+		t.Errorf("cache dimensions = %+v", sample)
+	}
+	if sample.ServiceTier != "priority" || sample.Speed != "fast" || sample.InferenceGeo != "us" || sample.WebSearchRequests != 2 || sample.WebFetchRequests != 3 {
+		t.Errorf("pricing dimensions = %+v", sample)
 	}
 }
 
@@ -367,10 +404,10 @@ func TestApplyFocusRecordsOnChangeOnly(t *testing.T) {
 	}
 }
 
-func TestObserveUsagePrimesThenSamples(t *testing.T) {
+func TestObserveUsageBackfillsThenSamples(t *testing.T) {
 	dir := t.TempDir()
 	tpath := filepath.Join(dir, "t.jsonl")
-	// Pre-existing backlog: must NOT be counted (it predates our watching).
+	// Pre-existing complete records are backfilled on first discovery.
 	writeLines(t, tpath, `{"type":"assistant","message":{"role":"assistant","content":[],"usage":{"input_tokens":9999,"output_tokens":9999}}}`)
 
 	histDir := t.TempDir()
@@ -379,7 +416,7 @@ func TestObserveUsagePrimesThenSamples(t *testing.T) {
 	sess := &state.Session{PID: 1, Agent: "claude", CWD: "/home/u/proj",
 		Claude: &state.AgentInfo{SessionID: "s1", Transcript: tpath}}
 
-	// First observe primes the usage cursor to EOF — no sample for the backlog.
+	// First observe emits the backlog using provider timestamps when available.
 	rs.observe(sink, sess, sess.Claude, time.Now())
 
 	// New usage accrues while we watch.
@@ -391,10 +428,10 @@ func TestObserveUsagePrimesThenSamples(t *testing.T) {
 	sink.Close()
 
 	samples := eventsOfType(readEvents(t, histDir), history.EventUsageSample)
-	if len(samples) != 1 {
-		t.Fatalf("got %d usage samples, want 1 (backlog primed away): %+v", len(samples), samples)
+	if len(samples) != 2 {
+		t.Fatalf("got %d usage samples, want backlog plus appended usage: %+v", len(samples), samples)
 	}
-	if samples[0].TokIn != 120 || samples[0].TokOut != 34 {
-		t.Errorf("usage sample = %+v, want only the post-priming delta (120/34)", samples[0])
+	if samples[0].TokIn != 9999 || samples[0].TokOut != 9999 || samples[1].TokIn != 120 || samples[1].TokOut != 34 {
+		t.Errorf("usage samples = %+v, want backlog 9999/9999 then appended 120/34", samples)
 	}
 }
