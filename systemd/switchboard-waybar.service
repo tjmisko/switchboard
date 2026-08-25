@@ -1,7 +1,10 @@
 [Unit]
 Description=Switchboard — Waybar bottom renderer
 PartOf=graphical-session.target
-After=switchboard.service
+# Do not order this renderer after switchboard.service. A target is implicitly
+# ordered after units in its Wants= set, while switchboard.service is ordered
+# after graphical-session.target; adding After=switchboard.service here closes
+# a startup cycle. The watcher reconnects while the daemon is unavailable.
 Wants=switchboard.service
 ConditionPathExists=%h/.config/waybar/claude.jsonc
 

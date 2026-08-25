@@ -24,6 +24,15 @@ func requireUnitText(t *testing.T, unit, text string, wants ...string) {
 	}
 }
 
+func hasUnitDirective(text, directive string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		if strings.TrimSpace(line) == directive {
+			return true
+		}
+	}
+	return false
+}
+
 func TestDaemonUnitKeepsMachineOverridesOutOfExecStart(t *testing.T) {
 	const unit = "switchboard.service"
 	text := readUnit(t, unit)
@@ -70,14 +79,16 @@ func TestRendererUnitsAreSeparateOptInProfiles(t *testing.T) {
 			text := readUnit(t, tt.unit)
 			requireUnitText(t, tt.unit, text,
 				"PartOf=graphical-session.target",
-				"After=switchboard.service",
 				"Wants=switchboard.service",
 				tt.condition,
 				tt.environment,
 				tt.command,
 				"WantedBy=graphical-session.target",
 			)
-			if strings.Contains(text, "After=graphical-session.target") {
+			if hasUnitDirective(text, "After=switchboard.service") {
+				t.Error("renderer waits for switchboard.service, closing the graphical-session.target startup cycle")
+			}
+			if hasUnitDirective(text, "After=graphical-session.target") {
 				t.Error("renderer ordered after the target that wants it, creating an activation cycle")
 			}
 			if strings.Contains(strings.ToLower(text), tt.other) {
