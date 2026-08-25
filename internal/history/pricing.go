@@ -70,13 +70,9 @@ func EstimateEvent(ev Event, catalogs pricing.CatalogSet, now time.Time) CostEst
 // looking complete merely because the amount of missing historical usage is
 // unknowable.
 func EstimateCoverageGap(ev Event) CostEstimate {
-	reason := "usage collector coverage is incomplete"
-	if ev.UsageCoverage != "" {
-		reason += ": " + ev.UsageCoverage
-	}
 	return CostEstimate{
 		Status: pricing.CostUnknown, Coverage: 0, UnpricedEvents: 1,
-		UnpricedReasons: []string{reason}, PricingKind: "coverage_gap",
+		UnpricedReasons: []string{usageCoverageReason(ev.UsageCoverage)}, PricingKind: "coverage_gap",
 	}
 }
 
@@ -92,7 +88,7 @@ func applyUsageCoverage(estimate CostEstimate, coverage string) CostEstimate {
 	if coverage == "" || coverage == "complete" || coverage == "full" {
 		return estimate
 	}
-	reason := "usage collector coverage is incomplete: " + coverage
+	reason := usageCoverageReason(coverage)
 	seen := false
 	for _, existing := range estimate.UnpricedReasons {
 		if existing == reason {
@@ -111,6 +107,17 @@ func applyUsageCoverage(estimate CostEstimate, coverage string) CostEstimate {
 		estimate.Status = pricing.CostUnknown
 	}
 	return estimate
+}
+
+func usageCoverageReason(coverage string) string {
+	if coverage == "tokens_only" {
+		return "provider usage stream does not expose billable tool-unit coverage"
+	}
+	reason := "usage collector coverage is incomplete"
+	if coverage != "" {
+		reason += ": " + coverage
+	}
+	return reason
 }
 
 func mergeCost(existing *CostEstimate, next CostEstimate) *CostEstimate {

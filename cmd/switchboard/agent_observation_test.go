@@ -22,9 +22,16 @@ type fakeCodexCoordinatorObserver struct {
 	release      chan struct{}
 	startsOnce   sync.Once
 	bindings     map[provider.RootKey]string
+	rollouts     []fakeRolloutBinding
 	forgets      map[provider.RootKey]int
 	closes       int
 	observes     int
+}
+
+type fakeRolloutBinding struct {
+	key    provider.RootKey
+	rootID string
+	path   string
 }
 
 func newFakeCodexCoordinatorObserver() *fakeCodexCoordinatorObserver {
@@ -72,10 +79,48 @@ func (f *fakeCodexCoordinatorObserver) RegisterHookBinding(key provider.RootKey,
 	return nil
 }
 
+func (f *fakeCodexCoordinatorObserver) RegisterHookRollout(key provider.RootKey, rootID, path string) error {
+	f.mu.Lock()
+	f.rollouts = append(f.rollouts, fakeRolloutBinding{key: key, rootID: rootID, path: path})
+	f.mu.Unlock()
+	return nil
+}
+
 func (f *fakeCodexCoordinatorObserver) binding(key provider.RootKey) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.bindings[key]
+}
+
+func (f *fakeCodexCoordinatorObserver) rolloutBindings() []fakeRolloutBinding {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]fakeRolloutBinding(nil), f.rollouts...)
+}
+
+func TestCodexRootAndChildHooksBindEveryExactRolloutPath(t *testing.T) {
+	store := state.New("")
+	ref := seedCoordinatorSession(store, 4055, time.Now().Add(-time.Hour), state.AgentKindCodex, "root", "/codex")
+	fake := newFakeCodexCoordinatorObserver()
+	coordinator := newAgentCoordinator(store, nil, nil, fake)
+	coordinator.refreshTrackedRoots()
+	defer coordinator.Close()
+
+	sess, _ := sessionForKey(store.Snapshot(), ref.Key())
+	coordinator.HandleHook(rpc.Request{
+		Agent: state.AgentKindCodex, Event: "UserPromptSubmit", SessionID: "root", Transcript: "/exact/root.jsonl",
+	}, sess)
+	sess, _ = sessionForKey(store.Snapshot(), ref.Key())
+	coordinator.HandleHook(rpc.Request{
+		Agent: state.AgentKindCodex, Event: "SubagentStart", SessionID: "root", AgentID: "child", Transcript: "/exact/child.jsonl",
+	}, sess)
+
+	got := fake.rolloutBindings()
+	if len(got) != 2 || got[0].key != ref.Key() || got[1].key != ref.Key() ||
+		got[0].rootID != "root" || got[1].rootID != "root" ||
+		got[0].path != "/exact/root.jsonl" || got[1].path != "/exact/child.jsonl" {
+		t.Fatalf("exact hook rollout bindings = %#v", got)
+	}
 }
 
 func testCodexObservation(ref provider.RootRef, rootID string, observed time.Time, runtime agentgraph.RuntimeState, attention agentgraph.AttentionState) agentgraph.Observation {

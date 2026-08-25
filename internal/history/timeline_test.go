@@ -928,6 +928,20 @@ func TestPartialCoverageOnPostCutoverSampleSurvivesBoundedRead(t *testing.T) {
 	}
 }
 
+func TestTokensOnlyCoverageCannotClaimCompleteAPICost(t *testing.T) {
+	event := Event{
+		Ts: ts(5), Type: EventUsageSample, SessionID: "s1", UsageEventID: "usage-1", UsageRevision: 1,
+		ExecutionProvider: pricing.ProviderOpenAI, BillingRoute: "api", Model: "gpt-5.6-sol",
+		UsageCoverage: "tokens_only", Usage: &UsageDelta{InputTokens: 1_000_000},
+	}
+	estimate := EstimateEvent(event, pricing.BootstrapCatalogs(), ts(5))
+	if estimate.Status != pricing.CostPartial || estimate.UnpricedEvents != 1 ||
+		len(estimate.UnpricedReasons) != 1 ||
+		estimate.UnpricedReasons[0] != "provider usage stream does not expose billable tool-unit coverage" {
+		t.Fatalf("tokens-only API estimate = %+v", estimate)
+	}
+}
+
 func TestUnsupportedTierKeepsVendorEstimateSeparate(t *testing.T) {
 	vendor := pricing.USDFromMicros(123_000)
 	event := Event{

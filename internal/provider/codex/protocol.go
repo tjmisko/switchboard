@@ -123,11 +123,12 @@ type waitOwnershipState struct {
 }
 
 type nodeState struct {
-	node        agentgraph.Node
-	baseRuntime agentgraph.RuntimeState
-	cohort      string
-	guardian    bool
-	wait        waitOwnershipState
+	node                      agentgraph.Node
+	baseRuntime               agentgraph.RuntimeState
+	cohort                    string
+	guardian                  bool
+	executionProviderObserved bool
+	wait                      waitOwnershipState
 }
 
 type graphState struct {
@@ -197,6 +198,7 @@ func (s *graphState) upsertThread(thread rpcThread, root bool) {
 	state.node.Billing.AgentClient = string(agentgraph.ProviderCodex)
 	if provider := strings.TrimSpace(thread.ModelProvider); provider != "" {
 		state.node.Billing.ExecutionProvider = provider
+		state.executionProviderObserved = true
 	}
 	if len(thread.Source) > 0 {
 		state.guardian = isGuardianSource(thread.Source)

@@ -172,7 +172,7 @@ func main() {
 	// the daemon.
 	claudeObs := claudeprovider.NewObserver(sink.Dir(), claudeprovider.WithTuning(tun))
 	codexObs := codexObserverForMode(codexMode, func() codexObserver {
-		observer := codexprovider.NewObserver(codexprovider.Config{Diagnostic: func(category string) {
+		codexConfig := codexprovider.Config{Diagnostic: func(category string) {
 			// The adapter guarantees this callback contains only a finite, content-free
 			// protocol category. Keep the log equally content-free.
 			log.Printf("agent-observer: provider=codex category=%s count=1", category)
@@ -182,7 +182,9 @@ func main() {
 				diagnostic.Evidence, diagnostic.Source, diagnostic.Duration.Milliseconds(), diagnostic.RedDuration.Milliseconds(),
 				diagnostic.RedPublished, diagnostic.HumanEvidence, diagnostic.ClearedWithoutHumanEvidence,
 				diagnostic.SuppressedFalseRed, diagnostic.LegacyWouldPublishRed)
-		}})
+		}}
+		codexConfig = configureCodexUsagePersistence(codexConfig, sink)
+		observer := codexprovider.NewObserver(codexConfig)
 		log.Printf("agent-observer: provider=codex category=observer_constructed count=1")
 		return observer
 	})
@@ -298,6 +300,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("rpc: %v", err)
 	}
+}
+
+func configureCodexUsagePersistence(config codexprovider.Config, sink *history.Sink) codexprovider.Config {
+	if sink == nil || !sink.Enabled() {
+		return config
+	}
+	config.RolloutStateDir = filepath.Join(sink.Dir(), ".codex-usage-cursors")
+	config.UsageRecorder = codexprovider.NewHistoryUsageRecorder(sink)
+	return config
 }
 
 // endSession closes one session's lane: it records the session_end that bounds

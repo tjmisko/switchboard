@@ -1,7 +1,9 @@
 package codex
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -11,6 +13,15 @@ import (
 	"github.com/tjmisko/switchboard/internal/agentgraph"
 	"github.com/tjmisko/switchboard/internal/provider"
 )
+
+type blockingVendorRecorder struct{}
+
+func (blockingVendorRecorder) PersistUsage(context.Context, UsageUpdate) error { return nil }
+
+func (blockingVendorRecorder) PersistVendorUsage(ctx context.Context, _ UsageUpdate) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
 
 func TestStableTokenUsageNotificationRetainsIdentityAndDeduplicates(t *testing.T) {
 	observer, key := fixtureObserver(t)
@@ -53,12 +64,12 @@ func TestStableTokenUsageNotificationRetainsIdentityAndDeduplicates(t *testing.T
 	}
 
 	first := receiveUsageUpdate(t, observer.UsageUpdates())
-	wantDelta := agentgraph.Usage{
+	wantLast := agentgraph.Usage{
 		InputTokens: 100, CachedInputTokens: 60, CacheWriteInputTokens: 10,
 		OutputTokens: 20, ReasoningOutputTokens: 8, TotalTokens: 120, ModelContextWindow: 272000,
 	}
 	if first.RootKey != key || first.ThreadID != fixtureRoot || first.TurnID != "turn-usage-1" ||
-		first.Delta != wantDelta || first.Total != wantTotal || first.UpdateID == "" || first.Identity != wantIdentity {
+		first.Delta != wantTotal || first.Total != wantTotal || first.UpdateID == "" || first.Identity != wantIdentity {
 		t.Fatalf("first usage update = %#v", first)
 	}
 
@@ -67,11 +78,11 @@ func TestStableTokenUsageNotificationRetainsIdentityAndDeduplicates(t *testing.T
 
 	// Equal per-turn values are distinct when their provider turn IDs differ and
 	// cumulative totals advance. An exact replay of the second update is not.
-	secondTotal := addBreakdownForTest(wantTotal, wantDelta)
-	secondParams := tokenUsageParamsForTest(fixtureRoot, "turn-usage-2", &wantDelta, &secondTotal)
+	secondTotal := addBreakdownForTest(wantTotal, wantLast)
+	secondParams := tokenUsageParamsForTest(fixtureRoot, "turn-usage-2", &wantLast, &secondTotal)
 	observer.applyNotificationLocked(rpcNotification{Generation: 1, Method: "thread/tokenUsage/updated", Params: secondParams})
 	second := receiveUsageUpdate(t, observer.UsageUpdates())
-	if second.TurnID != "turn-usage-2" || second.Delta != wantDelta || second.Total != secondTotal {
+	if second.TurnID != "turn-usage-2" || second.Delta != wantLast || second.Total != secondTotal {
 		t.Fatalf("second usage update = %#v", second)
 	}
 	observer.applyNotificationLocked(rpcNotification{Generation: 1, Method: "thread/tokenUsage/updated", Params: secondParams})
@@ -127,6 +138,26 @@ func TestTokenUsageBeforeThreadMetadataIsRetainedAndReplayed(t *testing.T) {
 	}
 }
 
+func TestLastOnlyUsageReplayDedupesButEqualDistinctTurnsAdvance(t *testing.T) {
+	observer, key := fixtureObserver(t)
+	delta := agentgraph.Usage{InputTokens: 5, OutputTokens: 2, TotalTokens: 7, ModelContextWindow: 100}
+	first := tokenUsageParamsForTest(fixtureRoot, "turn-last-1", &delta, nil)
+	observer.applyNotificationLocked(rpcNotification{Generation: 1, Method: "thread/tokenUsage/updated", Params: first})
+	_ = receiveUsageUpdate(t, observer.UsageUpdates())
+	observer.applyNotificationLocked(rpcNotification{Generation: 1, Method: "thread/tokenUsage/updated", Params: first})
+	assertNoUsageUpdate(t, observer.UsageUpdates())
+	if got := observer.roots[key].graph.nodes[fixtureRoot].node.Usage.TotalTokens; got != 7 {
+		t.Fatalf("last-only replay total = %d, want 7", got)
+	}
+
+	second := tokenUsageParamsForTest(fixtureRoot, "turn-last-2", &delta, nil)
+	observer.applyNotificationLocked(rpcNotification{Generation: 1, Method: "thread/tokenUsage/updated", Params: second})
+	update := receiveUsageUpdate(t, observer.UsageUpdates())
+	if update.Delta != delta || update.Total.TotalTokens != 14 {
+		t.Fatalf("equal distinct-turn last-only update = %#v", update)
+	}
+}
+
 func TestThreadAndCollaborationMetadataSurviveSnapshots(t *testing.T) {
 	state := newGraphState(rpcThread{ID: "root", ModelProvider: "openai", Status: rpcStatus{Type: "idle"}}, nil, 32)
 	state.applyCollaboration("turn", rpcItem{
@@ -161,15 +192,16 @@ func TestAccountRoutesAndNullableVendorEstimateRemainDistinct(t *testing.T) {
 		planType    string
 		kind        string
 		route       string
+		auth        string
 		provider    string
 	}{
-		{"apiKey", "", "api_key", "api", ""},
-		{"chatgpt", "pro", "chatgpt", "chatgpt_subscription", ""},
-		{"chatgpt", "self_serve_business_usage_based", "chatgpt", "credits", ""},
-		{"amazonBedrock", "", "amazon_bedrock", "cloud", "aws-bedrock"},
+		{"apiKey", "", "api_key", "api", "api_key", ""},
+		{"chatgpt", "pro", "chatgpt", "", "chatgpt", ""},
+		{"chatgpt", "self_serve_business_usage_based", "usage_based", "", "chatgpt", ""},
+		{"amazonBedrock", "", "amazon_bedrock", "cloud", "cloud_credentials", "aws-bedrock"},
 	} {
 		got := accountMetadataFromAccount(rpcAccount{Type: test.accountType, PlanType: test.planType})
-		if !got.known || got.accountKind != test.kind || got.billingRoute != test.route || got.executionProvider != test.provider {
+		if !got.known || got.accountKind != test.kind || got.billingRoute != test.route || got.authMode != test.auth || got.executionProvider != test.provider {
 			t.Errorf("account %q metadata = %#v", test.accountType, got)
 		}
 	}
@@ -201,7 +233,7 @@ func TestAccountRoutesAndNullableVendorEstimateRemainDistinct(t *testing.T) {
 	observer.installVendorEstimateLocked(key, observer.roots[key], decoded.ThreadUsage, fixtureNow)
 	update := receiveUsageUpdate(t, observer.UsageUpdates())
 	if update.VendorEstimate == nil || update.VendorEstimate.EstimatedUsageUSDMicros != nil ||
-		update.Identity.BillingRoute != "chatgpt_subscription" || update.Identity.AccountKind != "chatgpt" {
+		update.Identity.BillingRoute != "" || update.Identity.AuthMode != "chatgpt" || update.Identity.AccountKind != "chatgpt" {
 		t.Fatalf("vendor update = %#v", update)
 	}
 	latest, ok := observer.LatestThreadUsage(fixtureRoot)
@@ -237,11 +269,103 @@ func TestObserverReadsBoundedVendorEstimate(t *testing.T) {
 	waitCompleteObservation(t, observer, ref, time.Second)
 	update := receiveUsageUpdate(t, observer.UsageUpdates())
 	if update.VendorEstimate == nil || update.VendorEstimate.EstimatedUsageCreditsMicros != 12 ||
-		update.Identity.ExecutionProvider != "openai" || update.Identity.BillingRoute != "chatgpt_subscription" {
+		update.Identity.ExecutionProvider != "openai" || update.Identity.BillingRoute != "" || update.Identity.AuthMode != "chatgpt" {
 		t.Fatalf("bounded vendor read update = %#v", update)
 	}
 	methods := proxy.Methods()
 	assertMethodOrder(t, methods, []string{"initialize", "initialized", "account/read", "thread/read", "thread/turns/list", "thread/list", "account/usage/read"})
+}
+
+func TestTransientVendorFailureRetainsLKGAsStaleThenReplacesSnapshot(t *testing.T) {
+	observer, key := fixtureObserver(t)
+	initial := &ThreadUsageEstimate{ThreadID: fixtureRoot, EstimatedUsageCreditsMicros: 12}
+	observer.installVendorEstimateLocked(key, observer.roots[key], initial, fixtureNow)
+	_ = receiveUsageUpdate(t, observer.UsageUpdates())
+
+	failedSnapshot := newGraphState(rpcThread{ID: fixtureRoot, Status: rpcStatus{Type: "idle"}}, nil, 32)
+	observer.installSnapshot(1, key, fixtureRoot, failedSnapshot, nil, true, errors.New("synthetic vendor failure with private path"))
+	staleUpdate := receiveUsageUpdate(t, observer.UsageUpdates())
+	latest, ok := observer.LatestThreadUsage(fixtureRoot)
+	if !ok || !latest.Stale || latest.EstimatedUsageCreditsMicros != 12 || staleUpdate.VendorEstimate == nil || !staleUpdate.VendorEstimate.Stale {
+		t.Fatalf("stale LKG = %#v / %#v", latest, staleUpdate)
+	}
+	if !observer.roots[key].usageRefreshDue || !observer.roots[key].usageReadAt.IsZero() {
+		t.Fatalf("failure retry state = %#v", observer.roots[key])
+	}
+
+	fresh := &ThreadUsageEstimate{ThreadID: fixtureRoot, EstimatedUsageCreditsMicros: 20}
+	successSnapshot := newGraphState(rpcThread{ID: fixtureRoot, Status: rpcStatus{Type: "idle"}}, nil, 32)
+	observer.installSnapshot(1, key, fixtureRoot, successSnapshot, fresh, true, nil)
+	freshUpdate := receiveUsageUpdate(t, observer.UsageUpdates())
+	latest, ok = observer.LatestThreadUsage(fixtureRoot)
+	if !ok || latest.Stale || latest.EstimatedUsageCreditsMicros != 20 || freshUpdate.Revision <= staleUpdate.Revision {
+		t.Fatalf("fresh replacement = %#v / %#v", latest, freshUpdate)
+	}
+}
+
+func TestVendorRevisionSurvivesRestartClockAndPersistenceIsBounded(t *testing.T) {
+	first := nextVendorRevision(0, time.Unix(100, 123))
+	if first != time.Unix(100, 123).UnixNano() {
+		t.Fatalf("first revision = %d", first)
+	}
+	if next := nextVendorRevision(first, time.Unix(100, 123)); next != first+1 {
+		t.Fatalf("same-clock revision = %d, want %d", next, first+1)
+	}
+
+	observer, key := fixtureObserver(t)
+	observer.ctx = context.Background()
+	observer.config.UsageRecorder = blockingVendorRecorder{}
+	observer.config.UsageRequestTimeout = 10 * time.Millisecond
+	started := time.Now()
+	err := observer.installVendorEstimateLocked(key, observer.roots[key], &ThreadUsageEstimate{
+		ThreadID: fixtureRoot, EstimatedUsageCreditsMicros: 1,
+	}, time.Unix(101, 0))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("bounded persistence error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("vendor persistence was not bounded: %v", elapsed)
+	}
+	if !observer.roots[key].vendorPersistPending {
+		t.Fatal("timed-out vendor snapshot was not marked for retry")
+	}
+}
+
+func TestDisconnectInvalidatesAccountEnrichmentButRetainsGraphLKG(t *testing.T) {
+	observer, key := fixtureObserver(t)
+	account := accountMetadataFromAccount(rpcAccount{Type: "amazonBedrock"})
+	observer.account = account
+	observer.roots[key].graph.applyAccountMetadata(account)
+	observer.applyNotificationLocked(rpcNotification{
+		Generation: 1, Method: "account/updated", Params: mustJSON(t, map[string]any{}),
+	})
+	if observer.account.known {
+		t.Fatalf("unknown account update retained prior evidence: %#v", observer.account)
+	}
+	observer.account = account
+	observer.disconnect(1)
+
+	if observer.account.known || observer.account.billingRoute != "" || observer.account.authMode != "" {
+		t.Fatalf("connection-scoped account evidence survived disconnect: %#v", observer.account)
+	}
+	identity := observer.enrichRolloutIdentity(agentgraph.BillingIdentity{AgentClient: "codex", Model: "gpt"})
+	if identity.BillingRoute != "" || identity.AuthMode != "" || identity.AccountKind != "" {
+		t.Fatalf("new usage inherited prior account: %#v", identity)
+	}
+	root := observer.roots[key].graph.nodes[fixtureRoot].node
+	if root.Billing.BillingRoute != "cloud" || root.Billing.AuthMode != "cloud_credentials" || root.Billing.ExecutionProvider != "aws-bedrock" {
+		t.Fatalf("historical graph LKG was discarded: %#v", root.Billing)
+	}
+	if err := observer.installVendorEstimateLocked(key, observer.roots[key], &ThreadUsageEstimate{
+		ThreadID: fixtureRoot, EstimatedUsageCreditsMicros: 3,
+	}, fixtureNow); err != nil {
+		t.Fatal(err)
+	}
+	vendor := receiveUsageUpdate(t, observer.UsageUpdates())
+	if vendor.Identity.AuthMode != "" || vendor.Identity.BillingRoute != "" || vendor.Identity.AccountKind != "" ||
+		vendor.Identity.ExecutionProvider != "" {
+		t.Fatalf("new vendor snapshot inherited historical account: %#v", vendor.Identity)
+	}
 }
 
 func TestUsageQueueAndDedupRetentionAreBounded(t *testing.T) {

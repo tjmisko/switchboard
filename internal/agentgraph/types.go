@@ -133,15 +133,19 @@ func (u Usage) IsZero() bool {
 // provider adapters can preserve request-level pricing dimensions before a
 // history projection aggregates them.
 type BillingIdentity struct {
-	AgentClient       string
-	ExecutionProvider string
-	BillingRoute      string
-	AccountKind       string
-	Model             string
-	ServiceTier       string
-	Speed             string
-	InferenceGeo      string
-	ReasoningEffort   string
+	AgentClient       string `json:"agent_client,omitempty"`
+	ExecutionProvider string `json:"execution_provider,omitempty"`
+	// AuthMode describes how the client authenticated. It is deliberately
+	// separate from BillingRoute: ChatGPT authentication does not prove whether
+	// a particular turn consumed an included allowance or purchased credits.
+	AuthMode        string `json:"auth_mode,omitempty"`
+	BillingRoute    string `json:"billing_route,omitempty"`
+	AccountKind     string `json:"account_kind,omitempty"`
+	Model           string `json:"model,omitempty"`
+	ServiceTier     string `json:"service_tier,omitempty"`
+	Speed           string `json:"speed,omitempty"`
+	InferenceGeo    string `json:"inference_geo,omitempty"`
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
 // IsZero reports whether no billing identity metadata was supplied.

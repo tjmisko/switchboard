@@ -29,6 +29,8 @@ const (
 	DefaultUsageDedupLimit      = 2048
 	DefaultUsageRequestTimeout  = 2 * time.Second
 	DefaultUsageRefreshInterval = time.Minute
+	DefaultUsageFailureRetry    = 5 * time.Second
+	DefaultRolloutPollInterval  = time.Second
 	legacyWaitClassification    = 500 * time.Millisecond
 
 	DiagnosticUnknownProtocolEnum     = "unknown_protocol_enum"
@@ -47,6 +49,9 @@ const (
 	DiagnosticInitializedNotify       = "observer_initialized_notify_error"
 	DiagnosticObserverInitialized     = "observer_initialized"
 	DiagnosticConnectionLost          = "observer_connection_lost"
+	DiagnosticAccountRead             = "account_read_error"
+	DiagnosticVendorUsageRead         = "vendor_usage_read_error"
+	DiagnosticVendorUsagePersist      = "vendor_usage_persist_error"
 	DiagnosticSnapshotNoTargets       = "snapshot_no_targets"
 	DiagnosticSnapshotTargetsPresent  = "snapshot_targets_present"
 	DiagnosticSnapshotInstalled       = "snapshot_installed"
@@ -84,8 +89,16 @@ type Config struct {
 	UsageDedupLimit      int
 	UsageRequestTimeout  time.Duration
 	UsageRefreshInterval time.Duration
-	Now                  func() time.Time
-	Jitter               func(time.Duration) time.Duration
+	UsageFailureRetry    time.Duration
+	RolloutPollInterval  time.Duration
+	// RolloutStateDir contains content-free durable cursors. UsageRecorder is
+	// the synchronous canonical history boundary; when either is absent rollout
+	// ingestion is disabled rather than pretending a lossy notification stream
+	// is durable.
+	RolloutStateDir string
+	UsageRecorder   UsageRecorder
+	Now             func() time.Time
+	Jitter          func(time.Duration) time.Duration
 	// Diagnostic receives finite categories only; raw protocol errors and
 	// payloads never cross this callback.
 	Diagnostic     func(string)
@@ -113,15 +126,18 @@ type WaitClassificationDiagnostic struct {
 }
 
 type rootRecord struct {
-	threadID        string
-	binding         BindingSource
-	graph           *graphState
-	observation     agentgraph.Observation
-	generation      uint64
-	expiry          *time.Timer
-	usageReadAt     time.Time
-	usageRefreshDue bool
-	vendorEstimate  *ThreadUsageEstimate
+	threadID             string
+	binding              BindingSource
+	graph                *graphState
+	observation          agentgraph.Observation
+	generation           uint64
+	expiry               *time.Timer
+	usageReadAt          time.Time
+	usageAttemptAt       time.Time
+	usageRefreshDue      bool
+	vendorEstimate       *ThreadUsageEstimate
+	vendorRevision       int64
+	vendorPersistPending bool
 }
 
 // Observer is a supervised provider.Observer. NewObserver starts its standalone
@@ -152,11 +168,14 @@ type Observer struct {
 	usageTotals           map[string]agentgraph.Usage
 	usageFingerprints     map[string]struct{}
 	usageFingerprintOrder []string
+	rollout               *rolloutCollector
+	rolloutLatest         map[string]UsageUpdate
 	closed                bool
 	lastDiagnostics       map[string]time.Time
 
-	refresh chan struct{}
-	cadence chan struct{}
+	refresh        chan struct{}
+	cadence        chan struct{}
+	rolloutRefresh chan struct{}
 }
 
 var _ provider.Observer = (*Observer)(nil)
@@ -175,8 +194,17 @@ func NewObserver(config Config) *Observer {
 		usageUpdates:      make(chan UsageUpdate, config.UsageUpdateBuffer),
 		usageTotals:       make(map[string]agentgraph.Usage),
 		usageFingerprints: make(map[string]struct{}),
+		rolloutLatest:     make(map[string]UsageUpdate),
 		refresh:           make(chan struct{}, 1),
 		cadence:           make(chan struct{}, 1),
+		rolloutRefresh:    make(chan struct{}, 1),
+	}
+	if config.UsageRecorder != nil && config.RolloutStateDir != "" {
+		observer.rollout = newRolloutCollector(config.RolloutStateDir, config.UsageRecorder, observer.emitDiagnostic, config.Now)
+		observer.rollout.enrich = observer.enrichRolloutIdentity
+		observer.rollout.onPersisted = observer.installRolloutUsage
+		observer.wg.Add(1)
+		go observer.runRolloutCollector()
 	}
 	observer.wg.Add(1)
 	go observer.run()
@@ -234,6 +262,12 @@ func withDefaults(config Config) Config {
 	if config.UsageRefreshInterval <= 0 {
 		config.UsageRefreshInterval = DefaultUsageRefreshInterval
 	}
+	if config.UsageFailureRetry <= 0 {
+		config.UsageFailureRetry = DefaultUsageFailureRetry
+	}
+	if config.RolloutPollInterval <= 0 {
+		config.RolloutPollInterval = DefaultRolloutPollInterval
+	}
 	if config.Now == nil {
 		config.Now = time.Now
 	}
@@ -264,6 +298,31 @@ func (o *Observer) ReconcileHookBinding(key provider.RootKey, threadID string) (
 	}
 	o.signalRefresh()
 	return update, nil
+}
+
+// RegisterHookRollout binds the exact rollout path carried by the same trusted
+// hook that established root identity. The path remains memory-only; durable
+// state uses a digest and verifies session metadata plus file identity.
+func (o *Observer) RegisterHookRollout(key provider.RootKey, threadID, path string) error {
+	update, err := o.bindings.RegisterHook(key, threadID)
+	if err != nil {
+		return err
+	}
+	if update.Stale {
+		return errors.New("codex: stale hook rollout binding")
+	}
+	if o.rollout == nil || strings.TrimSpace(path) == "" {
+		return nil
+	}
+	if err := o.rollout.bind(key, threadID, path); err != nil {
+		o.emitDiagnostic(DiagnosticRolloutBindingInvalid)
+		return err
+	}
+	select {
+	case o.rolloutRefresh <- struct{}{}:
+	default:
+	}
+	return nil
 }
 
 // Observe resolves exact identity outside the cache mutex and returns a deep
@@ -323,6 +382,9 @@ func (o *Observer) Updates() <-chan provider.RootKey { return o.queue.Updates() 
 // It is idempotent and does not affect another process that reused the PID.
 func (o *Observer) Forget(key provider.RootKey) {
 	o.bindings.Forget(key)
+	if o.rollout != nil {
+		o.rollout.forget(key)
+	}
 	o.mu.Lock()
 	if record := o.roots[key]; record != nil {
 		if record.expiry != nil {
@@ -389,10 +451,16 @@ func (o *Observer) run() {
 		o.pendingStatuses = make(map[string]rpcStatus)
 		o.pendingWaits = make(map[string][]rpcNotification)
 		o.pendingUsage = make(map[string][]rpcNotification)
+		// Account/auth evidence belongs to one app-server connection. Keep the
+		// graph's historical LKG, but do not enrich new rollout usage with a prior
+		// account after reconnect until account/read succeeds for this generation.
 		o.account = accountMetadata{}
 		for _, record := range o.roots {
 			if record.graph != nil {
 				record.graph.resetWaitOwnership()
+				for _, node := range record.graph.nodes {
+					node.executionProviderObserved = false
+				}
 			}
 		}
 		o.mu.Unlock()
@@ -408,12 +476,15 @@ func (o *Observer) run() {
 			continue
 		}
 		o.emitDiagnostic(DiagnosticObserverInitialized)
-		account := o.readAccount(client)
+		account, accountErr := o.readAccount(client)
 		o.mu.Lock()
-		if o.generation == generation && o.connected {
+		if accountErr == nil && o.generation == generation && o.connected {
 			o.account = account
 		}
 		o.mu.Unlock()
+		if accountErr != nil {
+			o.emitDiagnostic(DiagnosticAccountRead)
+		}
 		o.resnapshotAll(client, generation)
 		o.finishSync(generation)
 
@@ -502,7 +573,8 @@ func (o *Observer) resnapshotAll(client *rpcClient, generation uint64) {
 	o.mu.Lock()
 	targets := make([]target, 0, len(o.roots))
 	for key, record := range o.roots {
-		readUsage := record.usageRefreshDue || record.usageReadAt.IsZero() || now.Sub(record.usageReadAt) >= o.config.UsageRefreshInterval
+		due := record.usageRefreshDue || record.usageReadAt.IsZero() || now.Sub(record.usageReadAt) >= o.config.UsageRefreshInterval
+		readUsage := due && (record.usageAttemptAt.IsZero() || now.Sub(record.usageAttemptAt) >= o.config.UsageFailureRetry)
 		targets = append(targets, target{key: key, id: record.threadID, readUsage: readUsage})
 	}
 	o.mu.Unlock()
@@ -521,10 +593,14 @@ func (o *Observer) resnapshotAll(client *rpcClient, generation uint64) {
 			continue
 		}
 		var estimate *ThreadUsageEstimate
+		var usageErr error
 		if target.readUsage {
-			estimate, _ = o.readThreadUsage(client, target.id)
+			estimate, usageErr = o.readThreadUsage(client, target.id)
+			if usageErr != nil {
+				o.emitDiagnostic(DiagnosticVendorUsageRead)
+			}
 		}
-		o.installSnapshot(generation, target.key, target.id, state, estimate, target.readUsage)
+		o.installSnapshot(generation, target.key, target.id, state, estimate, target.readUsage, usageErr)
 	}
 }
 
@@ -598,8 +674,9 @@ func (o *Observer) snapshot(client *rpcClient, rootID string) (*graphState, erro
 	return state, nil
 }
 
-func (o *Observer) installSnapshot(generation uint64, key provider.RootKey, threadID string, state *graphState, estimate *ThreadUsageEstimate, usageRead bool) {
+func (o *Observer) installSnapshot(generation uint64, key provider.RootKey, threadID string, state *graphState, estimate *ThreadUsageEstimate, usageRead bool, usageErr error) {
 	now := o.config.Now()
+	var vendorPersistErr error
 	o.mu.Lock()
 	record := o.roots[key]
 	if o.generation != generation || record == nil || record.threadID != threadID {
@@ -608,6 +685,7 @@ func (o *Observer) installSnapshot(generation uint64, key provider.RootKey, thre
 	}
 	state.mergeTelemetryFrom(record.graph)
 	state.applyAccountMetadata(o.account)
+	o.mergeRolloutLatestLocked(key, threadID, state)
 	observation, err := state.observation(now, o.config.Freshness)
 	if err != nil {
 		o.mu.Unlock()
@@ -619,12 +697,17 @@ func (o *Observer) installSnapshot(generation uint64, key provider.RootKey, thre
 	record.graph = state
 	record.generation = generation
 	if usageRead {
-		record.usageReadAt = now
-		record.usageRefreshDue = false
-		record.vendorEstimate = nil
+		record.usageAttemptAt = now
+		if usageErr == nil && estimate != nil {
+			record.usageReadAt = now
+			record.usageRefreshDue = false
+		} else {
+			record.usageRefreshDue = true
+			vendorPersistErr = o.markVendorEstimateStaleLocked(key, record, now)
+		}
 	}
 	if estimate != nil {
-		o.installVendorEstimateLocked(key, record, estimate, now)
+		vendorPersistErr = o.installVendorEstimateLocked(key, record, estimate, now)
 	}
 	diagnostics := o.reconcileClassificationsLocked(key, record, "snapshot")
 	publish := !state.hasPendingClassification() || state.hasHumanAttention()
@@ -633,6 +716,9 @@ func (o *Observer) installSnapshot(generation uint64, key provider.RootKey, thre
 		o.scheduleExpiryLocked(key, record)
 	}
 	o.mu.Unlock()
+	if vendorPersistErr != nil {
+		o.emitDiagnostic(DiagnosticVendorUsagePersist)
+	}
 	if publish {
 		o.queue.Signal(key)
 		o.emitDiagnostic(DiagnosticSnapshotInstalled)
@@ -918,6 +1004,8 @@ type notificationParams struct {
 	TokenUsage     rpcThreadTokenUsage `json:"tokenUsage"`
 	AuthMode       *string             `json:"authMode"`
 	PlanType       *string             `json:"planType"`
+	FromModel      string              `json:"fromModel"`
+	ToModel        string              `json:"toModel"`
 }
 
 type rpcThreadSettings struct {
@@ -926,6 +1014,7 @@ type rpcThreadSettings struct {
 	ModelProvider     string `json:"modelProvider"`
 	ServiceTier       string `json:"serviceTier"`
 	Effort            string `json:"effort"`
+	Speed             string `json:"speed"`
 }
 
 func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]provider.RootKey, bool, []WaitClassificationDiagnostic) {
@@ -945,7 +1034,9 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 			planType = *params.PlanType
 		}
 		if params.AuthMode == nil {
-			o.account = accountMetadataFromType("")
+			// A logout/unknown account update invalidates connection-scoped
+			// enrichment. Existing graph nodes remain historical LKG.
+			o.account = accountMetadata{}
 		} else {
 			o.account = accountMetadataFromAuthMode(*params.AuthMode, planType)
 		}
@@ -1058,6 +1149,12 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 				diagnostics = append(diagnostics, classifiedRequestDiagnostics(state, params.ThreadID, pending, classificationSource, eventAt)...)
 			}
 			touches = settingsChanged || reviewerChanged
+		case "model/rerouted":
+			if node := state.nodes[params.ThreadID]; node != nil && strings.TrimSpace(params.ToModel) != "" {
+				node.node.Billing.AgentClient = string(agentgraph.ProviderCodex)
+				node.node.Billing.Model = strings.TrimSpace(params.ToModel)
+				touches = true
+			}
 		case "account/updated":
 			touches = state.applyAccountMetadata(o.account)
 		case "item/autoApprovalReview/started", "item/autoApprovalReview/completed":

@@ -46,6 +46,10 @@ type codexBindingReconciler interface {
 	ReconcileHookBinding(provider.RootKey, string) (codexprovider.BindingUpdate, error)
 }
 
+type codexRolloutBinder interface {
+	RegisterHookRollout(provider.RootKey, string, string) error
+}
+
 type trackedProviderRoot struct {
 	provider provider.Observer
 	kind     agentgraph.ProviderKind
@@ -768,6 +772,14 @@ func (c *agentCoordinator) HandleHook(req rpc.Request, sess state.Session) {
 		rootID := req.SessionID
 		if rootID == "" {
 			rootID = ref.ProviderSessionID
+		}
+		if req.Transcript != "" {
+			if binder, ok := c.codex.(codexRolloutBinder); ok {
+				if err := binder.RegisterHookRollout(ref.Key(), rootID, req.Transcript); err != nil {
+					c.recordDiagnostic(ref.Provider, "rollout_binding_error", now)
+					return
+				}
+			}
 		}
 		if rootID == "" {
 			c.recordDiagnostic(ref.Provider, "exact_binding_unavailable", now)

@@ -57,6 +57,10 @@ type AgentNode struct {
 	UpdatedAt   time.Time                 `json:"updated_at,omitzero"`
 	CompletedAt time.Time                 `json:"completed_at,omitzero"`
 	Usage       AgentUsage                `json:"usage,omitzero"`
+	// Billing is last-known, non-secret pricing identity. Persisting it prevents
+	// a daemon restart from erasing the model/provider dimensions needed to
+	// price already-observed cumulative usage.
+	Billing agentgraph.BillingIdentity `json:"billing,omitzero"`
 }
 
 // AgentUsage is optional token accounting. A wholly zero value is omitted; no
@@ -205,6 +209,7 @@ func projectNode(node agentgraph.Node) AgentNode {
 		StartedAt:   node.StartedAt,
 		UpdatedAt:   node.UpdatedAt,
 		CompletedAt: node.CompletedAt,
+		Billing:     node.Billing,
 		Usage: AgentUsage{
 			InputTokens:           node.Usage.InputTokens,
 			CachedInputTokens:     node.Usage.CachedInputTokens,
@@ -240,6 +245,7 @@ func (g *AgentGraph) observation(provider agentgraph.ProviderKind) agentgraph.Ob
 			StartedAt:   node.StartedAt,
 			UpdatedAt:   node.UpdatedAt,
 			CompletedAt: node.CompletedAt,
+			Billing:     node.Billing,
 			Usage: agentgraph.Usage{
 				InputTokens:           node.Usage.InputTokens,
 				CachedInputTokens:     node.Usage.CachedInputTokens,
