@@ -89,6 +89,9 @@ func TestAppendDurableConcurrentCloseAlwaysAcknowledgesOrRejects(t *testing.T) {
 	if err := sink.AppendDurable([]Event{{Ts: time.Now(), Type: EventUsageSample}}); !errors.Is(err, ErrSinkClosed) {
 		t.Fatalf("post-close append error = %v, want ErrSinkClosed", err)
 	}
+	if err := sink.AppendDurable(nil); !errors.Is(err, ErrSinkClosed) {
+		t.Fatalf("post-close empty append error = %v, want ErrSinkClosed", err)
+	}
 	// Close remains idempotent.
 	sink.Close()
 }
