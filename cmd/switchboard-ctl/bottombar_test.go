@@ -92,6 +92,21 @@ func TestEnvOr(t *testing.T) {
 	}
 }
 
+func TestUnsupportedRPCCommand(t *testing.T) {
+	if !unsupportedRPCCommand("unknown cmd: subscribe-all", "subscribe-all") {
+		t.Error("exact legacy-daemon response should enable the local fallback")
+	}
+	for _, message := range []string{
+		"permission denied",
+		"unknown cmd: subscribe",
+		"unknown cmd: subscribe-all-extra",
+	} {
+		if unsupportedRPCCommand(message, "subscribe-all") {
+			t.Errorf("unexpected fallback for %q", message)
+		}
+	}
+}
+
 // stubOps is an in-memory bottomBarOps: it tracks a running flag and counts
 // start/stop calls, so the reconcile orchestration can be driven without
 // launching a real waybar.

@@ -29,6 +29,10 @@ Keep configuration in three layers:
   package post-install step.
 - Import the graphical environment before starting the renderer. Waybar needs
   the active Wayland display; Polybar needs `DISPLAY` and `I3SOCK`.
+- Install the daemon, control client, and renderer helpers from the same
+  revision. A machine-local binary override is an executable deployment, not
+  just a path preference; update the overridden binaries together before
+  restarting their units.
 - In a shared dotfiles repository, store overlays under a hostname directory
   (for example `hosts/goosebook/...`) and install only that host's overlay.
   Do not sync one host's enabled-unit symlinks as universal configuration.
@@ -86,6 +90,10 @@ If this host runs a development `switchboard-ctl`, override only the value:
 [Service]
 Environment=SWITCHBOARD_CTL=/home/alice/.config/switchboard/bin/switchboard-ctl
 ```
+
+Build that helper alongside the daemon selected by `SWITCHBOARD_BIN`. The
+bottom-bar watcher falls back to the legacy local-only RPC during a rolling
+upgrade, but mixed revisions should be temporary and visible in its journal.
 
 Do not also launch `switchboard-ctl bottombar watch` from Hyprland once the
 unit owns it.

@@ -183,12 +183,28 @@ func streamSnapshots(cfg bottomBarConfig) {
 		return
 	}
 	defer c.Close()
-	if err := c.Send(rpc.Request{Cmd: "subscribe-all"}); err != nil {
+	command := "subscribe-all"
+	if err := c.Send(rpc.Request{Cmd: command}); err != nil {
 		return
 	}
 	for {
 		var resp rpc.Response
 		if err := c.Recv(&resp); err != nil {
+			return
+		}
+		if resp.Error != "" {
+			if command == "subscribe-all" && unsupportedRPCCommand(resp.Error, command) {
+				// Federation was added after the original local-only protocol. A
+				// daemon and renderer can briefly differ during a rolling upgrade;
+				// keep the local bar useful until the daemon catches up.
+				fmt.Fprintln(os.Stderr, "bottombar: daemon lacks aggregate subscriptions; using local sessions")
+				command = "subscribe"
+				if err := c.Send(rpc.Request{Cmd: command}); err != nil {
+					return
+				}
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "bottombar: %s: %s\n", command, resp.Error)
 			return
 		}
 		if resp.Snapshot == nil {
@@ -213,17 +229,32 @@ func sessionCount(socketPath string) (int, bool) {
 		return 0, false
 	}
 	defer c.Close()
-	if err := c.Send(rpc.Request{Cmd: "list-all"}); err != nil {
-		return 0, false
+	command := "list-all"
+	for {
+		if err := c.Send(rpc.Request{Cmd: command}); err != nil {
+			return 0, false
+		}
+		var resp rpc.Response
+		if err := c.Recv(&resp); err != nil {
+			return 0, false
+		}
+		if resp.Error != "" {
+			if command == "list-all" && unsupportedRPCCommand(resp.Error, command) {
+				command = "list"
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "bottombar: %s: %s\n", command, resp.Error)
+			return 0, false
+		}
+		if resp.Snapshot == nil {
+			return 0, true
+		}
+		return len(resp.Snapshot.Sessions), true
 	}
-	var resp rpc.Response
-	if err := c.Recv(&resp); err != nil {
-		return 0, false
-	}
-	if resp.Snapshot == nil {
-		return 0, true
-	}
-	return len(resp.Snapshot.Sessions), true
+}
+
+func unsupportedRPCCommand(message, command string) bool {
+	return strings.TrimSpace(message) == "unknown cmd: "+command
 }
 
 // ensureStarted launches the bottom waybar if it is not already running.
