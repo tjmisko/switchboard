@@ -65,9 +65,10 @@ func detectWM(force string) wm.Manager {
 //	none
 //
 // A native Wayland compositor or i3's own IPC wins over generic X11/EWMH: under
-// sway or i3, DISPLAY is also set (XWayland), but the richer native IPC — with
-// pids (sway) and a precise event stream — is preferred. X11/EWMH is the
-// fallback for any other DISPLAY-backed WM.
+// sway or i3, DISPLAY is also set (XWayland), but the richer native IPC is
+// preferred. Sway provides pids itself; the i3 backend hydrates them from the
+// X11 window ids in GET_TREE while retaining precise i3 events and workspace
+// names. X11/EWMH is the fallback for any other DISPLAY-backed WM.
 //
 // The Hyprland probe asks the backend itself (Available), which discovers a
 // running instance under $XDG_RUNTIME_DIR/hypr even when

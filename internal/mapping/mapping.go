@@ -11,7 +11,9 @@ package mapping
 
 import (
 	"context"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tjmisko/switchboard/internal/osproc"
 	"github.com/tjmisko/switchboard/internal/state"
@@ -229,13 +231,14 @@ func (r *Resolver) findWindow(ctx context.Context, muxPID int, windowTitle strin
 // "retry next tick" contract, decisions.md #4). Pure, so the join logic is
 // testable without a live WM.
 func matchUniqueClient(clients []wm.Window, muxPID int, windowTitle string) *wm.Window {
+	wantTitle := normalizeTitle(windowTitle)
 	var matches []*wm.Window
 	for i := range clients {
 		c := &clients[i]
 		if c.PID != muxPID {
 			continue
 		}
-		if c.Title != windowTitle {
+		if normalizeTitle(c.Title) != wantTitle {
 			continue
 		}
 		matches = append(matches, c)
@@ -244,4 +247,21 @@ func matchUniqueClient(clients []wm.Window, muxPID int, windowTitle string) *wm.
 		return matches[0]
 	}
 	return nil // zero or ambiguous — let the next reconcile try again
+}
+
+// spinnerPrefixes contains the leading activity glyphs coding agents place in
+// pane/window titles. The terminal and WM seams sample independently, so a
+// spinner can advance between the two reads; it is presentation, not identity.
+const spinnerPrefixes = "◐◑◒◓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✳⠂⠐⠁⠈⠠⠄⡀⢀"
+
+func normalizeTitle(title string) string {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return ""
+	}
+	r, size := utf8.DecodeRuneInString(title)
+	if strings.ContainsRune(spinnerPrefixes, r) {
+		title = title[size:]
+	}
+	return strings.TrimSpace(title)
 }

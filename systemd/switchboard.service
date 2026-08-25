@@ -1,5 +1,5 @@
 [Unit]
-Description=Switchboard — Claude Code session tracker daemon
+Description=Switchboard — coding agent status tracker and navigator
 # Order after / stop with the graphical session where a compositor uses that
 # target, but do NOT gate startup on it (see [Install]).
 PartOf=graphical-session.target
@@ -7,22 +7,20 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-# Bind the WM backend even when the user manager never inherited the compositor
-# env (login race, OOM restart, or a bare `systemctl --user restart`). Two paths:
-#   fast  — if HYPRLAND_INSTANCE_SIGNATURE is already in the environment (the
-#           compositor ran `systemctl --user import-environment`), use it as-is.
-#   slow  — otherwise discover the live instance from its lock file: each
-#           $XDG_RUNTIME_DIR/hypr/<sig>/hyprland.lock holds the compositor PID on
-#           line 1; the dir whose PID is still in /proc is the live session.
-# Without this, an empty signature makes detection report wm=none and the daemon
-# silently drops to the Observe tier — chips render but focus is a no-op.
+# Bind the WM backend even when the user manager never inherited the graphical
+# session env (login race, OOM restart, or a bare `systemctl --user restart`).
+# Hyprland is discovered from its live lock file; i3 is discovered from its live
+# IPC socket. A compositor-imported environment remains the fast path for both.
+# Without this, detection reports wm=none and the daemon silently drops to the
+# Observe tier — chips render but focus is a no-op.
 # `exec` hands the PID to the daemon so Type=simple/Restart tracking stays exact.
-ExecStart=/bin/sh -c 'if [ -z "$$HYPRLAND_INSTANCE_SIGNATURE" ]; then for d in "$$XDG_RUNTIME_DIR"/hypr/*/; do [ -r "$$d/hyprland.lock" ] || continue; read -r p _ < "$$d/hyprland.lock"; [ -e "/proc/$$p" ] || continue; s=$${d%%/}; HYPRLAND_INSTANCE_SIGNATURE=$${s##*/}; export HYPRLAND_INSTANCE_SIGNATURE; break; done; fi; exec %h/go/bin/switchboard'
+ExecStart=/bin/sh -c 'if [ -z "$$HYPRLAND_INSTANCE_SIGNATURE" ]; then for d in "$$XDG_RUNTIME_DIR"/hypr/*/; do [ -r "$$d/hyprland.lock" ] || continue; read -r p _ < "$$d/hyprland.lock"; [ -e "/proc/$$p" ] || continue; s=$${d%%/}; HYPRLAND_INSTANCE_SIGNATURE=$${s##*/}; export HYPRLAND_INSTANCE_SIGNATURE; break; done; fi; if [ -z "$$SWAYSOCK" ] && [ -z "$$I3SOCK" ]; then for s in "$$XDG_RUNTIME_DIR"/i3/ipc-socket.*; do [ -S "$$s" ] || continue; p=$${s##*.}; [ -e "/proc/$$p" ] || continue; I3SOCK=$$s; export I3SOCK; break; done; fi; if [ -n "$$I3SOCK" ] && [ -z "$$DISPLAY" ]; then DISPLAY=:0; export DISPLAY; fi; exec %h/go/bin/switchboard'
 Restart=always
 RestartSec=2
-# Fast path only: the compositor may import these into the user-manager
-# environment at login. Not required — ExecStart self-discovers the signature.
-PassEnvironment=HYPRLAND_INSTANCE_SIGNATURE XDG_RUNTIME_DIR XDG_CACHE_HOME
+# Fast path: the compositor/WM may import these into the user-manager
+# environment at login. ExecStart can self-discover Hyprland and i3, while
+# DISPLAY/XAUTHORITY still come from the graphical session when available.
+PassEnvironment=HYPRLAND_INSTANCE_SIGNATURE SWAYSOCK I3SOCK DISPLAY XAUTHORITY XDG_RUNTIME_DIR XDG_CACHE_HOME
 NoNewPrivileges=true
 
 [Install]

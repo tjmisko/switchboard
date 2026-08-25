@@ -10,6 +10,9 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/jezek/xgb"
+	"github.com/jezek/xgb/xproto"
 )
 
 // I3 is the sway/i3 backend. Both speak the same IPC over a Unix socket
@@ -17,10 +20,9 @@ import (
 // difference this package cares about is the reported Name. The opaque window
 // ref is the container id (con_id); focus is `[con_id=N] focus`.
 //
-// Caveat: i3's GET_TREE does not expose a pid (only sway does), so under pure
-// i3 the terminal<->window join (which keys on the terminal's mux pid) cannot
-// resolve and such sessions stay Observe-only. Sway populates pid, so Navigate
-// works there. See docs/portability-plan.md.
+// Sway exposes client pids directly. i3's GET_TREE does not, but it does expose
+// each X11 window id; Clients batches _NET_WM_PID reads for those ids so the
+// terminal<->window join has the same pid key on both backends.
 type I3 struct {
 	name   string
 	socket string
@@ -53,7 +55,18 @@ func (i *I3) Clients(ctx context.Context) ([]Window, error) {
 	if err != nil {
 		return nil, err
 	}
-	return parseI3Tree(reply)
+	root, err := parseI3TreeRoot(reply)
+	if err != nil {
+		return nil, err
+	}
+	if i.name == "i3" && os.Getenv("DISPLAY") != "" {
+		// A failed X11 lookup degrades individual pids to zero; the i3 tree is
+		// still useful for focus/workspace events and a later tick can retry.
+		if pids, err := queryX11WindowPIDs(&root); err == nil {
+			hydrateI3PIDs(&root, pids)
+		}
+	}
+	return windowsFromI3Tree(&root), nil
 }
 
 func (i *I3) ActiveWindow(ctx context.Context) (string, error) {
@@ -272,10 +285,22 @@ func (n *i3Node) title() string {
 }
 
 func parseI3Tree(data []byte) ([]Window, error) {
+	root, err := parseI3TreeRoot(data)
+	if err != nil {
+		return nil, err
+	}
+	return windowsFromI3Tree(&root), nil
+}
+
+func parseI3TreeRoot(data []byte) (i3Node, error) {
 	var root i3Node
 	if err := json.Unmarshal(data, &root); err != nil {
-		return nil, fmt.Errorf("i3 tree: %w", err)
+		return i3Node{}, fmt.Errorf("i3 tree: %w", err)
 	}
+	return root, nil
+}
+
+func windowsFromI3Tree(root *i3Node) []Window {
 	var out []Window
 	var walk func(n *i3Node, wsName string, wsNum int)
 	walk = func(n *i3Node, wsName string, wsNum int) {
@@ -298,8 +323,86 @@ func parseI3Tree(data []byte) ([]Window, error) {
 			walk(&n.FloatingNodes[k], wsName, wsNum)
 		}
 	}
-	walk(&root, "", 0)
-	return out, nil
+	walk(root, "", 0)
+	return out
+}
+
+// hydrateI3PIDs fills only the pid-less X11 leaves in an i3 tree. Sway leaves
+// already carry PID and generally have Window=nil, so the same helper is safe
+// for both shapes and never overwrites authoritative compositor data.
+func hydrateI3PIDs(root *i3Node, pids map[int64]int) {
+	var walk func(*i3Node)
+	walk = func(n *i3Node) {
+		if n.PID == 0 && n.Window != nil {
+			if pid := pids[*n.Window]; pid > 0 {
+				n.PID = pid
+			}
+		}
+		for j := range n.Nodes {
+			walk(&n.Nodes[j])
+		}
+		for j := range n.FloatingNodes {
+			walk(&n.FloatingNodes[j])
+		}
+	}
+	walk(root)
+}
+
+// queryX11WindowPIDs batches all _NET_WM_PID requests before waiting for any
+// replies. That turns a whole GET_TREE hydration into one X11 request flight
+// instead of one synchronous round trip per client.
+func queryX11WindowPIDs(root *i3Node) (map[int64]int, error) {
+	windowIDs := collectI3WindowIDs(root)
+	if len(windowIDs) == 0 {
+		return nil, nil
+	}
+	c, err := xgb.NewConn()
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+	wmPID, err := internAtom(c, "_NET_WM_PID")
+	if err != nil {
+		return nil, err
+	}
+
+	cookies := make(map[int64]xproto.GetPropertyCookie, len(windowIDs))
+	for _, id := range windowIDs {
+		if id <= 0 || id > 1<<32-1 {
+			continue
+		}
+		cookies[id] = xproto.GetProperty(c, false, xproto.Window(id), wmPID,
+			xproto.GetPropertyTypeAny, 0, 1)
+	}
+	pids := make(map[int64]int, len(cookies))
+	for id, cookie := range cookies {
+		reply, err := cookie.Reply()
+		if err != nil || reply == nil || len(reply.Value) < 4 {
+			continue
+		}
+		if pid := int(xgb.Get32(reply.Value)); pid > 0 {
+			pids[id] = pid
+		}
+	}
+	return pids, nil
+}
+
+func collectI3WindowIDs(root *i3Node) []int64 {
+	var ids []int64
+	var walk func(*i3Node)
+	walk = func(n *i3Node) {
+		if n.PID == 0 && n.Window != nil {
+			ids = append(ids, *n.Window)
+		}
+		for j := range n.Nodes {
+			walk(&n.Nodes[j])
+		}
+		for j := range n.FloatingNodes {
+			walk(&n.FloatingNodes[j])
+		}
+	}
+	walk(root)
+	return ids
 }
 
 func parseI3Active(data []byte) (string, error) {
