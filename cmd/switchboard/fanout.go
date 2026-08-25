@@ -9,7 +9,6 @@ import (
 	"github.com/tjmisko/switchboard/internal/fanout"
 	"github.com/tjmisko/switchboard/internal/history"
 	"github.com/tjmisko/switchboard/internal/label"
-	"github.com/tjmisko/switchboard/internal/pricing"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/transcript"
 )
@@ -161,11 +160,11 @@ func (rs *reconcileState) observeUsage(sink *history.Sink, sess *state.Session, 
 				SchemaVersion: history.HistorySchemaVersion,
 				Ts:            ts, SessionID: c.SessionID, PID: sess.PID, Agent: sess.Agent, CWD: sess.CWD,
 				Source: agentgraph.SourceClaudeTranscript,
-				// Claude's first-party transcript usage is executed by Anthropic.
-				// No current session field proves an API/subscription/cloud billing
-				// route, account kind, or auth mode, so those remain unknown.
-				ExecutionProvider: pricing.ProviderAnthropic,
-				UsageEventID:      snapshot.UsageEventID, UsageSnapshot: true, UsageRevision: snapshot.UsageRevision,
+				// A Claude Code transcript proves the client and model, but Claude Code
+				// can route through Anthropic, Bedrock, Vertex, or another configured
+				// backend. No current session field proves the execution provider,
+				// billing route, account kind, or auth mode, so those remain unknown.
+				UsageEventID: snapshot.UsageEventID, UsageSnapshot: true, UsageRevision: snapshot.UsageRevision,
 				UsageCoverage: snapshot.Coverage,
 			}
 			if snapshot.Cutover {

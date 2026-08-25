@@ -192,6 +192,7 @@ type Swimlane struct {
 	TokOut         int64                 `json:"tok_out,omitempty"`
 	TokCacheRead   int64                 `json:"tok_cache_read,omitempty"`
 	TokCacheCreate int64                 `json:"tok_cache_create,omitempty"`
+	UsageCoverage  string                `json:"usage_coverage,omitempty"`
 
 	// Suspect and friends are the trailing-interval plausibility post-check
 	// (suspect.go). Suspect means this lane's length is an artifact of the end
@@ -533,6 +534,7 @@ func BuildSwimlanesWithCatalogs(events []Event, end time.Time, catalogs pricing.
 				accumulatePricingGroup(&b.lane.PricingGroups, ev.PricingIdentity(), UsageDelta{}, estimate)
 				coverageSeen[coverageKey] = true
 			}
+			b.lane.UsageCoverage = ev.UsageCoverage
 			b.lane.CostUSD = legacyCostAlias(b.lane.Cost)
 			b.absorb(ev)
 		case EventUsageSample:
@@ -554,6 +556,9 @@ func BuildSwimlanesWithCatalogs(events []Event, end time.Time, catalogs pricing.
 				b.lane.Cost = mergeCost(b.lane.Cost, gap)
 				accumulatePricingGroup(&b.lane.PricingGroups, ev.PricingIdentity(), UsageDelta{}, gap)
 				coverageSeen[coverageKey] = true
+			}
+			if ev.UsageCoverage != "" {
+				b.lane.UsageCoverage = ev.UsageCoverage
 			}
 			b.lane.CostUSD = legacyCostAlias(b.lane.Cost)
 			b.absorb(ev)
@@ -1248,6 +1253,7 @@ type Totals struct {
 	VendorUsage    *VendorUsageAggregate `json:"vendor_usage,omitempty"`
 	Cost           *CostEstimate         `json:"cost,omitempty"`
 	CostUSD        *pricing.USD          `json:"cost_usd"` // nullable API-equivalent compatibility alias
+	UsageCoverage  string                `json:"usage_coverage,omitempty"`
 }
 
 // TotalTokens is the grand total across all four token classes.
@@ -1273,6 +1279,7 @@ func AggregateTotalsWithCatalogs(events []Event, catalogs pricing.CatalogSet, pr
 				accumulatePricingGroup(&t.PricingGroups, ev.PricingIdentity(), UsageDelta{}, estimate)
 				coverageSeen[coverageKey] = true
 			}
+			t.UsageCoverage = ev.UsageCoverage
 			t.CostUSD = legacyCostAlias(t.Cost)
 		case EventUsageSample:
 			usage := ev.CanonicalUsage()
@@ -1289,6 +1296,9 @@ func AggregateTotalsWithCatalogs(events []Event, catalogs pricing.CatalogSet, pr
 				t.Cost = mergeCost(t.Cost, gap)
 				accumulatePricingGroup(&t.PricingGroups, ev.PricingIdentity(), UsageDelta{}, gap)
 				coverageSeen[coverageKey] = true
+			}
+			if ev.UsageCoverage != "" {
+				t.UsageCoverage = ev.UsageCoverage
 			}
 			t.CostUSD = legacyCostAlias(t.Cost)
 		case EventSubagentSpawn:
@@ -1317,6 +1327,7 @@ type PlanWindow struct {
 	TokOut                   int64  `json:"tok_out"`
 	TokCacheRead             int64  `json:"tok_cache_read"`
 	TokCacheCreate           int64  `json:"tok_cache_create"`
+	UsageCoverage            string `json:"usage_coverage,omitempty"`
 }
 
 // AggregatePlanWindow sums the usage_sample tokens and recomputes the dollar cost
@@ -1347,6 +1358,7 @@ func AggregatePlanWindowWithCatalogs(events []Event, from, to time.Time, catalog
 				accumulatePricingGroup(&pw.PricingGroups, ev.PricingIdentity(), UsageDelta{}, estimate)
 				coverageSeen[coverageKey] = true
 			}
+			pw.UsageCoverage = ev.UsageCoverage
 			pw.CostUSD = legacyCostAlias(pw.Cost)
 			continue
 		}
@@ -1364,6 +1376,9 @@ func AggregatePlanWindowWithCatalogs(events []Event, from, to time.Time, catalog
 			pw.Cost = mergeCost(pw.Cost, gap)
 			accumulatePricingGroup(&pw.PricingGroups, ev.PricingIdentity(), UsageDelta{}, gap)
 			coverageSeen[coverageKey] = true
+		}
+		if ev.UsageCoverage != "" {
+			pw.UsageCoverage = ev.UsageCoverage
 		}
 		pw.CostUSD = legacyCostAlias(pw.Cost)
 	}

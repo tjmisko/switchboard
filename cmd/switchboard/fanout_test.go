@@ -140,7 +140,7 @@ func TestObserveUsagePreservesClaudePricingDimensions(t *testing.T) {
 		sample.Source != agentgraph.SourceClaudeTranscript {
 		t.Errorf("sample correlation = %+v", sample)
 	}
-	if sample.SchemaVersion != history.HistorySchemaVersion || sample.ExecutionProvider != "anthropic" ||
+	if sample.SchemaVersion != history.HistorySchemaVersion || sample.ExecutionProvider != "" ||
 		sample.BillingRoute != "" || sample.AccountKind != "" || sample.AuthMode != "" {
 		t.Errorf("sample billing identity = %+v", sample)
 	}
@@ -200,7 +200,7 @@ func TestObserveUsageLegacyCutoverCarriesCanonicalIdentity(t *testing.T) {
 		t.Fatalf("cutover markers = %+v", markers)
 	}
 	marker := markers[0]
-	if marker.SchemaVersion != history.HistorySchemaVersion || marker.ExecutionProvider != "anthropic" ||
+	if marker.SchemaVersion != history.HistorySchemaVersion || marker.ExecutionProvider != "" ||
 		marker.BillingRoute != "" || marker.AccountKind != "" || marker.AuthMode != "" ||
 		marker.UsageCoverage != "partial_legacy_cutover" || marker.Usage != nil ||
 		!marker.UsageSnapshot || marker.UsageRevision <= 0 || !strings.HasPrefix(marker.UsageEventID, "cuev_") {
