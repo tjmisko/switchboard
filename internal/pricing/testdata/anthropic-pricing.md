@@ -10,6 +10,8 @@
 | Claude Sonnet 4.6 | $3 / MTok | $3.75 / MTok | $6 / MTok | $0.30 / MTok | $15 / MTok |
 | Claude Haiku 4.5 | $1 / MTok | $1.25 / MTok | $2 / MTok | $0.10 / MTok | $5 / MTok |
 
+Claude 4.6 and later models include the full 1M token context window at standard pricing.
+
 For Claude 4.6 and later models, using US-only inference applies a 1.1x pricing multiplier.
 
 ## Fast mode pricing
@@ -21,4 +23,3 @@ For Claude 4.6 and later models, using US-only inference applies a 1.1x pricing 
 ## Web search tool
 
 Web search is available on the Claude API for $10 per 1,000 searches.
-

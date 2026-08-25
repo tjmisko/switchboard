@@ -170,6 +170,12 @@ func ParseAnthropicMarkdown(body []byte, retrievedAt time.Time) (Catalog, error)
 	}
 
 	normalized := strings.ToLower(strings.ReplaceAll(string(body), "×", "x"))
+	// Current first-party Claude 4.6+ pricing explicitly keeps the full 1M
+	// context window at standard token/cache rates. Validate that publication
+	// contract so a future long-context premium cannot be silently missed.
+	if !regexp.MustCompile(`(?s)full.{0,160}1m\s+token\s+context\s+window.{0,160}standard\s+pricing`).MatchString(normalized) {
+		return Catalog{}, errors.New("standard full-context pricing marker is missing")
+	}
 	if !regexp.MustCompile(`1\.1\s*x\s+pricing multiplier`).MatchString(normalized) {
 		return Catalog{}, errors.New("US inference 1.1x multiplier marker is missing")
 	}

@@ -35,6 +35,13 @@ func TestParseAnthropicMarkdownFailsClosedOnHeaderChange(t *testing.T) {
 	}
 }
 
+func TestParseAnthropicMarkdownFailsClosedWithoutStandardLongContextMarker(t *testing.T) {
+	body := strings.ReplaceAll(string(readFixture(t, "anthropic-pricing.md")), "standard pricing", "premium pricing")
+	if _, err := ParseAnthropicMarkdown([]byte(body), time.Now()); err == nil {
+		t.Fatal("parser accepted a source whose long-context billing semantics changed")
+	}
+}
+
 func TestOpenAISourceParsesEveryExactModelFixture(t *testing.T) {
 	documents := map[string][]byte{
 		"pricing":       readFixture(t, "openai-pricing.md"),
