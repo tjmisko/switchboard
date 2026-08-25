@@ -3,11 +3,30 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
 	"github.com/tjmisko/switchboard/internal/testsupport"
 )
+
+func TestConfigureBottomCommandIOPreservesDiagnostics(t *testing.T) {
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer devNull.Close()
+
+	cmd := exec.Command("waybar")
+	configureBottomCommandIO(cmd, devNull)
+
+	if cmd.Stdin != devNull {
+		t.Error("waybar stdin should be connected to /dev/null")
+	}
+	if cmd.Stdout != os.Stdout || cmd.Stderr != os.Stderr {
+		t.Error("waybar diagnostics should remain connected to the watcher")
+	}
+}
 
 // §10.1 shouldRun — the bottom-bar invariant's pure core. All four F8
 // truth-table cases.

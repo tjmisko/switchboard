@@ -257,12 +257,13 @@ func stopBottom(cfg bottomBarConfig) {
 }
 
 // startBottom spawns `waybar -c <claude config>` detached into its own session
-// so it survives this process, and records its pid.
+// so it survives this process, and records its pid. Waybar diagnostics remain
+// connected to the watcher's stdout/stderr so systemd captures launch failures.
 func startBottom(cfg bottomBarConfig) error {
 	cmd := exec.Command("waybar", "-c", cfg.waybarConfig)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if dn, err := os.OpenFile(os.DevNull, os.O_RDWR, 0); err == nil {
-		cmd.Stdin, cmd.Stdout, cmd.Stderr = dn, dn, dn
+		configureBottomCommandIO(cmd, dn)
 		defer dn.Close()
 	}
 	if err := cmd.Start(); err != nil {
@@ -271,6 +272,12 @@ func startBottom(cfg bottomBarConfig) error {
 	pid := cmd.Process.Pid
 	_ = cmd.Process.Release()
 	return os.WriteFile(cfg.pidFile, []byte(strconv.Itoa(pid)), 0o644)
+}
+
+func configureBottomCommandIO(cmd *exec.Cmd, devNull *os.File) {
+	cmd.Stdin = devNull
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 }
 
 // bottomPID returns the live pid of the bottom waybar, or 0 if it is not
