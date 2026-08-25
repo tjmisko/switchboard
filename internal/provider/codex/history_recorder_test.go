@@ -50,6 +50,30 @@ func TestHistoryRecorderWritesVersionedUsageAndNullableVendorSnapshot(t *testing
 	}
 }
 
+func TestHistoryRecorderMarksNonAPIRoutesTokenOnly(t *testing.T) {
+	dir := t.TempDir()
+	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailMinimal, Dir: dir})
+	at := time.Date(2026, 8, 25, 12, 30, 0, 0, time.Local)
+	update := UsageUpdate{
+		RootKey: provider.RootKey{PID: 24, StartedAt: time.Unix(1, 0)}, RootSessionID: "root",
+		ThreadID: "root", TurnID: "turn", UpdateID: "usage-non-api", Revision: 1,
+		Source: agentgraph.SourceCodexRollout,
+		Identity: agentgraph.BillingIdentity{
+			AgentClient: "codex", ExecutionProvider: "openai", AuthMode: "chatgpt", Model: "gpt-5.6-sol",
+		},
+		Delta: agentgraph.Usage{InputTokens: 10, TotalTokens: 10},
+		Total: agentgraph.Usage{InputTokens: 10, TotalTokens: 10}, ObservedAt: at,
+	}
+	if err := NewHistoryUsageRecorder(sink).PersistUsage(context.Background(), update); err != nil {
+		t.Fatal(err)
+	}
+	sink.Close()
+	events, err := history.ReadRange(dir, time.Time{}, time.Time{})
+	if err != nil || len(events) != 1 || events[0].UsageCoverage != "tokens_only" {
+		t.Fatalf("non-API usage coverage = %#v, %v", events, err)
+	}
+}
+
 func TestVendorRevisionAfterRecorderRestartSupersedesDurableSnapshot(t *testing.T) {
 	dir := t.TempDir()
 	at := time.Date(2026, 8, 25, 13, 0, 0, 100, time.Local)

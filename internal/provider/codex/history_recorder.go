@@ -26,10 +26,13 @@ func (r *HistoryUsageRecorder) PersistUsage(ctx context.Context, update UsageUpd
 	}
 	coverage := update.Coverage
 	// Rollout token counters do not expose potentially billable OpenAI tool
-	// units (for example web-search calls). Until an exact provider field is
-	// available, API-route estimates must disclose that they are token-only.
-	if coverage == "" && update.Identity.BillingRoute == "api" {
+	// units (for example web-search calls). API-equivalent pricing needs those
+	// units regardless of whether this turn used an API key, credits, a plan, or
+	// an unknown route, so every otherwise-complete rollout remains token-only.
+	if coverage == "" || coverage == "complete" || coverage == "full" {
 		coverage = "tokens_only"
+	} else if coverage != "tokens_only" {
+		coverage += "_tokens_only"
 	}
 	delta := historyUsage(update.Delta)
 	total := historyUsage(update.Total)
