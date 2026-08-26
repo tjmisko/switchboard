@@ -104,10 +104,20 @@ type workflowCursor struct {
 // Observer holds the per-session cursor + seen-set for every tracked session.
 type Observer struct {
 	mu         sync.Mutex
-	dir        string // history dir, for first-sight seeding via PriorSubagentState
+	dir        string // history dir, for first-sight seeding via history.SeedScan
 	staleCap   time.Duration
 	quietGrace time.Duration            // workflow quiet window (DefaultWorkflowQuietGrace)
 	sessions   map[string]*sessionState // keyed by session-id
+
+	// seedIndex is the one-pass reduction of the history log (every session's
+	// already-recorded spawn/stop and workflow sets), built lazily on the first
+	// seeding need and kept for the process lifetime. Entries are HANDED OVER
+	// to a session on its first sight (and folded back by Prune), so the index
+	// plus the live sessions map always cover exactly what the log records —
+	// everything recorded after the scan was emitted by this process and lives
+	// in the session states. nil until the first seed; non-nil ever after,
+	// even when the scan failed (a partial fold beats an empty one).
+	seedIndex history.SeedIndex
 }
 
 // NewObserver builds an Observer that seeds from the history log at historyDir.
@@ -148,22 +158,20 @@ func (o *Observer) Reconcile(sess *state.Session, c *state.AgentInfo, now time.T
 	}
 	if !ss.seeded {
 		// G1: seed the seen-set from already-emitted history so a restart or
-		// `--resume` does not re-emit historical spawns (metas are never deleted).
-		// Prime the cursor to EOF — the dir scan is the authoritative spawn source,
-		// so there is no need to re-read the whole transcript on every restart.
-		seedStart, seedCPU := time.Now(), processCPU()
-		if sp, st, err := history.PriorSubagentState(o.dir, c.SessionID); err == nil {
-			ss.spawned, ss.stopped = sp, st
-		}
-		// Same guard for workflow runs: their dirs are never deleted either, so a
-		// restart re-sights every historical run and must not re-announce it.
-		if ws, we, err := history.PriorWorkflowState(o.dir, c.SessionID); err == nil {
-			ss.wfAnnounced, ss.wfEnded = ws, we
-		}
+		// `--resume` does not re-emit historical spawns (metas are never deleted;
+		// the same guard covers workflow runs, whose dirs are never deleted
+		// either). The index is one streaming pass over the log, built once per
+		// process and shared by every session — the per-session cost here is a
+		// map handover. Prime the cursor to EOF — the dir scan is the
+		// authoritative spawn source, so there is no need to re-read the whole
+		// transcript on every restart.
+		o.ensureSeedIndexLocked()
+		sets := o.seedIndex.Sets(c.SessionID)
+		delete(o.seedIndex, c.SessionID)
+		ss.spawned, ss.stopped = sets.Spawned, sets.Stopped
+		ss.wfAnnounced, ss.wfEnded = sets.WorkflowStarted, sets.WorkflowStopped
 		ss.offset = fileSize(c.Transcript)
 		ss.seeded = true
-		logSeedPass(c.SessionID, time.Since(seedStart), processCPU()-seedCPU,
-			len(ss.spawned), len(ss.stopped), len(ss.wfAnnounced), len(ss.wfEnded))
 	}
 
 	// 1) Advance the forward cursor. It supplies the run_in_background flag (only
@@ -481,8 +489,21 @@ func statMtime(path string) (time.Time, bool) {
 func (o *Observer) Prune(live map[string]bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	for id := range o.sessions {
+	for id, ss := range o.sessions {
 		if !live[id] {
+			// Fold the durable seen-sets back into the seed index rather than
+			// forgetting them. A pruned session can come back (`claude --resume`
+			// days later), and the index built at startup no longer covers the
+			// events THIS daemon recorded for it after the scan — re-seeding from
+			// the stale entry would re-emit them. The old per-session readers
+			// were immune because they re-read the whole log at seed time; the
+			// shared index keeps that guarantee by never dropping knowledge.
+			if o.seedIndex != nil {
+				o.seedIndex[id] = &history.SeedSets{
+					Spawned: ss.spawned, Stopped: ss.stopped,
+					WorkflowStarted: ss.wfAnnounced, WorkflowStopped: ss.wfEnded,
+				}
+			}
 			delete(o.sessions, id)
 		}
 	}

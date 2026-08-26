@@ -1,55 +1,29 @@
 package main
 
 import (
-	"os"
-	"path/filepath"
 	"testing"
+
+	"github.com/tjmisko/switchboard/internal/history"
 )
 
-// The Aug-14 repair scripts rewrote span lines with Python json.dumps spacing
-// (`"type": "subagent_stop"`), so any prefilter keyed on the compact
-// `"type":"…"` form silently skips exactly the repaired lines. The discovery
-// scan must find both spellings.
-func TestSeedBenchSessionsToleratesSpacedRepairLines(t *testing.T) {
-	dir := t.TempDir()
-	lines := `{"ts":"2026-01-01T10:00:00Z","type":"subagent_spawn","session_id":"s1","agent_id":"a1"}
-{"ts": "2026-01-01T10:01:00Z", "type": "subagent_stop", "session_id": "s1", "agent_id": "a1"}
-{"ts":"2026-01-01T10:02:00Z","type":"transition","session_id":"s1","from":"idle","to":"working"}
-{"ts":"2026-01-01T10:03:00Z","type":"workflow_start","session_id":"s2","workflow_run_id":"wf_1"}
-`
-	if err := os.WriteFile(filepath.Join(dir, "2026-01-01.jsonl"), []byte(lines), 0o644); err != nil {
-		t.Fatal(err)
+// The line-admission behavior seed-bench depends on (Python-spaced repair
+// lines, content mentions of event types) is pinned where the fold lives:
+// internal/history's seed tests. What is left to hold here is the bench's own
+// target selection.
+func TestSeedBenchOrderIsBusiestFirstAndDeterministic(t *testing.T) {
+	index := history.SeedIndex{
+		"light": {Spawned: map[string]bool{"a": true}, Stopped: map[string]bool{},
+			WorkflowStarted: map[string]bool{}, WorkflowStopped: map[string]bool{}},
+		"heavy": {Spawned: map[string]bool{"a": true, "b": true}, Stopped: map[string]bool{"a": true},
+			WorkflowStarted: map[string]bool{"wf": true}, WorkflowStopped: map[string]bool{}},
+		"also-light": {Spawned: map[string]bool{"z": true}, Stopped: map[string]bool{},
+			WorkflowStarted: map[string]bool{}, WorkflowStopped: map[string]bool{}},
 	}
-
-	ids, counts, err := seedBenchSessions(dir)
-	if err != nil {
-		t.Fatalf("seedBenchSessions: %v", err)
+	got := seedBenchOrder(index)
+	if len(got) != 3 || got[0] != "heavy" {
+		t.Fatalf("order = %v, want heavy first", got)
 	}
-	if counts["s1"] != 2 {
-		t.Errorf("s1 count = %d, want 2 (the spaced repair line must be counted)", counts["s1"])
-	}
-	if counts["s2"] != 1 {
-		t.Errorf("s2 count = %d, want 1", counts["s2"])
-	}
-	if len(ids) != 2 || ids[0] != "s1" {
-		t.Errorf("ids = %v, want [s1 s2] (busiest first)", ids)
-	}
-}
-
-// A line whose CONTENT mentions an event type must not be miscounted: the
-// substring markers only admit lines to the decode, the decoded type decides.
-func TestSeedBenchSessionsIgnoresTypeMentionsInContent(t *testing.T) {
-	dir := t.TempDir()
-	lines := `{"ts":"2026-01-01T10:00:00Z","type":"transition","session_id":"s1","reason":"saw a \"subagent_spawn\" in the log"}
-`
-	if err := os.WriteFile(filepath.Join(dir, "2026-01-01.jsonl"), []byte(lines), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	ids, counts, err := seedBenchSessions(dir)
-	if err != nil {
-		t.Fatalf("seedBenchSessions: %v", err)
-	}
-	if len(ids) != 0 || len(counts) != 0 {
-		t.Errorf("ids=%v counts=%v, want none — content mentions are not events", ids, counts)
+	if got[1] != "also-light" || got[2] != "light" {
+		t.Errorf("ties must break by id for run-to-run stability, got %v", got)
 	}
 }

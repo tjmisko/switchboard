@@ -106,66 +106,8 @@ func ReadRange(dir string, from, to time.Time) ([]Event, error) {
 	return out, nil
 }
 
-// PriorSubagentState scans the history log and returns, for sessionID, the set
-// of subagent agent_ids already recorded as spawned and as stopped. Keyed by
-// AgentID when present, else ToolUseID (eventAgentKey). Used to prime the fanout
-// Observer's seen-set so previously-emitted spawns are never re-emitted after a
-// daemon restart or a `claude --resume`. Events for other sessions are ignored,
-// and a spawn/stop carrying neither key contributes nothing. A zero sessionID
-// (or an empty/absent log) yields empty sets, not an error.
-func PriorSubagentState(dir, sessionID string) (spawned, stopped map[string]bool, err error) {
-	spawned = map[string]bool{}
-	stopped = map[string]bool{}
-	if sessionID == "" {
-		return spawned, stopped, nil
-	}
-	events, err := ReadRange(dir, time.Time{}, time.Time{})
-	if err != nil {
-		return nil, nil, err
-	}
-	for _, ev := range events {
-		if ev.SessionID != sessionID {
-			continue
-		}
-		key := eventAgentKey(ev)
-		if key == "" {
-			continue
-		}
-		switch ev.Type {
-		case EventSubagentSpawn:
-			spawned[key] = true
-		case EventSubagentStop:
-			stopped[key] = true
-		}
-	}
-	return spawned, stopped, nil
-}
-
-// PriorWorkflowState is PriorSubagentState's twin for workflow runs: the set of
-// WorkflowRunIDs already recorded as started and as stopped for sessionID. It
-// primes the Observer's per-run seen-set so a daemon restart mid-workflow does
-// not re-emit workflow_start for a run whose records it is seeing again for the
-// first time (the run dirs, like subagent metas, are never deleted).
-func PriorWorkflowState(dir, sessionID string) (started, stopped map[string]bool, err error) {
-	started = map[string]bool{}
-	stopped = map[string]bool{}
-	if sessionID == "" {
-		return started, stopped, nil
-	}
-	events, err := ReadRange(dir, time.Time{}, time.Time{})
-	if err != nil {
-		return nil, nil, err
-	}
-	for _, ev := range events {
-		if ev.SessionID != sessionID || ev.WorkflowRunID == "" {
-			continue
-		}
-		switch ev.Type {
-		case EventWorkflowStart:
-			started[ev.WorkflowRunID] = true
-		case EventWorkflowStop:
-			stopped[ev.WorkflowRunID] = true
-		}
-	}
-	return started, stopped, nil
-}
+// The per-session seeding readers (PriorSubagentState/PriorWorkflowState)
+// lived here until 2026-08-26. Each ran ReadRange over the WHOLE store —
+// per session, twice — which is what OOM-killed the daemon once memory
+// sampling fattened the store (docs/seed-replay-memory-plan.md). Seeding now
+// goes through SeedScan (seed.go): one streaming pass, every session at once.
