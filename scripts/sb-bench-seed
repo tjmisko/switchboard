@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""sb-bench-seed — measure fanout history-seeding cost against a store dir.
+
+Wraps `switchboard-ctl seed-bench`, which calls THE SAME history functions the
+daemon's first-sight seeding runs (see docs/seed-replay-memory-plan.md). Each
+scenario runs in a fresh subprocess because VmHWM — the kernel's peak-RSS
+figure, the headline number here — is process-lifetime.
+
+Scenarios:
+
+  single   seed the busiest session: the "one new session discovered" case
+  storm    seed every session in the log: the "daemon restart" case
+
+Always point -d at a FROZEN fixture (a copy of the store), never the live dir:
+pre/post numbers only compare on identical input. The incident fixture lives at
+~/.local/state/switchboard/bench-fixture-20260826.
+
+BASELINE — to be recorded here after the phase-1 capture on the incident
+fixture (459 MB / 859,836 events), and re-recorded after each remediation
+phase. Re-measure under comparable host load or the numbers do not compare.
+"""
+
+import argparse
+import json
+import statistics
+import subprocess
+import sys
+
+
+def run_once(ctl: str, store_dir: str, mode: str, extra: list[str]) -> dict:
+    argv = [ctl, "seed-bench", "-dir", store_dir] + extra
+    proc = subprocess.run(argv, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise SystemExit(
+            f"sb-bench-seed: {' '.join(argv)} failed:\n{proc.stderr.strip()}"
+        )
+    line = proc.stdout.strip().splitlines()[-1]
+    doc = json.loads(line)
+    doc["mode_label"] = mode
+    return doc
+
+
+def fmt_mb(n: float) -> str:
+    return f"{n / 1024:8.0f} MB"
+
+
+def report(mode: str, runs: list[dict]) -> None:
+    hwm = [r["vm_hwm_kb"] for r in runs]
+    wall = [r["total_wall_ms"] for r in runs]
+    cpu = [r["cpu_ms"] for r in runs]
+    alloc = [r["total_alloc_bytes"] for r in runs]
+    sessions = runs[0]["sessions"]
+    print(f"{mode}  sessions={sessions} runs={len(runs)}")
+    print(f"  vm_hwm      median {fmt_mb(statistics.median(hwm))}   "
+          f"max {fmt_mb(max(hwm))}")
+    print(f"  wall        median {statistics.median(wall):8.0f} ms   "
+          f"max {max(wall):8.0f} ms")
+    print(f"  cpu         median {statistics.median(cpu):8.0f} ms")
+    print(f"  allocated   median {statistics.median(alloc) / (1 << 20):8.0f} MB "
+          f"  (cumulative, not resident)")
+    print(f"  gc cycles   {runs[0]['num_gc']}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Measure fanout history-seeding cost (fresh subprocess per run).",
+        epilog="Baseline figures are recorded in this file's docstring.",
+    )
+    parser.add_argument("-d", "--dir", required=True,
+                        help="store directory (use a frozen fixture, not the live store)")
+    parser.add_argument("-c", "--ctl", default="switchboard-ctl",
+                        help="switchboard-ctl binary to bench (default: from PATH)")
+    parser.add_argument("-s", "--scenario", choices=("single", "storm", "all"),
+                        default="all")
+    parser.add_argument("-n", "--runs", type=int, default=3,
+                        help="runs per scenario (default 3)")
+    parser.add_argument("--json", action="store_true",
+                        help="emit every run's raw document as JSONL instead of the table")
+    args = parser.parse_args()
+
+    scenarios = []
+    if args.scenario in ("single", "all"):
+        scenarios.append(("single", []))
+    if args.scenario in ("storm", "all"):
+        scenarios.append(("storm", ["-storm"]))
+
+    for i, (mode, extra) in enumerate(scenarios):
+        runs = [run_once(args.ctl, args.dir, mode, extra)
+                for _ in range(args.runs)]
+        if args.json:
+            for r in runs:
+                print(json.dumps(r))
+            continue
+        if i:
+            print()
+        report(mode, runs)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

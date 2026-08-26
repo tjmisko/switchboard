@@ -71,6 +71,12 @@ func main() {
 		cmdMemory(args[1:])
 		return
 	}
+	// seed-bench measures the daemon's history-seeding cost against the on-disk
+	// log (docs/seed-replay-memory-plan.md); file-only, no daemon needed.
+	if args[0] == "seed-bench" {
+		cmdSeedBench(args[1:])
+		return
+	}
 
 	c, err := rpc.Dial(*socketPath)
 	if err != nil {
@@ -930,6 +936,8 @@ commands:
   memory [flags]          per-session memory (agent vs whole process tree) plus
                             machine-wide pressure, e.g. memory --day 2026-08-03.
                             Its own surface, not part of timeline; needs no daemon.
+  seed-bench [flags]      measure fanout history-seeding cost against a store
+                            dir (see scripts/sb-bench-seed); needs no daemon.
 
 flags:
   --socket <path>         daemon socket (default: $XDG_RUNTIME_DIR/switchboard.sock)

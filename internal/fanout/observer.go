@@ -151,6 +151,7 @@ func (o *Observer) Reconcile(sess *state.Session, c *state.AgentInfo, now time.T
 		// `--resume` does not re-emit historical spawns (metas are never deleted).
 		// Prime the cursor to EOF — the dir scan is the authoritative spawn source,
 		// so there is no need to re-read the whole transcript on every restart.
+		seedStart, seedCPU := time.Now(), processCPU()
 		if sp, st, err := history.PriorSubagentState(o.dir, c.SessionID); err == nil {
 			ss.spawned, ss.stopped = sp, st
 		}
@@ -161,6 +162,8 @@ func (o *Observer) Reconcile(sess *state.Session, c *state.AgentInfo, now time.T
 		}
 		ss.offset = fileSize(c.Transcript)
 		ss.seeded = true
+		logSeedPass(c.SessionID, time.Since(seedStart), processCPU()-seedCPU,
+			len(ss.spawned), len(ss.stopped), len(ss.wfAnnounced), len(ss.wfEnded))
 	}
 
 	// 1) Advance the forward cursor. It supplies the run_in_background flag (only
