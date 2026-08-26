@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""scrub-memory-samples — rewrite history day-files without memory_sample lines.
+
+The per-session memory sampler (retired 2026-08-26, see
+docs/seed-replay-memory-plan.md) left stores where ~80% of lines are
+memory_sample events nothing reads anymore. Every replay — daemon seeding,
+`switchboard-ctl timeline`, the dashboard providers — still pays to skip them,
+so this one-time scrub removes them from disk.
+
+Mechanics, chosen to keep the log the source of truth it is:
+
+  - Lines are judged by PARSING them: a line is dropped only when it is valid
+    JSON whose `type` is exactly "memory_sample". Substring matches would drop
+    a transition whose full-tier `reason` happens to mention the word.
+  - Kept lines are written back byte-for-byte (no re-serialization), so the
+    Aug-14 repair's Python-spaced lines and any torn final line survive
+    untouched.
+  - Each rewritten file's original moves to .scrub-backup-<UTC>/ in the store
+    dir first (precedent: .repair-backup-20260814), then the filtered temp
+    file renames into place. A file with nothing to drop is left alone.
+  - The daemon appends to today's file, so scrubbing under a live daemon can
+    lose concurrent appends. The script refuses to run while a `switchboard`
+    daemon process exists, unless --force.
+
+Run `systemctl --user stop switchboard.service` first, scrub, restart. The
+daemon's seeding notices the shrunken files and rebuilds cleanly (its seed
+cursor, once it exists, invalidates on any file shrinking).
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+
+DAY_FILE = re.compile(r"^\d{4}-\d{2}-\d{2}\.jsonl$")
+
+
+def daemon_running() -> bool:
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/comm") as fh:
+                if fh.read().strip() != "switchboard":
+                    continue
+            with open(f"/proc/{entry}/cmdline", "rb") as fh:
+                argv0 = fh.read().split(b"\0")[0].decode(errors="replace")
+            if os.path.basename(argv0) == "switchboard":
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def is_memory_sample(line: bytes) -> bool:
+    if b"memory_sample" not in line:
+        return False  # cheap pre-check only; the parse below is the authority
+    try:
+        obj = json.loads(line)
+    except (ValueError, UnicodeDecodeError):
+        return False  # torn/foreign line: keep, exactly as the readers do
+    return isinstance(obj, dict) and obj.get("type") == "memory_sample"
+
+
+def scrub_file(path: str, backup_dir: str, dry_run: bool) -> tuple[int, int]:
+    """Returns (lines_dropped, bytes_dropped); rewrites only when both > 0."""
+    with open(path, "rb") as fh:
+        data = fh.read()
+
+    kept: list[bytes] = []
+    dropped = dropped_bytes = 0
+    # splitlines(keepends) preserves the exact byte shape, including a final
+    # line with no trailing newline (a crash mid-append).
+    for line in data.splitlines(keepends=True):
+        if is_memory_sample(line):
+            dropped += 1
+            dropped_bytes += len(line)
+        else:
+            kept.append(line)
+
+    if dropped == 0 or dry_run:
+        return dropped, dropped_bytes
+
+    os.makedirs(backup_dir, exist_ok=True)
+    tmp = path + ".scrub-tmp"
+    with open(tmp, "wb") as fh:
+        fh.write(b"".join(kept))
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.rename(path, os.path.join(backup_dir, os.path.basename(path)))
+    os.rename(tmp, path)
+    return dropped, dropped_bytes
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Remove retired memory_sample lines from history day-files.")
+    parser.add_argument(
+        "-d", "--dir",
+        default=os.path.join(
+            os.environ.get("XDG_STATE_HOME",
+                           os.path.expanduser("~/.local/state")),
+            "switchboard", "history"),
+        help="history directory (default: the live store)")
+    parser.add_argument("-n", "--dry-run", action="store_true",
+                        help="report what would be removed; write nothing")
+    parser.add_argument("--force", action="store_true",
+                        help="scrub even while a switchboard daemon is running")
+    args = parser.parse_args()
+
+    if not os.path.isdir(args.dir):
+        raise SystemExit(f"scrub-memory-samples: not a directory: {args.dir}")
+    if not args.dry_run and not args.force and daemon_running():
+        raise SystemExit(
+            "scrub-memory-samples: a switchboard daemon is running and appends "
+            "to today's file.\nStop it first (systemctl --user stop "
+            "switchboard.service) or pass --force.")
+
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    backup_dir = os.path.join(args.dir, f".scrub-backup-{stamp}")
+
+    total_lines = total_bytes = touched = 0
+    for name in sorted(os.listdir(args.dir)):
+        if not DAY_FILE.match(name):
+            continue
+        path = os.path.join(args.dir, name)
+        lines, nbytes = scrub_file(path, backup_dir, args.dry_run)
+        if lines:
+            touched += 1
+            total_lines += lines
+            total_bytes += nbytes
+            print(f"{name}: -{lines} lines, -{nbytes / (1 << 20):.1f} MB")
+
+    verb = "would remove" if args.dry_run else "removed"
+    print(f"\n{verb} {total_lines} memory_sample lines "
+          f"({total_bytes / (1 << 20):.1f} MB) across {touched} day-files")
+    if touched and not args.dry_run:
+        print(f"originals preserved in {backup_dir}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
