@@ -181,8 +181,9 @@ func (n *nameConfig) config() projectname.Config {
 }
 
 // renderSlot emits JSON for the Nth session. The class array carries the
-// status, a "focused" flag, and a "suspended" flag so waybar CSS can paint the
-// chip. Empty slots get class=["empty"] so the CSS can collapse them.
+// status, a "focused" flag, a "suspended" flag, and a "remote" flag so waybar
+// CSS can paint the chip. Empty slots get class=["empty"] so the CSS can
+// collapse them.
 //
 // The chip text is the session's label abbreviated (with an ellipsis) so the
 // whole set fits the bar; the tooltip keeps the full name. Every slot fits the
@@ -220,6 +221,15 @@ func renderSlot(snap state.Snapshot, slot int, availPx float64, metrics barlayou
 	// clickable chips.
 	if s.Headless {
 		classes = append(classes, "headless")
+	}
+	// A session on another machine is drawn as a nested pill (a double border
+	// inside the chip outline) rather than a color or a glyph: color is already
+	// spoken for by status, and a glyph would cost label width on a row that is
+	// fitted to the pixel. The CSS trades border width against padding so a
+	// remote chip occupies exactly the same box as a local one — see the
+	// footprint note in barlayout.DefaultMetrics.
+	if s.Remote {
+		classes = append(classes, "remote")
 	}
 	if s.Hostname != "" && !s.Navigable {
 		classes = append(classes, "unnavigable")

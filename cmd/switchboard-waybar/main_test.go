@@ -88,6 +88,77 @@ func TestRenderSlotMarksUnboundAggregateRowObserveOnly(t *testing.T) {
 	}
 }
 
+func TestRenderSlotTagsRemoteSessionForNestedPill(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	session := state.Session{
+		PID: 7, Hostname: "boxy", Remote: true, Navigable: true, CWD: "/work/proj",
+		Agent: state.AgentKindClaude, Claude: &state.AgentInfo{Status: state.StatusWorking},
+	}
+	out := renderSlot(state.Snapshot{Sessions: []state.Session{session}}, 0, testAvail, testMetrics, &nameConfig{}, &sblabel.NameCache{})
+	if !slices.Contains(out.Class, "remote") {
+		t.Errorf("remote session missing 'remote' class: %v", out.Class)
+	}
+	// The nesting is additive: it must not displace the status fill or the
+	// focus ring the CSS layers underneath it.
+	if !slices.Contains(out.Class, state.StatusWorking) {
+		t.Errorf("remote chip dropped its status class: %v", out.Class)
+	}
+}
+
+func TestRenderSlotLeavesLocalSessionUnnested(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	session := state.Session{
+		PID: 8, CWD: "/work/proj", Agent: state.AgentKindClaude,
+		Claude: &state.AgentInfo{Status: state.StatusWorking},
+	}
+	out := renderSlot(state.Snapshot{Sessions: []state.Session{session}}, 0, testAvail, testMetrics, &nameConfig{}, &sblabel.NameCache{})
+	if slices.Contains(out.Class, "remote") {
+		t.Errorf("local session must not carry 'remote': %v", out.Class)
+	}
+}
+
+// A remote chip is styled as a nested pill, but the CSS pays for the extra ring
+// out of its own padding so its box matches a local chip's. The fit must
+// therefore be blind to remoteness: if a remote session widened the row, the
+// labels the user navigates by would re-abbreviate every time one appeared or
+// dropped. This pins the property at the layer that would break — the chip text
+// — rather than trusting the CSS comment alone.
+func TestRenderSlotFitIgnoresWhetherSessionsAreRemote(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	build := func(remote bool) []state.Session {
+		var out []state.Session
+		for i := range 8 {
+			out = append(out, state.Session{
+				PID: i + 1, Remote: remote, Navigable: true,
+				Hostname: map[bool]string{true: "boxy", false: ""}[remote],
+				CWD:      fmt.Sprintf("/work/project-with-a-long-name-%d", i),
+				Agent:    state.AgentKindClaude,
+				Claude:   &state.AgentInfo{Status: state.StatusWorking},
+			})
+		}
+		return out
+	}
+	// Narrow enough that the row is genuinely crowded and Fit has to abbreviate.
+	const narrow = 520
+	for slot := range 8 {
+		local := renderSlot(state.Snapshot{Sessions: build(false)}, slot, narrow, testMetrics, &nameConfig{}, &sblabel.NameCache{})
+		remote := renderSlot(state.Snapshot{Sessions: build(true)}, slot, narrow, testMetrics, &nameConfig{}, &sblabel.NameCache{})
+		// Guard against the comparison going vacuous: if a metrics change ever
+		// left this row roomy enough to render in full, both sides would match
+		// trivially and stop testing the budget at all.
+		if !strings.HasSuffix(local.Text, "…") {
+			t.Fatalf("slot %d rendered %q unabbreviated; widen the row or lengthen the labels", slot, local.Text)
+		}
+		if len([]rune(local.Text)) != len([]rune(remote.Text)) {
+			t.Fatalf("slot %d: local text %q (%d runes) vs remote %q (%d runes); remoteness changed the fit",
+				slot, local.Text, len([]rune(local.Text)), remote.Text, len([]rune(remote.Text)))
+		}
+	}
+}
+
 func TestRemoteTooltipDoesNotResolveCWDOnLocalFilesystem(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", root)

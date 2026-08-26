@@ -456,9 +456,9 @@ with two config files:
 
 `claude.jsonc` declares 10 `custom/claude-N` modules so each chip is a real GTK
 widget with its own CSS. Each runs `switchboard-waybar --slot N` and emits a
-JSON line per snapshot; `class` carries status + `focused` + `suspended` so
-`style.css` paints the chip. Click = focus that slot; right-click = rofi picker;
-scroll = cycle.
+JSON line per snapshot; `class` carries status + `focused` + `suspended` +
+`remote` so `style.css` paints the chip. Click = focus that slot; right-click =
+rofi picker; scroll = cycle.
 
 Waybar's row does not wrap, so each slot abbreviates its label to fit the
 monitor (`internal/barlayout`). The fit shares out *glyph cells*, not pixels —
@@ -469,12 +469,31 @@ than rounded off into the bar's margin. That overhead is the chip's CSS box, so
 
 ```
 ChipFixedPx = 2×padding + 2×border + 2×margin + spacing
-            =    2×7    +   2×1    +   2×2    +    2     = 22
+            =    2×8    +   2×1    +   2×2    +    2     = 24
 ```
 
 Change the chip padding, margin, or the bar's `spacing` and you must update
 `DefaultMetrics` to match, or the labels will be cut short (too high) or spill
 off the edge of the bar (too low).
+
+A session on another machine gains the `remote` class and is drawn as a **nested
+pill** — the chip outline with a second ring just inside it, via `border: 3px
+double`. The gap between the rings is the chip's own status fill, so the nesting
+spends no color: status keeps the background, focus keeps the border hue, and
+remoteness is carried by shape alone.
+
+That third dimension is free only because the ring is paid for out of the chip's
+padding rather than added to its width:
+
+```css
+/* local  */ padding: 4px 8px;  border: 1px solid  …   /* 8 + 1 = 9px per side */
+/* remote */ padding: 2px 6px;  border: 3px double …   /* 6 + 3 = 9px per side */
+```
+
+Keep that trade balanced. `ChipFixedPx` is a **single** number for the whole row,
+so a remote chip that were genuinely wider would make the fit depend on how many
+of the visible sessions happened to be remote — and every label on the bar would
+re-abbreviate whenever a remote session appeared or dropped.
 
 A chip whose `claude` process is job-control-stopped (Ctrl-Z) gains the
 `suspended` class on top of its status class. Grey it out in `style.css`:

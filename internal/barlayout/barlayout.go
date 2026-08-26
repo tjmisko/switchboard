@@ -34,20 +34,32 @@ type Metrics struct {
 // bar's CSS box and confirmed against rendered chip widths measured on the live
 // bar (grim screenshot, logical px):
 //
-//	a 14-glyph chip renders 133px wide; subtracting the 22px CSS box
-//	(padding 2×7 + border 2×1... see below) leaves 7.93px per glyph.
+//	a 14-glyph chip renders 133px wide; subtracting the CSS box that chip
+//	was measured against (22px: padding 2×7 + border 2×1 + margin 2×2 +
+//	spacing 2) leaves 7.93px per glyph. The box has since widened by 2px of
+//	padding, which moves ChipFixedPx but not the per-glyph advance.
 //
 // ChipFixedPx is the non-text part of one chip plus its share of the gap to the
 // next one, straight out of ~/.config/waybar/style.css and claude.jsonc:
 //
-//	padding 2×7 = 14 · border 2×1 = 2 · margin 2×2 = 4 · spacing = 2  →  22
+//	padding 2×8 = 16 · border 2×1 = 2 · margin 2×2 = 4 · spacing = 2  →  24
+//
+// ONE number covers both chip variants on purpose. A remote session is drawn as
+// a nested pill — `border: 3px double` instead of `1px solid` — and the CSS
+// pays for those two extra pixels of ring out of the chip's own padding
+// (2×6 + 2×3 = 2×8 + 2×1), so a remote chip's box is the same width as a local
+// one to the pixel. That is what lets Fit stay a single shared pool of glyph
+// cells: if the two variants had different overheads, the budget would depend on
+// how many of the row's sessions happened to be remote, and every chip on the
+// bar would re-abbreviate whenever a remote session came or went. Keep the
+// trade balanced in style.css, or restore the divergence here deliberately.
 //
 // CharPx is set slightly above the measured 7.93 because the ellipsis glyph
 // comes from a fallback font and is ~1.7px wider than a monospace cell;
 // amortized over a ~20-rune chip that is ~0.1px per glyph. Rounding up here
 // makes the estimate err toward abbreviating rather than overflowing the row.
 func DefaultMetrics() Metrics {
-	return Metrics{CharPx: 8.05, ChipFixedPx: 22}
+	return Metrics{CharPx: 8.05, ChipFixedPx: 24}
 }
 
 // chipWidth estimates the pixel width of a chip whose label has the given rune
