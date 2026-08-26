@@ -35,24 +35,26 @@ files), and bounded file sizes. A crash mid-append costs at most the final
 {
   "enabled": true,        // default false — nothing is written when off
   "detail": "minimal",    // "minimal" (default) | "full"
-  "memory": true,         // default true — per-session memory sampling
   "retain_days": 90,      // delete day-files older than this; 0 = unlimited
-  "max_bytes": 2147483648 // trim oldest day-files past this total; 0 = unlimited
+  "max_bytes": 104857600  // trim oldest day-files past this total; 0 = unlimited
 }
 ```
 
-`memory` gates per-session memory sampling independently of `enabled`, because it
-is the one stream whose volume is worth opting out of on its own — it is roughly
-12× everything else the log records. Turning it off leaves the rest untouched.
+> **Retired (2026-08-26): per-session memory sampling.** v3 added a `memory`
+> config key and a `memory_sample` event recorded per live session per reconcile
+> tick. At ~12× the line volume of everything else combined it fattened the
+> store ~100×, and the fanout seeding replay over that store OOM-killed the
+> daemon (docs/seed-replay-memory-plan.md). The sampler, the `mem_*`/`sys_*`
+> payload fields, the `switchboard-ctl memory` surface, and the 2 GB
+> memory-conditional `max_bytes` default are gone. A `memory` key in the config
+> file is ignored; `memory_sample` lines in old day-files are tolerated and
+> skipped by every reader (`scripts/scrub-memory-samples` rewrites them away).
 
-**`max_bytes` has two defaults, and which one applies depends on `memory`**: 2 GB
-with sampling on, 100 MB with it off. Retention is size-bounded *before* it is
-age-bounded — `pruneDir` trims oldest-first on total size and `retain_days` only
-rules on what survives — so leaving the smaller default in place would quietly
-turn a configured 90-day retention into about ten. An explicitly configured
-`max_bytes` always wins over both.
+Retention is size-bounded *before* it is age-bounded — `pruneDir` trims
+oldest-first on total size and `retain_days` only rules on what survives. An
+explicitly configured `max_bytes` always wins over the 100 MB default.
 
-The daemon logs `history: enabled=… detail=… memory=… retain_days=… max_bytes=…
+The daemon logs `history: enabled=… detail=… retain_days=… max_bytes=…
 dir=…` at startup, so the effective cap is never a silent multi-gigabyte
 commitment. Recording is **local only** — Switchboard never transmits the log.
 
@@ -60,7 +62,7 @@ commitment. Recording is **local only** — Switchboard never transmits the log.
 
 | Tier | Records | Omits |
 |------|---------|-------|
-| `minimal` (default) | `ts`, `type`, `session_id`, `pid`, `agent`, `project` (abbrev), `from`/`to`, `rule`, `subagents`, `dur_prev_ms`, `agent_type`, `tool_use_id`, token counts, `model`, all `mem_*` and `sys_*` counters | `cwd`, `pending`, `reason`, `description`, `label` |
+| `minimal` (default) | `ts`, `type`, `session_id`, `pid`, `agent`, `project` (abbrev), `from`/`to`, `rule`, `subagents`, `dur_prev_ms`, `agent_type`, `tool_use_id`, token counts, `model` | `cwd`, `pending`, `reason`, `description`, `label` |
 | `full` | everything above **plus** `cwd`, `pending`, `reason`, `description`, `label` | — |
 
 The subagent `agent_type` (e.g. `Explore`), token counts, and the usage-sample
@@ -69,16 +71,10 @@ The subagent `agent_type` (e.g. `Explore`), token counts, and the usage-sample
 text) and the session `label` (the session's name, which can reveal what you are
 working on) are scrubbed.
 
-The memory counters are kept at the minimal tier on the same reasoning: they are
-byte and microsecond counts describing *how much*, and carry nothing about what
-the process was doing. This is a deliberate decision, not an inherited one —
-`Sink.scrub` is a blacklist that clears five named content fields, so any new
-numeric field survives the minimal tier by default, and the choice deserves to be
-written down rather than discovered. Note what is **not** recorded: no child
-process names, command lines, or per-process breakdown. The tree is reported as a
-single summed figure plus a process count, which keeps the whole feature inside
-the minimal tier — a per-child breakdown would be content-shaped and would need
-scrubbing.
+Worth knowing when adding fields: `Sink.scrub` is a blacklist that clears five
+named content fields, so any new numeric field survives the minimal tier by
+default — a deliberate posture that deserves to be re-examined per field rather
+than discovered.
 
 The minimal tier keeps everything a timeline needs while omitting what reveals
 *what* you are doing (the raw path, the tool a prompt was for). The project
@@ -123,17 +119,6 @@ minimal log still labels each event by project.
 
   // session-label payload (session_label):
   "label": "sb-invest",              // the session's current name (full tier — scrubbed at minimal)
-
-  // memory payload (memory_sample) — an instantaneous gauge, not an accrual:
-  "mem_agent_pss_bytes": 450639872,  // the agent process alone: Pss from smaps_rollup
-  "mem_agent_swap_bytes": 0,         //   …and its SwapPss
-  "mem_tree_pss_bytes": 658374656,   // the process tree (agent + all descendants)
-  "mem_tree_swap_bytes": 157335552,  //   …and its SwapPss
-  "mem_tree_procs": 7,               // how many processes that tree covered
-  // …plus the machine-wide pressure reading taken once for the whole tick:
-  "sys_avail_bytes": 2977546240,     // MemAvailable
-  "sys_psi_some_avg10": 0.0,         // /proc/pressure/memory `some` avg10
-  "sys_psi_some_total_us": 556011549,// `some` total — monotonic since boot
 
   // full tier only:
   "cwd": "/home/u/Projects/switchboard",
@@ -197,7 +182,7 @@ fix are unaffected.
 | `session_label` | the session's name/label changed (deduped per **session id**, so a `/clear` re-announces the unchanged name to the new session) | `session_id`, `label` (full tier) |
 | `focus` | window focus moved to/away from an agent session (Hyprland) | `session_id` = focused agent session, empty = focus left all agent windows |
 | `activity` | the user went idle / active (global, session-less; from an idle daemon) | `to` = `idle` \| `active` |
-| `memory_sample` | the session's resident cost, sampled every reconcile tick | `mem_agent_*`, `mem_tree_*`, `mem_tree_procs`, `sys_*` |
+| `memory_sample` | **retired 2026-08-26** — recorded per session per tick by pre-retirement builds; readers skip these lines, `scrub-memory-samples` removes them | — |
 
 Fanout (`subagent_*`) is derived by diffing the main transcript's `Task` tool_use
 ↔ `tool_result` pairing across reconcile ticks; no extra hook is required.
@@ -507,95 +492,26 @@ each other: a lane marked `suspect` whose synthesized hours are still baked into
 `BuildSwimlanes`, so the text renderer, `--json`, and every dashboard provider
 read one set of flags and one set of aggregates.
 
-## Memory (`switchboard-ctl memory --json`)
+## Memory (retired)
 
-Memory is a **separate surface**, not part of the timeline envelope:
+v3 served a per-session memory surface (`switchboard-ctl memory --json`) fed by
+the `memory_sample` stream. The whole feature was retired 2026-08-26: at ~12×
+the line volume of everything else the log records it grew the store ~100× in
+three weeks, and the fanout seeding replay over that store is what OOM-killed
+the daemon (the full account, the measured numbers, and the remediation live in
+docs/seed-replay-memory-plan.md). The dashboard's `/api/memory` degrades by
+design when a provider lacks the subcommand.
 
-```
-switchboard-ctl memory --json [--day D | --since D --until D] [--dir D]
-```
+What deliberately survives the retirement:
 
-```jsonc
-{
-  "window": "2026-08-03",
-  "sessions": [{
-    "session_id": "…", "pid": 4821, "agent": "claude", "project": "sb",
-    "peak_agent_bytes": 512180224, "avg_agent_bytes": 431521792,
-    "peak_tree_bytes": 812187648, "avg_tree_bytes": 602931200,
-    "mem": [{ "ts": "…", "agent": 450639872, "tree": 658374656 }]
-  }],
-  "pressure": [{ "ts": "…", "avail_bytes": 2977546240,
-                 "psi_avg10": 0.0, "psi_stall_us": 14320 }]
-}
-```
-
-Bytes throughout; `psi_stall_us` is microseconds. Averages are **time-weighted**
-over each sample's interval, not a mean of samples, so an unevenly-sampled
-session still reports a true average. `tree` minus `agent` is what the session's
-spawned work cost — subagents have no PIDs, so the process tree is the only unit
-that can capture them, and the two buckets are measured separately (never
-subtracted from a third) so shared pages are not double-counted.
-
-`pressure` is machine-wide and therefore **session-less and deduplicated**: the
-`sys_*` fields repeat on every session's sample within a tick, and fold to one
-point per tick. `psi_stall_us` is the **delta** of `sys_psi_some_total_us`
-between adjacent samples — the actual microseconds the machine spent stalled in
-that interval. The raw `avg10` is kept alongside it for a human glance, but it is
-a decaying average that a 5-second sampler can alias straight past a spike, so
-anything deriving a number should use the delta. A kernel built without
-`CONFIG_PSI` omits these fields entirely.
-
-That last distinction is inference rather than proof, and the limit is worth
-knowing: `omitempty` drops a genuine zero too, so *PSI absent* and *PSI present
-and exactly idle* produce identical bytes. Readers recover presence from a
-nonzero reading. The only case this misreads is a freshly booted machine with no
-stall recorded yet — where both answers mean the same thing, so nothing acts on
-the difference. Making it exact would take a pointer or an explicit presence
-flag on the event.
-
-The rule does hold where it can bite: a failed memory reading emits **no
-`memory_sample` at all** rather than a zero one, because a zero tree would read
-as a session that had freed everything.
-
-The series are **bounded at 720 points** each (`DefaultMemSeriesCap`), per
-session and for `pressure`. That is one hour at full 5-second resolution, and it
-strides a whole day down to a point every two minutes. Downsampling keeps the
-first, the last, and the two peak readings, so a hover can never report a
-high-water mark its own series does not reach. Two properties consumers can rely
-on: the scalars are computed from the **full** series before any thinning, so
-bounding never moves a reported number; and `psi_stall_us` is the delta across
-adjacent *emitted* points, so the deltas telescope and thinning redistributes
-stall time rather than losing it.
-
-### Why memory is not in the timeline envelope
-
-Two deliberate separations, each protecting an existing guarantee:
-
-- **The ghost-lane guard.** `memory_sample` is excluded from lane routing
-  entirely, alongside `focus` and `activity`. A lane's `lastEvidence` is what
-  separates "a session still doing work" from "one nothing has been heard from",
-  and it is fed by events like `usage_sample` because token accrual *is* work. A
-  memory reading is not: the sample fires unconditionally every tick, and a hung,
-  idle, or Ctrl-Z'd process still holds its pages. Routing it onto a lane would
-  make every live pid look demonstrably alive forever and hollow out the
-  trailing-interval post-check that catches lost session deaths.
-- **The consumer's repaint guard.** The dashboard compares raw response text to
-  decide whether to re-render. A live sample series changes those bytes every
-  poll, so memory is served on its own endpoint at its own cadence and read
-  lazily when a tooltip is opened — the same treatment session summaries get.
-  `timeline --json` is byte-for-byte unaffected by this feature.
-
-### Volume
-
-A sample per live session per reconcile tick (~5 s) is roughly **12× the
-line volume of everything else the log records** — measured against the busiest
-recorded day, ~11.8 MB/day against the 1.0 MB it actually wrote. Enabling memory
-sampling therefore raises the default `max_bytes`, because the alternative is
-`pruneDir` silently trimming the store to about ten days: retention is
-size-bounded before it is age-bounded, so `retain_days` would quietly stop
-meaning anything. That corpus is load-bearing — the suspect caps were calibrated
-by replaying a month of it. An explicitly configured `max_bytes` still wins, and
-the effective cap is logged at startup so the disk commitment is never silent.
+- **The ghost-lane guard.** `memory_sample` lines still exist in old day-files
+  until scrubbed, and they remain excluded from lane routing alongside `focus`
+  and `activity`: the sample fired unconditionally every tick, and a hung, idle,
+  or Ctrl-Z'd process still holds its pages, so routing one would make every
+  live pid look demonstrably alive forever, and could close or create a lane on
+  a reused pid. Replaying an old day must render identically forever.
+- `scripts/scrub-memory-samples` rewrites day-files without the sample lines
+  (originals preserved in a backup dir); run it with the daemon stopped.
 
 ## Inspecting / managing it
 
@@ -603,7 +519,6 @@ the effective cap is logged at startup so the disk commitment is never silent.
 switchboard-ctl history path                       # print the directory
 switchboard-ctl history tail [--day D] [-n N]       # most recent events (--json for raw)
 switchboard-ctl history stat                        # event counts, size, date range
-switchboard-ctl memory [--day D] [--json]           # per-session memory + machine pressure
 switchboard-ctl history purge --before YYYY-MM-DD   # delete old day-files
 switchboard-ctl history purge --all                 # delete everything
 switchboard-ctl history calibrate                   # re-derive the suspect caps

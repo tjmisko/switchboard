@@ -105,19 +105,9 @@ func main() {
 	histCfg.ResolveProject = func(cwd string) string { return projectname.CanonicalForDir(nameCfg, cwd) }
 	sink := history.NewSink(histCfg)
 	defer sink.Close()
-	// max_bytes is logged because memory sampling raises its default into the
-	// gigabytes: a disk commitment that large should never be made silently.
-	log.Printf("history: enabled=%t detail=%s memory=%t retain_days=%d max_bytes=%s dir=%s",
-		sink.Enabled(), histCfg.Detail, histCfg.Memory, histCfg.RetainDays,
+	log.Printf("history: enabled=%t detail=%s retain_days=%d max_bytes=%s dir=%s",
+		sink.Enabled(), histCfg.Detail, histCfg.RetainDays,
 		history.HumanBytes(histCfg.MaxBytes), sink.Dir())
-
-	// Per-session memory sampling follows the history opt-in: the durable series
-	// is the point of the reading, so a user who has not opted in pays none of
-	// its /proc cost.
-	var memSampler *memorySampler
-	if histCfg.Enabled && histCfg.Memory {
-		memSampler = newMemorySampler()
-	}
 
 	// tun holds every status-color knob (statustune.Tuning). It is built once here
 	// and threaded into both decision sites — the RPC hook gate and the reconciler
@@ -203,7 +193,6 @@ func main() {
 				sess.StartedAt = prior.StartedAt
 				sess.DisplayName = prior.DisplayName
 				sess.Claude, sess.Codex, sess.AgentGraph = prior.Claude, prior.Codex, prior.AgentGraph
-				sess.MemAgentBytes, sess.MemTreeBytes = prior.MemAgentBytes, prior.MemTreeBytes
 			}
 			m[sess.PID] = &sess
 		})
@@ -238,7 +227,7 @@ func main() {
 	// land after a newer one. See resolveTurn.
 	turn := &resolveTurn{}
 	go runWMLoop(ctx, store, resolver, manager, sink, procSrc, forgetRoot, turn)
-	go runReconciler(ctx, store, resolver, manager, stack, *reconcileInterval, tun, sink, nil, memSampler, forgetRoot, turn)
+	go runReconciler(ctx, store, resolver, manager, stack, *reconcileInterval, tun, sink, nil, forgetRoot, turn)
 
 	server := rpc.New(store, *socketPath, term, manager)
 	server.SetTuning(tun)
@@ -806,10 +795,10 @@ func resolveSession(ctx context.Context, resolver *mapping.Resolver, sess *state
 // Catches anything missed by event-driven updates (e.g. a session whose
 // mapping was incomplete when first created, the initial focus state, or a
 // hyprctl race).
-func runReconciler(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, interval time.Duration, tun statustune.Tuning, sink *history.Sink, obs *fanout.Observer, mem *memorySampler, forget func(int), turn *resolveTurn) {
+func runReconciler(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, interval time.Duration, tun statustune.Tuning, sink *history.Sink, obs *fanout.Observer, forget func(int), turn *resolveTurn) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
-	rstate := newReconcileState(obs, mem)
+	rstate := newReconcileState(obs)
 	// The turn is taken around the WHOLE tick rather than threaded into
 	// reconcileOnce, so the enumeration and the writes it feeds cannot be split by
 	// the WM path landing an older observation between them. See resolveTurn.
@@ -836,8 +825,7 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 	store.SetCapabilities(stack.Capabilities())
 	active, _ := manager.ActiveWindow(ctx)
 	// The two enumerations the per-session resolve needs, fetched ONCE for the
-	// whole tick and OUTSIDE the lock. This is the same rule the memory sample
-	// below already follows, and it is why this function has this shape:
+	// whole tick and OUTSIDE the lock. It is why this function has this shape:
 	// resolver.Reconcile does a terminal enumeration and a WM client query PER
 	// SESSION, and it used to do them INSIDE store.Apply. A tick over N sessions
 	// therefore held the write lock across N forks of `wezterm cli list` — 16 of
@@ -851,11 +839,6 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 	// fetch duration, and TitleAt is the freshness gate for the H9 idle-title
 	// recovery (docs/timing-hazards.md).
 	now := time.Now()
-	// Memory is sampled BEFORE the lock is taken, against the pid set of the last
-	// published snapshot: the reads are milliseconds and Store.Apply blocks every
-	// RPC reader and every hook for as long as it holds. Only the assignment and
-	// the sink.Record below run under the lock. See memorySampler.
-	mem := rstate.sampleMemory(store)
 
 	// Prepare every per-session process/provider decision from a detached
 	// snapshot. This is the lock boundary for the reconcile path: /proc liveness
@@ -939,19 +922,6 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 			if item.after.Claude != nil && sess.AgentGraph == nil &&
 				(sess.Claude == nil || sess.Claude.SessionID == item.before.Claude.SessionID) {
 				sess.Claude = item.after.Claude
-			}
-			// The session's resident cost, read outside this lock at the top of the
-			// tick. The live fields take whatever the tick has, including a repeated
-			// last-known figure after a failed read (better a stale tooltip than one
-			// that flaps to zero); the log takes only a fresh reading, so a process
-			// that is gone yields NO sample rather than a zero one — a zero would
-			// read as "freed all its memory" and corrupt the peak and average.
-			if reading, ok := mem.Sessions[sess.PID]; ok {
-				sess.MemAgentBytes = reading.Agent.Pss
-				sess.MemTreeBytes = reading.Tree.Pss
-			}
-			if ev, ok := mem.event(sess, now); ok {
-				sink.Record(ev)
 			}
 		}
 		// Re-sync focus against the active window (the backstop for any focus event

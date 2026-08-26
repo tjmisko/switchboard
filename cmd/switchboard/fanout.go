@@ -20,12 +20,8 @@ import (
 // Observer, which owns InFlightSubagents and the subagent_spawn/stop events and
 // keys its own durable state by session-id (so it survives a daemon restart or a
 // `claude --resume` rather than re-emitting historical spawns).
-// Memory is the odd one out: it is sampled BEFORE the lock is taken rather than
-// inside the loop below, because its /proc reads are milliseconds rather than
-// microseconds (see memorySampler). nil when memory sampling is off.
 type reconcileState struct {
 	fanout      *fanout.Observer
-	memory      *memorySampler
 	usageOffset map[int]int64          // pid -> transcript bytes already summed for usage
 	labels      map[string]labelCursor // labelKey -> last-emitted session label (change dedup)
 	names       *label.NameCache       // pid -> Claude session name, memoized against the file's stamp
@@ -40,10 +36,9 @@ type labelCursor struct {
 	pid  int
 }
 
-func newReconcileState(obs *fanout.Observer, mem *memorySampler) *reconcileState {
+func newReconcileState(obs *fanout.Observer) *reconcileState {
 	return &reconcileState{
 		fanout:      obs,
-		memory:      mem,
 		usageOffset: map[int]int64{},
 		labels:      map[string]labelCursor{},
 		names:       &label.NameCache{},

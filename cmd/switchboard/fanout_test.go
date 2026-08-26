@@ -75,7 +75,7 @@ func TestObserveUsageEmitsOneSamplePerModel(t *testing.T) {
 
 	histDir := t.TempDir()
 	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
-	rs := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()))
 	sess := &state.Session{PID: 7, Agent: "claude", CWD: "/home/u/proj",
 		Claude: &state.AgentInfo{SessionID: "s7", Transcript: tpath}}
 
@@ -115,7 +115,7 @@ func TestObserveLabelEmitsOnChangeOnly(t *testing.T) {
 
 	histDir := t.TempDir()
 	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
-	rs := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()))
 	// pid 424242 has no ~/.claude/sessions file, so label.RawName falls to the
 	// wezterm window title — the name we control here.
 	sess := &state.Session{PID: 424242, Agent: "claude", CWD: "/home/u/proj",
@@ -145,7 +145,7 @@ func TestObserveLabelEmitsOnChangeOnly(t *testing.T) {
 func TestObserveLabelTracksCodexDisplayNameAndNativeOverrideOncePerVisibleChange(t *testing.T) {
 	histDir := t.TempDir()
 	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
-	rs := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()))
 	sess := &state.Session{
 		PID: 424244, Agent: state.AgentKindCodex, CWD: "/home/u/proj",
 		Codex: &state.AgentInfo{SessionID: "thread-1"},
@@ -206,7 +206,7 @@ func TestObserveLabelEmitsAgainWhenTheSessionFileIsRenamed(t *testing.T) {
 
 	histDir := t.TempDir()
 	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
-	rs := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()))
 	sess := &state.Session{PID: 424243, Agent: "claude", CWD: "/home/u/proj",
 		Wezterm: &state.WeztermInfo{WindowTitle: "ignored-window-title"},
 		Claude:  &state.AgentInfo{SessionID: "s1", Transcript: tpath}}
@@ -247,7 +247,7 @@ func TestObserveLabelReAnnouncesTheNameToANewSessionInTheSameProcess(t *testing.
 
 	histDir := t.TempDir()
 	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
-	rs := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()))
 	sess := &state.Session{PID: 424242, Agent: "claude", CWD: "/home/u/proj",
 		Wezterm: &state.WeztermInfo{WindowTitle: "digest-status"},
 		Claude:  &state.AgentInfo{SessionID: "s1", Transcript: tpath}}
@@ -276,7 +276,7 @@ func TestObserveLabelReAnnouncesTheNameToANewSessionInTheSameProcess(t *testing.
 // cursor a live pid owns survives, and a dead pid takes all of its cursors with
 // it.
 func TestPruneDropsLabelCursorsByTheirProcess(t *testing.T) {
-	rs := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()))
 	rs.labels["s:superseded"] = labelCursor{name: "digest-status", pid: 1} // pre-/clear session, pid still alive
 	rs.labels["s:live"] = labelCursor{name: "digest-status", pid: 1}
 	rs.labels["p:99"] = labelCursor{name: "some-pane", pid: 99} // its process is gone
@@ -307,7 +307,7 @@ func TestObserveLabelDoesNotReAnnounceAfterATickWithoutClaudeInfo(t *testing.T) 
 
 	histDir := t.TempDir()
 	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
-	rs := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()))
 	sess := &state.Session{PID: 424242, Agent: "claude", CWD: "/home/u/proj",
 		Wezterm: &state.WeztermInfo{WindowTitle: "digest-status"},
 		Claude:  &state.AgentInfo{SessionID: "s1", Transcript: tpath}}
@@ -375,7 +375,7 @@ func TestObserveUsagePrimesThenSamples(t *testing.T) {
 
 	histDir := t.TempDir()
 	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
-	rs := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()))
 	sess := &state.Session{PID: 1, Agent: "claude", CWD: "/home/u/proj",
 		Claude: &state.AgentInfo{SessionID: "s1", Transcript: tpath}}
 

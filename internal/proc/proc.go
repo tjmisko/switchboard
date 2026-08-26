@@ -23,8 +23,7 @@ type Info struct {
 // Reader reads from a /proc-shaped directory tree. Its zero value reads the
 // real /proc, so the package-level functions below are the whole API for
 // production callers; NewReader roots it at a fixture directory instead, which
-// is what makes the memory and process-tree paths unit-testable without
-// spawning real processes (see testsupport.FakeProcTree).
+// is what makes these paths unit-testable without spawning real processes.
 type Reader struct {
 	root string // "" means the real /proc
 }
@@ -177,22 +176,6 @@ func readSmallFile(path string) (string, error) {
 		return "", err
 	}
 	return string(b), nil
-}
-
-// parseKBToBytes reads the leading integer out of a "  440078 kB" value and
-// converts it to bytes. /proc reports memory in kB throughout; converting at
-// the parse boundary keeps every downstream field in the bytes the schema
-// specifies. Returns 0 for a missing or malformed value.
-func parseKBToBytes(value string) int64 {
-	fields := strings.Fields(value)
-	if len(fields) == 0 {
-		return 0
-	}
-	kb, err := strconv.ParseInt(fields[0], 10, 64)
-	if err != nil {
-		return 0
-	}
-	return kb * 1024
 }
 
 func parsePPID(status string) int {

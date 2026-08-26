@@ -83,7 +83,7 @@ func reconcileFixture(t *testing.T, sessionCount int) (*state.Store, *slowBatchL
 	manager := stubManager{}
 	stack := detect.Stack{OSProc: fakeProcSource{st: procs}, Terminal: loc, WM: manager}
 	resolver := mapping.NewResolver(loc, manager)
-	rstate := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+	rstate := newReconcileState(fanout.NewObserver(t.TempDir()))
 
 	tick := func() {
 		reconcileOnce(context.Background(), store, resolver, manager, stack,
@@ -200,7 +200,7 @@ func TestShouldFallBackToPerSessionResolveWhenTheBackendCannotBatch(t *testing.T
 	manager := stubManager{}
 	stack := detect.Stack{OSProc: fakeProcSource{st: map[int]procState{6000: procAlive}}, Terminal: loc, WM: manager}
 	resolver := mapping.NewResolver(loc, manager)
-	rstate := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+	rstate := newReconcileState(fanout.NewObserver(t.TempDir()))
 
 	reconcileOnce(context.Background(), store, resolver, manager, stack,
 		statustune.Default(), nil, rstate, func(int) {})
@@ -268,7 +268,7 @@ func runConcurrentResolves(t *testing.T, turn *resolveTurn) bool {
 	manager := stubManager{}
 	stack := detect.Stack{OSProc: fakeProcSource{st: map[int]procState{7000: procAlive}}, Terminal: loc, WM: manager}
 	resolver := mapping.NewResolver(loc, manager)
-	rstate := newReconcileState(fanout.NewObserver(t.TempDir()), nil)
+	rstate := newReconcileState(fanout.NewObserver(t.TempDir()))
 
 	var wg sync.WaitGroup
 	wg.Add(2)

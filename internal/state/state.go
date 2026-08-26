@@ -58,18 +58,6 @@ type Session struct {
 	// for its exact conversation_id and never changes Codex's native thread name.
 	DisplayName *DisplayName `json:"display_name,omitempty"`
 
-	// MemAgentBytes is the live resident cost of the agent process alone:
-	// Pss + SwapPss from /proc/<pid>/smaps_rollup, refreshed each reconcile tick.
-	// PSS charges shared pages to their sharers in fractions, so summing across
-	// sessions never double-counts. Omitted rather than zero when a reading
-	// failed or the backend cannot take one — 0 would mean "measured, and empty".
-	MemAgentBytes int64 `json:"mem_agent_bytes,omitempty"`
-	// MemTreeBytes is the same measure summed over the agent process and every
-	// descendant — the session's whole process tree, the only unit that captures
-	// subagent work (subagents have no PIDs of their own). Subtract
-	// MemAgentBytes for what the children cost. Same absence semantics.
-	MemTreeBytes int64 `json:"mem_tree_bytes,omitempty"`
-
 	Wezterm  *WeztermInfo  `json:"wezterm,omitempty"`
 	Hyprland *HyprlandInfo `json:"hyprland,omitempty"`
 	// Claude and Codex are the per-agent enrichment blocks; they share one shape
@@ -665,12 +653,6 @@ func (s *Store) invalidatePublished(gen uint64) {
 // `status != info.Status` guard, and each of the reconciler's self-heals stamps it
 // on the same line it assigns a new Status. It moves on a status edge and nowhere
 // else, so a moved status_since is a real change that must reach the bar.
-//
-// ⚠ Not excluded, and worth knowing: mem_agent_bytes / mem_tree_bytes are
-// re-sampled every tick and genuinely jitter, so a session whose PSS drifts
-// publishes even when nothing else moved. They are real wire data driving the
-// tooltip, so suppressing them would be a lie — the suppression simply fires less
-// often on a machine whose agents are still breathing.
 func snapshotChangeKey(snap Snapshot) []byte {
 	key, err := json.Marshal(struct {
 		SchemaVersion int           `json:"schema_version"`

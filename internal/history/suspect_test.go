@@ -552,15 +552,15 @@ func TestFlagSuspectLanesIgnoresMemorySamples(t *testing.T) {
 		{Ts: at(8, 0, 0), Type: EventSessionStart, PID: pid, Agent: "claude", Project: "sb"},
 		{Ts: at(8, 0, 0), Type: EventTransition, PID: pid, SessionID: sid, To: "working"},
 	}
-	// The same session, with the sampler running the whole time: a process that
-	// hung at 08:00 still reports its pages every tick until 14:55.
+	// The same session as recorded by a pre-retirement build with the sampler
+	// running the whole time: a process that hung at 08:00 still reported its
+	// pages every tick until 14:55. The sampler is gone (2026-08-26), but stores
+	// like this one exist until scrubbed, and replaying them must not change.
 	sampled := append([]Event(nil), silent...)
 	for m := 5; m <= 7*60-5; m += 5 {
 		sampled = append(sampled, Event{
-			Ts: at(8, 0, 0).Add(time.Duration(m) * time.Minute), Type: EventMemorySample,
+			Ts: at(8, 0, 0).Add(time.Duration(m) * time.Minute), Type: legacyEventMemorySample,
 			PID: pid, SessionID: sid, Agent: "claude", Project: "sb",
-			MemAgentPssBytes: 450 << 20, MemTreePssBytes: 658 << 20, MemTreeProcs: 7,
-			SysAvailBytes: 3 << 30, SysPsiSomeAvg10: 0.2, SysPsiSomeTotalUs: int64(556_000_000 + m*100),
 		})
 	}
 
@@ -607,8 +607,7 @@ func TestFlagSuspectLanesIgnoresMemorySamples(t *testing.T) {
 		events := []Event{
 			{Ts: at(8, 0, 0), Type: EventSessionStart, PID: pid, Agent: "claude"},
 			{Ts: at(8, 0, 0), Type: EventTransition, PID: pid, SessionID: sid, To: "working"},
-			{Ts: at(9, 0, 0), Type: EventMemorySample, PID: pid, SessionID: "some-other-session",
-				MemAgentPssBytes: 1 << 20, MemTreePssBytes: 1 << 20},
+			{Ts: at(9, 0, 0), Type: legacyEventMemorySample, PID: pid, SessionID: "some-other-session"},
 			{Ts: at(10, 0, 0), Type: EventSessionEnd, PID: pid, SessionID: sid},
 		}
 		lanes := BuildSwimlanes(events, end)

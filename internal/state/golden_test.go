@@ -17,8 +17,7 @@ var goldenPath = filepath.Join("testdata", "state.golden.json")
 // canonicalSnapshot is the schema example: a fully-populated claude session
 // (every optional block present, every optional scalar and AgentInfo field set
 // — deliberately maximal for coverage, not a realistic combination), a codex
-// session on the Observe tier (the additive "agent"/"codex" fields, plus the
-// mem_* pair to pin that memory is agent-agnostic), and one minimal session
+// session on the Observe tier (the additive "agent"/"codex" fields), and one minimal session
 // (all optional blocks omitted, only the always-present fields — it is what
 // pins the omitempty ABSENCE of the optional fields). All timestamps are fixed
 // and UTC so encode/decode is deterministic.
@@ -41,11 +40,6 @@ func canonicalSnapshot() Snapshot {
 				Suspended: true,
 				Headless:  true,
 				Agent:     AgentKindClaude,
-				// mem_agent_bytes / mem_tree_bytes: Pss+SwapPss for the agent
-				// process alone and for its whole tree. Tree > agent whenever
-				// subagents are in flight; the difference is what the children cost.
-				MemAgentBytes: 461373440,
-				MemTreeBytes:  674234368,
 				Wezterm: &WeztermInfo{
 					MuxPID:      4790,
 					MuxSocket:   "/run/user/1000/wezterm/gui-sock-4790",
@@ -103,8 +97,6 @@ func canonicalSnapshot() Snapshot {
 					ConversationID: "0199736b-b713-74e2-99a2-f015a1c42816",
 					NativeBaseline: stringPtr("API maintenance"),
 				},
-				MemAgentBytes: 298844160,
-				MemTreeBytes:  298844160,
 				Codex: &AgentInfo{
 					SessionID:  "0199736b-b713-74e2-99a2-f015a1c42816",
 					Transcript: "/home/tjmisko/.codex/sessions/2026/05/28/rollout-2026-05-28T09-02-00-0199736b-b713-74e2-99a2-f015a1c42816.jsonl",
@@ -241,7 +233,6 @@ func TestChangeKeyIgnoresUpdatedAtOnly(t *testing.T) {
 		"a focus change":      func(s *Snapshot) { s.Sessions[0].Focused = !s.Sessions[0].Focused },
 		"a status edge":       func(s *Snapshot) { s.Sessions[0].Claude.Status = StatusIdle },
 		"status_since moving": func(s *Snapshot) { s.Sessions[0].Claude.StatusSinceWire = timePtr(base.UpdatedAt) },
-		"a memory reading":    func(s *Snapshot) { s.Sessions[0].MemTreeBytes++ },
 		"a display name":      func(s *Snapshot) { s.Sessions[1].DisplayName.Value = "new-display-name" },
 		"a subagent landing":  func(s *Snapshot) { s.Sessions[0].Claude.InFlightSubagents++ },
 		"a window moving":     func(s *Snapshot) { s.Sessions[0].Hyprland.WorkspaceID = 9 },

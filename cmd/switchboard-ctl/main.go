@@ -65,12 +65,6 @@ func main() {
 		cmdTimeline(args[1:])
 		return
 	}
-	// memory is the second file-only derivation off the same log (its own surface,
-	// not a section of the timeline envelope), so it dials nothing either.
-	if args[0] == "memory" {
-		cmdMemory(args[1:])
-		return
-	}
 	// seed-bench measures the daemon's history-seeding cost against the on-disk
 	// log (docs/seed-replay-memory-plan.md); file-only, no daemon needed.
 	if args[0] == "seed-bench" {
@@ -933,9 +927,6 @@ commands:
   timeline [flags]        render the activity log as per-session swimlanes plus
                             attention stats, e.g. timeline --day 2026-06-26.
                             --json emits the structured data; needs no daemon.
-  memory [flags]          per-session memory (agent vs whole process tree) plus
-                            machine-wide pressure, e.g. memory --day 2026-08-03.
-                            Its own surface, not part of timeline; needs no daemon.
   seed-bench [flags]      measure fanout history-seeding cost against a store
                             dir (see scripts/sb-bench-seed); needs no daemon.
 

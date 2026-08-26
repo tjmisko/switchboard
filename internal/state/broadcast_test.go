@@ -222,7 +222,6 @@ func TestApply_publishesWhenAnObservableFieldChanges(t *testing.T) {
 		"a focus change":     func(s *state.Session) { s.Focused = true },
 		"a suspend":          func(s *state.Session) { s.Suspended = true },
 		"a status edge":      func(s *state.Session) { s.Claude.Status = state.StatusWorking },
-		"a memory reading":   func(s *state.Session) { s.MemTreeBytes = 1 << 20 },
 		"a subagent landing": func(s *state.Session) { s.Claude.InFlightSubagents = 2 },
 		"a workspace move":   func(s *state.Session) { s.Hyprland = &state.HyprlandInfo{WorkspaceID: 3} },
 		"a resolved cwd":     func(s *state.Session) { s.CWD = "/home/u/other" },

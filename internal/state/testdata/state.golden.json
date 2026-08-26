@@ -10,8 +10,6 @@
       "suspended": true,
       "headless": true,
       "agent": "claude",
-      "mem_agent_bytes": 461373440,
-      "mem_tree_bytes": 674234368,
       "wezterm": {
         "mux_pid": 4790,
         "mux_socket": "/run/user/1000/wezterm/gui-sock-4790",
@@ -60,8 +58,6 @@
         "conversation_id": "0199736b-b713-74e2-99a2-f015a1c42816",
         "native_baseline": "API maintenance"
       },
-      "mem_agent_bytes": 298844160,
-      "mem_tree_bytes": 298844160,
       "codex": {
         "session_id": "0199736b-b713-74e2-99a2-f015a1c42816",
         "transcript": "/home/tjmisko/.codex/sessions/2026/05/28/rollout-2026-05-28T09-02-00-0199736b-b713-74e2-99a2-f015a1c42816.jsonl",
