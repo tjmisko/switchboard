@@ -47,6 +47,24 @@ func TestDaemonUnitKeepsMachineOverridesOutOfExecStart(t *testing.T) {
 	}
 }
 
+// The memory bounds are regression insurance for the 2026-08-26 seed-replay
+// OOM (docs/seed-replay-memory-plan.md): the daemon must die alone inside its
+// cgroup, never invoke the global OOM killer against the desktop. All three
+// layers are required — GOMEMLIMIT so the GC self-limits first, MemoryHigh to
+// throttle before killing, MemoryMax as the hard wall.
+func TestDaemonUnitBoundsItsMemory(t *testing.T) {
+	text := readUnit(t, "switchboard.service")
+	for _, directive := range []string{
+		"Environment=GOMEMLIMIT=512MiB",
+		"MemoryHigh=1G",
+		"MemoryMax=2G",
+	} {
+		if !hasUnitDirective(text, directive) {
+			t.Errorf("switchboard.service is missing %q", directive)
+		}
+	}
+}
+
 func TestRendererUnitsAreSeparateOptInProfiles(t *testing.T) {
 	tests := []struct {
 		unit        string

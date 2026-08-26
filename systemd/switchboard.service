@@ -28,6 +28,17 @@ RestartSec=2
 # DISPLAY/XAUTHORITY still come from the graphical session when available.
 PassEnvironment=HYPRLAND_INSTANCE_SIGNATURE SWAYSOCK I3SOCK DISPLAY XAUTHORITY XDG_RUNTIME_DIR XDG_CACHE_HOME
 NoNewPrivileges=true
+# Containment, not the fix (docs/seed-replay-memory-plan.md): steady state is
+# tens of MB and a full seed rebuild peaks ~10MB, so these bounds are pure
+# regression insurance. GOMEMLIMIT makes the Go GC work its own heap down long
+# before the cgroup acts; MemoryHigh throttles-and-reclaims; MemoryMax kills a
+# runaway daemon before the kernel's GLOBAL OOM killer has to pick a victim —
+# on 2026-08-26 that victim selection is what took the whole desktop down.
+# These landed only AFTER the streaming-seed fix: on the old algorithm (~5GB
+# per seed) MemoryMax=2G would have turned every restart into a kill loop.
+Environment=GOMEMLIMIT=512MiB
+MemoryHigh=1G
+MemoryMax=2G
 
 [Install]
 # Want from default.target, not graphical-session.target. The compositor
