@@ -9,7 +9,10 @@ figure, the headline number here — is process-lifetime.
 Scenarios:
 
   single   seed the busiest session: the "one new session discovered" case
-  storm    seed every session in the log: the "daemon restart" case
+  storm    seed the N busiest sessions (--storm-sessions, default 6): the
+           "daemon restart" case. 6 models the 2026-08-26 incident, where the
+           restarted daemon re-seeded its 5-6 live sessions at once; seeding
+           every session the log has ever seen would overstate a real restart.
 
 Always point -d at a FROZEN fixture (a copy of the store), never the live dir:
 pre/post numbers only compare on identical input. The incident fixture lives at
@@ -74,6 +77,8 @@ def main() -> int:
                         default="all")
     parser.add_argument("-n", "--runs", type=int, default=3,
                         help="runs per scenario (default 3)")
+    parser.add_argument("--storm-sessions", type=int, default=6,
+                        help="busiest sessions the storm scenario seeds (default 6)")
     parser.add_argument("--json", action="store_true",
                         help="emit every run's raw document as JSONL instead of the table")
     args = parser.parse_args()
@@ -82,7 +87,7 @@ def main() -> int:
     if args.scenario in ("single", "all"):
         scenarios.append(("single", []))
     if args.scenario in ("storm", "all"):
-        scenarios.append(("storm", ["-storm"]))
+        scenarios.append(("storm", ["-storm", "-top", str(args.storm_sessions)]))
 
     for i, (mode, extra) in enumerate(scenarios):
         runs = [run_once(args.ctl, args.dir, mode, extra)

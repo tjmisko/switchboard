@@ -41,6 +41,7 @@ func cmdSeedBench(args []string) {
 	dir := fs.String("dir", history.DefaultDir(), "activity-log directory")
 	sessionsFlag := fs.String("sessions", "", "comma-separated session ids to seed")
 	storm := fs.Bool("storm", false, "seed every session found in the log (restart storm)")
+	top := fs.Int("top", 0, "with -storm: cap to the N busiest sessions (0 = all); models the live set a real restart re-seeds")
 	_ = fs.Parse(args)
 
 	ids, counts, err := seedBenchSessions(*dir)
@@ -61,6 +62,9 @@ func cmdSeedBench(args []string) {
 	case *storm:
 		mode = "storm"
 		targets = ids
+		if *top > 0 && len(targets) > *top {
+			targets = targets[:*top]
+		}
 	default:
 		if len(ids) == 0 {
 			fail("seed-bench: no sessions with subagent/workflow events in %s", *dir)
