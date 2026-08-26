@@ -42,6 +42,7 @@ func cmdSeedBench(args []string) {
 	sessionsFlag := fs.String("sessions", "", "comma-separated session ids to report")
 	storm := fs.Bool("storm", false, "report every session found in the log (restart storm)")
 	top := fs.Int("top", 0, "with -storm: cap to the N busiest sessions (0 = all); models the live set a real restart re-seeds")
+	cursor := fs.Bool("cursor", false, "seed via the cursor path (SeedLoad + cursor write) instead of a bare scan; the first run against a dir is cold and primes the cursor for the next")
 	_ = fs.Parse(args)
 
 	var ms0 runtime.MemStats
@@ -49,9 +50,24 @@ func cmdSeedBench(args []string) {
 	cpu0 := seedBenchCPU()
 	start := time.Now()
 
-	index, stats, err := history.SeedScan(*dir)
-	if err != nil {
-		fail("seed-bench: scan %s: %v", *dir, err)
+	var index history.SeedIndex
+	var stats history.SeedStats
+	source := "scan"
+	if *cursor {
+		res, err := history.SeedLoad(*dir)
+		if err != nil {
+			fail("seed-bench: load %s: %v", *dir, err)
+		}
+		if err := history.WriteSeedCursor(*dir, res); err != nil {
+			fail("seed-bench: write cursor: %v", err)
+		}
+		index, stats, source = res.Index, res.Stats, res.Source
+	} else {
+		var err error
+		index, stats, err = history.SeedScan(*dir)
+		if err != nil {
+			fail("seed-bench: scan %s: %v", *dir, err)
+		}
 	}
 
 	wall := time.Since(start)
@@ -103,6 +119,7 @@ func cmdSeedBench(args []string) {
 	out := map[string]any{
 		"dir":               *dir,
 		"mode":              mode,
+		"source":            source,
 		"sessions":          len(targets),
 		"known_sessions":    len(index),
 		"scan_files":        stats.Files,

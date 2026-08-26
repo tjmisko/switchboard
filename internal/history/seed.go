@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"io"
 	"os"
 )
 
@@ -97,45 +98,79 @@ var seedTypeMarkers = [][]byte{
 // caller treats a failed scan as "seed from empty", which re-emits at most
 // what a first-ever run would.
 func SeedScan(dir string) (SeedIndex, SeedStats, error) {
+	index, _, stats, err := seedScanAll(dir)
+	return index, stats, err
+}
+
+// seedScanAll is SeedScan plus the per-day consumed offsets the seed cursor
+// persists.
+func seedScanAll(dir string) (SeedIndex, map[string]int64, SeedStats, error) {
 	index := SeedIndex{}
+	offsets := map[string]int64{}
 	var stats SeedStats
 	days, err := Days(dir)
 	if err != nil {
-		return index, stats, err
+		return index, offsets, stats, err
 	}
 	for _, day := range days {
-		if err := seedScanFile(DayPath(dir, day), index, &stats); err != nil {
-			return index, stats, err
+		consumed, err := seedScanFileFrom(DayPath(dir, day), 0, index, &stats)
+		if err != nil {
+			return index, offsets, stats, err
 		}
+		offsets[day] = consumed
 	}
-	return index, stats, nil
+	return index, offsets, stats, nil
 }
 
-func seedScanFile(path string, index SeedIndex, stats *SeedStats) error {
+// seedScanFileFrom streams path from byte offset start, folding each line into
+// the index, and returns the offset consumed: start plus every line that ended
+// in '\n'. A final line WITHOUT a newline — a crash mid-append — is folded
+// best-effort (matching bufio.Scanner's old behavior: complete-JSON is kept,
+// torn JSON is skipped by the fold) but never counted as consumed, so a
+// cursor resuming at the returned offset re-reads it once the writer completes
+// it. Re-folding is harmless: the sets are idempotent.
+func seedScanFileFrom(path string, start int64, index SeedIndex, stats *SeedStats) (int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil // pruned between listing and open — nothing recorded there anymore
+			return start, nil // pruned between listing and open — nothing recorded there anymore
 		}
-		return err
+		return start, err
 	}
 	defer f.Close()
+	if start > 0 {
+		if _, err := f.Seek(start, io.SeekStart); err != nil {
+			return start, err
+		}
+	}
 	stats.Files++
 
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for sc.Scan() {
-		line := sc.Bytes()
-		stats.Lines++
-		stats.Bytes += int64(len(line)) + 1
-		seedFoldLine(line, index, stats)
+	consumed := start
+	r := bufio.NewReaderSize(f, 64*1024)
+	for {
+		line, err := r.ReadBytes('\n')
+		switch {
+		case err == nil:
+			stats.Lines++
+			stats.Bytes += int64(len(line))
+			consumed += int64(len(line))
+			seedFoldLine(line[:len(line)-1], index, stats)
+		case err == io.EOF:
+			if len(line) > 0 {
+				stats.Lines++
+				stats.Bytes += int64(len(line))
+				seedFoldLine(line, index, stats) // folded, NOT consumed — see above
+			}
+			return consumed, nil
+		default:
+			return consumed, err
+		}
 	}
-	return sc.Err()
 }
 
-// seedFoldLine folds one raw line into the index (exported to the cursor's
-// tail replay through seedScanFile only — the admission rules must never
-// diverge between a full scan and a tail).
+// seedFoldLine folds one raw line into the index. The full scan and the
+// cursor's tail replay both reach it through seedScanFileFrom, so the
+// admission rules can never diverge between them.
 func seedFoldLine(line []byte, index SeedIndex, stats *SeedStats) {
 	admitted := false
 	for _, marker := range seedTypeMarkers {

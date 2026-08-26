@@ -13,6 +13,10 @@ Scenarios:
            "daemon restart" case. 6 models the 2026-08-26 incident, where the
            restarted daemon re-seeded its 5-6 live sessions at once; seeding
            every session the log has ever seen would overstate a real restart.
+  warm     the cursor path (seed-bench -cursor): one unmeasured priming run
+           writes the cursor, then the measured runs load it and replay only
+           the (empty) tail — the steady-state restart cost once the seed
+           cursor exists. Writes .seed-cursor-v1.json into the store dir.
 
 Always point -d at a FROZEN fixture (a copy of the store), never the live dir:
 pre/post numbers only compare on identical input. The incident fixture lives at
@@ -73,7 +77,8 @@ def main() -> int:
                         help="store directory (use a frozen fixture, not the live store)")
     parser.add_argument("-c", "--ctl", default="switchboard-ctl",
                         help="switchboard-ctl binary to bench (default: from PATH)")
-    parser.add_argument("-s", "--scenario", choices=("single", "storm", "all"),
+    parser.add_argument("-s", "--scenario",
+                        choices=("single", "storm", "warm", "all"),
                         default="all")
     parser.add_argument("-n", "--runs", type=int, default=3,
                         help="runs per scenario (default 3)")
@@ -88,8 +93,13 @@ def main() -> int:
         scenarios.append(("single", []))
     if args.scenario in ("storm", "all"):
         scenarios.append(("storm", ["-storm", "-top", str(args.storm_sessions)]))
+    if args.scenario in ("warm", "all"):
+        scenarios.append(("warm", ["-cursor", "-storm", "-top",
+                                   str(args.storm_sessions)]))
 
     for i, (mode, extra) in enumerate(scenarios):
+        if mode == "warm":
+            run_once(args.ctl, args.dir, mode, extra)  # prime the cursor
         runs = [run_once(args.ctl, args.dir, mode, extra)
                 for _ in range(args.runs)]
         if args.json:

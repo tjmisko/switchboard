@@ -24,15 +24,25 @@ import (
 // the PROCESS" — and the wall/CPU pair beside them is per-build.
 
 // ensureSeedIndexLocked builds the shared seed index on first need (caller
-// holds o.mu). A failed scan keeps whatever was folded before the failure: a
-// partial index re-emits at most what a first-ever run would, and strictly
-// less than an empty one.
+// holds o.mu): from the seed cursor plus a tail replay when the cursor
+// validates, from a full scan otherwise — SeedLoad decides, and rebuilds
+// silently by design. A failed scan keeps whatever was folded before the
+// failure: a partial index re-emits at most what a first-ever run would, and
+// strictly less than an empty one.
+//
+// The refreshed cursor is written back BEFORE any entry is handed to a
+// session (handover mutates the sets), so the persisted reduction is always
+// the scan-time truth. A failed write only costs the next start one full
+// scan, so it is logged on the telemetry line and otherwise ignored.
 func (o *Observer) ensureSeedIndexLocked() {
 	if o.seedIndex != nil {
 		return
 	}
 	start, cpu0 := time.Now(), processCPU()
-	index, stats, err := history.SeedScan(o.dir)
+	res, err := history.SeedLoad(o.dir)
+	if err == nil {
+		err = history.WriteSeedCursor(o.dir, res)
+	}
 	wall, cpu := time.Since(start), processCPU()-cpu0
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
@@ -40,11 +50,11 @@ func (o *Observer) ensureSeedIndexLocked() {
 	if err != nil {
 		errText = err.Error()
 	}
-	log.Printf("fanout-seed: source=scan sessions=%d files=%d lines=%d matched=%d mb=%d wall=%s cpu=%s heap_alloc_mb=%d heap_sys_mb=%d vm_hwm_mb=%d err=%s",
-		len(index), stats.Files, stats.Lines, stats.Matched, stats.Bytes>>20,
+	log.Printf("fanout-seed: source=%s sessions=%d files=%d lines=%d matched=%d mb=%d wall=%s cpu=%s heap_alloc_mb=%d heap_sys_mb=%d vm_hwm_mb=%d err=%s",
+		res.Source, len(res.Index), res.Stats.Files, res.Stats.Lines, res.Stats.Matched, res.Stats.Bytes>>20,
 		wall.Round(time.Millisecond), cpu.Round(time.Millisecond),
 		ms.HeapAlloc>>20, ms.HeapSys>>20, vmHWMKB()>>10, errText)
-	o.seedIndex = index
+	o.seedIndex = res.Index
 }
 
 // processCPU is this process's cumulative CPU (user+system). Process-wide for
