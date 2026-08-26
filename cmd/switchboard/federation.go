@@ -30,14 +30,15 @@ func (r *remoteDestinations) Set(value string) error {
 }
 
 type federationRuntime struct {
-	hostname  string
-	store     *state.Store
-	manager   *remotestate.Manager
-	registry  *panebind.Registry
-	view      *federation.View
-	navigator *federation.Navigator
-	announcer panebind.Announcer
-	wg        sync.WaitGroup
+	hostname   string
+	store      *state.Store
+	manager    *remotestate.Manager
+	registry   *panebind.Registry
+	view       *federation.View
+	navigator  *federation.Navigator
+	workspaces *federation.WorkspaceIndex
+	announcer  panebind.Announcer
+	wg         sync.WaitGroup
 }
 
 func newFederationRuntime(store *state.Store, manager wm.Manager, destinations []string) (*federationRuntime, error) {
@@ -49,11 +50,13 @@ func newFederationRuntime(store *state.Store, manager wm.Manager, destinations [
 	if err != nil {
 		return nil, fmt.Errorf("canonical hostname: %w", err)
 	}
+	registry := panebind.NewRegistry()
 	runtime := &federationRuntime{
-		hostname:  hostname,
-		store:     store,
-		registry:  panebind.NewRegistry(),
-		announcer: panebind.NewAnnouncer(),
+		hostname:   hostname,
+		store:      store,
+		registry:   registry,
+		workspaces: federation.NewWorkspaceIndex(registry),
+		announcer:  panebind.NewAnnouncer(),
 	}
 	remoteManager, err := remotestate.NewManager(remotestate.ManagerConfig{
 		Destinations:  destinations,
@@ -88,7 +91,16 @@ func newFederationRuntime(store *state.Store, manager wm.Manager, destinations [
 		WM:            manager,
 	}
 	runtime.view.SetRouteReady(runtime.navigator.RouteReady)
+	runtime.view.SetRouteWorkspace(runtime.workspaces.Workspace)
 	return runtime, nil
+}
+
+// ObserveWindows feeds the reconcile tick's WM client enumeration to the
+// workspace index, which is what lets a remote chip sit at the local workspace
+// showing it. Install it on the mapping resolver, whose Enumerate already
+// fetches that list once per tick.
+func (f *federationRuntime) ObserveWindows(clients []wm.Window) {
+	f.workspaces.ObserveWindows(clients)
 }
 
 func (f *federationRuntime) ConfigureServer(server *rpc.Server) {
