@@ -210,14 +210,31 @@ scrubbed copy of it), never the live store.
 
 ## 6. Success criteria / results
 
+Measured 2026-08-26 with `scripts/sb-bench-seed` (median of 3, fresh process
+per run) on the frozen incident fixture — 459MB / 859,836 events — except
+where noted. "single" = 1 session discovered; "storm" = the 6 busiest
+sessions, the restart case.
+
 | Metric | Bad state | Target | Result |
 |---|---|---|---|
-| Single-seed peak (VmHWM over baseline) | ~5GB | <50MB | _tbd_ |
-| Storm seed (all sessions) | 3.4GB in 48s, then OOM | ≈ single (shared pass) | _tbd_ |
-| Cold full rebuild wall | ~8s/pass × 2N passes | <2s total (scrubbed store) | _tbd_ |
-| Warm cursor seed | n/a (didn't exist) | <50ms | _tbd_ |
-| Daemon `MemoryPeak` over a day | 3–4GB | <400MB | _tbd_ |
-| Span accuracy | exact (by replay) | exact (conformance-tested) | _tbd_ |
+| Single-seed peak (VmHWM) | 2,145MB | <50MB | **10MB** |
+| Storm seed | 2,431MB / 47.8s, then OOM | ≈ single (shared pass) | **10MB / 0.95s — identical to single** |
+| Cold full rebuild wall | 8.7s/pass × 2 passes × N sessions | <2s total (scrubbed store) | **105ms scrubbed; 0.98s even unscrubbed** |
+| Warm cursor seed | n/a (didn't exist) | <50ms | **~1ms** |
+| Daemon `MemoryPeak` over a day | 3–4GB | <400MB | _verify after deploy (journal `fanout-seed` lines + `MemoryPeak`)_ |
+| Span accuracy | exact (by replay) | exact (conformance-tested) | **exact** — busiest session 153/153 spawned/stopped, 9/9 workflow runs, 79 sessions, identical across every phase; cursor≡scan conformance tests |
+
+Full per-phase table (fixture, medians):
+
+| | phase 1 (baseline) | phase 2 (scrub only, old algorithm) | phase 3 (streaming, unscrubbed store) | phase 4 (warm cursor) |
+|---|---|---|---|---|
+| single VmHWM / wall / CPU | 2,145MB / 8.7s / 10.2s | 191MB / 1.34s / 1.46s | 10MB / 0.98s / 0.96s | 7MB / ~1ms / ~1ms |
+| storm VmHWM / wall / CPU | 2,431MB / 47.8s / 56.1s | 246MB / 6.6s / 7.3s | 10MB / 0.95s / 0.92s | 7MB / ~1ms / ~1ms |
+| cumulative allocations (storm) | 70.1GB | 6.7GB | 5MB | ~1MB |
+
+The incident's restart #1 died at 48.0s wall / 27.1s CPU — the phase-1 storm
+scenario reproduces that wall almost exactly (47.8s), which is what ties the
+benchmark to the outage. The same restart now costs ~1ms warm, ~1s cold.
 
 ## 7. Follow-ups (out of scope here)
 

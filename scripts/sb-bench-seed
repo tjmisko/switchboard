@@ -22,9 +22,21 @@ Always point -d at a FROZEN fixture (a copy of the store), never the live dir:
 pre/post numbers only compare on identical input. The incident fixture lives at
 ~/.local/state/switchboard/bench-fixture-20260826.
 
-BASELINE — to be recorded here after the phase-1 capture on the incident
-fixture (459 MB / 859,836 events), and re-recorded after each remediation
-phase. Re-measure under comparable host load or the numbers do not compare.
+BASELINE — 2026-08-26, incident fixture (459 MB / 859,836 events), goosebook
+(8 cores, 15.2 GB, idle), medians of 3. Full tables and the capture protocol:
+docs/seed-replay-memory-plan.md §6.
+
+  phase 1 (PriorSubagentState x2 per session — the code that OOM'd):
+    single  vm_hwm 2145 MB  wall  8.7 s  cpu 10.2 s  alloc 11.7 GB
+    storm   vm_hwm 2431 MB  wall 47.8 s  cpu 56.1 s  alloc 70.1 GB
+  phase 3 (shared streaming SeedScan, same store):
+    single  vm_hwm   10 MB  wall 0.98 s  cpu 0.96 s  alloc 5 MB
+    storm   vm_hwm   10 MB  wall 0.95 s  cpu 0.92 s  alloc 5 MB
+  phase 4 (warm seed cursor, same store):
+    warm    vm_hwm    7 MB  wall  ~1 ms  cpu  ~1 ms  alloc 1 MB
+  scrubbed store (150 MB, post scrub-memory-samples): cold scan ~105 ms.
+
+Re-measure under comparable host load or the numbers do not compare.
 """
 
 import argparse
