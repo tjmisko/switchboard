@@ -25,13 +25,30 @@ import (
 // Resolver decorates sessions using injected seam backends: the terminal
 // locator (Phase 1.2) and the window manager (Phase 1.3).
 type Resolver struct {
-	term terminal.Locator
-	wm   wm.Manager
+	term    terminal.Locator
+	wm      wm.Manager
+	windows func([]wm.Window)
 }
 
 // NewResolver builds a Resolver over the given terminal locator and WM manager.
 func NewResolver(term terminal.Locator, manager wm.Manager) *Resolver {
 	return &Resolver{term: term, wm: manager}
+}
+
+// SetWindowObserver installs a callback handed each WM client enumeration this
+// resolver fetches for a tick (Enumerate), including the nil one that means the
+// query failed.
+//
+// It exists so a second consumer of the window list can read the enumeration
+// this resolver ALREADY pays for. Federation needs one: to order a remote chip
+// it must know which local workspace holds the window displaying that session,
+// and it asks on the publish path, where forking its own hyprctl would
+// reintroduce precisely the per-lookup enumeration the batched reconcile
+// removed.
+//
+// Set it once at startup, before the reconcile and WM loops begin.
+func (r *Resolver) SetWindowObserver(observe func([]wm.Window)) {
+	r.windows = observe
 }
 
 // Resolve maps the given claude process to a Session, filling in terminal and
@@ -134,6 +151,9 @@ func (r *Resolver) Enumerate(ctx context.Context) (map[string]terminal.PaneRef, 
 	clients, err := r.wm.Clients(ctx)
 	if err != nil {
 		clients = nil
+	}
+	if r.windows != nil {
+		r.windows(clients)
 	}
 	return panes, clients
 }

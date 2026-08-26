@@ -138,6 +138,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("federation: %v", err)
 	}
+	// Both resolve paths enumerate WM clients through resolver.Enumerate. Hand
+	// that list to federation instead of letting it fetch its own: it is the
+	// list that says which local workspace displays each remote session, and so
+	// where that session's chip belongs on this machine's bar. Installed before
+	// the reconcile and WM loops start.
+	resolver.SetWindowObserver(federated.ObserveWindows)
 
 	// Provider observation is process-wide and graph-authoritative. Both periodic
 	// and app-server/hook invalidations land through agentRuntime's generation

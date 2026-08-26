@@ -38,11 +38,21 @@ type View struct {
 	remote   RemoteSource
 	hostname string
 
-	mu          sync.RWMutex
-	publishMu   sync.Mutex
-	subscribers map[chan state.Snapshot]struct{}
-	remoteFocus sessionKey
-	routeReady  func(string, int, time.Time) bool
+	mu             sync.RWMutex
+	publishMu      sync.Mutex
+	subscribers    map[chan state.Snapshot]struct{}
+	remoteFocus    sessionKey
+	routeReady     func(string, int, time.Time) bool
+	routeWorkspace func(string, int, time.Time) (int, bool)
+}
+
+// chipKey identifies a row within one aggregate snapshot. (host,pid) is enough
+// there: panebind.ReplaceLive rejects a duplicate PID within a host and the
+// local store is keyed by PID, so no StartedAt is needed — which keeps a
+// time.Time, with its monotonic reading and location, out of a map key.
+type chipKey struct {
+	host string
+	pid  int
 }
 
 func NewView(local *state.Store, hostname string, remote RemoteSource) (*View, error) {
@@ -71,6 +81,16 @@ func (v *View) SetRouteReady(check func(string, int, time.Time) bool) {
 	v.mu.Unlock()
 }
 
+// SetRouteWorkspace installs the LOCAL workspace lookup that places remote rows
+// in chip order (see WorkspaceIndex). Without it — or for any row it cannot
+// resolve — remote chips keep their previous position: after every row with a
+// workspace, ordered by start time.
+func (v *View) SetRouteWorkspace(lookup func(string, int, time.Time) (int, bool)) {
+	v.mu.Lock()
+	v.routeWorkspace = lookup
+	v.mu.Unlock()
+}
+
 // Snapshot returns a freshly detached aggregate. Local sessions are stamped
 // only on this copy, preserving the frozen host-local state.json shape.
 func (v *View) Snapshot() state.Snapshot {
@@ -83,6 +103,7 @@ func (v *View) Snapshot() state.Snapshot {
 	v.mu.RLock()
 	focused := v.remoteFocus
 	routeReady := v.routeReady
+	routeWorkspace := v.routeWorkspace
 	v.mu.RUnlock()
 	remoteFocusedLive := false
 	if focused.host != "" && focused.host != v.hostname {
@@ -126,6 +147,10 @@ func (v *View) Snapshot() state.Snapshot {
 		}
 	}
 	sort.Strings(hosts)
+	// The local workspace each remote row is displayed on, resolved once here
+	// rather than inside the comparator: the lookup takes a registry lock and
+	// scans the window list, and a sort would repeat it O(n log n) times.
+	workspaces := make(map[chipKey]int)
 	for _, host := range hosts {
 		snapshot := remote[host]
 		for _, session := range snapshot.Sessions {
@@ -137,11 +162,24 @@ func (v *View) Snapshot() state.Snapshot {
 			// routing, which is rebuilt from the exact WezTerm binding.
 			session.Wezterm = nil
 			session.Hyprland = nil
+			if routeWorkspace != nil {
+				if workspace, ok := routeWorkspace(host, session.PID, session.StartedAt); ok {
+					workspaces[chipKey{host: host, pid: session.PID}] = workspace
+				}
+			}
 			session.Focused = session.Navigable && remoteFocusedLive && focused.host == host && focused.pid == session.PID &&
 				focused.startedAt.Equal(session.StartedAt)
 			out.Sessions = append(out.Sessions, session)
 		}
 	}
+	// One chip order over both origins. Local rows keep their own workspace key,
+	// so they sort exactly as the host-local snapshot did; a remote row joins
+	// them at the workspace of the local window displaying it, and one whose
+	// window is unknown falls to the end as before.
+	state.SortChipOrder(out.Sessions, func(session state.Session) (int, bool) {
+		workspace, ok := workspaces[chipKey{host: session.Hostname, pid: session.PID}]
+		return workspace, ok
+	})
 	return out
 }
 

@@ -691,13 +691,12 @@ func (s *Store) snapshotLocked() Snapshot {
 		cp.DisplayName = cloneDisplayName(sess.DisplayName)
 		sessions = append(sessions, cp)
 	}
-	// Sort into chip order (lessChipOrder), which carries a PID tie-break for
-	// determinism: equal sort keys would otherwise leave order to map iteration,
-	// making positional selectors (rpc.pickSession index, sessions[0])
-	// nondeterministic across snapshots.
-	sort.Slice(sessions, func(i, j int) bool {
-		return lessChipOrder(sessions[i], sessions[j])
-	})
+	// Sort into chip order, which carries a PID tie-break for determinism: equal
+	// sort keys would otherwise leave order to map iteration, making positional
+	// selectors (rpc.pickSession index, sessions[0]) nondeterministic across
+	// snapshots. A host-local snapshot has only its own workspaces to order by,
+	// so it passes no override.
+	SortChipOrder(sessions, nil)
 	return Snapshot{SchemaVersion: CurrentSchemaVersion, Sessions: sessions, UpdatedAt: time.Now(), Capabilities: s.caps}
 }
 
@@ -727,14 +726,35 @@ func enrichForWire(info *AgentInfo) *AgentInfo {
 	return &cp
 }
 
+// SortChipOrder sorts sessions into left-to-right bottom-bar order.
+//
+// workspace supplies a row's workspace key, overriding the session's own
+// Hyprland block whenever it reports one; returning false falls back to that
+// block, and a nil func is the host-local rule (every row keyed by its own
+// window). The federated client view injects a key because a REMOTE row's
+// Hyprland block is nil by construction — a remote desktop's workspace numbers
+// mean nothing on the machine drawing the bar — while the local WezTerm window
+// displaying that session's SSH pane does sit on a local workspace, and that is
+// where the user expects its chip.
+//
+// The sort is stable, so rows whose keys tie keep the caller's input order.
+// That is what makes the aggregate deterministic without teaching this
+// comparator about hostnames: PID and even StartedAt can repeat across hosts,
+// and the aggregate builder appends hosts in a fixed order.
+func SortChipOrder(sessions []Session, workspace func(Session) (int, bool)) {
+	sort.SliceStable(sessions, func(i, j int) bool {
+		return lessChipOrder(sessions[i], sessions[j], workspace)
+	})
+}
+
 // lessChipOrder defines the left-to-right chip order on the bottom bar:
 // sessions with a resolved workspace come first, ordered by numeric workspace
 // ID (so chips follow workspace order); within a workspace, and among
 // sessions whose workspace is not yet resolved, oldest-started wins.
 // Unresolved-workspace sessions are pushed to the end.
-func lessChipOrder(a, b Session) bool {
-	aID, aResolved := workspaceID(a)
-	bID, bResolved := workspaceID(b)
+func lessChipOrder(a, b Session, workspace func(Session) (int, bool)) bool {
+	aID, aResolved := chipWorkspace(a, workspace)
+	bID, bResolved := chipWorkspace(b, workspace)
 	if aResolved != bResolved {
 		return aResolved // resolved sessions sort before unresolved ones
 	}
@@ -745,6 +765,17 @@ func lessChipOrder(a, b Session) bool {
 		return a.StartedAt.Before(b.StartedAt)
 	}
 	return a.PID < b.PID // deterministic tie-break (Phase 0.9)
+}
+
+// chipWorkspace returns the workspace a row sorts by: the injected key when it
+// resolves one, else the session's own window.
+func chipWorkspace(s Session, workspace func(Session) (int, bool)) (int, bool) {
+	if workspace != nil {
+		if id, ok := workspace(s); ok {
+			return id, true
+		}
+	}
+	return workspaceID(s)
 }
 
 // workspaceID returns the session's Hyprland workspace ID and whether it is

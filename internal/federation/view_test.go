@@ -243,3 +243,60 @@ func TestRunReadyPublishesQuietStateThatPredatedSubscription(t *testing.T) {
 		t.Fatal("quiet pre-subscription state was never published")
 	}
 }
+
+func TestViewOrdersRemoteRowsByTheLocalWorkspaceDisplayingThem(t *testing.T) {
+	local := state.New("")
+	local.Apply(func(sessions map[int]*state.Session) {
+		near := testSession(11, time.Unix(10, 0))
+		near.Hyprland = &state.HyprlandInfo{Address: "0xaa", Workspace: "2", WorkspaceID: 2}
+		far := testSession(12, time.Unix(20, 0))
+		far.Hyprland = &state.HyprlandInfo{Address: "0xbb", Workspace: "5", WorkspaceID: 5}
+		sessions[11], sessions[12] = &near, &far
+	})
+	startedAt := time.Unix(30, 0)
+	remote := newFakeRemote()
+	// The remote row arrives stamped with ITS desktop's workspace 9, which says
+	// nothing about this machine; the SSH pane showing it lives in a local
+	// window on workspace 3.
+	displayed := testSession(70, startedAt)
+	displayed.Hyprland = &state.HyprlandInfo{Address: "0xremote", Workspace: "9", WorkspaceID: 9}
+	unbound := testSession(71, startedAt)
+	remote.replace(map[string]state.Snapshot{
+		"buildbox": {Sessions: []state.Session{displayed, unbound}},
+	})
+	view, err := NewView(local, "local", remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view.SetRouteReady(func(string, int, time.Time) bool { return true })
+	view.SetRouteWorkspace(func(host string, pid int, started time.Time) (int, bool) {
+		if host == "buildbox" && pid == 70 && started.Equal(startedAt) {
+			return 3, true
+		}
+		return 0, false
+	})
+
+	got := view.Snapshot().Sessions
+	// Workspace order across both origins; the remote row whose local window is
+	// unknown keeps its old place at the end.
+	want := []int{11, 70, 12, 71}
+	if len(got) != len(want) {
+		t.Fatalf("sessions = %+v", got)
+	}
+	for i, pid := range want {
+		if got[i].PID != pid {
+			t.Fatalf("chip order = %v, want %v", pids(got), want)
+		}
+	}
+	if got[1].Hyprland != nil {
+		t.Fatalf("remote desktop window leaked into the aggregate: %+v", got[1].Hyprland)
+	}
+}
+
+func pids(sessions []state.Session) []int {
+	out := make([]int, len(sessions))
+	for i := range sessions {
+		out[i] = sessions[i].PID
+	}
+	return out
+}

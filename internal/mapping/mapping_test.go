@@ -2,6 +2,7 @@ package mapping
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -371,4 +372,47 @@ func reconcileTitleAt(t *testing.T, got, want *state.Session, before, after, tic
 
 	want.Wezterm.TitleAt = time.Time{}
 	got.Wezterm.TitleAt = time.Time{}
+}
+
+// failingManager stands in for a WM query that fails at fetch time, which
+// Enumerate reports as a nil client list.
+type failingManager struct{ sliceManager }
+
+func (failingManager) Clients(context.Context) ([]wm.Window, error) {
+	return nil, errors.New("hyprctl unavailable")
+}
+
+// The window observer exists so a second consumer can read the enumeration a
+// tick already fetched instead of forking its own. It must therefore see
+// exactly what Enumerate returns — including the nil that means "the query
+// failed", which the observer needs in order to tell that apart from an empty
+// desktop.
+func TestSetWindowObserverSeesEachTicksEnumerationIncludingFailures(t *testing.T) {
+	clients := []wm.Window{{Address: "0xAAA", PID: 4242, Title: "switchboard [sbw:4242:1]", WorkspaceID: 3}}
+	var observed [][]wm.Window
+	resolver := NewResolver(mapLocator{panes: map[string]terminal.PaneRef{}}, sliceManager{clients: clients})
+	resolver.SetWindowObserver(func(seen []wm.Window) { observed = append(observed, seen) })
+
+	if _, got := resolver.Enumerate(context.Background()); !reflect.DeepEqual(got, clients) {
+		t.Fatalf("Enumerate clients = %+v, want %+v", got, clients)
+	}
+	if len(observed) != 1 || !reflect.DeepEqual(observed[0], clients) {
+		t.Fatalf("observed = %+v, want one call with %+v", observed, clients)
+	}
+
+	failing := NewResolver(mapLocator{panes: map[string]terminal.PaneRef{}}, failingManager{})
+	failing.SetWindowObserver(func(seen []wm.Window) { observed = append(observed, seen) })
+	failing.Enumerate(context.Background())
+	if len(observed) != 2 || observed[1] != nil {
+		t.Fatalf("observed after failed query = %+v, want a nil enumeration", observed)
+	}
+}
+
+// An unobserved resolver is the ordinary case (no federation configured).
+func TestEnumerateWithoutAWindowObserverIsUnchanged(t *testing.T) {
+	clients := []wm.Window{{Address: "0xAAA", PID: 4242, Title: "switchboard"}}
+	resolver := NewResolver(mapLocator{panes: map[string]terminal.PaneRef{}}, sliceManager{clients: clients})
+	if _, got := resolver.Enumerate(context.Background()); !reflect.DeepEqual(got, clients) {
+		t.Fatalf("Enumerate clients = %+v, want %+v", got, clients)
+	}
 }
