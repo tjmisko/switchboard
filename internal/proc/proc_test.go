@@ -126,3 +126,44 @@ func TestReadAndAllPIDs(t *testing.T) {
 		t.Errorf("State(dead pid) err = %v, want ErrGone", err)
 	}
 }
+
+// parseVmHWMKB pulls the peak-RSS figure out of the status "VmHWM:" line. The
+// realistic fixture deliberately has no such line — a status file without it is
+// the non-Linux/masked case every caller must survive, and 0 is the answer.
+func TestParseVmHWMKB(t *testing.T) {
+	tests := []struct {
+		name   string
+		status string
+		want   int64
+	}{
+		{"kb suffix", "Name:\tx\nVmHWM:\t   51200 kB\nVmRSS:\t 33000 kB\n", 51200},
+		{"no suffix", "VmHWM:\t7\n", 7},
+		{"realistic status fixture has no VmHWM", testsupport.ProcStatus(1234), 0},
+		{"empty value", "VmHWM:\t\n", 0},
+		{"non-numeric value", "VmHWM:\tlots kB\n", 0},
+		{"empty input", "", 0},
+		// VmHWM is a prefix of nothing else, but VmHWMx would be a different
+		// field; CutPrefix matches on the colon so it cannot be confused.
+		{"different field with the same stem", "VmHWMX:\t99 kB\n", 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := parseVmHWMKB(tt.status); got != tt.want {
+				t.Errorf("parseVmHWMKB = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// Observable contract against real /proc: a running Go test binary has always
+// touched some pages, so its own high-water mark is positive. This is the
+// assertion that would catch the field being renamed or the reader reading the
+// wrong pid — the parser table above cannot.
+func TestVmHWMKBReadsThisProcess(t *testing.T) {
+	if _, err := os.Stat("/proc/self/status"); err != nil {
+		t.Skip("no /proc/self/status on this kernel")
+	}
+	if kb := VmHWMKB(); kb <= 0 {
+		t.Errorf("VmHWMKB() = %d, want a positive peak RSS for a live process", kb)
+	}
+}

@@ -508,6 +508,11 @@ type Store struct {
 	// never overwrite the newer full replacement in subscriber queues.
 	broadcastMu  sync.Mutex
 	broadcastGen uint64
+	// statsMu guards the publish-stats accumulator and NOTHING else. See
+	// publishstats.go for why it is its own lock rather than a few fields under
+	// s.mu.
+	statsMu sync.Mutex
+	stats   publishCounters
 }
 
 func New(statePath string) *Store {
@@ -515,6 +520,11 @@ func New(statePath string) *Store {
 		path:        statePath,
 		sessions:    make(map[int]*Session),
 		subscribers: make(map[chan Broadcast]struct{}),
+		// The first publish-stats window opens here, not when the daemon starts
+		// the ticker, so the startup burst is counted somewhere rather than
+		// discarded. It makes the first line's window= longer than the interval,
+		// which is why that field is printed.
+		stats: publishCounters{since: time.Now()},
 	}
 }
 
@@ -606,8 +616,12 @@ func (s *Store) Apply(fn func(map[int]*Session)) {
 func (s *Store) adoptPublishedLocked(snap Snapshot) (gen uint64, changed bool) {
 	key := snapshotChangeKey(snap)
 	if key != nil && bytes.Equal(key, s.publishedKey) {
+		s.countDecision(false)
 		return s.publishedGen, false
 	}
+	// A nil key (encode failure) lands here and is counted as a publish, because
+	// that is what it causes: failing open republishes.
+	s.countDecision(true)
 	s.publishedKey = key
 	s.publishedGen++
 	return s.publishedGen, true
@@ -867,6 +881,11 @@ func (s *Store) broadcast(snap Snapshot, gen uint64) {
 	b := Broadcast{Snapshot: snap}
 	if js, err := marshalSnapshot(snap); err == nil {
 		b.JSON = js
+		// Counted here rather than at the publish decision because this is the only
+		// place a frame actually exists: the zero-subscriber return above skips the
+		// encode entirely, so those publishes have no size to average. publish-stats
+		// reports frame_bytes as the mean over frames ENCODED, not over publishes.
+		s.countFrame(len(js))
 	} else {
 		// Leave JSON nil and let the subscriber encode the snapshot itself; a bar
 		// falling back to a slower path beats a bar receiving a broken frame.

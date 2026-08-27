@@ -2,21 +2,20 @@ package fanout
 
 import (
 	"log"
-	"os"
 	"runtime"
-	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/history"
+	"github.com/tjmisko/switchboard/internal/proc"
 )
 
 // Seeding telemetry: one fanout-seed line per seed-index build, in the journal
 // the 2026-08-26 OOM forensics were reconstructed from
-// (docs/seed-replay-memory-plan.md). It is deliberately permanent, not a bench
-// artifact — a future store-shape regression should surface as a fat
-// fanout-seed line long before it surfaces as an OOM kill.
+// (docs/seed-replay-memory-plan.md; field-by-field in docs/telemetry.md beside
+// the daemon's other permanent line, publish-stats). It is deliberately
+// permanent, not a bench artifact — a future store-shape regression should
+// surface as a fat fanout-seed line long before it surfaces as an OOM kill.
 //
 // The heap figures are process-wide (ReadMemStats and VmHWM cannot be scoped to
 // one goroutine), so on a busy daemon they carry everything else in flight too.
@@ -53,7 +52,7 @@ func (o *Observer) ensureSeedIndexLocked() {
 	log.Printf("fanout-seed: source=%s sessions=%d files=%d lines=%d matched=%d mb=%d wall=%s cpu=%s heap_alloc_mb=%d heap_sys_mb=%d vm_hwm_mb=%d err=%s",
 		res.Source, len(res.Index), res.Stats.Files, res.Stats.Lines, res.Stats.Matched, res.Stats.Bytes>>20,
 		wall.Round(time.Millisecond), cpu.Round(time.Millisecond),
-		ms.HeapAlloc>>20, ms.HeapSys>>20, vmHWMKB()>>10, errText)
+		ms.HeapAlloc>>20, ms.HeapSys>>20, proc.VmHWMKB()>>10, errText)
 	o.seedIndex = res.Index
 }
 
@@ -66,24 +65,4 @@ func processCPU() time.Duration {
 		return 0
 	}
 	return time.Duration(ru.Utime.Nano() + ru.Stime.Nano())
-}
-
-// vmHWMKB is the kernel's peak-RSS figure for this process in KB, 0 when
-// unreadable (non-Linux).
-func vmHWMKB() int64 {
-	data, err := os.ReadFile("/proc/self/status")
-	if err != nil {
-		return 0
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if rest, ok := strings.CutPrefix(line, "VmHWM:"); ok {
-			fields := strings.Fields(rest)
-			if len(fields) >= 1 {
-				if kb, err := strconv.ParseInt(fields[0], 10, 64); err == nil {
-					return kb
-				}
-			}
-		}
-	}
-	return 0
 }

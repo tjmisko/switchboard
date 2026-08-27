@@ -39,6 +39,13 @@ import (
 	"github.com/tjmisko/switchboard/internal/wm"
 )
 
+// publishStatsInterval is the publish-stats reporting window. One minute is a
+// deliberate choice, not a default: it is short enough that a publish storm is
+// visible within one journal page and long enough that the ReadMemStats
+// stop-the-world it costs is unmeasurable. Not a flag — a telemetry line whose
+// window varies per deployment is one whose numbers cannot be compared.
+const publishStatsInterval = time.Minute
+
 type codexObserverMode string
 
 const (
@@ -244,6 +251,10 @@ func main() {
 	// One turn shared by both resolve producers, so an older enumeration can never
 	// land after a newer one. See resolveTurn.
 	turn := &resolveTurn{}
+	// Standing churn telemetry: one publish-stats line a minute for as long as the
+	// daemon lives (docs/telemetry.md). Started after the producers above so its
+	// first window covers them.
+	go store.LogPublishStats(ctx, publishStatsInterval)
 	go runWMLoop(ctx, store, resolver, manager, sink, procSrc, forgetRoot, turn)
 	go runReconciler(ctx, store, resolver, manager, stack, *reconcileInterval, tun, sink, nil, forgetRoot, turn)
 

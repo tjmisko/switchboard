@@ -133,6 +133,9 @@ scrubbed copy of it), never the live store.
 - This is the durable production before/after evidence — the same journal
   the RCA was built from — and a standing regression tripwire: a future
   store-shape regression shows up as a fat `fanout-seed` line, not an OOM.
+- Field-by-field reference, and what a bad value means, live in
+  `docs/telemetry.md` alongside the daemon's other permanent line
+  (`publish-stats`). Keep that table in sync with the format string.
 
 ### 3.4 Containment guards (not the fix; regression insurance)
 

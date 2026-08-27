@@ -203,3 +203,52 @@ func parseState(status string) string {
 	}
 	return ""
 }
+
+// VmHWMKB reports the kernel's peak resident-set size ("high water mark") for
+// THIS process in KB, and 0 when the figure is unreadable — a non-Linux kernel,
+// or a /proc that does not carry the field.
+//
+// It lives here, beside the other /proc/<pid>/status readers, because two
+// unrelated telemetry lines need it: fanout's per-seed `fanout-seed` line and
+// state's per-minute `publish-stats` line (docs/telemetry.md). A second copy
+// would be a second thing to keep honest, and the value is exactly the kind
+// that must not quietly diverge between two lines a reader compares.
+//
+// Peak, not current: it never decreases for the life of the process, so it
+// answers "how much has this daemon ever needed" rather than "how much does it
+// hold now". That is deliberately the harder question — an OOM kill is decided
+// by the peak — and it is why the figure is worth carrying on a line that is
+// otherwise about the current minute. Current RSS is VmRSS, which no caller has
+// asked for yet.
+func VmHWMKB() int64 { return hostProc.VmHWMKB(os.Getpid()) }
+
+func (r *Reader) VmHWMKB(pid int) int64 {
+	status, err := readSmallFile(r.pidPath(pid, "status"))
+	if err != nil {
+		return 0
+	}
+	return parseVmHWMKB(status)
+}
+
+// parseVmHWMKB extracts the KB figure from the status "VmHWM:" line, e.g.
+// "VmHWM:\t   51200 kB" → 51200. Returns 0 if the line is absent or malformed;
+// there is no sentinel for "unknown" because every caller prints the number and
+// a 0 reads correctly as "not available here".
+func parseVmHWMKB(status string) int64 {
+	for line := range strings.SplitSeq(status, "\n") {
+		rest, ok := strings.CutPrefix(line, "VmHWM:")
+		if !ok {
+			continue
+		}
+		fields := strings.Fields(rest)
+		if len(fields) == 0 {
+			return 0
+		}
+		kb, err := strconv.ParseInt(fields[0], 10, 64)
+		if err != nil || kb < 0 {
+			return 0
+		}
+		return kb
+	}
+	return 0
+}
