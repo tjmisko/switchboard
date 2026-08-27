@@ -6,15 +6,12 @@ package remotestate
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 
-	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
 )
 
@@ -28,21 +25,110 @@ const (
 )
 
 var (
-	ErrFrameTooLarge     = errors.New("remote snapshot frame too large")
-	ErrInvalidFrame      = errors.New("invalid remote snapshot frame")
-	ErrSchemaMismatch    = errors.New("remote snapshot schema mismatch")
+	ErrFrameTooLarge  = errors.New("remote snapshot frame too large")
+	ErrInvalidFrame   = errors.New("invalid remote snapshot frame")
+	ErrSchemaMismatch = errors.New("remote snapshot schema mismatch")
+	// ErrTruncatedFrame is a TRANSPORT failure wearing a parser's clothes: the
+	// stream ended part-way through a line. It is separated from ErrInvalidFrame
+	// because the two must be answered differently — a peer that speaks a
+	// protocol we cannot read is dropped at once, while a cut mid-frame is
+	// exactly the flaky link whose last observation the client should hold.
+	ErrTruncatedFrame    = errors.New("remote snapshot frame truncated")
 	ErrHostnameChanged   = errors.New("remote source changed hostname")
 	ErrDuplicateHost     = errors.New("remote hostname already claimed")
 	ErrLocalHostname     = errors.New("remote source claimed local hostname")
 	ErrManagerAlreadyRun = errors.New("remote source manager already run")
+	// ErrCloseout ends a read loop on a deliberate peer teardown. It is not a
+	// failure: it is the peer's statement that its last frame is final and the
+	// client should stop holding rows for it.
+	ErrCloseout = errors.New("remote source closed the stream")
 )
 
-// Frame is one independently meaningful, complete replacement snapshot for a
-// canonical host. Frames are encoded as one bounded JSON object per line.
+// Frame is one independently meaningful message about a canonical host,
+// encoded as one bounded JSON object per line. It carries exactly one of:
+//
+//	Snapshot — a complete replacement snapshot (the ordinary case);
+//	Closeout — the peer is deliberately ending the stream.
+//
+// Both older and newer readers stay usable across this addition. A frame with a
+// snapshot is byte-identical to the original v1 shape apart from the optional
+// keepalive advertisement, which an older reader ignores as an unknown field. A
+// closeout frame has no snapshot, so an older reader rejects it as an invalid
+// frame and tears the stream down — which is exactly what a closeout asks it to
+// do, one log category off.
 type Frame struct {
-	Host     string         `json:"host"`
-	Snapshot state.Snapshot `json:"snapshot"`
+	Host string `json:"host"`
+	// Snapshot is nil on a closeout frame and non-nil on every other frame.
+	Snapshot *state.Snapshot `json:"snapshot,omitempty"`
+	// Closeout is non-nil only on the final frame of a deliberate teardown.
+	Closeout *Closeout `json:"closeout,omitempty"`
+	// KeepaliveSeconds is the peer ADVERTISING that it re-sends its current
+	// snapshot at least this often even when nothing changes. It is what lets a
+	// client distinguish "idle host, healthy stream" from "TCP black hole"
+	// without waiting for SSH's own keepalive to give up, and it is carried on
+	// every snapshot frame so a reconnect re-establishes it with no handshake —
+	// which matters because the transport is one-way (ssh -n) and there is no
+	// back-channel to negotiate on.
+	//
+	// Zero means the peer makes no such promise (an older remote), and a client
+	// must then fall back to transport-level detection alone.
+	KeepaliveSeconds int `json:"keepalive_seconds,omitempty"`
 }
+
+// Closeout is a peer's statement that it is going away on purpose, so its last
+// snapshot is final and must not be held.
+//
+// It is emitted for a DELIBERATE teardown of the streaming process only — the
+// remote being told to stop, which is what a host shutdown and a manual stop
+// both look like. It is deliberately NOT emitted when the remote's own daemon
+// socket drops: sessions on that machine are still running, the client is still
+// meant to be observing them, and holding the last observation across the
+// reconnect is the whole point.
+//
+// The design invariant is that a closeout can only ever restore the pre-hold
+// behavior (drop now, reconnect if you can). It can never remove rows that
+// would otherwise have survived, so a peer that emits one too eagerly is no
+// worse than a peer that cannot emit one at all.
+type Closeout struct {
+	// Reason is a short, finite, machine-readable token. It reaches a log line,
+	// so it is validated to a strict character set rather than trusted: a peer
+	// must not be able to forge log records through it. An unrecognized token is
+	// still a closeout — the drop decision must not depend on the client having
+	// heard of the reason.
+	Reason string `json:"reason,omitempty"`
+}
+
+// Closeout reasons emitted by this implementation.
+const (
+	// CloseoutSignal: the streaming process was told to stop (SIGTERM/SIGINT/
+	// SIGHUP). On a host going down this is the last thing that can be said
+	// while the link is still up, and it is what makes shutdown responsive.
+	CloseoutSignal = "signal"
+)
+
+const maxCloseoutReasonBytes = 32
+
+// validateCloseoutReason keeps peer-controlled text out of logs unless it is a
+// bare lowercase token. An empty reason is allowed and means "unspecified".
+func validateCloseoutReason(reason string) error {
+	if len(reason) > maxCloseoutReasonBytes {
+		return fmt.Errorf("%w: closeout reason length", ErrInvalidFrame)
+	}
+	for i := 0; i < len(reason); i++ {
+		c := reason[i]
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' {
+			continue
+		}
+		return fmt.Errorf("%w: closeout reason character", ErrInvalidFrame)
+	}
+	return nil
+}
+
+// MaxKeepaliveSeconds bounds a peer's advertised keepalive period. A peer that
+// promised an hour would effectively disable the client's silence detection
+// while still looking like it had made a promise, so an out-of-range value is
+// a protocol error rather than a clamp.
+const MaxKeepaliveSeconds = 300
 
 // CanonicalHostname normalizes the case-insensitive hostname returned by the
 // remote OS. SSH aliases are intentionally not accepted here: the host field is
@@ -80,7 +166,7 @@ func EncodeFrame(w io.Writer, frame Frame, maxBytes int) error {
 	if err != nil || canonical != frame.Host {
 		return fmt.Errorf("%w: non-canonical hostname", ErrInvalidFrame)
 	}
-	if err := validateSnapshot(frame.Snapshot); err != nil {
+	if err := validateFrameBody(frame); err != nil {
 		return err
 	}
 	body, err := json.Marshal(frame)
@@ -106,8 +192,10 @@ func DecodeFrame(body []byte) (Frame, error) {
 		return Frame{}, fmt.Errorf("%w: empty line", ErrInvalidFrame)
 	}
 	var envelope struct {
-		Host     string          `json:"host"`
-		Snapshot json.RawMessage `json:"snapshot"`
+		Host             string          `json:"host"`
+		Snapshot         json.RawMessage `json:"snapshot"`
+		Closeout         *Closeout       `json:"closeout"`
+		KeepaliveSeconds int             `json:"keepalive_seconds"`
 	}
 	dec := json.NewDecoder(bytes.NewReader(body))
 	if err := dec.Decode(&envelope); err != nil {
@@ -121,7 +209,23 @@ func DecodeFrame(body []byte) (Frame, error) {
 	if err != nil || canonical != envelope.Host {
 		return Frame{}, fmt.Errorf("%w: non-canonical hostname", ErrInvalidFrame)
 	}
-	if len(envelope.Snapshot) == 0 || bytes.Equal(bytes.TrimSpace(envelope.Snapshot), []byte("null")) {
+	if envelope.KeepaliveSeconds < 0 || envelope.KeepaliveSeconds > MaxKeepaliveSeconds {
+		return Frame{}, fmt.Errorf("%w: keepalive out of range", ErrInvalidFrame)
+	}
+	hasSnapshot := len(envelope.Snapshot) > 0 && !bytes.Equal(bytes.TrimSpace(envelope.Snapshot), []byte("null"))
+	if envelope.Closeout != nil {
+		// A closeout is terminal, so nothing after it in this frame can matter.
+		// Rejecting a snapshot alongside it keeps "exactly one of" true on the
+		// wire and denies a peer any way to make the two disagree.
+		if hasSnapshot {
+			return Frame{}, fmt.Errorf("%w: closeout carries a snapshot", ErrInvalidFrame)
+		}
+		if err := validateCloseoutReason(envelope.Closeout.Reason); err != nil {
+			return Frame{}, err
+		}
+		return Frame{Host: canonical, Closeout: &Closeout{Reason: envelope.Closeout.Reason}}, nil
+	}
+	if !hasSnapshot {
 		return Frame{}, fmt.Errorf("%w: missing snapshot", ErrInvalidFrame)
 	}
 
@@ -140,13 +244,33 @@ func DecodeFrame(body []byte) (Frame, error) {
 	if err := json.Unmarshal(envelope.Snapshot, &snapshot); err != nil {
 		return Frame{}, fmt.Errorf("%w: snapshot", ErrInvalidFrame)
 	}
-	if err := validateSnapshot(snapshot); err != nil {
+	if err := validateSnapshot(&snapshot); err != nil {
 		return Frame{}, err
 	}
-	return Frame{Host: canonical, Snapshot: snapshot}, nil
+	return Frame{Host: canonical, Snapshot: &snapshot, KeepaliveSeconds: envelope.KeepaliveSeconds}, nil
 }
 
-func validateSnapshot(snapshot state.Snapshot) error {
+// validateFrameBody enforces the "exactly one of snapshot/closeout" rule and
+// whichever payload is present. It is shared by the encoder and by Manager's
+// injected-frame path so a frame built in memory faces the same rules as one
+// that arrived over the wire.
+func validateFrameBody(frame Frame) error {
+	if frame.KeepaliveSeconds < 0 || frame.KeepaliveSeconds > MaxKeepaliveSeconds {
+		return fmt.Errorf("%w: keepalive out of range", ErrInvalidFrame)
+	}
+	if frame.Closeout != nil {
+		if frame.Snapshot != nil {
+			return fmt.Errorf("%w: closeout carries a snapshot", ErrInvalidFrame)
+		}
+		return validateCloseoutReason(frame.Closeout.Reason)
+	}
+	return validateSnapshot(frame.Snapshot)
+}
+
+func validateSnapshot(snapshot *state.Snapshot) error {
+	if snapshot == nil {
+		return fmt.Errorf("%w: missing snapshot", ErrInvalidFrame)
+	}
 	if snapshot.SchemaVersion != state.CurrentSchemaVersion {
 		return fmt.Errorf("%w: got %d, want %d", ErrSchemaMismatch, snapshot.SchemaVersion, state.CurrentSchemaVersion)
 	}
@@ -183,6 +307,13 @@ type FrameReader func(io.Reader, int, func(Frame) error) error
 // ReadFrames reads bounded JSONL objects until EOF or until validation or the
 // callback rejects a frame. It never allocates beyond the configured line
 // ceiling for peer-controlled input.
+//
+// Only COMPLETE lines are decoded. A non-empty tail with no terminating newline
+// means the stream was cut part-way through a frame, and reporting that as a
+// malformed frame would libel the peer: EncodeFrame marshals whole and always
+// terminates, so an unterminated tail is the transport's doing, never the
+// encoder's. The distinction is load-bearing downstream — a malformed frame
+// drops the host at once, a cut link holds its last observation.
 func ReadFrames(r io.Reader, maxBytes int, accept func(Frame) error) error {
 	limit, err := frameLimit(maxBytes)
 	if err != nil {
@@ -194,10 +325,15 @@ func ReadFrames(r io.Reader, maxBytes int, accept func(Frame) error) error {
 		if errors.Is(readErr, bufio.ErrBufferFull) || len(line) > limit+1 {
 			return ErrFrameTooLarge
 		}
-		if len(line) > 0 {
-			if line[len(line)-1] == '\n' {
-				line = line[:len(line)-1]
-			}
+		complete := len(line) > 0 && line[len(line)-1] == '\n'
+		if !complete && len(bytes.TrimSpace(line)) > 0 {
+			// Report the truncation, not whatever the partial JSON happens to
+			// parse as. Any read outcome is subordinate to it: the frame this
+			// prefix belonged to is lost either way.
+			return ErrTruncatedFrame
+		}
+		if complete {
+			line = line[:len(line)-1]
 			if len(line) > limit {
 				return ErrFrameTooLarge
 			}
@@ -216,76 +352,6 @@ func ReadFrames(r io.Reader, maxBytes int, accept func(Frame) error) error {
 			return io.EOF
 		default:
 			return readErr
-		}
-	}
-}
-
-// SubscriptionClient is the narrow local RPC surface needed by StreamLocal.
-// rpc.Client satisfies it; tests can provide a finite in-memory subscription.
-type SubscriptionClient interface {
-	Send(rpc.Request) error
-	Recv(*rpc.Response) error
-}
-
-// StreamOptions configures StreamLocal. OnAttach is called once before the
-// subscription request and is the only binding re-announcement hook. This
-// package intentionally supplies no binding implementation; switchboard-ctl
-// uses the hook to complete the daemon's announce-bindings RPC on the same
-// connection before subscribe takes over that connection.
-type StreamOptions struct {
-	Hostname      func() (string, error)
-	OnAttach      func(context.Context) error
-	MaxFrameBytes int
-}
-
-// StreamLocal subscribes to the daemon on the same machine as the caller and
-// emits read-only complete snapshots. It never accepts an SSH destination and
-// never forwards an RPC command channel; callers are responsible for dialing
-// their normal local daemon socket before entering this function.
-func StreamLocal(ctx context.Context, client SubscriptionClient, out io.Writer, options StreamOptions) error {
-	hostname := options.Hostname
-	if hostname == nil {
-		hostname = os.Hostname
-	}
-	rawHost, err := hostname()
-	if err != nil {
-		return fmt.Errorf("read local hostname: %w", err)
-	}
-	host, err := CanonicalHostname(rawHost)
-	if err != nil {
-		return fmt.Errorf("canonicalize local hostname: %w", err)
-	}
-	if _, err := frameLimit(options.MaxFrameBytes); err != nil {
-		return err
-	}
-	if options.OnAttach != nil {
-		if err := options.OnAttach(ctx); err != nil {
-			return fmt.Errorf("announce local bindings: %w", err)
-		}
-	}
-	if err := client.Send(rpc.Request{Cmd: "subscribe"}); err != nil {
-		return fmt.Errorf("subscribe local daemon: %w", err)
-	}
-
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		var response rpc.Response
-		if err := client.Recv(&response); err != nil {
-			return fmt.Errorf("receive local snapshot: %w", err)
-		}
-		if response.Error != "" {
-			return errors.New("local daemon rejected subscription")
-		}
-		if response.Snapshot == nil {
-			return errors.New("local daemon sent no snapshot")
-		}
-		if err := validateSnapshot(*response.Snapshot); err != nil {
-			return fmt.Errorf("local daemon snapshot: %w", err)
-		}
-		if err := EncodeFrame(out, Frame{Host: host, Snapshot: *response.Snapshot}, options.MaxFrameBytes); err != nil {
-			return fmt.Errorf("write remote stream: %w", err)
 		}
 	}
 }

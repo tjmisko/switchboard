@@ -17,7 +17,7 @@ import (
 
 var testNow = time.Date(2026, 8, 24, 20, 0, 0, 0, time.UTC)
 
-func testSnapshot(pid int) state.Snapshot {
+func testSnapshot(pid int) *state.Snapshot {
 	snapshot := state.Snapshot{
 		SchemaVersion: state.CurrentSchemaVersion,
 		Sessions:      []state.Session{},
@@ -31,10 +31,10 @@ func testSnapshot(pid int) state.Snapshot {
 			StartedAt: testNow.Add(-time.Minute),
 		})
 	}
-	return snapshot
+	return &snapshot
 }
 
-func encodedFrame(t *testing.T, host string, snapshot state.Snapshot) []byte {
+func encodedFrame(t *testing.T, host string, snapshot *state.Snapshot) []byte {
 	t.Helper()
 	var output bytes.Buffer
 	if err := EncodeFrame(&output, Frame{Host: host, Snapshot: snapshot}, 0); err != nil {
@@ -176,12 +176,13 @@ func TestStreamLocalAnnouncesBeforeSubscribingAndEmitsCanonicalFrames(t *testing
 	second := testSnapshot(2)
 	client := &fakeSubscriptionClient{responses: []rpc.Response{
 		{OK: true},
-		{Snapshot: &first},
-		{Snapshot: &second},
+		{Snapshot: first},
+		{Snapshot: second},
 	}}
 	var output bytes.Buffer
 	options := StreamOptions{
-		Hostname: func() (string, error) { return "BuildBox.", nil },
+		Hostname:  func() (string, error) { return "BuildBox.", nil },
+		Keepalive: -1,
 		OnAttach: func(context.Context) error {
 			if err := client.Send(rpc.Request{Cmd: "announce-bindings"}); err != nil {
 				return err

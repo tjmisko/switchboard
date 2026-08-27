@@ -1,7 +1,14 @@
 // Package federation builds the read-only, live view shown by local clients.
 // The host-local state.Store remains the only owner of local discovery and
-// persistence; remote snapshots are detached copies and disappear as soon as
-// their transport disappears.
+// persistence; remote snapshots are detached copies owned by remotestate.
+//
+// A remote row does not vanish the instant its transport does. remotestate
+// holds a host's last observation across a silent disconnect and marks the rows
+// Stale once it has lasted long enough to matter (docs/remote-hysteresis.md);
+// this package passes that verdict through untouched. What it must NOT do is
+// treat a held row as unnavigable — the local pane a remote chip focuses has
+// not moved — so route readiness stays the registry's answer, exactly as it is
+// for a connected host.
 package federation
 
 import (
@@ -19,6 +26,11 @@ import (
 // Subscribe values are wakeups, not ordered revisions: consumers re-read the
 // current full Snapshot on every receive. Dropped intermediate wakeups can
 // delay a view but cannot make it apply a partial or out-of-order delta.
+//
+// Presence of a hostname in Snapshot means the source is still willing to speak
+// for it, not that its stream is up; a held host is present with Stale rows.
+// The two travel together in one map on purpose, so a consumer cannot read
+// rows from one instant and liveness from another.
 type RemoteSource interface {
 	Snapshot() map[string]state.Snapshot
 	Subscribe() (<-chan map[string]state.Snapshot, func())

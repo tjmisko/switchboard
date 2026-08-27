@@ -45,8 +45,8 @@ func TestNewSSHCommandUsesFixedArgumentVector(t *testing.T) {
 		"ssh", "-n", "-T",
 		"-o", "BatchMode=yes",
 		"-o", "ConnectTimeout=10",
-		"-o", "ServerAliveInterval=15",
-		"-o", "ServerAliveCountMax=2",
+		"-o", "ServerAliveInterval=5",
+		"-o", "ServerAliveCountMax=3",
 		"-o", "StrictHostKeyChecking=yes",
 		"-o", "ClearAllForwardings=yes",
 		"build", "switchboard-ctl", "remote-stream",
@@ -173,8 +173,8 @@ func TestManagerHostnameClaimIsStickyAcrossDisconnect(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-updates // initial live replacement
-	if _, removed := manager.removeLive("primary"); !removed {
-		t.Fatal("primary snapshot was not removed")
+	if outcome := manager.endContact("primary", lossTransport); outcome.Held {
+		t.Fatal("primary snapshot was held by a manager configured with no hold")
 	}
 	if !reflect.DeepEqual(removedHosts, []string{"buildbox"}) {
 		t.Fatalf("removed host callbacks = %v, want [buildbox]", removedHosts)
@@ -249,7 +249,7 @@ func TestManagerTombstonePreventsAnotherSourceRepublishingRemovingHost(t *testin
 
 	removeDone := make(chan struct{})
 	go func() {
-		manager.removeLive("source-a")
+		manager.endContact("source-a", lossTransport)
 		close(removeDone)
 	}()
 	<-removalStarted
@@ -511,7 +511,7 @@ func TestManagerSaturatedSubscriberStillReceivesNewestDisconnect(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, removed := manager.removeLive("build"); !removed {
+	if outcome := manager.endContact("build", lossTransport); outcome.Held {
 		t.Fatal("expected final disconnect to remove live host")
 	}
 	var last map[string]state.Snapshot
