@@ -173,6 +173,22 @@ func FullForDir(cfg Config, dir string) string {
 	return r.Canonical
 }
 
+// FullForBase is the lexical counterpart of FullForDir, for a session whose
+// directory lives on another machine. It runs the same Full -> title-cased
+// basename -> Canonical fallback chain against a bare basename, touching no
+// filesystem: a remote CWD names a directory on the remote host, so resolving it
+// here would at best miss and at worst match a same-named repo of this user's.
+func FullForBase(cfg Config, base string) string {
+	r := cfg.RuleForBase(base)
+	if r.Full != "" {
+		return r.Full
+	}
+	if t := titleize(base); t != "" {
+		return t
+	}
+	return r.Canonical
+}
+
 // FullForAbbrev is the reverse lookup the timeline uses: it has only the stored
 // abbreviation (the Canonical) and wants the pretty display name. It returns the
 // Full of the first rule whose Canonical matches abbrev, falling back to abbrev

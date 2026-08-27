@@ -72,13 +72,38 @@ switchboard · 3 sessions · navigate · wm=hyprland term=wezterm
 
 Only the root lines are navigation targets. Child agents do not own independent
 terminal targets or Switchboard sessions; they appear as indented, non-focusable
-rows in the TUI and as bounded detail in Waybar tooltips.
+rows in the TUI, and as a one-line roll-up in the Waybar hover.
 
 Prefer your own UI? Read `~/.cache/switchboard/state.json` directly — see the
 [schema](docs/state-schema.md) and [bar integrations](docs/bars/README.md) for
-Polybar / Waybar / eww / i3blocks. Every Waybar chip's tooltip also shows how long the session
-has held its current status (`idle · 3m`, `permission · 45s`), from the
-additive `status_since` field.
+Polybar / Waybar / eww / i3blocks.
+
+Every Waybar chip has a hover card:
+
+```
+goosebook   ● working · 53m
+ARACHNE
+react-canvas-refactor
+up 2h20m · started 14:49 · ws 4
+~/Projects/Arachne · pid 20805
+33 agents · 3 live · 2h24m done
+```
+
+The host leads, because the chip label already carries the project and a remote
+session is only a nested outline away from a local one. Below it: the project's
+full display name in small caps (the chip shows the terse abbreviation), the
+task, then how long the session has run and when it started, where it lives, and
+what its subagents have been doing. Status age comes from the additive
+`status_since` field.
+
+**Nothing on the card may tick faster than once a minute.** The tooltip travels
+inside the module's JSON, so rewriting it makes Waybar re-render the module,
+which dismisses an open hover — a per-second counter makes the card impossible
+to read. Durations therefore use `durfmt.Coarse` (`<1m` below a minute), and the
+subagent roll-up counts cumulative time for *finished* agents only, since live
+ones would advance the sum a minute per minute each. Measured on the live bar:
+the old per-agent tree emitted 1.17 lines/s, of which 93% were tooltip-only
+churn; the card emits 0.07/s.
 
 ## Activity history & timeline (opt-in)
 

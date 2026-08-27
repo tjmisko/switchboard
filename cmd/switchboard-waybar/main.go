@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/barlayout"
@@ -39,8 +40,6 @@ type waybarOutput struct {
 	Class   []string `json:"class"`
 	Alt     string   `json:"alt,omitempty"`
 }
-
-const maxTooltipAgentRows = 6
 
 func main() {
 	socketPath := flag.String("socket", defaultSocketPath(), "daemon socket")
@@ -284,31 +283,42 @@ func sessionStatus(s state.Session) string {
 	return "unknown"
 }
 
-// sessionTooltip renders the Compact-stacked hover with pango markup:
+// sessionTooltip renders the hover card with pango markup:
 //
-//	<b>arachne</b>   ● working
-//	assess-npm-vulnerabilities
-//	~/Projects/Arachne · ws 4 · pid 292511
+//	goosebook   ● working · 37m
+//	Cyclops                              (small caps)
+//	s1-hardening-status-update
+//	up 4h12m · started 12:44 · ws 5
+//	~/Projects/cyclops · pid 23137
+//	12 agents · 5 live · 9h40m done
 //
-// Line 1 is the project abbreviation + a status-colored dot; line 2 is the bare
-// task name (the project prefix stripped, since the abbrev already shows it);
-// line 3 is dimmed metadata.
+// Line 1 names the HOST, not the project abbreviation the old card led with:
+// the chip label already carries the project, and with remote sessions now
+// drawn as a nested pill, "which machine" is the question the card exists to
+// answer. Line 2 is the project's full display name in small caps — the chip
+// shows the terse Canonical ("sb"), so the hover is where "Switchboard" belongs.
+// Line 3 is the bare task, and the dimmed block below is timing, location, and
+// the subagent roll-up.
+//
+// EVERY field here is either event-driven or coarsened to minute resolution, and
+// that is a hard constraint rather than a style choice. The tooltip travels in
+// the module's JSON, so rewriting it makes waybar re-render the module and
+// dismiss any open hover; a field that ticks per second makes the card
+// unhoverable. See durfmt.Coarse for the measurement that motivated it.
 func sessionTooltip(cfg projectname.Config, cache *sblabel.NameCache, s state.Session, now time.Time) string {
-	var abbrev, task string
+	var full, task string
 	if s.Remote {
 		base := strings.TrimSpace(s.CWD)
 		if base != "" {
 			base = filepath.Base(filepath.Clean(base))
 		}
-		rule := cfg.RuleForBase(base)
-		abbrev = rule.Canonical
-		task = rule.StripKnownPrefix(cache.RawName(s))
+		full = projectname.FullForBase(cfg, base)
+		task = cfg.RuleForBase(base).StripKnownPrefix(cache.RawName(s))
 	} else {
-		abbrev = projectname.CanonicalForDir(cfg, s.CWD)
+		full = projectname.FullForDir(cfg, s.CWD)
 		task = projectname.TaskForDir(cfg, s.CWD, cache.RawName(s))
 	}
 	status := sessionStatus(s)
-	hasAgentTree := len(barlayout.AgentRows(s.AgentGraph)) > 0
 
 	statusText := status
 	// A delegating chip is green but idle on the main thread; spell out why so the
@@ -316,10 +326,15 @@ func sessionTooltip(cfg projectname.Config, cache *sblabel.NameCache, s state.Se
 	// workflow run is the richer answer to the same question — name the workflow
 	// and its progress ("workflow simplification-audit · 7/17 agents") instead of
 	// the bare count, mirroring the CLI's own "N/M agents done" line.
-	if !hasAgentTree && status == state.StatusDelegating {
+	//
+	// The workflow name survives even when the graph roll-up is present: the
+	// roll-up counts agents, it does not say what they are collectively doing.
+	// The bare in-flight count does NOT survive, because that is precisely what
+	// the roll-up already says, and better.
+	if status == state.StatusDelegating {
 		if wf := workflowAnnotation(s); wf != "" {
 			statusText = wf
-		} else if n := subagentCount(s); n > 0 {
+		} else if n := subagentCount(s); n > 0 && agentFanout(s.AgentGraph) == "" {
 			statusText = fmt.Sprintf("delegating · %d agent%s", n, plural(n))
 		}
 	}
@@ -329,21 +344,18 @@ func sessionTooltip(cfg projectname.Config, cache *sblabel.NameCache, s state.Se
 	//
 	//	permission · escalate-cleanup · 45s
 	//
-	// Same shape as the delegating annotation above (detail after the status, clock
-	// last). Deliberately NOT on the chip TEXT: chip labels are fitted against the
-	// bar's width budget as a set (barlayout.Fit), so a label that grew when a
-	// prompt appeared and shrank when it cleared would re-abbreviate every OTHER
-	// chip on the row twice per prompt — and would break the stable chip identity
-	// the user navigates by.
-	if !hasAgentTree {
-		if w := cache.BlockedWriters(s); w != "" {
-			statusText += " · " + w
-		}
+	// Deliberately NOT on the chip TEXT: chip labels are fitted against the bar's
+	// width budget as a set (barlayout.Fit), so a label that grew when a prompt
+	// appeared and shrank when it cleared would re-abbreviate every OTHER chip on
+	// the row twice per prompt — and would break the stable chip identity the user
+	// navigates by.
+	if w := cache.BlockedWriters(s); w != "" {
+		statusText += " · " + w
 	}
-	// How long the session has held this status: "idle · 3m", "permission · 45s".
-	// Skipped while suspended — the status (and its clock) is stale until resume.
+	// How long the session has held this status. Skipped while suspended — the
+	// status (and its clock) is stale until resume.
 	if !s.Suspended {
-		if d := durfmt.Since(statusSince(s), now); d != "" {
+		if d := durfmt.CoarseSince(statusSince(s), now); d != "" {
 			statusText += " · " + d
 		}
 	}
@@ -358,71 +370,145 @@ func sessionTooltip(cfg projectname.Config, cache *sblabel.NameCache, s state.Se
 		statusText += " · observe only (navigation unavailable)"
 	}
 
+	dot := fmt.Sprintf("<span foreground='%s'>●</span>", statusColor(status))
+	lines := []string{
+		fmt.Sprintf("<b>%s</b>   %s %s", pangoEscape(sessionHost(s)), dot, pangoEscape(statusText)),
+	}
+	if full != "" {
+		lines = append(lines, fmt.Sprintf("<span variant='smallcaps'>%s</span>", pangoEscape(full)))
+	}
+	if task != "" {
+		lines = append(lines, pangoEscape(task))
+	}
+	for _, meta := range []string{lifeLine(s, now), placeLine(s), agentFanout(s.AgentGraph)} {
+		if meta == "" {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf(
+			"<span foreground='#6c7086' size='smaller'>%s</span>", pangoEscape(meta)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// localHostname is this machine's name, resolved once for the process.
+//
+// The card names a host for EVERY session, local ones included. A blank line for
+// local sessions would make the most prominent field on the card conditional,
+// and "which machine" is exactly what a federated bar has to answer at a glance.
+var localHostname = sync.OnceValue(func() string {
+	if h, err := os.Hostname(); err == nil && h != "" {
+		return h
+	}
+	return "local"
+})
+
+// sessionHost names the machine a session runs on: the federated Hostname when
+// the daemon attached one, otherwise this host.
+func sessionHost(s state.Session) string {
+	if s.Hostname != "" {
+		return s.Hostname
+	}
+	return localHostname()
+}
+
+// lifeLine renders "up 4h12m · started 12:44 · ws 5" — how long the session has
+// existed, when it began on the wall clock, and which workspace to switch to.
+//
+// Uptime and start time answer different questions and neither substitutes for
+// the other: uptime is the one you compare across chips, the clock time is the
+// one you match against your own memory of the day. The workspace rides along
+// because it is what you act on after reading the card.
+func lifeLine(s state.Session, now time.Time) string {
+	var parts []string
+	if !s.StartedAt.IsZero() {
+		parts = append(parts,
+			"up "+durfmt.Coarse(now.Sub(s.StartedAt)),
+			"started "+startedClock(s.StartedAt, now))
+	}
 	ws := "-"
 	if s.Hyprland != nil && s.Hyprland.Workspace != "" {
 		ws = s.Hyprland.Workspace
 	}
-	dot := fmt.Sprintf("<span foreground='%s'>●</span>", statusColor(status))
-	process := fmt.Sprintf("pid %d", s.PID)
-	if s.Hostname != "" {
-		process = fmt.Sprintf("%s/%d", s.Hostname, s.PID)
-	}
-	displayCWD := s.CWD
-	if !s.Remote {
-		displayCWD = contractHome(displayCWD)
-	}
-	meta := fmt.Sprintf("%s · ws %s · %s", displayCWD, ws, process)
-	tip := fmt.Sprintf(
-		"<b>%s</b>   %s %s\n%s\n<span foreground='#6c7086' size='smaller'>%s</span>",
-		pangoEscape(abbrev), dot, pangoEscape(statusText),
-		pangoEscape(task),
-		pangoEscape(meta),
-	)
-	if tree := agentTooltip(s, now); tree != "" {
-		tip += "\n" + tree
-	}
-	return tip
+	return strings.Join(append(parts, "ws "+ws), " · ")
 }
 
-// agentTooltip renders a compact, bounded detail tree. It may prioritize rows
-// for scanability, but it never re-reduces them: the chip class remains the
-// daemon-projected session summary from sessionStatus.
-func agentTooltip(s state.Session, now time.Time) string {
-	rows := barlayout.PrioritizeAgentRows(barlayout.AgentRows(s.AgentGraph))
-	rows, folded := barlayout.LimitAgentRows(rows, maxTooltipAgentRows)
-	if len(rows) == 0 && folded == 0 {
+// startedClock renders the wall-clock time a session began, in the VIEWER's zone
+// so the times are comparable down the row even when a federated host keeps a
+// different one. The date rides along only when the session did not start today,
+// since a bare "started 12:44" on a three-day-old session reads as this
+// afternoon.
+func startedClock(t, now time.Time) string {
+	t, now = t.Local(), now.Local()
+	if t.Year() == now.Year() && t.YearDay() == now.YearDay() {
+		return t.Format("15:04")
+	}
+	return t.Format("Jan 2 15:04")
+}
+
+// placeLine renders "~/Projects/cyclops · pid 23137". The host is deliberately
+// not repeated here — it leads the card.
+func placeLine(s state.Session) string {
+	cwd := s.CWD
+	if !s.Remote {
+		cwd = contractHome(cwd)
+	}
+	if cwd == "" {
+		return fmt.Sprintf("pid %d", s.PID)
+	}
+	return fmt.Sprintf("%s · pid %d", cwd, s.PID)
+}
+
+// agentFanout rolls the subagent graph up into one line:
+//
+//	12 agents · 5 live · 2 waiting · 9h40m done
+//
+// It replaces the per-agent tree the card used to draw. The tree cost six lines
+// and a "+6 more" elision to say less than this does, and every row carried its
+// own live age — which is what made the hover flicker (see durfmt.Coarse).
+//
+// The cumulative duration counts only agents that have FINISHED, which is what
+// keeps this line event-driven. Including live agents would make the sum advance
+// one minute per minute per live agent, so a twelve-agent fan-out would rewrite
+// the tooltip every five seconds and reintroduce exactly the flicker the
+// redesign removes. "done" names that restriction rather than hiding it.
+//
+// Counts come from the daemon's reduced Summary; only the duration is computed
+// here, as one pass over nodes already in memory.
+func agentFanout(g *state.AgentGraph) string {
+	if g == nil {
 		return ""
 	}
-	stale := s.Suspended || !s.AgentGraph.Fresh(now)
-	lines := []string{"<span foreground='#6c7086' size='smaller'>agents</span>"}
-	for _, row := range rows {
-		stateText := barlayout.AgentStateText(row.Node)
-		if stateText == "user input" {
-			stateText = "question"
+	var fanned int
+	var done time.Duration
+	for _, n := range g.Nodes {
+		if n.ID == g.RootID {
+			continue // the root is the session itself, not a fan-out
 		}
-		if stale {
-			if s.Suspended {
-				stateText += " · stale (root suspended)"
-			} else {
-				stateText += " · stale"
-			}
-		} else if at := barlayout.AgentStateAt(row.Node); !at.IsZero() {
-			stateText += " · " + durfmt.Compact(now.Sub(at))
+		fanned++
+		if !n.Lifecycle.Terminal() || n.StartedAt.IsZero() || n.CompletedAt.IsZero() {
+			continue
 		}
-		if usage := barlayout.AgentUsageText(row.Node); usage != "" {
-			stateText += " · " + usage
+		if d := n.CompletedAt.Sub(n.StartedAt); d > 0 {
+			done += d
 		}
-		prefix := strings.Repeat("  ", row.Depth) + "↳ "
-		if row.Depth > 6 {
-			prefix = "  " + strings.Repeat("  ", 5) + "… "
-		}
-		lines = append(lines, fmt.Sprintf("%s%s — %s",
-			prefix, pangoEscape(barlayout.AgentName(row.Node)), pangoEscape(stateText)))
 	}
-	if folded > 0 {
-		lines = append(lines, fmt.Sprintf("  +%d more", folded))
+	if fanned == 0 {
+		return ""
 	}
-	return strings.Join(lines, "\n")
+	parts := []string{fmt.Sprintf("%d agent%s", fanned, plural(fanned))}
+	if n := g.Summary.LiveChildren; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d live", n))
+	}
+	if n := g.Summary.WaitingNodes; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d waiting", n))
+	}
+	if n := g.Summary.ErrorNodes; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d error%s", n, plural(n)))
+	}
+	if done > 0 {
+		parts = append(parts, durfmt.Coarse(done)+" done")
+	}
+	return strings.Join(parts, " · ")
 }
 
 // statusColor maps a session status to the pango hex color of its tooltip dot,

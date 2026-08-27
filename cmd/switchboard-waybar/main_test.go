@@ -159,6 +159,12 @@ func TestRenderSlotFitIgnoresWhetherSessionsAreRemote(t *testing.T) {
 	}
 }
 
+// pangoPlain reverses pangoEscape so hover assertions read as the card renders,
+// not as the markup that carries it.
+func pangoPlain(s string) string {
+	return strings.NewReplacer("&lt;", "<", "&gt;", ">", "&amp;", "&").Replace(s)
+}
+
 func TestRemoteTooltipDoesNotResolveCWDOnLocalFilesystem(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", root)
@@ -174,32 +180,45 @@ func TestRemoteTooltipDoesNotResolveCWDOnLocalFilesystem(t *testing.T) {
 		Agent: state.AgentKindClaude, Claude: &state.AgentInfo{Status: state.StatusIdle},
 	}
 	tip := sessionTooltip(projectname.DefaultConfig(), &sblabel.NameCache{}, s, time.Now())
-	if !strings.Contains(tip, "<b>sb</b>") || !strings.Contains(tip, "buildbox/4") {
+	// The full display name resolves from the basename alone; the host leads.
+	if !strings.Contains(tip, "<b>buildbox</b>") || !strings.Contains(tip, "Switchboard") {
 		t.Fatalf("remote tooltip did not use lexical remote project/identity:\n%s", tip)
+	}
+	if !strings.Contains(tip, "pid 4") {
+		t.Fatalf("remote tooltip lost the process identity:\n%s", tip)
 	}
 	if !strings.Contains(tip, remoteDir) || strings.Contains(tip, "~/nested") {
 		t.Fatalf("remote tooltip contracted source-host cwd as local HOME:\n%s", tip)
 	}
 }
 
-func TestAgentTooltipPrioritizesWaitsAndFoldsWithoutAddingSlots(t *testing.T) {
+func TestAgentFanoutRollsUpGraphWithoutAddingSlots(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
 	nodes := []state.AgentNode{{ID: "root"}}
-	for i := 0; i < maxTooltipAgentRows+2; i++ {
+	for i := range 8 {
 		nodes = append(nodes, state.AgentNode{
 			ID: fmt.Sprintf("child-%d", i), ParentID: "root", Nickname: fmt.Sprintf("child-%d", i),
 			Runtime: agentgraph.RuntimeIdle, Lifecycle: agentgraph.LifecycleRunning, UpdatedAt: now.Add(-time.Minute),
 		})
 	}
-	nodes = append(nodes, state.AgentNode{
-		ID: "question", ParentID: "root", Nickname: "needs-input",
-		Attention: agentgraph.AttentionUserInput, Lifecycle: agentgraph.LifecycleRunning, UpdatedAt: now.Add(-30 * time.Second),
-	})
+	// Two that finished, contributing 30m and 1h to the cumulative total.
+	nodes = append(nodes,
+		state.AgentNode{
+			ID: "done-a", ParentID: "root", Nickname: "done-a", Lifecycle: agentgraph.LifecycleCompleted,
+			StartedAt: now.Add(-2 * time.Hour), CompletedAt: now.Add(-90 * time.Minute),
+		},
+		state.AgentNode{
+			ID: "done-b", ParentID: "root", Nickname: "done-b", Lifecycle: agentgraph.LifecycleCompleted,
+			StartedAt: now.Add(-3 * time.Hour), CompletedAt: now.Add(-2 * time.Hour),
+		})
 	graph := &state.AgentGraph{
 		RootID: "root", ObservedAt: now.Add(-time.Second), FreshUntil: now.Add(time.Minute), Complete: true,
-		Summary: state.AgentGraphSummary{Status: state.StatusPermission}, Nodes: nodes,
+		Summary: state.AgentGraphSummary{
+			Status: state.StatusPermission, LiveChildren: 8, WaitingNodes: 2, ErrorNodes: 1,
+		},
+		Nodes: nodes,
 	}
 	snap := state.Snapshot{Sessions: []state.Session{{
 		PID: 1, CWD: "/home/u/proj", Agent: state.AgentKindCodex, AgentGraph: graph,
@@ -208,45 +227,85 @@ func TestAgentTooltipPrioritizesWaitsAndFoldsWithoutAddingSlots(t *testing.T) {
 	if !slices.Contains(out.Class, state.StatusPermission) {
 		t.Fatalf("root class did not use projected summary: %v", out.Class)
 	}
-	tip := agentTooltip(snap.Sessions[0], now)
-	if !strings.Contains(tip, "needs-input — question · 30s") {
-		t.Fatalf("tooltip did not distinguish/prioritize user input:\n%s", tip)
-	}
-	if strings.Index(tip, "needs-input") > strings.Index(tip, "child-0") {
-		t.Fatalf("attention row should precede idle rows:\n%s", tip)
-	}
-	if !strings.Contains(tip, "+3 more") {
-		t.Fatalf("tooltip missing folded count:\n%s", tip)
-	}
-	if got, max := strings.Count(tip, "\n")+1, 1+maxTooltipAgentRows+1; got > max {
-		t.Fatalf("agent tooltip has %d lines, want <= %d:\n%s", got, max, tip)
+	// 10 fan-outs (root excluded), and only the two finished ones counted.
+	if got, want := agentFanout(graph), "10 agents · 8 live · 2 waiting · 1 error · 1h30m done"; got != want {
+		t.Fatalf("agentFanout = %q, want %q", got, want)
 	}
 	if extra := renderSlot(snap, 1, testAvail, testMetrics, &nameConfig{}, &sblabel.NameCache{}); !slices.Contains(extra.Class, "empty") {
 		t.Fatalf("children must not create slots: %#v", extra)
 	}
 }
 
-func TestAgentTooltipDistinguishesApprovalErrorStaleAndUsage(t *testing.T) {
+// The cumulative figure counts finished agents only. Live agents would each add
+// a minute per minute, so a large fan-out would rewrite the tooltip every few
+// seconds and bring back the hover flicker the card was redesigned to remove.
+func TestAgentFanoutExcludesRunningAgentsFromCumulativeTime(t *testing.T) {
 	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
 	graph := &state.AgentGraph{
-		RootID: "root", ObservedAt: now.Add(-time.Minute), FreshUntil: now,
+		RootID:  "root",
+		Summary: state.AgentGraphSummary{LiveChildren: 1},
 		Nodes: []state.AgentNode{
 			{ID: "root"},
-			{ID: "approve", ParentID: "root", Role: "reviewer", Attention: agentgraph.AttentionApproval, Lifecycle: agentgraph.LifecycleRunning, Usage: state.AgentUsage{TotalTokens: 42}},
-			{ID: "error", ParentID: "root", Nickname: "broken", Runtime: agentgraph.RuntimeSystemError, Lifecycle: agentgraph.LifecycleRunning},
-			{ID: "unknown", ParentID: "root", Nickname: "mystery", Runtime: agentgraph.RuntimeUnknown, Lifecycle: agentgraph.LifecycleUnknown},
+			{ID: "live", ParentID: "root", Lifecycle: agentgraph.LifecycleRunning, StartedAt: now.Add(-5 * time.Hour)},
 		},
 	}
-	s := state.Session{PID: 1, CWD: "/tmp/x", AgentGraph: graph}
-	tip := agentTooltip(s, now)
-	for _, want := range []string{"reviewer — approval · stale · 42 tok", "broken — system error · stale", "mystery — unknown · stale"} {
-		if !strings.Contains(tip, want) {
-			t.Errorf("tooltip missing %q:\n%s", want, tip)
-		}
+	got := agentFanout(graph)
+	if strings.Contains(got, "done") || strings.Contains(got, "5h") {
+		t.Fatalf("running agent leaked into cumulative time: %q", got)
 	}
-	if strings.Contains(tip, "0 tok") {
-		t.Fatalf("tooltip fabricated absent usage:\n%s", tip)
+	if want := "1 agent · 1 live"; got != want {
+		t.Fatalf("agentFanout = %q, want %q", got, want)
 	}
+}
+
+func TestAgentFanoutSilentWhenNothingFannedOut(t *testing.T) {
+	if got := agentFanout(nil); got != "" {
+		t.Errorf("nil graph = %q, want empty", got)
+	}
+	lone := &state.AgentGraph{RootID: "root", Nodes: []state.AgentNode{{ID: "root"}}}
+	if got := agentFanout(lone); got != "" {
+		t.Errorf("root-only graph = %q, want empty (the root is not a fan-out)", got)
+	}
+}
+
+// The whole point of the redesign: nothing on the card may tick faster than once
+// a minute, or hovering it dismisses the hover. This walks a session forward
+// second by second and pins the number of distinct tooltips produced.
+func TestSessionTooltipDoesNotChangeAtSecondResolution(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	start := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	since := start
+	s := state.Session{
+		PID: 1, CWD: "/home/u/proj", StartedAt: start, Agent: state.AgentKindClaude,
+		Claude: &state.AgentInfo{Status: state.StatusWorking, StatusSinceWire: &since},
+		AgentGraph: &state.AgentGraph{
+			RootID:  "root",
+			Summary: state.AgentGraphSummary{LiveChildren: 12},
+			Nodes:   agentNodes(12, start.Add(-5*time.Hour)),
+		},
+	}
+	seen := map[string]bool{}
+	for sec := range 90 {
+		seen[sessionTooltip(projectname.DefaultConfig(), &sblabel.NameCache{}, s, start.Add(time.Duration(sec)*time.Second))] = true
+	}
+	// 90 seconds spans one minute boundary, so at most two distinct cards.
+	if len(seen) > 2 {
+		t.Fatalf("tooltip produced %d distinct strings over 90s, want <= 2 "+
+			"(a per-second field is back; it will flicker the hover)", len(seen))
+	}
+}
+
+// agentNodes builds n running child nodes started at the same instant.
+func agentNodes(n int, startedAt time.Time) []state.AgentNode {
+	nodes := []state.AgentNode{{ID: "root"}}
+	for i := range n {
+		nodes = append(nodes, state.AgentNode{
+			ID: fmt.Sprintf("child-%d", i), ParentID: "root", Nickname: fmt.Sprintf("child-%d", i),
+			Lifecycle: agentgraph.LifecycleRunning, StartedAt: startedAt,
+		})
+	}
+	return nodes
 }
 
 func TestSessionTooltipWithoutAgentGraphKeepsLegacyDetail(t *testing.T) {
@@ -274,24 +333,43 @@ func TestSessionTooltipWithAgentGraphDoesNotDuplicateLegacyDetail(t *testing.T) 
 		},
 	}
 	tip := sessionTooltip(projectname.Config{}, &sblabel.NameCache{}, s, now)
-	if !strings.Contains(tip, "canonical — active") {
-		t.Fatalf("canonical graph detail missing:\n%s", tip)
+	if !strings.Contains(tip, "1 agent") {
+		t.Fatalf("graph roll-up missing:\n%s", tip)
 	}
-	if strings.Contains(tip, "legacy-workflow") || strings.Contains(tip, "3 agents") {
-		t.Fatalf("legacy detail duplicated a present graph:\n%s", tip)
+	// The raw in-flight count is what the roll-up already says, so it goes...
+	if strings.Contains(tip, "3 agents") {
+		t.Fatalf("legacy in-flight count duplicated the graph roll-up:\n%s", tip)
+	}
+	// ...but the workflow's NAME is not in the roll-up, so it stays.
+	if !strings.Contains(tip, "legacy-workflow") {
+		t.Fatalf("workflow name is not derivable from the roll-up and must survive:\n%s", tip)
 	}
 }
 
 func TestSessionTooltipShowsStatusDuration(t *testing.T) {
 	now := time.Date(2026, 6, 26, 14, 30, 0, 0, time.UTC)
-	since := now.Add(-45 * time.Second)
-	s := state.Session{
-		PID: 4821, CWD: "/home/u/proj",
-		Claude: &state.ClaudeInfo{Status: "permission", StatusSinceWire: &since},
-	}
-	tip := sessionTooltip(projectname.Config{}, nil, s, now)
-	if !strings.Contains(tip, "permission · 45s") {
-		t.Errorf("tooltip should show the permission-wait duration:\n%s", tip)
+	for _, tc := range []struct {
+		name string
+		age  time.Duration
+		want string
+	}{
+		// Under a minute the card floors rather than counting seconds: a
+		// per-second field rewrites the tooltip and dismisses an open hover.
+		{"should floor a sub-minute wait", 45 * time.Second, "permission · <1m"},
+		{"should show minutes past the floor", 7 * time.Minute, "permission · 7m"},
+		{"should show hours and minutes", 2*time.Hour + 5*time.Minute, "permission · 2h05m"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			since := now.Add(-tc.age)
+			s := state.Session{
+				PID: 4821, CWD: "/home/u/proj",
+				Claude: &state.ClaudeInfo{Status: "permission", StatusSinceWire: &since},
+			}
+			tip := pangoPlain(sessionTooltip(projectname.Config{}, nil, s, now))
+			if !strings.Contains(tip, tc.want) {
+				t.Errorf("tooltip should contain %q:\n%s", tc.want, tip)
+			}
+		})
 	}
 }
 
@@ -474,7 +552,7 @@ func blockedSession(t *testing.T, writers []string, inflight int, names map[stri
 			t.Fatal(err)
 		}
 	}
-	since := blockedNow.Add(-45 * time.Second)
+	since := blockedNow.Add(-45 * time.Minute)
 	return state.Session{
 		PID: 4821, CWD: "/home/u/proj",
 		Claude: &state.ClaudeInfo{
@@ -495,7 +573,7 @@ func TestSessionTooltipShouldNameTheBlockedTeammate(t *testing.T) {
 	s := blockedSession(t, []string{"af5bd126402ac16c7"}, 4,
 		map[string]string{"af5bd126402ac16c7": "escalate-cleanup"})
 	tip := sessionTooltip(projectname.Config{}, &sblabel.NameCache{}, s, blockedNow)
-	if !strings.Contains(tip, "permission · escalate-cleanup · 45s") {
+	if !strings.Contains(tip, "permission · escalate-cleanup · 45m") {
 		t.Errorf("tooltip should name the blocked teammate:\n%s", tip)
 	}
 }
@@ -504,7 +582,7 @@ func TestSessionTooltipShouldNameEveryWriterWhenTwoAreBlockedAtOnce(t *testing.T
 	s := blockedSession(t, []string{"af5bd126402ac16c7", "main"}, 2,
 		map[string]string{"af5bd126402ac16c7": "escalate-cleanup"})
 	tip := sessionTooltip(projectname.Config{}, &sblabel.NameCache{}, s, blockedNow)
-	if !strings.Contains(tip, "permission · escalate-cleanup, main · 45s") {
+	if !strings.Contains(tip, "permission · escalate-cleanup, main · 45m") {
 		t.Errorf("tooltip should name both blocked writers:\n%s", tip)
 	}
 }
@@ -514,7 +592,7 @@ func TestSessionTooltipShouldNameEveryWriterWhenTwoAreBlockedAtOnce(t *testing.T
 func TestSessionTooltipShouldLeaveASoloPermissionUnannotated(t *testing.T) {
 	s := blockedSession(t, []string{"main"}, 0, nil)
 	tip := sessionTooltip(projectname.Config{}, &sblabel.NameCache{}, s, blockedNow)
-	if !strings.Contains(tip, "permission · 45s") {
+	if !strings.Contains(tip, "permission · 45m") {
 		t.Errorf("solo permission tooltip should be status + duration only:\n%s", tip)
 	}
 	if strings.Contains(tip, "main") {
@@ -609,8 +687,10 @@ func TestNameConfigShouldReloadWhenConfigFileChanges(t *testing.T) {
 	if got.Text != "zzz-proj" {
 		t.Errorf("chip text = %q, want zzz-proj — the rewritten config was not picked up", got.Text)
 	}
-	if !strings.Contains(got.Tooltip, "<b>zzz</b>") {
-		t.Errorf("tooltip kept the stale abbreviation: %q", got.Tooltip)
+	// The hover names the project in full, so a changed ABBREVIATION must not
+	// show up there — that is the chip's job, asserted above.
+	if !strings.Contains(got.Tooltip, "Proj") || strings.Contains(got.Tooltip, "zzz") {
+		t.Errorf("hover should keep the full display name, not the abbreviation: %q", got.Tooltip)
 	}
 }
 
@@ -982,7 +1062,7 @@ func TestNameConfigShouldPickUpARenameWrittenBySetAbbrev(t *testing.T) {
 	if got.Text != "zzz-proj" {
 		t.Errorf("chip text = %q, want zzz-proj — the middle-click rename did not reach the chip", got.Text)
 	}
-	if !strings.Contains(got.Tooltip, "<b>zzz</b>") {
-		t.Errorf("tooltip kept the stale abbreviation: %q", got.Tooltip)
+	if !strings.Contains(got.Tooltip, "Proj") || strings.Contains(got.Tooltip, "zzz") {
+		t.Errorf("hover should keep the full display name, not the abbreviation: %q", got.Tooltip)
 	}
 }
