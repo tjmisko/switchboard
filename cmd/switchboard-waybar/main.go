@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -426,12 +427,26 @@ func lifeLine(s state.Session, now time.Time) string {
 			"up "+durfmt.Coarse(now.Sub(s.StartedAt)),
 			"started "+startedClock(s.StartedAt, now))
 	}
-	ws := "-"
-	if s.Hyprland != nil && s.Hyprland.Workspace != "" {
-		ws = s.Hyprland.Workspace
-	}
-	parts = append(parts, "ws "+ws, fmt.Sprintf("pid %d", s.PID))
+	parts = append(parts, "ws "+chipWorkspace(s), fmt.Sprintf("pid %d", s.PID))
 	return strings.Join(parts, " · ")
+}
+
+// chipWorkspace names the workspace to switch to in order to reach a session.
+//
+// For a local session that is simply its own window's workspace. For a REMOTE
+// one it is not: the aggregate view strips the remote Hyprland block because
+// those coordinates locate a desktop on the other machine, and answering "ws 5"
+// from them would send the reader to an unrelated local workspace. The
+// actionable answer is where the window SHOWING that session lives here, which
+// the view resolves alongside chip order and publishes as LocalWorkspace.
+func chipWorkspace(s state.Session) string {
+	if s.LocalWorkspace != 0 {
+		return strconv.Itoa(s.LocalWorkspace)
+	}
+	if s.Hyprland != nil && s.Hyprland.Workspace != "" {
+		return s.Hyprland.Workspace
+	}
+	return "-"
 }
 
 // startedClock renders the wall-clock time a session began, in the VIEWER's zone

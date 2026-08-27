@@ -383,6 +383,61 @@ func TestSessionTooltipPairsProjectNameWithPathAheadOfHost(t *testing.T) {
 	}
 }
 
+// A remote row's own Hyprland block is stripped by the aggregate view because
+// it locates the other machine's desktop. The workspace the card reports must be
+// the LOCAL one showing that session — the only one the reader can act on.
+func TestSessionTooltipReportsTheLocalWorkspaceForRemoteSessions(t *testing.T) {
+	s := state.Session{
+		PID: 310315, Hostname: "nlessfun", Remote: true, Navigable: true,
+		CWD: "/home/u/proj", LocalWorkspace: 7,
+		Claude: &state.AgentInfo{Status: state.StatusWorking},
+	}
+	tip := sessionTooltip(projectname.Config{}, &sblabel.NameCache{}, s, time.Now())
+	if !strings.Contains(tip, "ws 7") {
+		t.Errorf("remote card should report the local workspace:\n%s", tip)
+	}
+	if strings.Contains(tip, "ws -") {
+		t.Errorf("remote card still shows an unresolved workspace:\n%s", tip)
+	}
+}
+
+func TestChipWorkspace(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		s    state.Session
+		want string
+	}{
+		{
+			"should use the local workspace for a remote session",
+			state.Session{Remote: true, LocalWorkspace: 7},
+			"7",
+		},
+		{
+			// The remote's own coordinates must never win: they name a
+			// workspace on the other machine.
+			"should prefer the local workspace over a stale remote one",
+			state.Session{Remote: true, LocalWorkspace: 7, Hyprland: &state.HyprlandInfo{Workspace: "2"}},
+			"7",
+		},
+		{
+			"should use its own workspace for a local session",
+			state.Session{Hyprland: &state.HyprlandInfo{Workspace: "4"}},
+			"4",
+		},
+		{
+			"should fall back to a dash when nothing resolves",
+			state.Session{Remote: true},
+			"-",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := chipWorkspace(tc.s); got != tc.want {
+				t.Errorf("chipWorkspace = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestSessionTooltipShowsStatusDuration(t *testing.T) {
 	now := time.Date(2026, 6, 26, 14, 30, 0, 0, time.UTC)
 	for _, tc := range []struct {

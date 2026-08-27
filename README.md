@@ -97,6 +97,12 @@ one uniform height. Line 2 names the host, then the task, then a dimmed block of
 timing, workspace, process, and the subagent roll-up. Status age comes from the
 additive `status_since` field.
 
+The workspace is the one **on this machine**. For a local session that is simply
+its own window's; for a remote one the daemon strips the remote desktop's
+coordinates — they name a workspace on the other machine — and publishes
+`local_workspace`, the workspace of the window actually showing that session. It
+is the same number the chip is ordered by, and the only one worth acting on.
+
 **Nothing on the card may tick faster than once a minute.** The tooltip travels
 inside the module's JSON, so rewriting it makes Waybar re-render the module,
 which dismisses an open hover — a per-second counter makes the card impossible
@@ -505,36 +511,29 @@ off the edge of the bar (too low).
 Every chip carries a border, and the border encodes three independent things at
 once:
 
-| | resting | focused |
-|---|---|---|
-| **local** | `1px solid` | `2px solid`, brighter |
-| **remote** | `3px double` | `4px double`, brighter |
+*Shape* is location: a session on another machine gains the `remote` class and is
+drawn as a **nested pill** — `3px double` instead of `1px solid`, the chip
+outline with a second ring just inside it. *Colour* is status and focus, and the
+remote rule sets border width and style but deliberately **never colour**, so the
+ring simply picks up whatever hue the status and focus rules assign. An idle
+remote chip therefore rings amber rather than wearing a fixed accent that fights
+its own fill. The gap between a double ring's two lines is the chip's own status
+fill, so the nesting spends no colour of its own; focus is a brighter hue of that
+same status colour and does not change the border width.
 
-*Shape* is location — a session on another machine gains the `remote` class and
-is drawn as a **nested pill**, the chip outline with a second ring just inside
-it. *Colour* is status, and the CSS for the ring sets width and style but
-deliberately never colour, so the ring simply picks up whatever hue the status
-and focus rules assign: an idle remote chip rings amber, not some fixed accent
-fighting its own fill. *Weight* is focus, which reads twice — brighter and
-thicker — so the current session survives a washed-out display. The gap between
-a double ring's two lines is the chip's own status fill, so the nesting spends no
-colour of its own.
-
-All four combinations are free only because the extra width is paid for out of
-the chip's padding rather than added to its box:
+The nesting is free only because the extra width is paid for out of the chip's
+padding rather than added to its box:
 
 ```css
-/* local         */ padding: 4px 8px;  border-width: 1px;   /* 8 + 1 = 9 per side */
-/* local focused */ padding: 3px 7px;  border-width: 2px;   /* 7 + 2 = 9 */
-/* remote        */ padding: 2px 6px;  border-width: 3px;   /* 6 + 3 = 9 */
-/* remote focus  */ padding: 1px 5px;  border-width: 4px;   /* 5 + 4 = 9 */
+/* local  */ padding: 4px 8px;  border-width: 1px;   /* 8 + 1 = 9 per side */
+/* remote */ padding: 2px 6px;  border-width: 3px;   /* 6 + 3 = 9 */
 ```
 
 Keep that trade balanced — `.headless` restates the base padding for the same
 reason, since it resets the border to 1px. `ChipFixedPx` is a **single** number
 for the whole row, so a chip that were genuinely wider would make the fit depend
-on which sessions happened to be remote or focused, and every label on the bar
-would re-abbreviate whenever focus moved.
+on how many of the visible sessions happened to be remote, and every label on the
+bar would re-abbreviate whenever a remote session appeared or dropped.
 
 A chip whose `claude` process is job-control-stopped (Ctrl-Z) gains the
 `suspended` class on top of its status class. Grey it out in `style.css`:
