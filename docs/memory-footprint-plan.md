@@ -342,7 +342,66 @@ different *processes* — the hook in `switchboard-ctl`
 therefore orders a client wall clock against a daemon wall clock. Correct on one
 host today; invertible under an NTP step, a suspend/resume, or a remote `ctl`.
 
-#### 1.4.4 Pre-existing test failures on `main` (not caused by this work)
+#### 1.4.4 Spurious `focus` events from a non-deterministic map pick
+
+Found while extending the task #3 guard to cover `sink.Record` calls inside
+`Store.Apply`. Not a memory issue — a history-data issue — but it is recorded
+here because it was found by this work and because it inflates one of the event
+classes §2 lists as a dashboard input.
+
+`applyFocus` (`cmd/switchboard/main.go:1005`) decides whether focus changed by
+comparing two picks taken from two independent `range` statements over the
+session map:
+
+```go
+prevID := ""
+for _, sess := range m {                 // range #1
+    if sess.Focused { prevID = enrichmentID(sess); break }   // FIRST focused
+}
+newID := ""
+for _, sess := range m {                 // range #2
+    focused := activeAddr != "" && sess.Hyprland != nil && sess.Hyprland.Address == activeAddr
+    sess.Focused = focused
+    if focused { newID = enrichmentID(sess) }                // LAST focused
+}
+if newID == prevID { return }
+sink.Record(...)                          // else: a focus event
+```
+
+Two agent sessions in one Hyprland window — two wezterm splits or tabs — share
+an `Hyprland.Address`, so `applyFocus` marks BOTH `Focused`. `prevID` is then
+the *first* focused session range #1 happens to reach and `newID` the *last*
+range #2 happens to reach. Go randomizes map iteration per range statement, so
+with two focused sessions the two picks disagree roughly half the time and a
+`focus` event is recorded — while both sessions were already `Focused` and stay
+`Focused`, so not one byte of the wire snapshot moves.
+
+Measured over 40 real `reconcileOnce` ticks against a fixture with two sessions
+on one address: **34 focus events, 0 broadcast frames, wire unchanged.**
+
+Live in production data. Today's day-file holds 6125 `focus` events, of which
+**301 are A→B→A alternations inside 6 s** — the signature of the two picks
+disagreeing on consecutive 5 s ticks. Nobody changed focus 301 times in
+sub-6-second alternations. That is a lower bound: it counts only strict
+alternation.
+
+`switchboard-dashboard` builds focus spans from these events, so the spans for
+any multi-pane window are contaminated.
+
+Fix is small — make range #1's pick deterministic, or compare the focused *set*
+rather than a first-vs-last pick. Both loops should agree on what "the focused
+session" means when more than one session matches the address, and that
+question deserves an answer in `docs/state-schema.md` too: with two panes in one
+window, which session is *the* focused one?
+
+**Note for whoever fixes it:** `TestShouldRecordFocusFromInsideApplyWhenApplySuppressesThePublish`
+depends on this bug to reach an in-Apply `sink.Record` on a suppressed tick.
+Convert it to a `t.Skip` naming this section rather than deleting it; the
+coverage it provides then falls back to
+`TestShouldRunTheApplyClosureAndItsRecordsWhenTheChangeKeyIsUnchanged`, which
+was written to survive exactly this.
+
+#### 1.4.5 Pre-existing test failures on `main` (not caused by this work)
 
 - `internal/conformance` — `TestWeztermLocatorConformance` and
   `TestAutoLocatorConformance` fail whenever a Codex session is running.
