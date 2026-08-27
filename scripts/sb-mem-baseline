@@ -43,9 +43,17 @@
 #                        the capture lost its write half. Check both.
 #   no_frames            0 frames; the capture failed. Exit code 2.
 #
-# The publish rate scales with the number of live sessions in the snapshot, so
-# every capture records a session census (total, per agent, remote count).
-# A rate is only comparable against another rate taken at a similar census.
+# The publish rate does NOT scale with the live-session count — it is dominated
+# by how many Codex panes are ACTIVELY SPINNING, and total session count is only
+# a weak proxy. Measured 2026-08-26: two of five sessions produced 92% of the
+# churn, and the rate moved 6.93 -> 11.50/s at a constant 5-session census. The
+# capture records a census (total, per agent, remote count) so a workload change
+# between runs is visible, not so the rate can be normalized by it.
+#
+# A single capture is a SAMPLE, not a LEVEL: 4.7-11.5/s was observed on one
+# unchanged build. To claim an effect, prefer the daemon's own publish-stats
+# counters (docs/telemetry.md), which integrate over a minute, and take >=3
+# captures.
 #
 # BASELINE — 2026-08-26T17:00:08-07:00, goosebook (Asahi arm64, 16K pages,
 # Go 1.26.5, 15.2 GiB RAM), default 15 s capture, capture_status=ok.
@@ -240,7 +248,29 @@ ps -eww -o pid=,ppid=,args= >|"$tmp/ps.txt" 2>/dev/null
 bar_procs="/sys/fs/cgroup$(unit_cgroup "$UNIT_WAYBAR")/cgroup.procs"
 [ -r "$bar_procs" ] || bar_procs=/dev/null
 
-awk -F'\t' '
+# Tie the daemon row to the socket we are about to measure. Without this the
+# daemon is "the first `switchboard` in ps order", which silently mixes two
+# daemons in the -s A/B workflow this script documents: churn from the scratch
+# daemon, RSS and units from the systemd one, no warning, one report. ss -xp
+# names the pid holding the socket; fall back to the ps scan when ss is absent.
+socket_pid=
+if command -v ss >/dev/null 2>&1; then
+	socket_pid=$(ss -xp 2>/dev/null |
+		awk -v p="$socket" 'index($0, p) > 0 && match($0, /pid=[0-9]+/) {
+			print substr($0, RSTART + 4, RLENGTH - 4); exit }')
+fi
+
+# The units table is hardcoded to the systemd units. If the socket belongs to a
+# different process, the two halves of the report describe different daemons —
+# say so rather than presenting them as one measurement.
+unit_pid=$(systemctl --user show "$UNIT_SWITCHBOARD" -p MainPID --value 2>/dev/null)
+if [ -n "$socket_pid" ] && [ -n "$unit_pid" ] && [ "$socket_pid" != "$unit_pid" ]; then
+	printf '%s: WARNING socket %s is held by pid %s, but %s MainPID is %s.\n' \
+		"$PROG" "$socket" "$socket_pid" "$UNIT_SWITCHBOARD" "$unit_pid" >&2
+	printf '%s: the churn probe and the units table describe DIFFERENT daemons.\n' "$PROG" >&2
+fi
+
+awk -F'\t' -v barfile="$bar_procs" -v wantpid="$socket_pid" '
 	function base(path,   n, a) { n = split(path, a, "/"); return a[n] }
 
 	# VmRSS/RssAnon for one pid; "-" if the process died between ps and now.
@@ -261,17 +291,39 @@ awk -F'\t' '
 		print label "\t" pid "\t" RSS "\t" ANON
 	}
 
-	FNR == NR { inbar[$1] = 1; next }
+	# Keyed on FILENAME, not FNR == NR: when the cgroup.procs file is empty or
+	# is the /dev/null fallback, FNR == NR stays true for every line of ps.txt
+	# and the first rule swallows the entire process table.
+	FILENAME == barfile { inbar[$1] = 1; next }
 
 	{
 		# ps was asked for pid,ppid,args, so field 3 is argv[0]. comm is
 		# truncated at 15 chars, which makes switchboard-ctl and
 		# switchboard-waybar both read as "switchboard"; match the basename of
 		# argv[0] exactly instead (same rule as sb-perf daemon_pid).
-		n = split($0, f, /[ \t]+/)
+		#
+		# The leading trim is load-bearing. `ps -o pid=` RIGHT-JUSTIFIES the pid
+		# column to the widest pid on the box, so a daemon started at boot (pid
+		# ~1200) beside any 7-digit pid gets leading spaces. split() with an
+		# explicit regex does NOT strip those the way default field splitting
+		# does, so f[1] comes back empty and f[3] is the ppid — the daemon row
+		# silently becomes unmatchable, and with it codex_app_server and
+		# remote_stream, which are keyed off it in END.
+		line = $0
+		sub(/^[ \t]+/, "", line)
+		n = split(line, f, /[ \t]+/)
 		pid = f[1]; ppid = f[2]; argv0 = base(f[3])
 
-		if (argv0 == "switchboard" && daemon == "") { daemon = pid; next }
+		# Prefer the pid that actually holds the socket; only fall back to
+		# "first switchboard in ps order" when ss could not resolve it.
+		if (argv0 == "switchboard") {
+			if (wantpid != "") {
+				if (pid == wantpid) { daemon = pid }
+			} else if (daemon == "") {
+				daemon = pid
+			}
+			next
+		}
 		if (argv0 == "switchboard-waybar" && match($0, /--slot[ =]+[0-9]+/)) {
 			s = substr($0, RSTART, RLENGTH)
 			sub(/^--slot[ =]+/, "", s)
@@ -329,6 +381,24 @@ if [ "$frames" -eq 0 ] && [ "$capture_rc" -ne 0 ]; then
 	die "cannot subscribe on $socket ($NCAT exited $capture_rc)"
 fi
 
+# How long the STREAM actually lasted, which is not how long the pipeline took.
+# The `{ printf; sleep; }` writer keeps running after ncat exits, so `ended -
+# started` is always ~duration even when the daemon dropped us two seconds in.
+# Without this, a daemon restart mid-capture yields a handful of frames divided
+# by the full window and reported as a clean, very low rate — exactly the
+# silently-wrong measurement the header promises not to produce. ncat exits 0
+# on a clean remote close, so the exit status alone does not reveal it either;
+# the tell is the timestamp span inside the frames themselves.
+span=$(jq -rs 'if length < 2 then empty else
+	(map(.snapshot.updated_at | fromdateiso8601) | (max - min)) end' \
+	"$tmp/frames.jsonl" 2>/dev/null || true)
+truncated=0
+if [ -n "${span:-}" ]; then
+	# Allow a wide margin: a quiet daemon legitimately publishes nothing for a
+	# stretch, so only flag a span that fell well short of the requested window.
+	truncated=$(awk -v s="$span" -v d="$duration" 'BEGIN { print (s < d * 0.5) ? 1 : 0 }')
+fi
+
 # A capture that produced no publishes is not a measurement of zero publishes.
 # Classify it, keep publish_rate_hz null unless it is real, and say which.
 exit_code=0
@@ -346,25 +416,39 @@ case $frames in
 	printf '%s: or the capture lost its write half (see the HAZARD note in this script).\n' "$PROG" >&2
 	;;
 *)
-	capture_status=ok
+	if [ "$truncated" -eq 1 ]; then
+		capture_status=truncated
+		exit_code=2
+		printf '%s: WARNING the stream ended after ~%ss of a %ss window.\n' "$PROG" "${span%.*}" "$duration" >&2
+		printf '%s: the daemon almost certainly restarted or dropped us mid-capture.\n' "$PROG" >&2
+		printf '%s: publish_rate_hz is over the OBSERVED span, not the requested one. capture_status=truncated\n' "$PROG" >&2
+	else
+		capture_status=ok
+	fi
 	;;
 esac
 
 # A timeout kill can truncate the last frame; count bytes over whole lines only.
 total_bytes=$(head -n "$frames" "$tmp/frames.jsonl" | wc -c)
 
+# Rate divides by the OBSERVED frame span when there is one, not by the
+# pipeline's wall time: the writer outlives ncat, so wall time is always ~the
+# requested duration and would understate the rate on any truncated capture.
 read -r elapsed publishes rate mean <<<"$(awk \
-	-v s="$started" -v e="$ended" -v n="$frames" -v b="$total_bytes" -v st="$capture_status" '
+	-v s="$started" -v e="$ended" -v sp="${span:-}" -v n="$frames" -v b="$total_bytes" -v st="$capture_status" '
 	BEGIN {
 		el = e - s
+		win = (sp != "" && sp + 0 > 0) ? sp + 0 : el
 		pub = n > 0 ? n - 1 : 0
 		printf "%.3f %d %s %s\n", el, pub,
-			(st == "ok" && el > 0 ? sprintf("%.3f", pub / el) : "-"),
+			((st == "ok" || st == "truncated") && win > 0 ? sprintf("%.3f", pub / win) : "-"),
 			(n > 0 ? sprintf("%.0f", b / n) : "-")
 	}')"
 
-# The publish rate scales with the session count, so record the census the rate
-# was taken at. The connect snapshot is always the first frame when there is one.
+# Record the census so a workload change between runs is visible. It is NOT a
+# normalizer: the rate tracks actively-spinning Codex panes, not session count
+# (see the header). The connect snapshot is always the first frame when there
+# is one.
 census='null'
 if [ "$frames" -ge 1 ]; then
 	census=$(head -n 1 "$tmp/frames.jsonl" | jq -c '
