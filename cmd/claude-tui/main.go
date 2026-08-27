@@ -248,9 +248,19 @@ func renderSnapshot(snap state.Snapshot, home string, color bool, now time.Time,
 		if s.Hostname != "" {
 			process = fmt.Sprintf("%s/%d", s.Hostname, s.PID)
 		}
-		fmt.Fprintf(&b, "%s %s %s %s %s%s%s%s\r\n",
+		// A held remote row is the last thing its host said, not what it is
+		// saying. It keeps its status glyph and color — that WAS true — with the
+		// contact age spelled out so the reader can weigh it.
+		held := ""
+		if s.Stale {
+			held = "  stale"
+			if d := durfmt.Since(s.LastContact, now); d != "" {
+				held += " " + d
+			}
+		}
+		fmt.Fprintf(&b, "%s %s %s %s %s%s%s%s%s\r\n",
 			focus, c(gcol, glyph), label, cwd,
-			c(colGrey, process), c(colGrey, ws), c(colGrey, dur), c(gcol, blocked))
+			c(colGrey, process), c(colGrey, ws), c(colGrey, dur), c(colGrey, held), c(gcol, blocked))
 		renderAgentTree(&b, s, now, c)
 	}
 	return b.String()

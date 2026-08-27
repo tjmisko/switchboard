@@ -149,6 +149,12 @@ func cmdList(c *rpc.Client, jsonOut bool) {
 		if s.Hostname != "" {
 			identity = fmt.Sprintf("host=%s pid=%d", s.Hostname, s.PID)
 		}
+		// A held remote row is the last thing its host said, not what it is
+		// saying. Date it rather than dropping it: the row is still actionable,
+		// but every value on the line is as old as this stamp.
+		if s.Stale && s.LastContact != nil {
+			identity += " stale-since=" + s.LastContact.UTC().Format(time.RFC3339)
+		}
 		fmt.Printf("%s [%d] %s cwd=%s\n", marker, i, identity, s.CWD)
 		if s.Wezterm != nil {
 			fmt.Printf("       wezterm: mux=%d pane=%d title=%q\n", s.Wezterm.MuxPID, s.Wezterm.PaneID, s.Wezterm.WindowTitle)

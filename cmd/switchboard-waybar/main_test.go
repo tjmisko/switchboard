@@ -915,3 +915,48 @@ func TestNameConfigShouldPickUpARenameWrittenBySetAbbrev(t *testing.T) {
 		t.Errorf("tooltip kept the stale abbreviation: %q", got.Tooltip)
 	}
 }
+
+func TestRenderSlotShouldDimAHeldRemoteRowWithoutChangingItsStatusColorWhenContactIsLost(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	now := time.Date(2026, 8, 24, 20, 0, 0, 0, time.UTC)
+	lastContact := now.Add(-90 * time.Second)
+	session := state.Session{
+		PID: 4, Hostname: "buildbox", Remote: true, Navigable: true, CWD: "/work",
+		Agent: state.AgentKindClaude, Claude: &state.AgentInfo{Status: state.StatusWorking},
+		Stale: true, LastContact: &lastContact,
+	}
+	out := renderSlot(state.Snapshot{Sessions: []state.Session{session}}, 0, testAvail, testMetrics, &nameConfig{}, &sblabel.NameCache{})
+	if !slices.Contains(out.Class, "stale") {
+		t.Fatalf("classes = %v, want a stale class", out.Class)
+	}
+	// The held report is "this WAS working", so the colour must survive: losing
+	// contact is not the same as losing the status, and repainting the chip
+	// would be the very flicker the hold exists to remove.
+	if !slices.Contains(out.Class, state.StatusWorking) || out.Alt != state.StatusWorking {
+		t.Fatalf("held row lost its status colour: classes=%v alt=%q", out.Class, out.Alt)
+	}
+	if slices.Contains(out.Class, "unnavigable") {
+		t.Fatal("held row was marked unnavigable; the local pane it focuses has not moved")
+	}
+	tip := sessionTooltip(projectname.DefaultConfig(), &sblabel.NameCache{}, session, now)
+	if !strings.Contains(tip, "stale (no contact 1m)") {
+		t.Fatalf("tooltip does not date the last contact:\n%s", tip)
+	}
+}
+
+func TestRenderSlotShouldLeaveALiveRemoteRowUnmarkedWhenContactIsCurrent(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	session := state.Session{
+		PID: 4, Hostname: "buildbox", Remote: true, Navigable: true, CWD: "/work",
+		Agent: state.AgentKindClaude, Claude: &state.AgentInfo{Status: state.StatusWorking},
+	}
+	out := renderSlot(state.Snapshot{Sessions: []state.Session{session}}, 0, testAvail, testMetrics, &nameConfig{}, &sblabel.NameCache{})
+	if slices.Contains(out.Class, "stale") {
+		t.Fatalf("classes = %v, want no stale class", out.Class)
+	}
+	if tip := sessionTooltip(projectname.DefaultConfig(), &sblabel.NameCache{}, session, time.Now()); strings.Contains(tip, "stale") {
+		t.Fatalf("live row tooltip mentions staleness:\n%s", tip)
+	}
+}
