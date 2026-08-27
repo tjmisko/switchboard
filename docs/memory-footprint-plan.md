@@ -379,14 +379,36 @@ with two focused sessions the two picks disagree roughly half the time and a
 Measured over 40 real `reconcileOnce` ticks against a fixture with two sessions
 on one address: **34 focus events, 0 broadcast frames, wire unchanged.**
 
-Live in production data. Today's day-file holds 6125 `focus` events, of which
-**301 are A→B→A alternations inside 6 s** — the signature of the two picks
-disagreeing on consecutive 5 s ticks. Nobody changed focus 301 times in
-sub-6-second alternations. That is a lower bound: it counts only strict
-alternation.
+Production evidence, stated carefully — an earlier draft of this section quoted
+"301 A→B→A alternations inside 6 s" for this bug, and that number was wrong
+because it conflated two different patterns. Today's day-file holds 6272 `focus`
+events. Splitting the A→B→A alternations by what they alternate between:
 
-`switchboard-dashboard` builds focus spans from these events, so the spans for
-any multi-pane window are contaminated.
+| pattern | total | gap < 1 s |
+|---|---|---|
+| between **two real session ids** | 177 | **84** |
+| involving **NULL** (`session_id: ""`, focus left to a non-agent window) | 353 | 77 |
+
+Only the first row is evidence for THIS bug. The 84 sub-second two-session
+alternations are the load-bearing figure: a person cannot alt-tab between two
+agent windows and back inside one second, 84 times. The NULL row is a separate
+question (see below) and must not be counted here.
+
+The definitive proof of mechanism is the fixture measurement above, not the
+day-file: production timestamps cannot show which sessions shared a window
+address at the time, so the day-file can only corroborate.
+
+**A second, unexplained pattern in the same data:** 77 sub-second alternations
+between a real session and NULL. `applyFocus` should emit at most ONE event when
+focus leaves to a non-agent window — the tick after, no session is `Focused`, so
+`prevID` and `newID` are both `""` and it returns early. Repeated sub-second
+NULL↔real alternation implies `activeAddr` itself is flapping between a match
+and a non-match, which would be a WM-query problem rather than a map-pick one.
+Not investigated. Worth its own issue.
+
+`switchboard-dashboard` builds focus spans from these events, so spans for any
+multi-pane window are contaminated by the first pattern, and spans for every
+session may be fragmented by the second.
 
 Fix is small — make range #1's pick deterministic, or compare the focused *set*
 rather than a first-vs-last pick. Both loops should agree on what "the focused
@@ -593,18 +615,43 @@ journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
 
 - [ ] #5: Shared title normalization
   - **Prereqs**: none
-  - **DoD**: One package (`internal/terminal` or new `internal/titlenorm`)
-    exports the spinner glyph table and a `Normalize(title string) string`
-    that strips one leading spinner rune plus surrounding whitespace, covering
-    both Claude's set (`internal/label/label.go:32`) and the braille set the
-    Codex TUI uses (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`, plus `◐◓◑◒`). `internal/mapping.normalizeTitle`
-    (`mapping.go:300`) and `internal/label` call it; their existing tests still
-    pass; a table test covers every glyph, an empty title, a title that is only
-    a glyph, and a title whose first rune is a normal letter.
+  - **DECIDED 2026-08-26 (owner): option (b) — normalize at the
+    `internal/terminal` boundary**, not only in the change key. §1.4.5 laid out
+    (a) change-key-only versus (b) at the boundary; (b) is the one to build.
+    This supersedes #6's "the wire snapshot is unchanged" sentence for the title
+    specifically: `window_title` now goes out stripped.
+  - **DoD**: One package exports the spinner glyph table and a
+    `Normalize(title string) string` that strips one leading spinner rune plus
+    surrounding whitespace. The table is `internal/mapping.spinnerPrefixes`
+    (`◐◑◒◓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✳⠂⠐⠁⠈⠠⠄⡀⢀`) — verified a strict superset of
+    `internal/label.spinnerPrefixes` (`✳ ⠂ ⠐ ⠁ ⠈ ⠠ ⠄ ⡀ ⢀`), so `label` gains
+    coverage of the braille and circle spinners it currently misses.
+    Applied where `terminal.PaneRef.WindowTitle` is CONSTRUCTED —
+    `internal/terminal/wezterm.go:79` and `internal/terminal/tmux.go:106` — so
+    every downstream consumer sees the normalized form.
+    `internal/mapping.normalizeTitle` (`mapping.go:300`) and `internal/label`
+    call the shared `Normalize`; their existing tests still pass.
+    A table test covers every glyph, an empty title, a title that is only a
+    glyph, a title whose first rune is a normal letter, and **idempotence**
+    (`Normalize(Normalize(x)) == Normalize(x)`) — load-bearing, because the
+    mapping join normalizes both sides at compare time and will now be
+    normalizing an already-normalized pane title.
+    `internal/conformance` (`TestWeztermLocatorConformance`,
+    `TestAutoLocatorConformance`) goes GREEN with Codex sessions running — that
+    is the acceptance test for this task, and it is currently red on `main`.
+    `docs/state-schema.md` updated: `window_title` is the spinner-stripped
+    title, and the raw title is not preserved anywhere on the wire.
   - **Phase**: 1
-  - **Notes**: Issue #80 is the same race seen from the mapping side. Check
-    whether #80 can be closed once this lands — `normalizeTitle` may already
-    have fixed it; if so, note it on the issue with the commit hash.
+  - **Notes**: Issue #80 is the same race seen from the mapping side, and
+    §1.4.5 is it seen from a third. Verified over 5 runs: 23 of 23 conformance
+    disagreements are one leading spinner rune, with `Mux`, `PaneID` and `TTY`
+    identical in all 23 — so (b) is sufficient to close them, and nothing else
+    is hiding behind the title mismatch. Check whether #80 can be closed once
+    this lands; if so, note it on the issue with the commit hash.
+    Watch for consumers that WANT the raw title: `cmd/switchboard-ctl/main.go:154`
+    prints it in `list`, and `internal/rpc/rpc.go:1433` builds a session
+    description from it. Both read better stripped, but confirm rather than
+    assume.
 
 - [ ] #6: Normalize the publish change key
   - **Prereqs**: #5 (needs the shared normalizer), #3 (the invariant guard
@@ -620,8 +667,11 @@ journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
     `should republish when fresh_until crosses a bucket boundary`,
     `should republish when a node runtime state changes`,
     `should republish when a session's label or status changes`.
-    The wire snapshot is unchanged (title and timestamps still go out raw on
-    the frames that do publish).
+    Timestamps still go out raw on the frames that do publish. **The title does
+    not** — #5 was decided as option (b), so `window_title` is already
+    normalized at the `internal/terminal` boundary before it reaches the
+    snapshot, and the change key inherits that rather than re-normalizing.
+    Do NOT normalize the title a second time here.
   - **Phase**: 1
   - **Notes**: Keep the "fail open on encode error" behavior. The 5 s bucket
     means the bar can be at most 5 s behind on freshness; #7 makes that
