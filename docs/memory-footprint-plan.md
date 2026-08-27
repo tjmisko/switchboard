@@ -15,6 +15,13 @@
 > `agent_state` history a production invariant. Task #3 guards this with a test
 > that must stay green through every phase.
 
+> **Phase 1 executors: start at `docs/memory-footprint-phase1/README.md`.**
+> That directory holds the per-task designs, the operating procedure (deploy
+> paths, measurement protocol, review gates), and — importantly —
+> `05-corrections-to-the-plan.md`, which lists the places THIS document is wrong
+> or has stale line anchors. Several corrections are already applied inline
+> below; the rest are listed there.
+
 ---
 
 ## 1. Baseline (2026-08-26 16:20–16:25, goosebook: Asahi arm64, 16K pages, Go 1.26.5, 15.2 GiB RAM)
@@ -56,12 +63,23 @@ Chain: spinner tick → Hyprland `windowtitlev2` → `reresolveAll`
 `snapshotChangeKey` (`internal/state/state.go:656`) includes the title →
 `broadcast` + `persist(state.json)`.
 
-With `-remote` configured, `rpc.subscribeAll` (`internal/rpc/rpc.go:467`)
-goes through `federation.View`, and **every subscriber rebuilds the aggregate
-and re-encodes it itself** (`s.view.Snapshot()` + `enc.Encode` per wakeup) —
-11 deep copies + 11 encodes per publish, ~100/s total. `View.publish()`
-(`internal/federation/view.go:320`) has no change gate, so remote-side churn
-fans out identically.
+`rpc.subscribeAll` (`internal/rpc/rpc.go:462`) goes through `federation.View`,
+and **every subscriber rebuilds the aggregate and re-encodes it itself**
+(`s.view.Snapshot()` + `enc.Encode` per wakeup) — 11 deep copies + 11 encodes
+per publish, ~100/s total. `View.publish()` (`internal/federation/view.go:320`)
+has **no change gate at all**, so this churn fans out ungated.
+
+**Correction (verified 2026-08-26): this is NOT conditional on `-remote`.** An
+earlier draft of this paragraph said "with `-remote` configured". The View is
+constructed unconditionally (`cmd/switchboard/federation.go:80`, no
+`remoteFlags` guard) and installed unconditionally (`federation.go:108`, called
+from `main.go:261`), so **every waybar slot and the bottom bar go through
+`View.publish()` on every box.** That is why #6 alone cannot reach #10's DoD:
+#6 gates `Store.Apply`, #8 gates `View.publish()`, and the wire rate #10
+measures is the View's output. The View is suppressed indirectly when the store
+stops broadcasting, but it also publishes on remote updates, focus transitions
+and navigator `Refresh` (`federation.go:129`, `navigator.go:58,164,182`) — all
+ungated. **#8 is load-bearing, not a tidy-up.**
 
 Each waybar slot decodes 14 KB ~10×/s → the ~4.8 MB heap arena per slot.
 
@@ -202,16 +220,28 @@ matched exactly.
 | + `fresh_until` 30 s bucket | 49 | 2.47/s | 78.7% |
 | + drop `fresh_until` entirely (bucket asymptote) | 45 | 2.27/s | 80.5% |
 | + also drop `agent_graph.source` | 45 | 2.27/s | 80.5% |
-| + also drop `agent_graph.complete` — **i.e. after #4.5** | **3** | **0.15/s** | 98.7% |
+| + also drop `agent_graph.complete` — **i.e. #4.5 AND #6 together** | **3** | **0.15/s** | 98.7% |
+
+Note the rows are **cumulative**. The `fresh_until`-dropped row is a bound on
+what bucketing can achieve, not a reachable design: dropping `fresh_until` from
+the key breaks the suppression's soundness (the key must encode the same
+quantized value the wire carries, or a consumer that receives no frame goes
+falsely stale). See `docs/memory-footprint-phase1/02-tasks-5-6-7-change-key.md`.
 
 **Task #10's DoD is < 0.5/s. Phase 1 as specified reaches 4.73/s, and widening
 the bucket asymptotes at 2.27/s — it never gets close.** Three conclusions:
 
-- **`complete` alone accounts for essentially the whole residual.** `source`
-  contributes nothing once `complete` is gone; the two co-move perfectly.
-  Removing the flap fields takes the rate to **0.15/s**, so **#4.5 alone
-  plausibly clears #10's DoD and no amount of #6 bucket tuning does.** That is
-  the justification for the reordering.
+- **#4.5 and #6 are complementary; NEITHER reaches the target alone.** Isolated
+  on the same capture: **#4.5 alone 5.74/s** (flap fixed, `fresh_until` still
+  compared exactly), **#6 alone 2.27/s** (`fresh_until` neutralized, flap
+  present), **both 0.15/s**. With the flap fixed but `fresh_until` still in the
+  key, it advances once per second per active Codex session
+  (`DefaultActiveResnapshot = 1s`, `internal/provider/codex/observer.go:21`);
+  with `fresh_until` quantized but the flap present, the ten-minute oscillation
+  defeats any bucket width. `complete` accounts for essentially the whole flap
+  residual — `source` contributes nothing once `complete` is gone.
+  **#4.5's job is to remove a floor no bucket can collapse**, which is the
+  precondition for #6 to work. That is the justification for the reordering.
 - **#6 must also normalize node-level `updated_at`.** The plan says to keep it
   in the key. The data says it is pure clock churn — it moves in 73 of 230 pairs
   with no sibling field on that node moving — and costs ~1.76 publishes/s.
@@ -595,11 +625,16 @@ journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
     `should still overlay the root node status when the app-server reports the root unavailable`,
     `should emit no child agent_state row carrying source hook after a Forget followed by a hook frame`.
     The last one is the #83 regression test and is the reason #3 is a prereq.
-  - **Verify**: re-run the §1.4.2 ablation against a fresh capture. Replaying
-    the ablation with the flap fields removed gives **0.15/s**, so this task
-    alone plausibly clears #10's DoD; only then is #6's bucket worth tuning.
-    Also re-check that the remote `nlessfun` session stops being pinned at
-    `source=hook` (§1.4.3).
+  - **Verify**: re-run the §1.4.2 ablation against a fresh capture and confirm
+    `source`, `complete` and `fresh_until` stop oscillating. **Expect ~5.7/s, not
+    0.15/s** — this task removes the floor, and #6 does the rest (§1.4.2).
+    **Judge this gate on the oscillation being gone, not on the rate.** Only then
+    is #6's bucket worth tuning, against these numbers rather than the pre-#4.5
+    table. Note the fix is host-local and does NOT reach the remote `nlessfun`
+    session — that graph is produced by nlessfun's own daemon, and that host
+    shows `app_server 0 / hook 231`, so the preserve branch could never fire
+    there. Its 600 s hold is the designed no-app-server fallback and contributes
+    zero churn; see `docs/memory-footprint-phase1/01-task-4.5-hook-provenance.md` §8.
   - **Phase**: 0 (lands with Phase 0, ahead of #5/#6)
   - **Notes**: Does NOT fix #83's duplication half — the projector's `seen`
     dedupe map is in-memory and cleared by `Forget`
@@ -678,6 +713,20 @@ journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
     invisible.
 
 - [ ] #7: Freshness lease on the wire
+  - **DECIDED 2026-08-26 (owner): the IN-MEMORY policy change is DEFERRED.**
+    Two mechanisms reach this DoD. Applying the ceiling in `ProjectAgentGraph`
+    would make every provider's freshness horizon genuinely longer by up to the
+    bucket width — one representation everywhere, no divergence, no encode
+    overhead, but a real policy change. The owner is not comfortable with that
+    yet, so #7 ships the **wire-only** mechanism (`AgentGraph.MarshalJSON`),
+    which leaves in-memory `Fresh()` untouched at the cost of a nested encode per
+    graph and a ≤1-bucket daemon/consumer divergence. Full write-up, including
+    the round-trip asymmetry it introduces for remote and hydrated graphs, in
+    `docs/memory-footprint-phase1/02-tasks-5-6-7-change-key.md` §"#7". Revisit
+    the deferred alternative with the `heap_sys_mb` measurement taken after C2.
+  - **NOTE**: #6 without #7 is a **correctness regression**, not merely an
+    incomplete one — if the key quantizes `fresh_until` but the wire carries the
+    raw value, suppression makes consumers falsely stale. They ship together.
   - **Prereqs**: #6 complete — only meaningful once republishes are suppressed
   - **DoD**: On the frames that are published, `agent_graph.fresh_until` is
     the bucket **ceiling** (never earlier than the true value), so a consumer
