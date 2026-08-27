@@ -285,20 +285,20 @@ func sessionStatus(s state.Session) string {
 
 // sessionTooltip renders the hover card with pango markup:
 //
+//	cyclops  ~/Projects/cyclops          (name in small caps, path dimmed)
 //	goosebook   ● working · 37m
-//	Cyclops                              (small caps)
 //	s1-hardening-status-update
-//	up 4h12m · started 12:44 · ws 5
-//	~/Projects/cyclops · pid 23137
+//	up 4h12m · started 12:44 · ws 5 · pid 23137
 //	12 agents · 5 live · 9h40m done
 //
-// Line 1 names the HOST, not the project abbreviation the old card led with:
-// the chip label already carries the project, and with remote sessions now
-// drawn as a nested pill, "which machine" is the question the card exists to
-// answer. Line 2 is the project's full display name in small caps — the chip
-// shows the terse Canonical ("sb"), so the hover is where "Switchboard" belongs.
-// Line 3 is the bare task, and the dimmed block below is timing, location, and
-// the subagent roll-up.
+// Line 1 is the project's full display name — the chip shows the terse Canonical
+// ("sb"), so the hover is where "Switchboard" belongs — paired on the same line
+// with the path it lives at, since the name and its location answer one question
+// together. It is lowercased before the small-caps run: pango renders an
+// uppercase letter at full height, so a mixed-case name like "SSPI Data Webapp"
+// would come out unevenly sized, and folding the case first makes every card's
+// title one uniform height. Line 2 names the host, then the task, then a dimmed
+// block of timing, workspace, and the subagent roll-up.
 //
 // EVERY field here is either event-driven or coarsened to minute resolution, and
 // that is a hard constraint rather than a style choice. The tooltip travels in
@@ -371,16 +371,16 @@ func sessionTooltip(cfg projectname.Config, cache *sblabel.NameCache, s state.Se
 	}
 
 	dot := fmt.Sprintf("<span foreground='%s'>●</span>", statusColor(status))
-	lines := []string{
-		fmt.Sprintf("<b>%s</b>   %s %s", pangoEscape(sessionHost(s)), dot, pangoEscape(statusText)),
+	var lines []string
+	if head := identityLine(full, s); head != "" {
+		lines = append(lines, head)
 	}
-	if full != "" {
-		lines = append(lines, fmt.Sprintf("<span variant='smallcaps'>%s</span>", pangoEscape(full)))
-	}
+	lines = append(lines,
+		fmt.Sprintf("<b>%s</b>   %s %s", pangoEscape(sessionHost(s)), dot, pangoEscape(statusText)))
 	if task != "" {
 		lines = append(lines, pangoEscape(task))
 	}
-	for _, meta := range []string{lifeLine(s, now), placeLine(s), agentFanout(s.AgentGraph)} {
+	for _, meta := range []string{lifeLine(s, now), agentFanout(s.AgentGraph)} {
 		if meta == "" {
 			continue
 		}
@@ -411,8 +411,9 @@ func sessionHost(s state.Session) string {
 	return localHostname()
 }
 
-// lifeLine renders "up 4h12m · started 12:44 · ws 5" — how long the session has
-// existed, when it began on the wall clock, and which workspace to switch to.
+// lifeLine renders "up 4h12m · started 12:44 · ws 5 · pid 23137" — how long the
+// session has existed, when it began on the wall clock, which workspace to
+// switch to, and the process behind it.
 //
 // Uptime and start time answer different questions and neither substitutes for
 // the other: uptime is the one you compare across chips, the clock time is the
@@ -429,7 +430,8 @@ func lifeLine(s state.Session, now time.Time) string {
 	if s.Hyprland != nil && s.Hyprland.Workspace != "" {
 		ws = s.Hyprland.Workspace
 	}
-	return strings.Join(append(parts, "ws "+ws), " · ")
+	parts = append(parts, "ws "+ws, fmt.Sprintf("pid %d", s.PID))
+	return strings.Join(parts, " · ")
 }
 
 // startedClock renders the wall-clock time a session began, in the VIEWER's zone
@@ -445,17 +447,34 @@ func startedClock(t, now time.Time) string {
 	return t.Format("Jan 2 15:04")
 }
 
-// placeLine renders "~/Projects/cyclops · pid 23137". The host is deliberately
-// not repeated here — it leads the card.
-func placeLine(s state.Session) string {
+// identityLine renders the card's title: the project's full display name in
+// small caps, paired with the directory it lives in.
+//
+// The name is lowercased first. Pango renders a small-caps run by shrinking
+// LOWERCASE letters to cap height and leaving uppercase ones alone, so
+// "SSPI Data Webapp" would come out as a jumble of two heights. Folding the case
+// first makes every title one uniform height, which is the whole point of asking
+// for small caps.
+//
+// The path is dimmed and set at the same size as the metadata below rather than
+// the title, so the pairing reads as "name, and where it is" instead of two
+// competing headings. A remote CWD is printed verbatim: it names a directory on
+// another machine, so contracting it against this user's HOME would be a lie.
+func identityLine(full string, s state.Session) string {
 	cwd := s.CWD
 	if !s.Remote {
 		cwd = contractHome(cwd)
 	}
-	if cwd == "" {
-		return fmt.Sprintf("pid %d", s.PID)
+	var parts []string
+	if full != "" {
+		parts = append(parts, fmt.Sprintf("<span variant='smallcaps'>%s</span>",
+			pangoEscape(strings.ToLower(full))))
 	}
-	return fmt.Sprintf("%s · pid %d", cwd, s.PID)
+	if cwd != "" {
+		parts = append(parts, fmt.Sprintf("<span foreground='#6c7086' size='smaller'>%s</span>",
+			pangoEscape(cwd)))
+	}
+	return strings.Join(parts, "  ")
 }
 
 // agentFanout rolls the subagent graph up into one line:

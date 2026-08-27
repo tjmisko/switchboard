@@ -180,9 +180,13 @@ func TestRemoteTooltipDoesNotResolveCWDOnLocalFilesystem(t *testing.T) {
 		Agent: state.AgentKindClaude, Claude: &state.AgentInfo{Status: state.StatusIdle},
 	}
 	tip := sessionTooltip(projectname.DefaultConfig(), &sblabel.NameCache{}, s, time.Now())
-	// The full display name resolves from the basename alone; the host leads.
-	if !strings.Contains(tip, "<b>buildbox</b>") || !strings.Contains(tip, "Switchboard") {
-		t.Fatalf("remote tooltip did not use lexical remote project/identity:\n%s", tip)
+	// The full display name resolves from the basename alone, case-folded for
+	// the small-caps run; the host follows on line 2.
+	if !strings.Contains(tip, "<span variant='smallcaps'>switchboard</span>") {
+		t.Fatalf("remote tooltip did not use the lexical remote project name:\n%s", tip)
+	}
+	if !strings.Contains(tip, "<b>buildbox</b>") {
+		t.Fatalf("remote tooltip did not name the remote host:\n%s", tip)
 	}
 	if !strings.Contains(tip, "pid 4") {
 		t.Fatalf("remote tooltip lost the process identity:\n%s", tip)
@@ -343,6 +347,39 @@ func TestSessionTooltipWithAgentGraphDoesNotDuplicateLegacyDetail(t *testing.T) 
 	// ...but the workflow's NAME is not in the roll-up, so it stays.
 	if !strings.Contains(tip, "legacy-workflow") {
 		t.Fatalf("workflow name is not derivable from the roll-up and must survive:\n%s", tip)
+	}
+}
+
+// Pango shrinks only LOWERCASE letters in a small-caps run, so a mixed-case
+// display name would render at two different heights. The card folds the case
+// first so every title is one uniform height.
+func TestSessionTooltipLowercasesTheSmallCapsTitle(t *testing.T) {
+	cfg := projectname.Config{Rules: []projectname.ProjectRule{
+		{Match: []string{"webapp"}, Canonical: "sspi", Full: "SSPI Data Webapp"},
+	}}
+	s := state.Session{PID: 1, CWD: "/home/u/webapp", Claude: &state.AgentInfo{Status: state.StatusWorking}}
+	tip := sessionTooltip(cfg, &sblabel.NameCache{}, s, time.Now())
+	if !strings.Contains(tip, "<span variant='smallcaps'>sspi data webapp</span>") {
+		t.Errorf("title should be case-folded for the small-caps run:\n%s", tip)
+	}
+	if strings.Contains(tip, "SSPI Data Webapp") {
+		t.Errorf("mixed-case title leaked through:\n%s", tip)
+	}
+}
+
+// The name and the path answer one question together, so they share line 1 —
+// ahead of the host, which takes line 2.
+func TestSessionTooltipPairsProjectNameWithPathAheadOfHost(t *testing.T) {
+	s := state.Session{PID: 1, CWD: "/home/u/webapp", Claude: &state.AgentInfo{Status: state.StatusWorking}}
+	lines := strings.Split(sessionTooltip(projectname.Config{}, &sblabel.NameCache{}, s, time.Now()), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("card too short: %q", lines)
+	}
+	if !strings.Contains(lines[0], "smallcaps") || !strings.Contains(lines[0], "/home/u/webapp") {
+		t.Errorf("line 1 should pair the project name with its path, got %q", lines[0])
+	}
+	if !strings.Contains(lines[1], "<b>") {
+		t.Errorf("line 2 should be the host, got %q", lines[1])
 	}
 }
 
@@ -689,7 +726,8 @@ func TestNameConfigShouldReloadWhenConfigFileChanges(t *testing.T) {
 	}
 	// The hover names the project in full, so a changed ABBREVIATION must not
 	// show up there — that is the chip's job, asserted above.
-	if !strings.Contains(got.Tooltip, "Proj") || strings.Contains(got.Tooltip, "zzz") {
+	if !strings.Contains(got.Tooltip, "<span variant='smallcaps'>proj</span>") ||
+		strings.Contains(got.Tooltip, "zzz") {
 		t.Errorf("hover should keep the full display name, not the abbreviation: %q", got.Tooltip)
 	}
 }
@@ -1062,7 +1100,8 @@ func TestNameConfigShouldPickUpARenameWrittenBySetAbbrev(t *testing.T) {
 	if got.Text != "zzz-proj" {
 		t.Errorf("chip text = %q, want zzz-proj — the middle-click rename did not reach the chip", got.Text)
 	}
-	if !strings.Contains(got.Tooltip, "Proj") || strings.Contains(got.Tooltip, "zzz") {
+	if !strings.Contains(got.Tooltip, "<span variant='smallcaps'>proj</span>") ||
+		strings.Contains(got.Tooltip, "zzz") {
 		t.Errorf("hover should keep the full display name, not the abbreviation: %q", got.Tooltip)
 	}
 }

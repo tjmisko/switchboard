@@ -81,20 +81,21 @@ Polybar / Waybar / eww / i3blocks.
 Every Waybar chip has a hover card:
 
 ```
+ARACHNE  ~/Projects/Arachne
 goosebook   ● working · 53m
-ARACHNE
 react-canvas-refactor
-up 2h20m · started 14:49 · ws 4
-~/Projects/Arachne · pid 20805
+up 2h20m · started 14:49 · ws 4 · pid 20805
 33 agents · 3 live · 2h24m done
 ```
 
-The host leads, because the chip label already carries the project and a remote
-session is only a nested outline away from a local one. Below it: the project's
-full display name in small caps (the chip shows the terse abbreviation), the
-task, then how long the session has run and when it started, where it lives, and
-what its subagents have been doing. Status age comes from the additive
-`status_since` field.
+Line 1 is the project's full display name — the chip carries only the terse
+abbreviation, so the hover is where `Switchboard` belongs — paired with the path
+it lives at, since the name and its location answer one question together. It is
+lowercased before the small-caps run: pango shrinks lowercase letters and leaves
+uppercase ones at full height, so folding the case first is what makes the title
+one uniform height. Line 2 names the host, then the task, then a dimmed block of
+timing, workspace, process, and the subagent roll-up. Status age comes from the
+additive `status_since` field.
 
 **Nothing on the card may tick faster than once a minute.** The tooltip travels
 inside the module's JSON, so rewriting it makes Waybar re-render the module,
@@ -501,24 +502,39 @@ Change the chip padding, margin, or the bar's `spacing` and you must update
 `DefaultMetrics` to match, or the labels will be cut short (too high) or spill
 off the edge of the bar (too low).
 
-A session on another machine gains the `remote` class and is drawn as a **nested
-pill** — the chip outline with a second ring just inside it, via `border: 3px
-double`. The gap between the rings is the chip's own status fill, so the nesting
-spends no color: status keeps the background, focus keeps the border hue, and
-remoteness is carried by shape alone.
+Every chip carries a border, and the border encodes three independent things at
+once:
 
-That third dimension is free only because the ring is paid for out of the chip's
-padding rather than added to its width:
+| | resting | focused |
+|---|---|---|
+| **local** | `1px solid` | `2px solid`, brighter |
+| **remote** | `3px double` | `4px double`, brighter |
+
+*Shape* is location — a session on another machine gains the `remote` class and
+is drawn as a **nested pill**, the chip outline with a second ring just inside
+it. *Colour* is status, and the CSS for the ring sets width and style but
+deliberately never colour, so the ring simply picks up whatever hue the status
+and focus rules assign: an idle remote chip rings amber, not some fixed accent
+fighting its own fill. *Weight* is focus, which reads twice — brighter and
+thicker — so the current session survives a washed-out display. The gap between
+a double ring's two lines is the chip's own status fill, so the nesting spends no
+colour of its own.
+
+All four combinations are free only because the extra width is paid for out of
+the chip's padding rather than added to its box:
 
 ```css
-/* local  */ padding: 4px 8px;  border: 1px solid  …   /* 8 + 1 = 9px per side */
-/* remote */ padding: 2px 6px;  border: 3px double …   /* 6 + 3 = 9px per side */
+/* local         */ padding: 4px 8px;  border-width: 1px;   /* 8 + 1 = 9 per side */
+/* local focused */ padding: 3px 7px;  border-width: 2px;   /* 7 + 2 = 9 */
+/* remote        */ padding: 2px 6px;  border-width: 3px;   /* 6 + 3 = 9 */
+/* remote focus  */ padding: 1px 5px;  border-width: 4px;   /* 5 + 4 = 9 */
 ```
 
-Keep that trade balanced. `ChipFixedPx` is a **single** number for the whole row,
-so a remote chip that were genuinely wider would make the fit depend on how many
-of the visible sessions happened to be remote — and every label on the bar would
-re-abbreviate whenever a remote session appeared or dropped.
+Keep that trade balanced — `.headless` restates the base padding for the same
+reason, since it resets the border to 1px. `ChipFixedPx` is a **single** number
+for the whole row, so a chip that were genuinely wider would make the fit depend
+on which sessions happened to be remote or focused, and every label on the bar
+would re-abbreviate whenever focus moved.
 
 A chip whose `claude` process is job-control-stopped (Ctrl-Z) gains the
 `suspended` class on top of its status class. Grey it out in `style.css`:
