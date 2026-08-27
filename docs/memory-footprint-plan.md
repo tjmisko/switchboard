@@ -74,6 +74,307 @@ Each waybar slot decodes 14 KB ~10×/s → the ~4.8 MB heap arena per slot.
 | `GOMAXPROCS=1 GOGC=25` | 7.9 MB / 3.7 MB |
 | `switchboard-ctl timeline --json --plan-window --day 2026-08-26` | 34 MB peak, 0.54 s |
 
+### 1.4 Baseline capture (task #4)
+
+Captured with `scripts/sb-mem-baseline` (task #1) on the build running at the
+time — `~/.config/switchboard/bin/switchboard -remote nlessfun`, pid 1097019,
+started 16:15:51, so `MemoryPeak` is since that restart and not since boot.
+
+**Census.** 5 live sessions — 2 Claude, 3 Codex — of which 2 Codex panes were
+actively spinning; bottom bar up; 11 socket subscribers (10 `switchboard-waybar
+--slot N` + `bottombar watch`). Host: goosebook, Asahi arm64, 16K pages,
+Go 1.26.5, 15.2 GiB RAM.
+
+**The publish rate does NOT scale with the live-session count** — it is
+dominated by how many Codex panes are *actively spinning*; total session count
+is a weak proxy. Per-session attribution over this capture (publishes each
+session would generate alone, today's key): `[0] claude 10, [1] claude 8,
+[2] remote codex 12, [3] codex 153, [4] codex 125`. Two of five sessions produce
+92% of the churn, and the union is strongly sublinear (308 summed, 212 together).
+Record the census anyway — it is cheap and it is the only way to notice a
+workload change between runs — but as "what workload was this", not as a
+normalizer.
+
+Raw JSON line, `sb-mem-baseline` default 15 s capture at
+**2026-08-26T16:51:05-07:00**:
+
+```json
+{"timestamp":"2026-08-26T16:51:05-07:00","host":"goosebook","socket":"/run/user/1000/switchboard.sock","subscribers":11,"units":{"switchboard.service":{"state":"active","memory_current_bytes":123535360,"memory_peak_bytes":208715776,"anon_bytes":72253440,"file_bytes":40173568},"switchboard-waybar.service":{"state":"active","memory_current_bytes":138739712,"memory_peak_bytes":167804928,"anon_bytes":97632256,"file_bytes":21987328},"switchboard-dashboard.service":{"state":"active","memory_current_bytes":73351168,"memory_peak_bytes":1091878912,"anon_bytes":8568832,"file_bytes":58327040}},"processes":{"daemon":{"pid":1097019,"rss_bytes":49299456,"rss_anon_bytes":43794432},"codex_app_server":{"pid":1097049,"rss_bytes":56737792,"rss_anon_bytes":28606464},"remote_stream":{"pid":1097033,"rss_bytes":6979584,"rss_anon_bytes":409600},"waybar_slot_0":{"pid":1407043,"rss_bytes":12337152,"rss_anon_bytes":7929856},"waybar_slot_1":{"pid":1407045,"rss_bytes":11829248,"rss_anon_bytes":7503872},"waybar_slot_2":{"pid":1407047,"rss_bytes":12484608,"rss_anon_bytes":8077312},"waybar_slot_3":{"pid":1407049,"rss_bytes":12320768,"rss_anon_bytes":7913472},"waybar_slot_4":{"pid":1407051,"rss_bytes":12173312,"rss_anon_bytes":7831552},"waybar_slot_5":{"pid":1407057,"rss_bytes":12320768,"rss_anon_bytes":7979008},"waybar_slot_6":{"pid":1407069,"rss_bytes":12107776,"rss_anon_bytes":7766016},"waybar_slot_7":{"pid":1407081,"rss_bytes":12025856,"rss_anon_bytes":7700480},"waybar_slot_8":{"pid":1407088,"rss_bytes":12042240,"rss_anon_bytes":7700480},"waybar_slot_9":{"pid":1407092,"rss_bytes":12058624,"rss_anon_bytes":7716864},"waybar_gtk":{"pid":1407017,"rss_bytes":51970048,"rss_anon_bytes":11911168},"bottombar_watch":{"pid":1098140,"rss_bytes":12402688,"rss_anon_bytes":7487488}},"capture":{"duration_s":15.002,"frames":105,"publishes":104,"publish_rate_hz":6.932,"mean_frame_bytes":19121,"total_frame_bytes":2007725}}
+```
+
+**§1.1 confirmed.** Every figure in §1.1 reproduces within its stated range. The
+one correction: the `codex app-server` child measured 54–57 MB RSS / 27–31 MB
+anon here, not the 103 MB / 33 MB in §1.1 — that process grows with Codex
+session count and conversation size, so treat §1.1's figure as an upper
+observation rather than a steady state.
+
+**Daemon sawtooth, 56 samples at 10 s, 16:48:42–16:57:52** (a single `VmRSS`
+reading is not a baseline — the daemon oscillates by 15 MB between GCs). MiB,
+all n=56:
+
+| | min | mean | max | median | sd |
+|---|---|---|---|---|---|
+| daemon `VmRSS` | 32.4 | **39.3** | 47.9 | 38.9 | 4.3 |
+| daemon `RssAnon` | 27.2 | **34.1** | 42.7 | 33.7 | 4.3 |
+| `switchboard.service` cgroup anon | 51.5 | **63.3** | 74.7 | 62.4 | 5.3 |
+| `switchboard-waybar.service` cgroup anon | 80.7 | **90.1** | 93.9 | 91.9 | 4.1 |
+
+Three caveats on this table, all of which matter for the "after" comparison:
+
+- **This is a BUSY-case baseline, not an idle one.** The window is the middle of
+  the multi-agent Phase-0 investigation, with 3–5 subagents live and two captures
+  in flight. Phase 1's "after" reading must be taken under comparable load or it
+  is measuring the workload, not the fix.
+- **A regime change sits inside the window.** `switchboard-waybar` cgroup anon
+  drops from ~94 to ~85 MiB at 16:55:52 and stays there, with no unit restart in
+  the journal. The mean above averages across two regimes.
+- **min/max of 56 draws are inward-biased** estimators of the true trough and
+  peak: the real sawtooth almost certainly exceeds 42.7 and dips below 27.2. The
+  mean is unbiased (Go's GC is allocation-paced, so a fixed 10 s probe has no
+  phase to alias against).
+
+Note for #19: the criterion there is "daemon `RssAnon` after Phase 1 still
+> 25 MB". Pre-Phase-1 mean is 34.1 and *minimum* is 27.2, so apply it to the
+**mean over a sampled window**, never to a single reading.
+
+**Churn.** Independent captures, all at 11 subscribers, same 5-session census:
+
+| capture | window | publishes/s | mean frame |
+|---|---|---|---|
+| raw `ncat` capture, 16:45:13 | 19.854 s | 11.58 | 18.3 KiB |
+| `sb-mem-baseline`, 16:51:05 | 15 s | 6.93 | 18.7 KiB |
+| `sb-mem-baseline`, 16:57 | 3 s | 4.66 | 21.1 KiB |
+| `sb-mem-baseline`, 17:00:08 | 15 s | 7.93 | 19.8 KiB |
+
+(All frame sizes here are binary KiB, as `sb-mem-baseline` prints them. The
+first row is 230 publishes over the measured 19.854 s span, not over a nominal
+20 s.)
+
+**A single capture is a sample, not a level.** The rate spans 4.7–11.5/s on an
+unchanged build, tracking how hard the Codex TUIs happen to be spinning. To
+claim an effect, use the daemon's own `publish-stats` counters (#2), which
+integrate over a minute rather than sampling, cross-checked with ≥3 captures.
+#10's < 0.5/s DoD is an order of magnitude below this spread and so survives it;
+#19's `RssAnon` criterion does not, which is why it must use the sampled mean.
+
+Frame size is stable at ~18.7 KB (§1.2's 13.7 KB was at a smaller session
+count). At 6.9/s this is 130 KB/s encoded per subscriber, ~1.4 MB/s across 11.
+
+#### 1.4.1 Frame-diff — what actually moves between consecutive frames
+
+230 consecutive pairs from the 16:45 capture. **Two denominators, and they are
+not interchangeable:** `cells` counts every (pair, session) or (pair, session,
+node) slot that moved; `pairs` counts how many of the 230 transitions the field
+moved in *at all*. Only `pairs` is comparable to the publish counts in §1.4.2,
+because one publish is one pair no matter how many cells changed in it.
+
+| cells | pairs /230 | path | nature |
+|---|---|---|---|
+| 230 | 230 | `snapshot.updated_at` | clock, already dropped from the change key |
+| 190 | **99** | `sessions[i].wezterm.window_title` | Codex braille spinner |
+| 111 | 111 | `sessions[i].agent_graph.fresh_until` | clock **and see §1.4.3** |
+| 111 | 111 | `sessions[i].agent_graph.observed_at` | clock |
+| 73 | 71 | `sessions[i].agent_graph.nodes[i].updated_at` | clock, per node |
+| 42 | 42 | `sessions[i].agent_graph.source` | **provenance flap, §1.4.3** |
+| 42 | 42 | `sessions[i].agent_graph.complete` | **provenance flap, §1.4.3** |
+| 6 | 6 | `focused`, node `runtime`/`lifecycle`, `summary.*` | genuine changes |
+
+`fresh_until` and `observed_at` move in exactly the same 111 cells (set
+equality, empty symmetric difference) — they are stamped together, and there is
+no transition where the freshness horizon moved without a new observation.
+
+#### 1.4.2 Ablation — what each planned lever actually buys
+
+The planned change-key rules replayed over the real 231-frame capture. Counts
+are key *changes* over the 230 consecutive pairs; rates divide by the measured
+span, **19.854 s** (from the first and last frame's `updated_at`), not a nominal
+20 s. Independently re-derived from scratch by a second reviewer: every count
+matched exactly.
+
+| change key | changes | rate | suppressed |
+|---|---|---|---|
+| today (drops `updated_at` only) | 211 | 10.63/s | 8.3% |
+| + #5/#6 title spinner normalize | 114 | 5.74/s | 50.4% |
+| + drop `agent_graph.observed_at` | 114 | 5.74/s | 50.4% |
+| + #6 `fresh_until` 5 s bucket — **plan's Phase 1 as written** | **94** | **4.73/s** | 59.1% |
+| + drop node `updated_at` (not in the plan) | 59 | 2.97/s | 74.3% |
+| + `fresh_until` 15 s bucket | 52 | 2.67/s | 77.4% |
+| + `fresh_until` 30 s bucket | 49 | 2.47/s | 78.7% |
+| + drop `fresh_until` entirely (bucket asymptote) | 45 | 2.27/s | 80.5% |
+| + also drop `agent_graph.source` | 45 | 2.27/s | 80.5% |
+| + also drop `agent_graph.complete` — **i.e. after #4.5** | **3** | **0.15/s** | 98.7% |
+
+**Task #10's DoD is < 0.5/s. Phase 1 as specified reaches 4.73/s, and widening
+the bucket asymptotes at 2.27/s — it never gets close.** Three conclusions:
+
+- **`complete` alone accounts for essentially the whole residual.** `source`
+  contributes nothing once `complete` is gone; the two co-move perfectly.
+  Removing the flap fields takes the rate to **0.15/s**, so **#4.5 alone
+  plausibly clears #10's DoD and no amount of #6 bucket tuning does.** That is
+  the justification for the reordering.
+- **#6 must also normalize node-level `updated_at`.** The plan says to keep it
+  in the key. The data says it is pure clock churn — it moves in 73 of 230 pairs
+  with no sibling field on that node moving — and costs ~1.76 publishes/s.
+- **The ablation is optimistic, which strengthens the conclusion.** Three
+  reasons, all pushing the true figure up: (1) these are `federation.View`
+  frames, not `state.Store` frames — the daemon ran `-remote`, and
+  `View.publish()` (`internal/federation/view.go:320`) has no change gate at all,
+  so 19 of the 231 frames are byte-identical to their predecessor under today's
+  key and could not have come from the Store gate; the "today" row therefore
+  measures View, not `snapshotChangeKey`. (2) Session `[2]` is remote, and #6
+  cannot gate it — restricting to goosebook sessions gives 83 changes (4.18/s)
+  for Phase 1, so **#8 is load-bearing, not cosmetic.** (3) `View.Subscribe`
+  coalesces with a 4-deep drop-oldest channel (`view.go:340`), so frames lost
+  there remove potential key changes.
+
+Method note: "differs from the immediately preceding frame" is *exact*, not an
+approximation of the daemon's "differs from the last published key". After every
+`Apply`, `s.publishedKey` equals the key of the frame just processed — either it
+differed and `adoptPublishedLocked` assigned it, or it matched and was already
+equal — so by induction the two are identical. Both were implemented; they agree
+on every variant. The only case that breaks the induction is the
+`invalidatePublished` retraction after a failed persist, which did not fire here.
+
+#### 1.4.3 The `agent_graph` provenance flap — blocks Phase 1's DoD
+
+Two producers write the same Codex session's graph and alternate frame to frame
+with different clock conventions *and* different freshness horizons:
+
+```
+source=codex_app_server  observed_at 16:45:13-07:00  fresh_until 16:45:28-07:00   15 s horizon, LOCAL tz
+source=hook              observed_at 23:45:16Z       fresh_until 23:55:16Z       600 s horizon, UTC
+```
+
+Same 31 nodes in both — the only per-node difference is the root's `updated_at`.
+Horizons measured at exactly 15.000 s and 600.000 s with zero variance, matching
+`codex.DefaultFreshness` (`internal/provider/codex/observer.go:20`) and
+`codexHookActiveFreshness` (`cmd/switchboard/agent_observation.go:27`).
+
+Flip counts over the 231-frame capture, per session:
+
+| session | source mix | one-way transitions | round trips |
+|---|---|---|---|
+| `[3]` goosebook/codex/20805 | app_server 143 / hook 88 | 26 | 13 |
+| `[4]` goosebook/codex/23137 | app_server 191 / hook 40 | 16 | 8 |
+| `[2]` **nlessfun**/codex/310315 | **hook 231 / app_server 0** | 0 | 0 |
+
+The split is 62/38 and 83/17, not the clean 50/50 the shape suggests.
+`|Δfresh_until|` reaches 587 s on both, so `fresh_until` oscillates between two
+values **~10 minutes apart**, which no bucket width can collapse — that is the
+2.27/s asymptote.
+
+**The remote `nlessfun` session is pinned at `source=hook` with the 600 s
+horizon for all 231 frames.** The same defect is live there in its permanently
+degraded form rather than flapping: that chip holds "working" for up to 10
+minutes after Codex stops, with nothing to correct it.
+
+Mechanism, all in `cmd/switchboard/agent_observation.go:589-593`
+(`overlayCodexHookObservation`): a Codex hook produces a *single-node* root
+observation (`codex_hook_transitions.go:1176`), which is inflated back to the
+app-server's full graph and relabelled wholesale —
+
+```go
+overlay.Source     = agentgraph.SourceHook   // :590  unguarded
+overlay.FreshUntil = hook.FreshUntil         // :592  imports the 600 s horizon
+overlay.Complete   = false                   // :593  unguarded
+```
+
+The alternation is not a race: `shouldApplyObservation` returns at
+`agent_observation.go:565` on the `ObservedAt` comparison, *before* `sourceRank`
+(`:568`, app_server 4 > hook 3) is ever read. Both producers stamp their own
+`now`, so the ranks never apply and last-writer-by-wall-clock wins;
+`codex_hook_transitions.go:270` then schedules an app-server re-observation
+after every hook, closing the loop.
+
+The 600 s horizon is itself deliberate (`agent_observation.go:22-30`) but scoped
+to the *no-attachable-app-server* case. Applying it to a graph a live
+app-server re-confirms every second is wrong by ~40x, and it means a chip holds
+"working" for up to 10 minutes after Codex dies mid-turn instead of greying in
+15 s (`agentgraph.Reduce`, `internal/agentgraph/reduce.go:9`).
+
+**This also violates issue #83 in production data.** `:590`/`:593` stamp
+`source: hook` onto app-server-derived children. Today's day-file
+(`~/.local/state/switchboard/history/2026-08-26.jsonl`, 538 `agent_state` rows):
+
+```
+codex hook child rows                                              33
+  with a contradictory codex_app_server twin
+  (same session_id, thread_id, ts, to_runtime, to_lifecycle)       31
+  hook-only child rows (#83 requirement 3 forbids these)            2
+```
+
+Grouping sensitivity: on the `to_*` identity above it is 31 twinned / 2
+orphaned; including the `from_*` axes it is **24 / 9** — seven more hook child
+rows have an app-server row at the same instant that disagrees about the *prior*
+state, which is arguably the more damning number. #83 requirement 3 is violated
+either way. The two orphans are unambiguous: threads `01a0403b…` and `01a0402c…`,
+both `parent_thread_id 01a03f8f…`, both `unknown→not_loaded`, at 23:01:38Z and
+23:01:46Z — genuinely hook-manufactured child edges.
+
+**These rows reach the dashboard.** `cmd/switchboard-ctl/timeline.go:306` filters
+`agent_state` on `ev.ThreadID == "" || ev.ParentThreadID == ""` and **does not
+filter on `source` at all**, so all 33 mislabelled rows are admitted into
+`agent_timeline`. §2's phrasing ("child `agent_state` with `parent_thread_id`
+*and* `source: codex_app_server`") describes the intended contract, not the
+implemented filter. That makes #4.5 a dashboard-correctness fix, not only a churn
+fix.
+
+Separately, 89 same-source duplicate facts today on #83's requirement-5 identity
+`(provider, root_id, thread_id, changed_axis, target_value, ts)` — the
+projector's `seen` dedupe map is in-memory only and is cleared by `Forget`
+(`internal/history/agent_state.go:142`). **The trigger is in-lifetime lane churn,
+not process restarts:** 73 of the 89 fall inside the single 01:24:48→14:31:18
+daemon lifetime, only 7 of 89 land within 120 s of any of the day's 8 starts
+(median distance to the nearest start: 47 min), and the three lifetimes after
+16:01 produced 106 `agent_state` rows and zero duplicates. #83 requirement 5 is
+unmet in production, but whoever picks it up should look at `Forget` call sites,
+not at startup replay.
+
+**Consequence for this plan: one fix at `agent_observation.go:589-593` collapses
+the source flap, the `complete` flap and the `fresh_until` oscillation, and
+removes the #83 mislabelling mechanism. It must land before #6, or Phase 1
+cannot meet task #10's DoD.** Filed as task #4.5 in §3.
+
+Latent hazard, worth its own issue: the two `ObservedAt` values are stamped in
+different *processes* — the hook in `switchboard-ctl`
+(`cmd/switchboard-ctl/main.go:621`, UTC) and the app-server in the daemon
+(`internal/provider/codex/observer.go:204`, local). `shouldApplyObservation`
+therefore orders a client wall clock against a daemon wall clock. Correct on one
+host today; invertible under an NTP step, a suspend/resume, or a remote `ctl`.
+
+#### 1.4.4 Pre-existing test failures on `main` (not caused by this work)
+
+- `internal/conformance` — `TestWeztermLocatorConformance` and
+  `TestAutoLocatorConformance` fail whenever a Codex session is running.
+  `conformance.go:430` compares the whole `terminal.PaneRef` with `*got != want`,
+  `WindowTitle` included, and the batch and single probes read the pane title at
+  different instants, so a rotating spinner fails the comparison. **This is issue
+  #80 from a third angle, and it bears on where task #5 puts the normalizer:**
+  the plan wires it into `internal/mapping` and `internal/label` only, which
+  leaves `internal/terminal` (`wezterm.go:79`, `tmux.go:106`) raw and the suite
+  still flaky. Normalizing at the `internal/terminal` boundary instead would fix
+  the change key, the mapping join, `label` and conformance in one place, at the
+  cost of `window_title` going out stripped on the wire and in `state.json`
+  (so `docs/state-schema.md` would need updating). Safe for the mapping join,
+  which already normalizes both sides at compare time and is idempotent.
+  Owner's call — recorded as an open decision on #5.
+  Verified over 5 runs: **23 of 23 disagreement pairs are one leading spinner
+  rune and nothing else** — `Mux`, `PaneID` and `TTY` are identical in all 23,
+  and stripping one rune from mapping's table makes both titles equal in all 23.
+  There is no second disagreement hiding behind the title mismatch. Note the
+  suite normally runs with its live assertions GATED OFF
+  (`SWITCHBOARD_LIVE_CONFORMANCE=1` opens them); re-run with the gate open and
+  the only failures are still the same title-only disagreements.
+- `internal/projectname` — `TestProjectRoot_noGitReturnsDirItself` fails because
+  a stray empty `/tmp/.git` directory exists on this box (created 2026-08-26
+  14:49), so `ProjectRoot` walks up and finds `/tmp` as a repo root. Purely
+  environmental; `rmdir /tmp/.git` clears it.
+
+Note also that `mapping.spinnerPrefixes` (`◐◑◒◓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✳⠂⠐⠁⠈⠠⠄⡀⢀`) is already a
+strict superset of `label.spinnerPrefixes` (`✳ ⠂ ⠐ ⠁ ⠈ ⠠ ⠄ ⡀ ⢀`), so #5's shared
+table is mapping's, and `label` *gains* coverage of the braille and circle
+spinners it currently misses.
+
 ---
 
 ## 2. Dashboard data contract (what must not move)
@@ -131,7 +432,7 @@ journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
 
 ### Phase 0: Measurement apparatus [CURRENT]
 
-- [ ] #1: `scripts/sb-mem-baseline` — one-shot footprint + churn report
+- [x] #1: `scripts/sb-mem-baseline` — one-shot footprint + churn report
   - **Prereqs**: none
   - **DoD**: Script prints (a) `MemoryCurrent/MemoryPeak` and `memory.stat`
     anon/file for `switchboard`, `switchboard-waybar`, `switchboard-dashboard`
@@ -148,7 +449,7 @@ journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
     dependency in `scripts/`. Bash rules: no `for` loops where `xargs`/`jq`
     will do; `>|` for overwrites.
 
-- [ ] #2: Daemon `publish-stats` telemetry line
+- [x] #2: Daemon `publish-stats` telemetry line
   - **Prereqs**: none
   - **DoD**: Once per minute the daemon logs one line
     `publish-stats: publishes=<n/min> suppressed=<n/min> subscribers=<n>
@@ -164,7 +465,7 @@ journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
     one place that decides). Reuse `vmHWMKB` from `seedtelemetry.go` — move it
     to a small shared helper rather than copy it.
 
-- [ ] #3: Invariant test — history recording is independent of publish suppression
+- [x] #3: Invariant test — history recording is independent of publish suppression
   - **Prereqs**: none — this is the guard every later phase runs against
   - **DoD**: A test in `cmd/switchboard` (or `internal/state` + a sink fake)
     named `should record history events when Apply suppresses the publish`:
@@ -177,13 +478,57 @@ journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
     projection) or `main.go:920` (transition). Pick whichever has an existing
     test harness with an injectable sink.
 
-- [ ] #4: Record the baseline in this document
+- [x] #4: Record the baseline in this document
   - **Prereqs**: #1 (the script is the measurement) complete
   - **DoD**: §1 tables above replaced/confirmed by `sb-mem-baseline` output
     captured with two Codex sessions live and the bottom bar showing; the raw
     JSON line pasted under a `### 1.4 Baseline capture` heading with the
     timestamp.
   - **Phase**: 0
+
+- [ ] #4.5: Stop the hook overlay from relabelling the whole Codex graph
+  - **Prereqs**: #3 (the invariant guard must exist first — this is the one
+    Phase-0/1 change that touches what lands in the history day-files)
+  - **Why this is here and not behind #83**: measured in §1.4.3. The five lines
+    at `cmd/switchboard/agent_observation.go:589-593` produce BOTH the
+    `fresh_until` oscillation that pins the publish rate at a ~2.45/s floor
+    (against #10's < 0.5/s DoD) AND the 33 mislabelled Codex child
+    `agent_state` rows in today's day-file that violate issue #83
+    requirements 3 and 5. One fix addresses both, so it lands here and gets
+    noted on #83 rather than the reverse.
+  - **DoD**: In `overlayCodexHookObservation`
+    (`cmd/switchboard/agent_observation.go:585`), when the current graph is a
+    fresh `codex_app_server` graph whose root the app-server actually knows,
+    `Source`, `Complete` and `FreshUntil` are carried over from the app-server
+    graph and only the root node's `Runtime`/`Attention`/`Lifecycle`/`UpdatedAt`
+    are overlaid. Reuse the predicate that already exists —
+    `codexAppServerRootUnavailable` (`cmd/switchboard/codex_hook_transitions.go:826`)
+    — do not introduce a second one. When there is no app-server graph, the
+    600 s `codexHookActiveFreshness` fallback (`agent_observation.go:27`) still
+    applies unchanged, and the 24 h / 7 d attention and idle horizons are
+    untouched. Tests:
+    `should not change agent_graph source when a hook arrives for a live app-server graph`,
+    `should not change agent_graph complete when a hook arrives for a live app-server graph`,
+    `should keep the app-server freshness horizon when a hook arrives for a live app-server graph`,
+    `should still apply the hook fallback horizon when there is no app-server graph`,
+    `should still overlay the root node status when the app-server reports the root unavailable`,
+    `should emit no child agent_state row carrying source hook after a Forget followed by a hook frame`.
+    The last one is the #83 regression test and is the reason #3 is a prereq.
+  - **Verify**: re-run the §1.4.2 ablation against a fresh capture. Replaying
+    the ablation with the flap fields removed gives **0.15/s**, so this task
+    alone plausibly clears #10's DoD; only then is #6's bucket worth tuning.
+    Also re-check that the remote `nlessfun` session stops being pinned at
+    `source=hook` (§1.4.3).
+  - **Phase**: 0 (lands with Phase 0, ahead of #5/#6)
+  - **Notes**: Does NOT fix #83's duplication half — the projector's `seen`
+    dedupe map is in-memory and cleared by `Forget`
+    (`internal/history/agent_state.go:142`). 89 same-source duplicate facts on
+    2026-08-26, of which **73 fall inside a single daemon lifetime** — the
+    trigger is in-lifetime lane churn, not process restarts, so look at the
+    `Forget` call sites (`agent_observation.go:306,311,508,827`), not at startup
+    replay. That stays a #83 sub-item. Also file a separate issue for the
+    cross-process clock comparison in `shouldApplyObservation` (§1.4.3).
+
 
 ### Phase 1: Stop the publish storm [FUTURE — do not start until Phase 0 is in DONE.md]
 
@@ -431,11 +776,20 @@ journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
 
 ## 4. Landing order and session loop
 
-Order: #1 #2 #3 (parallel) → #4 → #5 → #6 → #7 → #8 → #9 → #10 → #15 (any time) →
-#11 → #12 → #13 → #14 → #16 → #17 → #18 → #19 → #20.
+Order: #1 #2 #3 (parallel) → #4 → **#4.5** → #5 → #6 → #7 → #8 → #9 → #10 →
+#15 (any time) → #11 → #12 → #13 → #14 → #16 → #17 → #18 → #19 → #20.
 
-Suggested PRs: Phase 0 (one PR); #5+#6+#7+#8 (one PR — they only make sense
-together); #9; Phase 2; #16 findings as a doc commit; #17+#18; #19.
+#4.5 was added after the §1.4 baseline: it is a prerequisite for #6, not an
+optimization on top of it. Until the hook overlay stops importing a 600 s
+freshness horizon onto a live app-server graph, `fresh_until` oscillates
+between two values ~10 minutes apart and no change-key bucketing can suppress
+it — the measured floor is ~2.45/s against #10's < 0.5/s DoD. Tune #6's bucket
+only against a capture taken after #4.5 has landed.
+
+Suggested PRs: Phase 0 (one PR); #4.5 (its own PR — it is the only Phase-0/1
+change that touches history content, and it needs a #83 cross-reference);
+#5+#6+#7+#8 (one PR — they only make sense together); #9; Phase 2; #16 findings
+as a doc commit; #17+#18; #19.
 
 After completing each task:
 1. Tick the box here.
