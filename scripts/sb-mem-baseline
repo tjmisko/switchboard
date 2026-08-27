@@ -1,0 +1,483 @@
+#!/usr/bin/env bash
+# sb-mem-baseline — one-shot switchboard footprint + publish-churn report.
+#
+# Three probes, all against the LIVE system, all read-only:
+#
+#   units      MemoryCurrent/MemoryPeak from systemd plus anon/file from the
+#              unit's cgroup memory.stat, for switchboard, switchboard-waybar
+#              and switchboard-dashboard. MemoryPeak is reset by a restart, so
+#              it only means anything relative to the unit's start time — note
+#              the restart before quoting it.
+#
+#   processes  VmRSS/RssAnon from /proc for the daemon, the `codex app-server`
+#              child it spawns, the `ssh ... remote-stream` federation child,
+#              every `switchboard-waybar --slot N`, the GTK `waybar` that owns
+#              those slots, and `switchboard-ctl bottombar watch`. The cgroup
+#              figures above are these processes plus page cache; this table is
+#              where the anon bytes actually live. `waybar` and
+#              `remote_stream` are not switchboard code but they are charged to
+#              switchboard cgroups, so they are listed to make the unit totals
+#              add up.
+#
+#   churn      A `subscribe-all` capture on the daemon socket (15 s default).
+#              Every newline-delimited JSON object is one published frame. The
+#              daemon sends one snapshot on connect before any publish, so the
+#              publish rate subtracts that first frame; mean frame bytes is
+#              over all frames. Multiply the byte rate by the subscriber count
+#              for what the daemon actually encodes: with -remote configured
+#              every subscriber rebuilds and re-encodes the aggregate itself
+#              (`rpc.subscribeAll`, internal/rpc/rpc.go).
+#
+# HAZARD — the capture must hold its write half open for the whole window.
+# `printf '{"cmd":"subscribe-all"}\n' | ncat -U sock` captures exactly ONE
+# frame and exits 0: the daemon's connectionClosed watcher treats EOF on the
+# read side as a disconnect and stops streaming. That failure mode looks like a
+# successful capture of a perfectly idle daemon, which is the worst answer a
+# measurement script can give, so this one keeps stdin open with a `sleep` and
+# classifies the result in `capture_status` — never silently reports 0/s:
+#
+#   ok                   >1 frame; publish_rate_hz is a measurement
+#   connect_frame_only   exactly 1 frame; publish_rate_hz is null. Either the
+#                        daemon published nothing in the window (legitimate
+#                        after Phase 1 suppression, or with a very short -d) or
+#                        the capture lost its write half. Check both.
+#   no_frames            0 frames; the capture failed. Exit code 2.
+#
+# The publish rate scales with the number of live sessions in the snapshot, so
+# every capture records a session census (total, per agent, remote count).
+# A rate is only comparable against another rate taken at a similar census.
+#
+# BASELINE — 2026-08-26T17:00:08-07:00, goosebook (Asahi arm64, 16K pages,
+# Go 1.26.5, 15.2 GiB RAM), default 15 s capture, capture_status=ok.
+# CENSUS: 7 sessions (4 claude, 3 codex; 3 of them remote over the nlessfun
+# federation link), 11 subscribers (10 waybar slots + bottombar watch), bottom
+# bar up, both local Codex TUIs actively spinning.
+#
+#   units      switchboard.service            109.4 MB cur / 199.0 MB peak / 63.8 MB anon
+#              switchboard-waybar.service     110.4 MB cur / 160.0 MB peak / 82.1 MB anon
+#              switchboard-dashboard.service   48.3 MB cur /   1.0 GB peak /  8.8 MB anon
+#   processes  daemon 42.4 MB RSS / 37.3 MB anon (sawtooths 36-47 MB between
+#              GCs — one row is a sample, not a level), codex app-server
+#              49.3 MB, remote_stream 9.2 MB, 10 waybar slots 10.7 MB each,
+#              GTK waybar 25.6 MB, bottombar watch 11.1 MB
+#   churn      7.9 publishes/s, 19.8 KB mean frame, 158.6 KB/s encoded per
+#              subscriber, 1.7 MB/s across 11 subscribers
+#
+# Plan §1.2 recorded 9.4/s at 13.7 KB with 2 Codex sessions and fewer sessions
+# in the snapshot; the frame has grown with the session count since. That is
+# why the census above is part of the baseline — a rate is only comparable
+# against a rate taken at a similar census. switchboard.service MemoryPeak is
+# since the 16:15 restart that day, not since boot.
+#
+# The churn source is the Codex TUI's braille spinner rotating in the pane
+# title (see docs/memory-footprint-plan.md §1.2). Re-measure with the Codex
+# sessions live and the bottom bar showing, at the 15 s default — short windows
+# read high (I saw 4.7-11.0/s on 1-3 s captures) because the spinner bursts.
+#
+# Output is the table above on stdout followed by ONE JSON line, always last:
+#   sb-mem-baseline | tail -n 1 >> baseline.jsonl
+# keeps a machine-readable history.
+#
+# Exit codes: 0 report produced; 1 no socket, socket unreachable, or bad usage;
+# 2 report produced but the capture failed (capture_status=no_frames). A unit
+# that is not running or a child that is not present is `-` in the table and
+# null in the JSON, and is never a non-zero exit.
+
+set -u
+LC_ALL=C
+export LC_ALL
+
+readonly PROG=sb-mem-baseline
+readonly UNIT_SWITCHBOARD=switchboard.service
+readonly UNIT_WAYBAR=switchboard-waybar.service
+readonly UNIT_DASHBOARD=switchboard-dashboard.service
+
+die() {
+	printf '%s: %s\n' "$PROG" "$*" >&2
+	exit 1
+}
+
+usage() {
+	cat <<'EOF'
+usage: sb-mem-baseline [-d SECONDS] [-s SOCKET]
+
+  -d, --duration  subscribe-all capture length in seconds (default 15)
+  -s, --socket    daemon socket (default: $XDG_RUNTIME_DIR/switchboard.sock).
+                  Point this at a second daemon on a scratch socket to A/B a
+                  build against the running one.
+  -h, --help      this message
+
+Prints a human-readable table, then one JSON line. Baseline figures and the
+re-measure protocol are in this file's header.
+EOF
+}
+
+duration=15
+socket=
+
+while [ $# -gt 0 ]; do
+	case $1 in
+	-d | --duration)
+		[ $# -ge 2 ] || die "$1 needs a value"
+		duration=$2
+		shift 2
+		;;
+	--duration=*)
+		duration=${1#*=}
+		shift
+		;;
+	-s | --socket)
+		[ $# -ge 2 ] || die "$1 needs a value"
+		socket=$2
+		shift 2
+		;;
+	--socket=*)
+		socket=${1#*=}
+		shift
+		;;
+	-h | --help)
+		usage
+		exit 0
+		;;
+	*)
+		usage >&2
+		die "unknown argument: $1"
+		;;
+	esac
+done
+
+case $duration in
+'' | *[!0-9.]* | *.*.*) die "--duration must be a positive number, got: $duration" ;;
+esac
+awk -v d="$duration" 'BEGIN { exit !(d + 0 > 0) }' || die "--duration must be > 0"
+
+if [ -z "$socket" ]; then
+	if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+		socket=$XDG_RUNTIME_DIR/switchboard.sock
+	else
+		socket=/tmp/switchboard-$(id -u).sock
+	fi
+fi
+
+# The one hard failure: no daemon to measure. Everything else degrades to null.
+[ -S "$socket" ] || die "no daemon socket at $socket"
+
+command -v jq >/dev/null 2>&1 || die "missing required tool: jq"
+command -v awk >/dev/null 2>&1 || die "missing required tool: awk"
+if command -v ncat >/dev/null 2>&1; then
+	NCAT=ncat
+elif command -v nc >/dev/null 2>&1; then
+	NCAT=nc
+else
+	die "need ncat (or an nc with AF_UNIX support) to read the socket"
+fi
+
+# Traditional netcat has no -U at all and would connect to nothing; refuse
+# rather than emit a zero publish rate that looks like a measurement.
+"$NCAT" -h 2>&1 | grep -qE '(^|[[:space:]])-U(,|[[:space:]])' ||
+	die "$NCAT does not support -U (AF_UNIX); install nmap-ncat"
+
+tmp=$(mktemp -d) || die "cannot create a temp dir"
+trap 'rm -rf "$tmp"' EXIT
+
+# ---------------------------------------------------------------- units
+
+# prop DOC KEY — the value of one `systemctl show` KEY=VALUE line.
+prop() {
+	printf '%s\n' "$1" | awk -v k="$2" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }'
+}
+
+# bytes_or_dash VALUE — systemd writes "[not set]" / "infinity" for a unit that
+# is not running or has no accounting; both mean "no number".
+bytes_or_dash() {
+	case $1 in
+	'' | *[!0-9]*) printf -- '-' ;;
+	*) printf '%s' "$1" ;;
+	esac
+}
+
+unit_cgroup() {
+	systemctl --user show "$1" -p ControlGroup --value 2>/dev/null
+}
+
+# unit_row UNIT — one TSV row: unit, state, current, peak, anon, file.
+unit_row() {
+	local unit=$1 props state cgroup current peak statfile anon file
+	props=$(systemctl --user show "$unit" \
+		-p ActiveState -p ControlGroup -p MemoryCurrent -p MemoryPeak 2>/dev/null)
+	state=$(prop "$props" ActiveState)
+	[ -n "$state" ] || state='-'
+	cgroup=$(prop "$props" ControlGroup)
+	current=$(bytes_or_dash "$(prop "$props" MemoryCurrent)")
+	peak=$(bytes_or_dash "$(prop "$props" MemoryPeak)")
+
+	# Derive the cgroup path from systemd rather than hardcoding the uid slice.
+	anon='-'
+	file='-'
+	statfile="/sys/fs/cgroup${cgroup}/memory.stat"
+	if [ -n "$cgroup" ] && [ -r "$statfile" ]; then
+		read -r anon file <<<"$(awk '
+			$1 == "anon" { a = $2 }
+			$1 == "file" { f = $2 }
+			END { print (a == "" ? "-" : a), (f == "" ? "-" : f) }
+		' "$statfile")"
+	fi
+
+	printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$unit" "$state" "$current" "$peak" "$anon" "$file"
+}
+
+{
+	unit_row "$UNIT_SWITCHBOARD"
+	unit_row "$UNIT_WAYBAR"
+	unit_row "$UNIT_DASHBOARD"
+} >|"$tmp/units.tsv"
+
+# ------------------------------------------------------------ processes
+
+ps -eww -o pid=,ppid=,args= >|"$tmp/ps.txt" 2>/dev/null
+
+# Bare `waybar` is not ours; scope it to the unit that owns the slots.
+bar_procs="/sys/fs/cgroup$(unit_cgroup "$UNIT_WAYBAR")/cgroup.procs"
+[ -r "$bar_procs" ] || bar_procs=/dev/null
+
+awk -F'\t' '
+	function base(path,   n, a) { n = split(path, a, "/"); return a[n] }
+
+	# VmRSS/RssAnon for one pid; "-" if the process died between ps and now.
+	function status(pid,   f, line, a) {
+		RSS = "-"; ANON = "-"
+		f = "/proc/" pid "/status"
+		while ((getline line < f) > 0) {
+			split(line, a, /[ \t]+/)
+			if (a[1] == "VmRSS:") RSS = a[2]
+			else if (a[1] == "RssAnon:") ANON = a[2]
+		}
+		close(f)
+	}
+
+	function emit(label, pid) {
+		if (pid == "") { print label "\t-\t-\t-"; return }
+		status(pid)
+		print label "\t" pid "\t" RSS "\t" ANON
+	}
+
+	FNR == NR { inbar[$1] = 1; next }
+
+	{
+		# ps was asked for pid,ppid,args, so field 3 is argv[0]. comm is
+		# truncated at 15 chars, which makes switchboard-ctl and
+		# switchboard-waybar both read as "switchboard"; match the basename of
+		# argv[0] exactly instead (same rule as sb-perf daemon_pid).
+		n = split($0, f, /[ \t]+/)
+		pid = f[1]; ppid = f[2]; argv0 = base(f[3])
+
+		if (argv0 == "switchboard" && daemon == "") { daemon = pid; next }
+		if (argv0 == "switchboard-waybar" && match($0, /--slot[ =]+[0-9]+/)) {
+			s = substr($0, RSTART, RLENGTH)
+			sub(/^--slot[ =]+/, "", s)
+			slot[s + 0] = pid
+			if (s + 0 > maxslot) maxslot = s + 0
+			next
+		}
+		if (argv0 == "switchboard-ctl" && $0 ~ /bottombar/ && $0 ~ /watch/) { bottombar = pid; next }
+		if (argv0 == "waybar" && (pid in inbar)) { gtk = pid; next }
+		# Children are resolved against the daemon pid in END: ps output order
+		# is not guaranteed to put the parent first.
+		if (argv0 == "codex" && $0 ~ /app-server/) { codex[ppid] = pid; next }
+		if (argv0 == "ssh" && $0 ~ /remote-stream/) { stream[ppid] = pid; next }
+	}
+
+	END {
+		emit("daemon", daemon)
+		emit("codex_app_server", (daemon in codex) ? codex[daemon] : "")
+		emit("remote_stream", (daemon in stream) ? stream[daemon] : "")
+		for (i = 0; i <= maxslot; i++)
+			if (i in slot) emit("waybar_slot_" i, slot[i])
+		emit("waybar_gtk", gtk)
+		emit("bottombar_watch", bottombar)
+	}
+' "$bar_procs" "$tmp/ps.txt" >|"$tmp/procs.tsv"
+
+# ---------------------------------------------------------------- churn
+
+# Sampled before this probe connects, so the count is the steady-state
+# subscriber set and excludes us. Client ends of an AF_UNIX pair are unnamed,
+# so only the daemon's accepted fds carry the socket path.
+subscribers='-'
+if command -v ss >/dev/null 2>&1; then
+	subscribers=$(ss -x 2>/dev/null | awk -v p="$socket" '$2 == "ESTAB" && index($0, p) > 0' | wc -l)
+fi
+
+timestamp=$(date -Is)
+hard_stop=$(awk -v d="$duration" 'BEGIN { printf "%.3f", d + 5 }')
+
+printf '%s: capturing %ss of subscribe-all on %s ...\n' "$PROG" "$duration" "$socket" >&2
+
+# Hold stdin open for the whole window: the daemon's connectionClosed watcher
+# treats EOF on the read side as a disconnect and stops streaming immediately.
+# timeout is only a backstop; the capture normally ends when sleep returns.
+started=$(date +%s.%N)
+{
+	printf '%s\n' '{"cmd":"subscribe-all"}'
+	sleep "$duration"
+} | timeout "$hard_stop" "$NCAT" -U "$socket" >|"$tmp/frames.jsonl"
+capture_rc=$?
+ended=$(date +%s.%N)
+
+frames=$(wc -l <"$tmp/frames.jsonl")
+if [ "$frames" -eq 0 ] && [ "$capture_rc" -ne 0 ]; then
+	die "cannot subscribe on $socket ($NCAT exited $capture_rc)"
+fi
+
+# A capture that produced no publishes is not a measurement of zero publishes.
+# Classify it, keep publish_rate_hz null unless it is real, and say which.
+exit_code=0
+case $frames in
+0)
+	capture_status=no_frames
+	exit_code=2
+	printf '%s: WARNING no frames captured — the daemon accepted the connection and sent nothing.\n' "$PROG" >&2
+	printf '%s: this is a broken capture, not an idle daemon. capture_status=no_frames\n' "$PROG" >&2
+	;;
+1)
+	capture_status=connect_frame_only
+	printf '%s: WARNING only the connect snapshot arrived in %ss — no publish rate.\n' "$PROG" "$duration" >&2
+	printf '%s: either the daemon published nothing (suppression working, or -d too short)\n' "$PROG" >&2
+	printf '%s: or the capture lost its write half (see the HAZARD note in this script).\n' "$PROG" >&2
+	;;
+*)
+	capture_status=ok
+	;;
+esac
+
+# A timeout kill can truncate the last frame; count bytes over whole lines only.
+total_bytes=$(head -n "$frames" "$tmp/frames.jsonl" | wc -c)
+
+read -r elapsed publishes rate mean <<<"$(awk \
+	-v s="$started" -v e="$ended" -v n="$frames" -v b="$total_bytes" -v st="$capture_status" '
+	BEGIN {
+		el = e - s
+		pub = n > 0 ? n - 1 : 0
+		printf "%.3f %d %s %s\n", el, pub,
+			(st == "ok" && el > 0 ? sprintf("%.3f", pub / el) : "-"),
+			(n > 0 ? sprintf("%.0f", b / n) : "-")
+	}')"
+
+# The publish rate scales with the session count, so record the census the rate
+# was taken at. The connect snapshot is always the first frame when there is one.
+census='null'
+if [ "$frames" -ge 1 ]; then
+	census=$(head -n 1 "$tmp/frames.jsonl" | jq -c '
+		(.snapshot.sessions // []) as $s | {
+			total: ($s | length),
+			by_agent: ($s | group_by(.agent) | map({key: (.[0].agent // "unknown"), value: length}) | from_entries),
+			remote: ([$s[] | select(.remote == true)] | length)
+		}' 2>/dev/null)
+	[ -n "$census" ] || census='null'
+fi
+census_label=$(printf '%s' "$census" | jq -r '
+	if . == null then "sessions unknown"
+	else "\(.total) sessions (\(.by_agent | to_entries | map("\(.value) \(.key)") | join(", "))\(if .remote > 0 then "; \(.remote) remote" else "" end))"
+	end' 2>/dev/null)
+[ -n "$census_label" ] || census_label="sessions unknown"
+
+# ---------------------------------------------------------------- report
+
+printf '%s  %s  socket=%s\n\n' "$PROG" "$timestamp" "$socket"
+
+awk -F'\t' '
+	function hum(b,   u, i) {
+		if (b == "-" || b == "") return "-"
+		u[1] = "B"; u[2] = "KB"; u[3] = "MB"; u[4] = "GB"
+		i = 1
+		while (b >= 1024 && i < 4) { b /= 1024; i++ }
+		return sprintf("%.1f %s", b, u[i])
+	}
+	function kib(v) { return v == "-" ? "-" : hum(v * 1024) }
+
+	FNR == NR {
+		if (!units++) printf "units\n  %-30s %-9s %10s %10s %10s %10s\n", \
+			"unit", "state", "current", "peak", "anon", "file"
+		printf "  %-30s %-9s %10s %10s %10s %10s\n", $1, $2, hum($3), hum($4), hum($5), hum($6)
+		next
+	}
+	{
+		if (!procs++) printf "\nprocesses\n  %-18s %9s %10s %10s\n", "label", "pid", "rss", "anon"
+		printf "  %-18s %9s %10s %10s\n", $1, $2, kib($3), kib($4)
+	}
+' "$tmp/units.tsv" "$tmp/procs.tsv"
+
+printf '\nchurn  %ss subscribe-all, %s live subscribers, %s\n' "$elapsed" "$subscribers" "$census_label"
+awk -v n="$frames" -v pub="$publishes" -v rate="$rate" -v mean="$mean" \
+	-v total="$total_bytes" -v el="$elapsed" -v subs="$subscribers" -v st="$capture_status" '
+	function hum(b,   u, i) {
+		u[1] = "B"; u[2] = "KB"; u[3] = "MB"; u[4] = "GB"
+		i = 1
+		while (b >= 1024 && i < 4) { b /= 1024; i++ }
+		return sprintf("%.1f %s", b, u[i])
+	}
+	BEGIN {
+		printf "  status          %8s%s\n", st,
+			(st == "ok" ? "" : "   <- NOT a publish-rate measurement")
+		printf "  frames          %8d   (%d connect snapshot + %d publishes)\n", n, (n > 0 ? 1 : 0), pub
+		printf "  publish rate    %8s%s\n", rate, (rate == "-" ? "" : " /s")
+		printf "  mean frame      %8s\n", (mean == "-" ? "-" : hum(mean))
+		printf "  captured        %8s\n", hum(total)
+		if (st == "ok" && el + 0 > 0) {
+			per = total / el
+			printf "  encoded         %8s /s per subscriber", hum(per)
+			if (subs != "-" && subs + 0 > 0)
+				printf "   x%d = %s /s", subs, hum(per * subs)
+			printf "\n"
+		}
+	}'
+
+# One line, last, so `| tail -n 1 >> baseline.jsonl` is a usable history.
+jq -cn \
+	--rawfile units "$tmp/units.tsv" \
+	--rawfile procs "$tmp/procs.tsv" \
+	--arg timestamp "$timestamp" \
+	--arg host "$(uname -n)" \
+	--arg socket "$socket" \
+	--arg subscribers "$subscribers" \
+	--arg duration "$elapsed" \
+	--arg frames "$frames" \
+	--arg publishes "$publishes" \
+	--arg rate "$rate" \
+	--arg mean "$mean" \
+	--arg total "$total_bytes" \
+	--arg capture_status "$capture_status" \
+	--argjson sessions "$census" '
+	def n: if . == "-" or . == "" then null else tonumber end;
+	def kib: n | if . == null then null else . * 1024 end;
+	def rows: split("\n") | map(select(length > 0) | split("\t"));
+	{
+		timestamp: $timestamp,
+		host: $host,
+		socket: $socket,
+		subscribers: ($subscribers | n),
+		sessions: $sessions,
+		units: ($units | rows | map({key: .[0], value: {
+			state: .[1],
+			memory_current_bytes: (.[2] | n),
+			memory_peak_bytes: (.[3] | n),
+			anon_bytes: (.[4] | n),
+			file_bytes: (.[5] | n)
+		}}) | from_entries),
+		processes: ($procs | rows | map({key: .[0], value: {
+			pid: (.[1] | n),
+			rss_bytes: (.[2] | kib),
+			rss_anon_bytes: (.[3] | kib)
+		}}) | from_entries),
+		capture_status: $capture_status,
+		capture: {
+			duration_s: ($duration | n),
+			frames: ($frames | n),
+			publishes: ($publishes | n),
+			publish_rate_hz: ($rate | n),
+			mean_frame_bytes: ($mean | n),
+			total_frame_bytes: ($total | n)
+		}
+	}'
+
+exit "$exit_code"
