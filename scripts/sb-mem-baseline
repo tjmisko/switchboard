@@ -352,12 +352,20 @@ awk -F'\t' -v barfile="$bar_procs" -v wantpid="$socket_pid" '
 
 # ---------------------------------------------------------------- churn
 
-# Sampled before this probe connects, so the count is the steady-state
-# subscriber set and excludes us. Client ends of an AF_UNIX pair are unnamed,
-# so only the daemon's accepted fds carry the socket path.
+# Sampled before this probe connects, so the count excludes us. Client ends of
+# an AF_UNIX pair are unnamed (ss prints `*` for both address columns), so
+# exactly one row per connection carries the path and this is an exact count of
+# the daemon's accepted fds.
+#
+# It is CONNECTIONS, not subscribers. Every short-lived RPC connection open at
+# the sample instant is counted too — `switchboard-ctl` fires a hook on every
+# Claude tool use — so a capture that catches one reads one high and the
+# `encoded ... xN` line overstates fan-out by ~1/N. Treat it as an upper bound.
+# Field 5 is the local address; matching it exactly rather than by substring
+# keeps a neighbouring socket (`<path>.old`, `<path>2`) from being counted.
 subscribers='-'
 if command -v ss >/dev/null 2>&1; then
-	subscribers=$(ss -x 2>/dev/null | awk -v p="$socket" '$2 == "ESTAB" && index($0, p) > 0' | wc -l)
+	subscribers=$(ss -x 2>/dev/null | awk -v p="$socket" '$2 == "ESTAB" && $5 == p' | wc -l)
 fi
 
 timestamp=$(date -Is)
