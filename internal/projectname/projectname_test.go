@@ -289,3 +289,42 @@ func TestSetFull_preservesExistingAbbrev(t *testing.T) {
 		t.Errorf("FullForDir = %q, want Widget Factory", got)
 	}
 }
+
+func TestFullForBase(t *testing.T) {
+	cfg := DefaultConfig()
+	for _, tc := range []struct {
+		name string
+		base string
+		want string
+	}{
+		{"should use the rule's full name when configured", "switchboard", "Switchboard"},
+		{"should match a rule case-insensitively", "SwitchBoard", "Switchboard"},
+		{"should title-case an unknown basename", "my-cool-repo", "My Cool Repo"},
+		{"should yield empty for an empty basename", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := FullForBase(cfg, tc.base); got != tc.want {
+				t.Errorf("FullForBase(%q) = %q, want %q", tc.base, got, tc.want)
+			}
+		})
+	}
+}
+
+// A remote session's CWD names a directory on the remote host. Resolving it here
+// could match a same-named repo of this user's and report the wrong project, so
+// the lookup must be purely lexical.
+func TestFullForBaseShouldNotConsultTheLocalFilesystem(t *testing.T) {
+	root := t.TempDir()
+	local := filepath.Join(root, "switchboard")
+	if err := os.MkdirAll(filepath.Join(local, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A basename that exists locally and one that does not must both resolve
+	// from the rules alone, identically.
+	if got, want := FullForBase(DefaultConfig(), "switchboard"), "Switchboard"; got != want {
+		t.Errorf("FullForBase = %q, want %q", got, want)
+	}
+	if got, want := FullForBase(DefaultConfig(), "definitely-not-here"), "Definitely Not Here"; got != want {
+		t.Errorf("FullForBase = %q, want %q", got, want)
+	}
+}

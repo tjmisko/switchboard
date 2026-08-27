@@ -72,13 +72,45 @@ switchboard · 3 sessions · navigate · wm=hyprland term=wezterm
 
 Only the root lines are navigation targets. Child agents do not own independent
 terminal targets or Switchboard sessions; they appear as indented, non-focusable
-rows in the TUI and as bounded detail in Waybar tooltips.
+rows in the TUI, and as a one-line roll-up in the Waybar hover.
 
 Prefer your own UI? Read `~/.cache/switchboard/state.json` directly — see the
 [schema](docs/state-schema.md) and [bar integrations](docs/bars/README.md) for
-Polybar / Waybar / eww / i3blocks. Every Waybar chip's tooltip also shows how long the session
-has held its current status (`idle · 3m`, `permission · 45s`), from the
+Polybar / Waybar / eww / i3blocks.
+
+Every Waybar chip has a hover card:
+
+```
+ARACHNE  ~/Projects/Arachne
+goosebook   ● working · 53m
+react-canvas-refactor
+up 2h20m · started 14:49 · ws 4 · pid 20805
+33 agents · 3 live · 2h24m done
+```
+
+Line 1 is the project's full display name — the chip carries only the terse
+abbreviation, so the hover is where `Switchboard` belongs — paired with the path
+it lives at, since the name and its location answer one question together. It is
+lowercased before the small-caps run: pango shrinks lowercase letters and leaves
+uppercase ones at full height, so folding the case first is what makes the title
+one uniform height. Line 2 names the host, then the task, then a dimmed block of
+timing, workspace, process, and the subagent roll-up. Status age comes from the
 additive `status_since` field.
+
+The workspace is the one **on this machine**. For a local session that is simply
+its own window's; for a remote one the daemon strips the remote desktop's
+coordinates — they name a workspace on the other machine — and publishes
+`local_workspace`, the workspace of the window actually showing that session. It
+is the same number the chip is ordered by, and the only one worth acting on.
+
+**Nothing on the card may tick faster than once a minute.** The tooltip travels
+inside the module's JSON, so rewriting it makes Waybar re-render the module,
+which dismisses an open hover — a per-second counter makes the card impossible
+to read. Durations therefore use `durfmt.Coarse` (`<1m` below a minute), and the
+subagent roll-up counts cumulative time for *finished* agents only, since live
+ones would advance the sum a minute per minute each. Measured on the live bar:
+the old per-agent tree emitted 1.17 lines/s, of which 93% were tooltip-only
+churn; the card emits 0.07/s.
 
 ## Activity history & timeline (opt-in)
 
@@ -456,9 +488,9 @@ with two config files:
 
 `claude.jsonc` declares 10 `custom/claude-N` modules so each chip is a real GTK
 widget with its own CSS. Each runs `switchboard-waybar --slot N` and emits a
-JSON line per snapshot; `class` carries status + `focused` + `suspended` so
-`style.css` paints the chip. Click = focus that slot; right-click = rofi picker;
-scroll = cycle.
+JSON line per snapshot; `class` carries status + `focused` + `suspended` +
+`remote` so `style.css` paints the chip. Click = focus that slot; right-click =
+rofi picker; scroll = cycle.
 
 Waybar's row does not wrap, so each slot abbreviates its label to fit the
 monitor (`internal/barlayout`). The fit shares out *glyph cells*, not pixels —
@@ -469,12 +501,39 @@ than rounded off into the bar's margin. That overhead is the chip's CSS box, so
 
 ```
 ChipFixedPx = 2×padding + 2×border + 2×margin + spacing
-            =    2×7    +   2×1    +   2×2    +    2     = 22
+            =    2×8    +   2×1    +   2×2    +    2     = 24
 ```
 
 Change the chip padding, margin, or the bar's `spacing` and you must update
 `DefaultMetrics` to match, or the labels will be cut short (too high) or spill
 off the edge of the bar (too low).
+
+Every chip carries a border, and the border encodes three independent things at
+once:
+
+*Shape* is location: a session on another machine gains the `remote` class and is
+drawn as a **nested pill** — `3px double` instead of `1px solid`, the chip
+outline with a second ring just inside it. *Colour* is status and focus, and the
+remote rule sets border width and style but deliberately **never colour**, so the
+ring simply picks up whatever hue the status and focus rules assign. An idle
+remote chip therefore rings amber rather than wearing a fixed accent that fights
+its own fill. The gap between a double ring's two lines is the chip's own status
+fill, so the nesting spends no colour of its own; focus is a brighter hue of that
+same status colour and does not change the border width.
+
+The nesting is free only because the extra width is paid for out of the chip's
+padding rather than added to its box:
+
+```css
+/* local  */ padding: 4px 8px;  border-width: 1px;   /* 8 + 1 = 9 per side */
+/* remote */ padding: 2px 6px;  border-width: 3px;   /* 6 + 3 = 9 */
+```
+
+Keep that trade balanced — `.headless` restates the base padding for the same
+reason, since it resets the border to 1px. `ChipFixedPx` is a **single** number
+for the whole row, so a chip that were genuinely wider would make the fit depend
+on how many of the visible sessions happened to be remote, and every label on the
+bar would re-abbreviate whenever a remote session appeared or dropped.
 
 A chip whose `claude` process is job-control-stopped (Ctrl-Z) gains the
 `suspended` class on top of its status class. Grey it out in `style.css`:
