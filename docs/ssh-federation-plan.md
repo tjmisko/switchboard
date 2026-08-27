@@ -158,14 +158,27 @@ Use OpenSSH's ordinary host-key checking and noninteractive authentication.
 Bound half-open connections with `ServerAliveInterval`/`ServerAliveCountMax`
 through the user's SSH config or narrowly scoped process arguments.
 
-### 4.3 No stale remote rows initially
+### 4.3 Contact loss and remote rows
 
-When the SSH stream dies, remove that host's sessions immediately. This is the
-simplest correct behavior: the UI never presents an old snapshot as live, and
-no application heartbeat or stale TTL is needed. The source may show one
-bounded disconnected diagnostic outside the session list.
+**Superseded.** The first implementation removed a host's sessions the moment
+its SSH stream died, on the grounds that the UI must never present an old
+snapshot as live. In practice the two facts it conflated — the stream's health
+and the sessions' existence — come apart constantly on a flaky link, and a
+two-second reconnect blanked and restored a whole host's chips. The rule now is
+in [remote hysteresis](remote-hysteresis.md):
 
-Reconnect supplies a fresh initial snapshot and restores the rows.
+- a peer that is deliberately going away sends a **closeout** frame, and its
+  rows are removed at once (`§9`'s ban on stale retention held for *silent*
+  disconnects, not for a peer's own statement);
+- a stream that merely stops being audible **holds** its host's last
+  observation: unchanged for a quiet window, then marked `stale` with a
+  client-side last-contact stamp, then dropped at the hold deadline;
+- a frame that fails validation still drops its host immediately — rows that
+  can never be refreshed are not worth holding.
+
+Reconnect still supplies a fresh initial snapshot; inside the quiet window it
+produces no observable change at all. The source may show one bounded
+disconnected/held diagnostic outside the session list.
 
 ### 4.4 Read-only aggregation
 
@@ -412,7 +425,10 @@ Do not implement these until a demonstrated requirement needs them:
 - two persistent SSH command channels;
 - request IDs or RPC multiplexing;
 - daemon instance IDs, random incarnations, revisions, or generations;
-- application heartbeats or stale snapshot retention;
+- ~~application heartbeats or stale snapshot retention~~ — both now exist, in
+  the narrow forms [remote hysteresis](remote-hysteresis.md) describes: the
+  keepalive is a verbatim re-send of the current snapshot rather than a new
+  message type, and retention is a bounded hold that marks what it retains;
 - delta snapshots, replay, or resynchronization protocols;
 - SSH wrappers, `AcceptEnv`, forwarded `WEZTERM_PANE`, or route tokens;
 - a generic typed multi-hop focus planner;
@@ -458,6 +474,7 @@ an installed WezTerm and an ordinary SSH PTY pass the escape end to end.
 - Keep one detached latest snapshot keyed by returned hostname.
 - Add a minimal `list-all`/`subscribe-all` view and host labels.
 - Remove remote rows on disconnect and reconnect with a small bounded delay.
+  (Superseded by the hold; see §4.3.)
 
 Definition of done: one remote host appears and changes at the same latency as
 its local Switchboard subscription, while stopping SSH removes only those rows.
@@ -487,7 +504,8 @@ focus path, with no duplicate or cross-host selection.
 ### Later, only if wanted
 
 - tmux passthrough and multi-client policy;
-- grey stale rows instead of immediate removal;
+- ~~grey stale rows instead of immediate removal~~ — done; see
+  [remote hysteresis](remote-hysteresis.md);
 - explicit host IDs for duplicate-hostname topologies;
 - persistent source configuration;
 - transport optimization if one SSH process per host measures poorly.
