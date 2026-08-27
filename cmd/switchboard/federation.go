@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/tjmisko/switchboard/internal/federation"
 	"github.com/tjmisko/switchboard/internal/panebind"
@@ -41,7 +42,19 @@ type federationRuntime struct {
 	wg         sync.WaitGroup
 }
 
-func newFederationRuntime(store *state.Store, manager wm.Manager, destinations []string) (*federationRuntime, error) {
+// remoteHoldConfig is the client's hysteresis policy for remote rows. It is
+// separated from the destination list because it is a display/trust decision,
+// not a topology one.
+type remoteHoldConfig struct {
+	// HoldFor is how long a host's last observation stands after contact is lost
+	// with no closeout. Zero removes rows at the disconnect.
+	HoldFor time.Duration
+	// QuietFor is how much of HoldFor passes with no observable change before
+	// held rows are marked stale.
+	QuietFor time.Duration
+}
+
+func newFederationRuntime(store *state.Store, manager wm.Manager, destinations []string, hold remoteHoldConfig) (*federationRuntime, error) {
 	rawHostname, err := os.Hostname()
 	if err != nil {
 		return nil, fmt.Errorf("hostname: %w", err)
@@ -61,11 +74,19 @@ func newFederationRuntime(store *state.Store, manager wm.Manager, destinations [
 	remoteManager, err := remotestate.NewManager(remotestate.ManagerConfig{
 		Destinations:  destinations,
 		LocalHostname: hostname,
+		HoldFor:       hold.HoldFor,
+		QuietFor:      hold.QuietFor,
 		OnDiagnostic: func(diagnostic remotestate.Diagnostic) {
 			// Destination is trusted local configuration and category is finite;
-			// never include SSH stderr or a peer-controlled frame.
-			log.Printf("remote-state: destination=%s host=%s category=%s",
-				diagnostic.Destination, diagnostic.Host, diagnostic.Category)
+			// the reason is a peer-supplied token that DecodeFrame has already
+			// constrained to [a-z0-9_-]{0,32}, so it cannot forge a log record.
+			// Never include SSH stderr or a peer-controlled frame.
+			reason := ""
+			if diagnostic.Reason != "" {
+				reason = " reason=" + diagnostic.Reason
+			}
+			log.Printf("remote-state: destination=%s host=%s category=%s%s",
+				diagnostic.Destination, diagnostic.Host, diagnostic.Category, reason)
 		},
 		OnHostRemoved: func(host string) {
 			runtime.registry.DropLiveHost(host)

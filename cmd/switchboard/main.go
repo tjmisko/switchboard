@@ -30,6 +30,7 @@ import (
 	"github.com/tjmisko/switchboard/internal/projectname"
 	claudeprovider "github.com/tjmisko/switchboard/internal/provider/claude"
 	codexprovider "github.com/tjmisko/switchboard/internal/provider/codex"
+	"github.com/tjmisko/switchboard/internal/remotestate"
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/statustune"
@@ -84,6 +85,10 @@ func main() {
 	codexObserverFlag := flag.String("codex-observer", string(defaultCodexObserverMode), "Codex app-server observer: auto|off")
 	codexDisplayNameModel := flag.String("codex-autoname-model", codexprovider.DefaultDisplayNameModel, "model for isolated Codex display-name generation")
 	flag.Var(&remoteFlags, "remote", "SSH destination to observe (repeatable)")
+	remoteHold := flag.Duration("remote-hold", remotestate.DefaultHoldFor,
+		"how long a remote host's last observation is held after contact is lost without a closeout (0 removes its rows immediately)")
+	remoteQuiet := flag.Duration("remote-quiet", remotestate.DefaultQuietFor,
+		"how much of -remote-hold passes with no visible change before held rows are marked stale")
 	flag.Parse()
 	codexMode, err := parseCodexObserverMode(*codexObserverFlag)
 	if err != nil {
@@ -134,7 +139,10 @@ func main() {
 	scanner := discovery.New(procSrc)
 	dropStaleSessions(store, procSrc, sink, scanner.Forget, tun.TailBytes)
 	resolver := mapping.NewResolver(term, manager)
-	federated, err := newFederationRuntime(store, manager, remoteFlags)
+	federated, err := newFederationRuntime(store, manager, remoteFlags, remoteHoldConfig{
+		HoldFor:  *remoteHold,
+		QuietFor: *remoteQuiet,
+	})
 	if err != nil {
 		log.Fatalf("federation: %v", err)
 	}
