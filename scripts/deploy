@@ -1,0 +1,404 @@
+#!/usr/bin/env bash
+#
+# deploy — build, install and verify a Switchboard release on this machine.
+#
+# The model is one immutable directory per revision plus a `current` symlink:
+#
+#   $root/releases/<rev>/{switchboard,switchboard-ctl,switchboard-waybar}
+#   $root/current -> releases/<rev>
+#
+# Everything that consumes a binary — both systemd units, the agent hooks, the
+# PATH link — resolves through `current`, so one atomic rename moves all of
+# them together and rollback is the same rename backwards. Nothing is ever
+# written in place, so no running executable is truncated and no consumer is
+# left holding a half-updated daemon/client pair.
+#
+# The guarantee this script provides is that a deploy which did not take effect
+# FAILS, loudly. Four things enforce it:
+#
+#   1. a wrong-tree guard, because a second clone of this module with the same
+#      command names silently overwrites the right binaries at exit 0;
+#   2. a smoke test of every staged binary before anything goes live;
+#   3. an assert, after the restart, that the RUNNING process reports the
+#      revision we meant to ship — read from /proc, not from a path or mtime;
+#   4. automatic rollback to the previous release when that assert fails.
+#
+# Usage:
+#   scripts/deploy [--dry-run] [--allow-dirty] [--allow-downgrade] [--no-restart]
+#   scripts/deploy --rollback
+#   scripts/deploy --status
+
+set -Eeuo pipefail
+
+# Release directory names are revisions this script creates itself — a hex
+# short-rev, or <rev>-dirty-<timestamp> — so word-splitting `ls` output is safe
+# here, and ordering by mtime is exactly what picking "the previous release"
+# needs. find(1) cannot sort by time without a portability fight.
+# shellcheck disable=SC2012
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repo_dir=$(cd -- "$script_dir/.." && pwd)
+
+root=${SWITCHBOARD_DEPLOY_ROOT:-$HOME/.local/share/switchboard}
+releases_dir=$root/releases
+current_link=$root/current
+commands=(switchboard switchboard-ctl switchboard-waybar)
+units=(switchboard.service switchboard-waybar.service)
+keep_releases=5
+version_ldflag_path=github.com/tjmisko/switchboard/internal/buildinfo.Version
+
+dry_run=0
+allow_dirty=0
+allow_downgrade=0
+no_restart=0
+mode=deploy
+stage_dir=
+
+log() { printf '%s\n' "$*"; }
+warn() { printf '%s\n' "$*" >&2; }
+die() {
+	printf 'deploy: %s\n' "$*" >&2
+	exit 1
+}
+
+cleanup_stage() {
+	if [ -n "$stage_dir" ] && [ -d "$stage_dir" ]; then
+		rm -rf "$stage_dir"
+	fi
+}
+trap cleanup_stage EXIT
+
+run() {
+	if [ "$dry_run" -eq 1 ]; then
+		printf '  would run: %s\n' "$*"
+		return 0
+	fi
+	"$@"
+}
+
+require_command() {
+	command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+usage() {
+	sed -n '3,31p' "${BASH_SOURCE[0]}" | sed 's/^#\{1,\} \{0,1\}//'
+}
+
+for arg in "$@"; do
+	case "$arg" in
+	--dry-run) dry_run=1 ;;
+	--allow-dirty) allow_dirty=1 ;;
+	--allow-downgrade) allow_downgrade=1 ;;
+	--no-restart) no_restart=1 ;;
+	--rollback) mode=rollback ;;
+	--status) mode=status ;;
+	-h | --help)
+		usage
+		exit 0
+		;;
+	*) die "unknown argument: $arg (try --help)" ;;
+	esac
+done
+
+for command in git go systemctl readlink mv ln rm mktemp install date hostname sleep; do
+	require_command "$command"
+done
+
+# live_revision prints what the `current` release reports, or nothing when no
+# release is deployed. It asks the binary rather than reading the symlink
+# target: the directory name is a label, the binary is the fact.
+live_revision() {
+	local bin=$current_link/switchboard
+	[ -x "$bin" ] || return 0
+	"$bin" -version 2>/dev/null || true
+}
+
+# running_revision prints the revision of the process systemd currently has
+# under switchboard.service, resolved through /proc so that neither the unit
+# file, the symlink, nor our own expectations can launder the answer.
+running_revision() {
+	local pid exe
+	pid=$(systemctl --user show switchboard.service -p MainPID --value 2>/dev/null || true)
+	if [ -z "$pid" ] || [ "$pid" = "0" ]; then
+		return 0
+	fi
+	exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+	if [ -z "$exe" ] || [ ! -x "$exe" ]; then
+		return 0
+	fi
+	"$exe" -version 2>/dev/null || true
+}
+
+release_path_for() { printf '%s\n' "$releases_dir/$1"; }
+
+current_target() {
+	[ -L "$current_link" ] || return 0
+	readlink -f "$current_link" 2>/dev/null || true
+}
+
+# previous_release names the most recent release that is not the live one.
+previous_release() {
+	local current dir
+	current=$(current_target || true)
+	[ -d "$releases_dir" ] || return 0
+	while IFS= read -r dir; do
+		[ -n "$dir" ] || continue
+		case "$dir" in .stage.*) continue ;; esac
+		if [ "$releases_dir/$dir" != "$current" ]; then
+			printf '%s\n' "$dir"
+			return 0
+		fi
+	done < <(ls -1t "$releases_dir" 2>/dev/null || true)
+}
+
+cmd_status() {
+	log "root:     $root"
+	log "current:  $(current_target || true)"
+	log "deployed: $(live_revision || true)"
+	log "running:  $(running_revision || true)"
+	if [ -d "$releases_dir" ]; then
+		log "releases (newest first):"
+		# shellcheck disable=SC2012
+		ls -1t "$releases_dir" 2>/dev/null | sed 's/^/  /' || true
+	fi
+}
+
+# assert_source_tree_can_explain refuses a deploy whose source tree cannot
+# account for the revision already live.
+#
+# The concrete failure it catches: a stale second clone of this module, same
+# module path and same command names, whose build silently replaces the right
+# binaries at exit 0. Such a tree does not contain the live revision, so
+# `git cat-file` cannot find it. That is a far better signal than comparing
+# directory paths, and it needs no hardcoded location to work.
+assert_source_tree_can_explain() {
+	local live_rev=${1%%-dirty*}
+	[ -n "$live_rev" ] || return 0
+	if git -C "$repo_dir" cat-file -e "${live_rev}^{commit}" 2>/dev/null; then
+		return 0
+	fi
+	die "live revision $live_rev is not present in $repo_dir.
+    This tree cannot account for what is already deployed, which is exactly
+    what building from a stale second clone looks like. Deploy from the tree
+    that produced the live release, or pass --allow-downgrade if you really
+    intend to replace it with unrelated history."
+}
+
+assert_not_a_downgrade() {
+	local new_rev=${1%%-dirty*} live_rev=${2%%-dirty*}
+	[ -n "$live_rev" ] || return 0
+	[ "$new_rev" != "$live_rev" ] || return 0
+	git -C "$repo_dir" cat-file -e "${live_rev}^{commit}" 2>/dev/null || return 0
+	if git -C "$repo_dir" merge-base --is-ancestor "$new_rev" "$live_rev" 2>/dev/null; then
+		die "$new_rev is an ancestor of the live $live_rev — this would deploy older code.
+    Pass --allow-downgrade if that is deliberate."
+	fi
+}
+
+smoke_test_staged() {
+	local dir=$1 want=$2 cmd got
+	for cmd in "${commands[@]}"; do
+		[ -x "$dir/$cmd" ] || die "staged $cmd is missing or not executable"
+		got=$("$dir/$cmd" -version 2>/dev/null || true)
+		if [ "$got" != "$want" ]; then
+			die "staged $cmd reports '$got', expected '$want' — the build did not stamp what we asked for"
+		fi
+	done
+}
+
+flip_current_to() {
+	local target=$1 tmp=$root/.current.new
+	# Stage the symlink under a fresh name, then rename over `current`.
+	# rename(2) is atomic, so no consumer ever observes a missing or
+	# half-written link.
+	run mkdir -p "$root"
+	run ln -sfn "$target" "$tmp"
+	run mv -T "$tmp" "$current_link"
+}
+
+restart_units() {
+	local unit
+	if [ "$no_restart" -eq 1 ]; then
+		log "  (skipping restarts: --no-restart)"
+		return 0
+	fi
+	for unit in "${units[@]}"; do
+		if ! systemctl --user cat "$unit" >/dev/null 2>&1; then
+			log "  skipping $unit (not installed on this host)"
+			continue
+		fi
+		if ! systemctl --user is-enabled "$unit" >/dev/null 2>&1 &&
+			! systemctl --user is-active "$unit" >/dev/null 2>&1; then
+			log "  skipping $unit (neither enabled nor active)"
+			continue
+		fi
+		log "  restarting $unit"
+		run systemctl --user restart "$unit"
+	done
+}
+
+# running_matches is the check that makes a silent no-op impossible. systemd
+# reports `active` whether or not new code landed, so the only trustworthy
+# question is what the live process itself says it is.
+running_matches() {
+	local want=$1 got='' tries=0
+	if [ "$no_restart" -eq 1 ] || [ "$dry_run" -eq 1 ]; then
+		return 0
+	fi
+	# Restart=always means the daemon may still be re-execing; give it a few
+	# moments rather than racing its first scheduling slice.
+	while [ "$tries" -lt 20 ]; do
+		got=$(running_revision)
+		[ -n "$got" ] && break
+		tries=$((tries + 1))
+		sleep 0.25
+	done
+	if [ "$got" = "$want" ]; then
+		return 0
+	fi
+	warn "deploy: the running daemon reports '${got:-nothing}', expected '$want'"
+	return 1
+}
+
+install_units() {
+	local unit overlay host conf rel
+	host=$(hostname -s 2>/dev/null || hostname)
+	run mkdir -p "$HOME/.config/systemd/user"
+	for unit in "${units[@]}"; do
+		[ -f "$repo_dir/systemd/$unit" ] || continue
+		log "  installing $unit"
+		run install -Dm644 "$repo_dir/systemd/$unit" "$HOME/.config/systemd/user/$unit"
+	done
+	# Host values live in an installed overlay, never edited into the shared
+	# unit: a unit reinstall silently reverts an in-place edit, and the repo's
+	# own tests pin the shipped defaults.
+	overlay=$repo_dir/hosts/$host/systemd
+	if [ ! -d "$overlay" ]; then
+		warn "deploy: no host overlay at hosts/$host/systemd — units will use their shipped defaults"
+		run systemctl --user daemon-reload
+		return 0
+	fi
+	log "  installing host overlay for $host"
+	for conf in "$overlay"/*/*.conf; do
+		[ -e "$conf" ] || continue
+		rel=${conf#"$overlay"/}
+		run install -Dm644 "$conf" "$HOME/.config/systemd/user/$rel"
+	done
+	run systemctl --user daemon-reload
+}
+
+prune_releases() {
+	local keep=$1 current dir n=0
+	current=$(current_target || true)
+	[ -d "$releases_dir" ] || return 0
+	while IFS= read -r dir; do
+		[ -n "$dir" ] || continue
+		case "$dir" in .stage.*) continue ;; esac
+		if [ "$releases_dir/$dir" = "$current" ]; then
+			continue
+		fi
+		n=$((n + 1))
+		if [ "$n" -le "$keep" ]; then
+			continue
+		fi
+		log "  pruning old release $dir"
+		run rm -rf "${releases_dir:?}/$dir"
+	done < <(ls -1t "$releases_dir" 2>/dev/null || true)
+}
+
+cmd_rollback() {
+	local previous
+	previous=$(previous_release)
+	[ -n "$previous" ] || die "no previous release to roll back to"
+
+	log "rolling back to $previous"
+	flip_current_to "$(release_path_for "$previous")"
+	restart_units
+	if ! running_matches "$previous"; then
+		die "rollback to $previous did not take effect"
+	fi
+	log "rolled back to $previous"
+}
+
+build_release() {
+	local version=$1 target=$2 cmd
+	log "building $version"
+	if [ "$dry_run" -eq 1 ]; then
+		printf '  would build: %s\n' "${commands[*]}"
+		return 0
+	fi
+	mkdir -p "$releases_dir"
+	stage_dir=$(mktemp -d "$releases_dir/.stage.XXXXXX")
+	chmod 0755 "$stage_dir"
+	for cmd in "${commands[@]}"; do
+		log "  go build $cmd"
+		(cd "$repo_dir" && go build -trimpath \
+			-ldflags "-X $version_ldflag_path=$version" \
+			-o "$stage_dir/$cmd" "./cmd/$cmd")
+	done
+	smoke_test_staged "$stage_dir" "$version"
+	mv -T "$stage_dir" "$target"
+	stage_dir=
+}
+
+cmd_deploy() {
+	local rev version target live_rev previous
+
+	rev=$(git -C "$repo_dir" rev-parse --short HEAD)
+
+	# Dirtiness is asked of git, never read from the build stamp: Go marks a
+	# CLEAN linked worktree as modified, so the stamp is true almost always
+	# under a worktree-per-branch workflow and cannot gate anything.
+	if [ -n "$(git -C "$repo_dir" status --porcelain)" ]; then
+		if [ "$allow_dirty" -ne 1 ]; then
+			die "$repo_dir has uncommitted changes; commit them or pass --allow-dirty"
+		fi
+		version="$rev-dirty-$(date +%Y%m%d%H%M%S)"
+	else
+		version=$rev
+	fi
+
+	live_rev=$(live_revision)
+	if [ "$allow_downgrade" -ne 1 ]; then
+		assert_source_tree_can_explain "$live_rev"
+		assert_not_a_downgrade "$rev" "$live_rev"
+	fi
+
+	log "repo:     $repo_dir"
+	log "deployed: ${live_rev:-(none)}"
+	log "shipping: $version"
+
+	target=$(release_path_for "$version")
+	if [ -d "$target" ]; then
+		log "reusing existing release $version"
+	else
+		build_release "$version" "$target"
+	fi
+
+	previous=$(current_target || true)
+	install_units
+	log "flipping current -> $version"
+	flip_current_to "$target"
+	restart_units
+
+	if ! running_matches "$version"; then
+		if [ -n "$previous" ]; then
+			warn "deploy: rolling back to $previous"
+			flip_current_to "$previous"
+			restart_units
+		fi
+		die "deploy did NOT take effect; nothing about the unit's state would have told you"
+	fi
+
+	prune_releases "$keep_releases"
+	log "deployed ${live_rev:-(none)} -> $version"
+	if [ -n "$previous" ]; then
+		log "previous release kept at $previous"
+	fi
+}
+
+case "$mode" in
+status) cmd_status ;;
+rollback) cmd_rollback ;;
+deploy) cmd_deploy ;;
+esac
