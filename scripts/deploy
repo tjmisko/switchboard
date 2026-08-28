@@ -283,8 +283,37 @@ install_units() {
 		[ -e "$conf" ] || continue
 		rel=${conf#"$overlay"/}
 		run install -Dm644 "$conf" "$HOME/.config/systemd/user/$rel"
+		assert_no_later_dropin_overrides "$rel"
 	done
 	run systemctl --user daemon-reload
+}
+
+# assert_no_later_dropin_overrides refuses when some OTHER drop-in in the same
+# .d directory sets the same variable and sorts after ours.
+#
+# systemd merges drop-ins in lexical filename order, so a leftover file wins on
+# its name alone and quietly keeps a unit on the old binary path. That is the
+# same silent no-op this whole script exists to prevent, arriving one layer up:
+# the deploy would succeed, the flip would be correct, and the unit would still
+# launch the previous deployment.
+assert_no_later_dropin_overrides() {
+	local rel=$1 dir base other conflict
+	dir=$HOME/.config/systemd/user/$(dirname -- "$rel")
+	base=$(basename -- "$rel")
+	[ -d "$dir" ] || return 0
+	for other in "$dir"/*.conf; do
+		[ -e "$other" ] || continue
+		conflict=$(basename -- "$other")
+		[ "$conflict" != "$base" ] || continue
+		# Only a name sorting after ours can override what we just wrote.
+		[[ "$conflict" > "$base" ]] || continue
+		if grep -qE '^\s*Environment=.*(SWITCHBOARD_BIN|SWITCHBOARD_CTL)' "$other" 2>/dev/null; then
+			die "$dir/$conflict sets SWITCHBOARD_BIN/SWITCHBOARD_CTL and sorts after $base,
+    so systemd would apply it last and keep this unit on the old binary. The
+    deploy would report success while the unit ran the previous release.
+    Remove it:  rm $dir/$conflict && systemctl --user daemon-reload"
+		fi
+	done
 }
 
 prune_releases() {
