@@ -4,9 +4,10 @@
 // integration — it works in any terminal, including over SSH — so it is the
 // canonical demo of the Observe tier.
 //
-// The rendering is hand-rolled ANSI (alt-screen + redraw on each snapshot) to
-// keep the binary dependency-free. With -once it prints a single plain frame
-// and exits, which is handy for scripting and testing.
+// The rendering is hand-rolled ANSI (alt-screen + redraw on each snapshot or
+// visible clock boundary) to keep the binary dependency-free. With -once it
+// prints a single plain frame and exits, which is handy for scripting and
+// testing.
 package main
 
 import (
@@ -71,8 +72,9 @@ func fetchOnce(socketPath string) (state.Snapshot, error) {
 	return *resp.Snapshot, nil
 }
 
-// runLive holds an alt-screen view, redrawing on every snapshot and reconnecting
-// whenever the daemon is unavailable, until the context is cancelled.
+// runLive holds an alt-screen view, redrawing on snapshots and visible clock
+// boundaries and reconnecting whenever the daemon is unavailable, until the
+// context is cancelled.
 func runLive(ctx context.Context, socketPath, home string) {
 	fmt.Print(altScreenEnter + hideCursor)
 	defer fmt.Print(showCursor + altScreenLeave)
@@ -115,15 +117,120 @@ func streamInto(ctx context.Context, socketPath, home string, writers *sblabel.N
 	if err := c.Send(rpc.Request{Cmd: "subscribe-all"}); err != nil {
 		return err
 	}
+	snapshots := make(chan state.Snapshot, 1)
+	errs := make(chan error, 1)
+	go receiveSnapshots(ctx, c, snapshots, errs)
+	return runSnapshotRenderer(ctx, snapshots, errs, home, writers, drawFrame, durfmt.SystemClock{})
+}
+
+type snapshotReceiver interface {
+	Recv(*rpc.Response) error
+}
+
+func receiveSnapshots(ctx context.Context, receiver snapshotReceiver, snapshots chan<- state.Snapshot, errs chan<- error) {
 	for {
 		var resp rpc.Response
-		if err := c.Recv(&resp); err != nil {
-			return err
+		if err := receiver.Recv(&resp); err != nil {
+			select {
+			case errs <- err:
+			case <-ctx.Done():
+			}
+			return
 		}
 		if resp.Snapshot != nil {
-			drawFrame(renderSnapshot(*resp.Snapshot, home, true, time.Now(), writers))
+			select {
+			case snapshots <- *resp.Snapshot:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}
+}
+
+// runSnapshotRenderer owns no socket. It retains the newest received snapshot
+// and redraws that same value at the next visible compact-duration or freshness
+// boundary, so a correctly quiet daemon does not freeze the display clock.
+func runSnapshotRenderer(ctx context.Context, snapshots <-chan state.Snapshot, errs <-chan error, home string, writers *sblabel.NameCache, draw func(string), clock durfmt.Clock) error {
+	var latest state.Snapshot
+	var haveSnapshot bool
+	var timer durfmt.Timer
+	var timerC <-chan time.Time
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+
+	render := func(now time.Time) {
+		draw(renderSnapshot(latest, home, true, now, writers))
+		next := nextTUIRefresh(latest, now)
+		if next.IsZero() {
+			if timer != nil {
+				timer.Stop()
+			}
+			timerC = nil
+			return
+		}
+		delay := next.Sub(now)
+		if timer == nil {
+			timer = clock.NewTimer(delay)
+		} else {
+			timer.Reset(delay)
+		}
+		timerC = timer.C()
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case snapshot, ok := <-snapshots:
+			if !ok {
+				return nil
+			}
+			latest, haveSnapshot = snapshot, true
+			render(clock.Now())
+		case <-timerC:
+			if haveSnapshot {
+				render(clock.Now())
+			}
+		case err := <-errs:
+			return err
+		}
+	}
+}
+
+func nextTUIRefresh(snap state.Snapshot, now time.Time) time.Time {
+	var next time.Time
+	for _, session := range snap.Sessions {
+		if !session.Suspended {
+			if since := statusSince(session); since != nil && !since.IsZero() {
+				next = durfmt.Earlier(next, durfmt.NextCompactChange(*since, now))
+			}
+		}
+		graph := session.AgentGraph
+		if graph == nil || session.Suspended {
+			continue
+		}
+		rows, _ := barlayout.LimitAgentRows(barlayout.AgentRows(graph), maxAgentRows)
+		if len(rows) == 0 {
+			continue
+		}
+		if now.Before(graph.ObservedAt) {
+			next = durfmt.Earlier(next, graph.ObservedAt)
+			continue
+		}
+		if !graph.Fresh(now) {
+			continue
+		}
+		next = durfmt.Earlier(next, graph.FreshUntil)
+		for _, row := range rows {
+			if at := barlayout.AgentStateAt(row.Node); !at.IsZero() {
+				next = durfmt.Earlier(next, durfmt.NextCompactChange(at, now))
+			}
+		}
+	}
+	return next
 }
 
 // --- rendering ---

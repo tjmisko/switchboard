@@ -2,18 +2,25 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/agentgraph"
 	"github.com/tjmisko/switchboard/internal/barlayout"
+	"github.com/tjmisko/switchboard/internal/durfmt"
 	sblabel "github.com/tjmisko/switchboard/internal/label"
 	"github.com/tjmisko/switchboard/internal/projectname"
+	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
 )
 
@@ -22,6 +29,87 @@ var (
 	testAvail   = 100000.0
 	testMetrics = barlayout.DefaultMetrics()
 )
+
+type fakeRefreshTimer struct {
+	c      chan time.Time
+	resets chan time.Duration
+}
+
+func newFakeRefreshTimer() *fakeRefreshTimer {
+	return &fakeRefreshTimer{c: make(chan time.Time, 1), resets: make(chan time.Duration, 8)}
+}
+
+func (t *fakeRefreshTimer) C() <-chan time.Time { return t.c }
+func (t *fakeRefreshTimer) Reset(d time.Duration) {
+	t.resets <- d
+}
+func (t *fakeRefreshTimer) Stop() {}
+
+type fakeRefreshClock struct {
+	mu    sync.RWMutex
+	now   time.Time
+	timer *fakeRefreshTimer
+}
+
+func (c *fakeRefreshClock) Now() time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.now
+}
+func (c *fakeRefreshClock) NewTimer(d time.Duration) durfmt.Timer {
+	c.timer.resets <- d
+	return c.timer
+}
+func (c *fakeRefreshClock) advance(now time.Time) {
+	c.mu.Lock()
+	c.now = now
+	c.mu.Unlock()
+	c.timer.c <- now
+}
+
+type recvStep struct {
+	response *rpc.Response
+	err      error
+}
+
+type scriptedSnapshotReceiver struct {
+	calls atomic.Int32
+	steps chan recvStep
+	enter chan int
+}
+
+func (r *scriptedSnapshotReceiver) Recv(response *rpc.Response) error {
+	call := int(r.calls.Add(1))
+	r.enter <- call
+	step := <-r.steps
+	if step.response != nil {
+		*response = *step.response
+	}
+	return step.err
+}
+
+func waitRecvCall(t *testing.T, receiver *scriptedSnapshotReceiver, want int) {
+	t.Helper()
+	select {
+	case got := <-receiver.enter:
+		if got != want {
+			t.Fatalf("Recv call = %d, want %d", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("Recv call %d never started", want)
+	}
+}
+
+func waitRefreshDelay(t *testing.T, timer *fakeRefreshTimer) time.Duration {
+	t.Helper()
+	select {
+	case d := <-timer.resets:
+		return d
+	case <-time.After(time.Second):
+		t.Fatal("renderer did not schedule its next refresh")
+		return 0
+	}
+}
 
 func TestRenderSlotCodexNameDoesNotMoveWithTerminalSpinner(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
@@ -958,6 +1046,68 @@ func benchSnapshot(b *testing.B) state.Snapshot {
 }
 
 // --- emission dedupe -------------------------------------------------------
+
+func TestQuietWaybarSnapshotAdvancesAtCoarseBoundaryWithoutAnotherSocketRead(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	base := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	since := base.Add(-59 * time.Second)
+	snapshot := state.Snapshot{Sessions: []state.Session{{
+		PID: 7, CWD: "/work", Claude: &state.AgentInfo{Status: state.StatusIdle, StatusSinceWire: &since},
+	}}}
+	receiver := &scriptedSnapshotReceiver{steps: make(chan recvStep), enter: make(chan int, 2)}
+	snapshots := make(chan state.Snapshot, 1)
+	errs := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go receiveSnapshots(ctx, receiver, snapshots, errs)
+	waitRecvCall(t, receiver, 1)
+	receiver.steps <- recvStep{response: &rpc.Response{Snapshot: &snapshot}}
+
+	timer := newFakeRefreshTimer()
+	clock := &fakeRefreshClock{now: base, timer: timer}
+	var output bytes.Buffer
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runSnapshotRenderer(snapshots, errs, 0, testAvail, testMetrics,
+			&nameConfig{}, &sblabel.NameCache{}, &emitter{w: &output}, clock)
+	}()
+	if got := waitRefreshDelay(t, timer); got != time.Second {
+		t.Fatalf("first visible boundary delay = %v, want 1s", got)
+	}
+	waitRecvCall(t, receiver, 2) // the one continuous read now blocks for a daemon frame
+
+	clock.advance(base.Add(time.Second))
+	if got := waitRefreshDelay(t, timer); got != time.Minute {
+		t.Fatalf("post-boundary refresh delay = %v, want 1m (no 1 Hz polling)", got)
+	}
+	if got := receiver.calls.Load(); got != 2 {
+		t.Fatalf("timer refresh started %d Recv calls, want the same one blocked read", got)
+	}
+
+	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("emitted %d lines, want initial plus clock refresh: %s", len(lines), output.String())
+	}
+	var initial, refreshed waybarOutput
+	if err := json.Unmarshal([]byte(lines[0]), &initial); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(lines[1]), &refreshed); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(initial.Tooltip, "idle · &lt;1m") || !strings.Contains(refreshed.Tooltip, "idle · 1m") {
+		t.Fatalf("quiet age did not advance across boundary\ninitial: %s\nrefreshed: %s", initial.Tooltip, refreshed.Tooltip)
+	}
+
+	receiver.steps <- recvStep{err: io.EOF}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("renderer did not stop after socket reader ended")
+	}
+}
 
 func TestEmitterShouldSuppressALineIdenticalToThePrevious(t *testing.T) {
 	var buf bytes.Buffer

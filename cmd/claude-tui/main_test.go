@@ -1,18 +1,156 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/agentgraph"
+	"github.com/tjmisko/switchboard/internal/durfmt"
+	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
 )
 
 var graphRenderNow = time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+
+type fakeTUITimer struct {
+	c      chan time.Time
+	resets chan time.Duration
+}
+
+func newFakeTUITimer() *fakeTUITimer {
+	return &fakeTUITimer{c: make(chan time.Time, 1), resets: make(chan time.Duration, 8)}
+}
+func (t *fakeTUITimer) C() <-chan time.Time { return t.c }
+func (t *fakeTUITimer) Reset(d time.Duration) {
+	t.resets <- d
+}
+func (t *fakeTUITimer) Stop() {}
+
+type fakeTUIClock struct {
+	mu    sync.RWMutex
+	now   time.Time
+	timer *fakeTUITimer
+}
+
+func (c *fakeTUIClock) Now() time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.now
+}
+func (c *fakeTUIClock) NewTimer(d time.Duration) durfmt.Timer {
+	c.timer.resets <- d
+	return c.timer
+}
+func (c *fakeTUIClock) advance(now time.Time) {
+	c.mu.Lock()
+	c.now = now
+	c.mu.Unlock()
+	c.timer.c <- now
+}
+
+type tuiRecvStep struct {
+	response *rpc.Response
+	err      error
+}
+
+type scriptedTUIReceiver struct {
+	calls atomic.Int32
+	steps chan tuiRecvStep
+	enter chan int
+}
+
+func (r *scriptedTUIReceiver) Recv(response *rpc.Response) error {
+	call := int(r.calls.Add(1))
+	r.enter <- call
+	step := <-r.steps
+	if step.response != nil {
+		*response = *step.response
+	}
+	return step.err
+}
+
+func waitTUIRecvCall(t *testing.T, receiver *scriptedTUIReceiver, want int) {
+	t.Helper()
+	select {
+	case got := <-receiver.enter:
+		if got != want {
+			t.Fatalf("Recv call = %d, want %d", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("Recv call %d never started", want)
+	}
+}
+
+func waitTUIRefreshDelay(t *testing.T, timer *fakeTUITimer) time.Duration {
+	t.Helper()
+	select {
+	case d := <-timer.resets:
+		return d
+	case <-time.After(time.Second):
+		t.Fatal("TUI did not schedule its next refresh")
+		return 0
+	}
+}
+
+func TestQuietTUISnapshotAdvancesAtCompactBoundaryWithoutAnotherSocketRead(t *testing.T) {
+	base := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	since := base.Add(-59 * time.Second)
+	snapshot := state.Snapshot{Sessions: []state.Session{{
+		PID: 7, CWD: "/work", Claude: &state.AgentInfo{Status: state.StatusIdle, StatusSinceWire: &since},
+	}}}
+	receiver := &scriptedTUIReceiver{steps: make(chan tuiRecvStep), enter: make(chan int, 2)}
+	snapshots := make(chan state.Snapshot, 1)
+	errs := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go receiveSnapshots(ctx, receiver, snapshots, errs)
+	waitTUIRecvCall(t, receiver, 1)
+	receiver.steps <- tuiRecvStep{response: &rpc.Response{Snapshot: &snapshot}}
+
+	timer := newFakeTUITimer()
+	clock := &fakeTUIClock{now: base, timer: timer}
+	frames := make(chan string, 2)
+	done := make(chan error, 1)
+	go func() {
+		done <- runSnapshotRenderer(ctx, snapshots, errs, "/home/u", nil,
+			func(frame string) { frames <- frame }, clock)
+	}()
+	if got := waitTUIRefreshDelay(t, timer); got != time.Second {
+		t.Fatalf("first visible boundary delay = %v, want 1s", got)
+	}
+	waitTUIRecvCall(t, receiver, 2)
+	initial := <-frames
+
+	clock.advance(base.Add(time.Second))
+	if got := waitTUIRefreshDelay(t, timer); got != time.Minute {
+		t.Fatalf("post-boundary refresh delay = %v, want 1m", got)
+	}
+	refreshed := <-frames
+	if got := receiver.calls.Load(); got != 2 {
+		t.Fatalf("timer refresh started %d Recv calls, want the same one blocked read", got)
+	}
+	if !strings.Contains(initial, "59s") || !strings.Contains(refreshed, "1m") {
+		t.Fatalf("quiet TUI age did not advance\ninitial:\n%s\nrefreshed:\n%s", initial, refreshed)
+	}
+
+	receiver.steps <- tuiRecvStep{err: io.EOF}
+	select {
+	case err := <-done:
+		if err != io.EOF {
+			t.Fatalf("renderer ended with %v, want EOF", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("TUI renderer did not stop after socket reader ended")
+	}
+}
 
 func TestRenderSnapshotCodexRootPlusTreeGolden(t *testing.T) {
 	since := graphRenderNow.Add(-5 * time.Minute)

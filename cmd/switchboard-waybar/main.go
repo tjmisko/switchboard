@@ -16,6 +16,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -117,18 +118,90 @@ func runOnce(socketPath string, slot int, availPx float64, metrics barlayout.Met
 	// retry loop would then re-print the degraded chip every 2s for as long as
 	// the daemon is down, which is the relayout churn the dedupe exists to stop.
 	out.forget()
+	snapshots := make(chan state.Snapshot, 1)
+	errs := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go receiveSnapshots(ctx, c, snapshots, errs)
+	runSnapshotRenderer(snapshots, errs, slot, availPx, metrics, names, labels, out, durfmt.SystemClock{})
+}
+
+type snapshotReceiver interface {
+	Recv(*rpc.Response) error
+}
+
+func receiveSnapshots(ctx context.Context, receiver snapshotReceiver, snapshots chan<- state.Snapshot, errs chan<- error) {
 	for {
 		var resp rpc.Response
-		if err := c.Recv(&resp); err != nil {
+		if err := receiver.Recv(&resp); err != nil {
+			select {
+			case errs <- err:
+			case <-ctx.Done():
+			}
 			return
 		}
 		if resp.Snapshot == nil {
 			continue
 		}
+		select {
+		case snapshots <- *resp.Snapshot:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// runSnapshotRenderer retains the newest socket frame and re-renders it only at
+// the next visible clock boundary. Timer edges never call Recv: the one reader
+// goroutine above remains the sole owner of socket reads.
+func runSnapshotRenderer(snapshots <-chan state.Snapshot, errs <-chan error, slot int, availPx float64, metrics barlayout.Metrics, names *nameConfig, labels *sblabel.NameCache, out *emitter, clock durfmt.Clock) {
+	var latest state.Snapshot
+	var haveSnapshot bool
+	var timer durfmt.Timer
+	var timerC <-chan time.Time
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+
+	render := func(now time.Time) {
 		if slot >= 0 {
-			out.emit(renderSlot(*resp.Snapshot, slot, availPx, metrics, names, labels))
+			out.emit(renderSlotAt(latest, slot, availPx, metrics, names, labels, now))
 		} else {
-			out.emit(renderAggregate(*resp.Snapshot, names, labels))
+			out.emit(renderAggregate(latest, names, labels))
+		}
+		next := nextWaybarRefresh(latest, slot, now)
+		if next.IsZero() {
+			if timer != nil {
+				timer.Stop()
+			}
+			timerC = nil
+			return
+		}
+		delay := next.Sub(now)
+		if timer == nil {
+			timer = clock.NewTimer(delay)
+		} else {
+			timer.Reset(delay)
+		}
+		timerC = timer.C()
+	}
+
+	for {
+		select {
+		case snapshot, ok := <-snapshots:
+			if !ok {
+				return
+			}
+			latest, haveSnapshot = snapshot, true
+			render(clock.Now())
+		case <-timerC:
+			if haveSnapshot {
+				render(clock.Now())
+			}
+		case <-errs:
+			return
 		}
 	}
 }
@@ -197,6 +270,10 @@ func (n *nameConfig) config() projectname.Config {
 // names EVERY session, not just its own, and why the name lookup behind it is
 // worth caching (see sblabel.NameCache).
 func renderSlot(snap state.Snapshot, slot int, availPx float64, metrics barlayout.Metrics, names *nameConfig, cache *sblabel.NameCache) waybarOutput {
+	return renderSlotAt(snap, slot, availPx, metrics, names, cache, time.Now())
+}
+
+func renderSlotAt(snap state.Snapshot, slot int, availPx float64, metrics barlayout.Metrics, names *nameConfig, cache *sblabel.NameCache, now time.Time) waybarOutput {
 	if slot >= len(snap.Sessions) {
 		return waybarOutput{Text: "", Class: []string{"empty"}}
 	}
@@ -242,10 +319,31 @@ func renderSlot(snap state.Snapshot, slot int, availPx float64, metrics barlayou
 	}
 	return waybarOutput{
 		Text:    labels[slot],
-		Tooltip: sessionTooltip(cfg, cache, s, time.Now()),
+		Tooltip: sessionTooltip(cfg, cache, s, now),
 		Class:   classes,
 		Alt:     chipClass(status),
 	}
+}
+
+// nextWaybarRefresh returns the earliest coarse-duration boundary visible in
+// this process's output. Aggregate mode has no live clocks; a slot has its
+// status age (unless suspended) and its session uptime. Coarse formatting never
+// schedules a one-second poll.
+func nextWaybarRefresh(snap state.Snapshot, slot int, now time.Time) time.Time {
+	if slot < 0 || slot >= len(snap.Sessions) {
+		return time.Time{}
+	}
+	s := snap.Sessions[slot]
+	var next time.Time
+	if !s.Suspended {
+		if since := statusSince(s); since != nil && !since.IsZero() {
+			next = durfmt.NextCoarseChange(*since, now)
+		}
+	}
+	if !s.StartedAt.IsZero() {
+		next = durfmt.Earlier(next, durfmt.NextCoarseChange(s.StartedAt, now))
+	}
+	return next
 }
 
 // chipClass maps a session status to the CSS class that paints its color.
@@ -653,12 +751,11 @@ func plural(n int) string {
 // thing a skip can get wrong is our BELIEF about what the bar last read, which
 // is what forget() re-syncs.
 //
-// This is worth having despite the tooltip's live "idle · 3m" counter, which
-// does make a chip's bytes change on its own as the clock advances. durfmt
-// coarsens with magnitude on purpose, so the counter only ticks per-second below
-// one minute and per-minute above it; measured against this machine's own
-// history log, 95.6% of session-time is spent at a status age past that first
-// minute, where all but one emission per minute is a duplicate.
+// This remains the final guard on the tooltip's live "idle · 3m" counter. The
+// renderer timer aims directly at durfmt.Coarse's next visible boundary (never
+// a one-second poll), but a concurrent daemon frame or an early/redundant edge
+// can still ask for the same bytes; only emit decides whether Waybar must see a
+// line and relayout the module.
 type emitter struct {
 	w    io.Writer
 	last string
