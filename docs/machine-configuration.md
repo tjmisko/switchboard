@@ -253,6 +253,84 @@ systemctl --user start graphical-session.target
 
 Do not also launch `polybar -c ... switchboard` from i3 once the unit owns it.
 
+## Deployed layout on goosebook
+
+This host runs a machine-local binary deployment. Recorded 2026-08-27 at
+`18c9ba5`.
+
+| What | Path | Read by |
+| --- | --- | --- |
+| Daemon (live) | `~/.config/switchboard/bin/switchboard` | `switchboard.service`, via `SWITCHBOARD_BIN` |
+| Control client (live) | `~/.config/switchboard/bin/switchboard-ctl` | `switchboard-waybar.service`, via `SWITCHBOARD_CTL` |
+| `go install` output | `~/go/bin/switchboard{,-ctl,-waybar,-codex}` | Claude Code hooks only — **not** the units |
+| Previous binaries | `~/.config/switchboard/bin/.switchboard-backup-<date>-<tag>/` | nothing; kept for rollback |
+
+Active units are `switchboard.service` and `switchboard-waybar.service`, both
+enabled. `switchboard-polybar.service` is not installed: this is a Hyprland +
+Waybar host.
+
+The two overrides live in drop-ins, as the rules above require:
+
+```ini
+# ~/.config/systemd/user/switchboard.service.d/local-binary.conf
+[Service]
+Environment=SWITCHBOARD_BIN=%h/.config/switchboard/bin/switchboard
+```
+
+```ini
+# ~/.config/systemd/user/switchboard-waybar.service.d/local-binary.conf
+[Service]
+Environment=SWITCHBOARD_CTL=%h/.config/switchboard/bin/switchboard-ctl
+```
+
+`switchboard.service.d/lock-debug.conf` also sets `SWITCHBOARD_DEBUG_LOCK=5ms`.
+That one is measurement instrumentation, not a setting; drop it when the
+store-lock arms are finished.
+
+### `go install` alone does not redeploy this host
+
+The shared unit defaults `SWITCHBOARD_BIN` to `%h/go/bin/switchboard`, and the
+drop-in above overrides it. So `go install ./cmd/...` updates the hook binaries
+and leaves the daemon untouched. Restarting afterward is a silent no-op: the
+unit reports `active`, the journal looks healthy, and the old binary keeps
+running. Nothing in the restart output distinguishes this from a real deploy.
+
+Redeploy with the staged build in
+[Remote command path for SSH federation](#remote-command-path-for-ssh-federation)
+above — it stages inside the target directory so each `mv -T` stays on one
+filesystem and no running executable is truncated in place — then:
+
+```bash
+systemctl --user restart switchboard.service
+systemctl --user restart switchboard-waybar.service
+```
+
+Verify against behavior, not unit state. Keep the previous binaries and diff
+their rendered output against the new ones:
+
+```bash
+~/.config/switchboard/bin/.switchboard-backup-<date>-<tag>/switchboard-ctl pick
+~/.config/switchboard/bin/switchboard-ctl pick
+```
+
+Identical output where the commit claimed a label change means the deploy did
+not land.
+
+### Local edit to the installed unit
+
+`~/.config/systemd/user/switchboard.service` is **not** identical to
+`systemd/switchboard.service` in the repository. One line was edited in place to
+add this host's federation peer:
+
+```ini
+Environment="SWITCHBOARD_ARGS=-remote nlessfun"   # repo ships SWITCHBOARD_ARGS=
+```
+
+Reinstalling the shared unit with `install -Dm644` silently reverts that and
+drops the `nlessfun` peer. Move it into a `20-machine.conf` drop-in, or re-add
+it after every unit reinstall. The peer resolves `switchboard-ctl` at
+`/usr/local/bin/switchboard-ctl` on the remote's noninteractive SSH path.
+
 ## Switching a host
 
 Switching renderers is an explicit host operation: disable the old renderer,
