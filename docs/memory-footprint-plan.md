@@ -610,6 +610,13 @@ journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
   - **Phase**: 0
 
 - [ ] #4.5: Stop the hook overlay from relabelling the whole Codex graph
+  - **Implementation status (2026-08-28)**: Code and regression coverage are
+    complete on `fix/memory-hook-provenance` at `54b077c`. The targeted Codex
+    transition suite and race run pass. Leave this task unchecked until the
+    live verification below confirms that `source`, `complete`, and
+    `fresh_until` no longer oscillate; the managed workspace cannot deploy to
+    `~/.local` or open the Unix sockets needed by the one remaining full-suite
+    test.
   - **Prereqs**: #3 (the invariant guard must exist first — this is the one
     Phase-0/1 change that touches what lands in the history day-files)
   - **Why this is here and not behind #83**: measured in §1.4.3. The five lines
