@@ -810,6 +810,16 @@ journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
     the same commit.
 
 - [ ] #8.5: Renderer-owned clock refresh
+  - **Implementation status (2026-08-28)**: Complete at `0e531b8`. Waybar and
+    the reference TUI retain the latest snapshot and schedule only the next
+    visible duration/freshness boundary; timer refreshes never open or read a
+    socket. Injected-clock tests prove quiet counters advance, Waybar coarsens
+    to a one-minute delay after the first minute, and the existing output
+    dedupe remains in the write path. Renderer and duration suites pass normally
+    and under the race detector; all packages compile. Live visual verification
+    remains pending. The broad race run still hits the known Unix-socket sandbox
+    failures and produced one unrelated history-count flake that passed three
+    consecutive isolated race reruns.
   - **Prereqs**: #6 and #7 complete — only needed once clock-only daemon
     publishes are suppressed
   - **DoD**: `switchboard-waybar` and `claude-tui` retain the latest snapshot

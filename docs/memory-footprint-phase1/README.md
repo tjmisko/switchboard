@@ -329,7 +329,7 @@ See "Definition of done" below.
 
 ---
 
-## ⚠ A predicted failure of #10's DoD — read before PR 2
+## Renderer clock dependency — implemented at `0e531b8`
 
 #10 requires "'idle · Nm' counters unchanged by eye". **That will not hold, and
 it is a consequence of #6 working correctly.**
@@ -342,11 +342,12 @@ the tooltip's age rows — advances **only when a frame arrives**. Today the
 After #6 a quiet Claude session publishes nothing and its counter **freezes
 indefinitely**. `cmd/claude-tui` has the same shape.
 
-The fix is task #8.5 and is **client-side, not a daemon heartbeat**. Waybar now
-uses `durfmt.Coarse`, so its output changes at most once per minute; schedule the
-next visible boundary instead of polling at 1 Hz. The TUI can schedule second
-boundaries only while `durfmt.Compact` displays seconds, then coarsen. Existing
-output dedupe remains the last guard against unnecessary writes.
+Task #8.5 implements the fix **client-side, not as a daemon heartbeat**. Waybar
+uses `durfmt.Coarse` and schedules its next visible boundary instead of polling
+at 1 Hz. The TUI schedules second boundaries only while `durfmt.Compact`
+displays seconds, then coarsens. Both retain the latest snapshot, so timer edges
+perform no socket read; existing output dedupe remains the last guard against
+unnecessary writes.
 
 ---
 
