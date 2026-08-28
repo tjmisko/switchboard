@@ -23,26 +23,29 @@ Each is a trap a careful reader still walks into.
 1. **#4.5 and #6 are complementary; neither reaches the target alone.** #4.5 ≈
    5.7/s, #6 ≈ 2.27/s, together 0.15/s. `memory-footprint-plan.md` says
    otherwise in two places and is wrong — see `05-corrections`.
-2. **Deploy to `~/.config/switchboard/bin/`, not `~/go/bin/`.** The checked-in
-   unit says the latter; a machine-local drop-in overrides it. Building to the
-   wrong path measures an unchanged daemon and reads as "the fix didn't help".
+2. **Deploy with `scripts/deploy`.** It stages one immutable release, flips the
+   `current` symlink, restarts, and verifies the running revision from `/proc`.
+   Manual copies into `~/go/bin` or `~/.config/switchboard/bin` are obsolete.
 3. **Other sessions deploy to this machine.** One restarted the daemon during
    planning with a different branch. Verify the running build is yours before
    quoting any number.
 4. **In #5, normalize `WindowTitle` only — never `PaneRef.Title`.** H9's
    stuck-chip recovery reads `Title`'s first rune; stripping it silently
    disables the rule.
-5. **#10's "counters unchanged by eye" will fail, and that means #6 worked.**
-   waybar has no render timer. Raise it before PR 2 — see §"Predicted DoD
-   failure" below.
+5. **#10 needs task #8.5's renderer-owned clock refresh.** Waybar has no render
+   timer, but current `main` coarsens its hover ages to minute resolution. Use
+   adaptive display-boundary timers, not a fixed 1 Hz Waybar poll.
 
 ---
 
 ## Context — why this work exists
 
-The switchboard process tree charges ~410 MB across its systemd units. The
-daemon's *live heap* is only 5–10 MB, so this is not a leak: it is allocation
-**churn**. A Codex TUI rotates a braille spinner in its pane title; that title
+The original full-cgroup observation was ~410 MB across the related units. The
+optimization target is narrower and actionable: Switchboard-attributable
+anonymous memory, excluding GTK Waybar, under 120 MB with Codex and 60 MB
+without. Full `MemoryCurrent` remains a reported secondary metric. The daemon's
+*live heap* is only 5–10 MB, so this is not a leak: it is allocation **churn**.
+A Codex TUI rotates a braille spinner in its pane title; that title
 reaches the publish change key; every rotation republishes a ~19 KB JSON
 snapshot to 11 subscribers and rewrites `state.json`. Measured 2026-08-26:
 **6.9–11.5 publishes/s, ~1.4 MB/s of JSON**, for a machine where nothing
@@ -152,50 +155,36 @@ are flagged uncalibrated; you will produce the first real calibration.
 
 ### You do not have this machine to yourself
 
-Verified during planning: at 16:15 the daemon was pid 1097019; by 17:30 another
-session had rebuilt `~/.config/switchboard/bin/switchboard` and restarted the
-unit (new pid, binary mtime 17:30:05, start 17:30:09). The deployed binary
-contained **no `publish-stats` string**, so it was built from a branch without
-Phase 0.
+The original planning session observed another worktree replacing the running
+daemon mid-measurement. The current deploy model prevents ambiguous in-place
+copies, but another session can still deploy a different immutable revision.
+Always verify the release before quoting a number.
 
 ```sh
-strings ~/.config/switchboard/bin/switchboard | grep -c publish-stats   # 0 = not your build
+scripts/deploy --status
 pid=$(systemctl --user show switchboard -p MainPID --value)
-readlink /proc/$pid/exe; ps -o lstart= -p $pid
-stat -c %y ~/.config/switchboard/bin/switchboard
+readlink /proc/$pid/exe
+/proc/$pid/exe -version
 journalctl --user -u switchboard -g 'Started switchboard' --since today
 ```
 
-A start time earlier than the binary mtime means someone deployed without
-restarting. **`MemoryPeak` resets on every restart, including someone else's** —
-it was 208.7 MB at 16:15 and 180.0 MB after the 17:30 restart, so always pair a
-`MemoryPeak` reading with the unit's start time.
+A different running revision means the control is no longer comparable.
+`MemoryPeak` resets on every restart, including someone else's, so always pair
+it with the running revision and unit start time.
 
-### Deploy paths — the repo unit is overridden
-
-`systemd/switchboard.service:14` says `SWITCHBOARD_BIN=%h/go/bin/switchboard`,
-but machine-local drop-ins override it:
-
-| file | effect |
-|---|---|
-| `~/.config/systemd/user/switchboard.service.d/local-binary.conf` | `SWITCHBOARD_BIN=%h/.config/switchboard/bin/switchboard` |
-| `~/.config/systemd/user/switchboard-waybar.service.d/local-binary.conf` | `SWITCHBOARD_CTL=%h/.config/switchboard/bin/switchboard-ctl` |
-| `~/.config/systemd/user/switchboard.service.d/lock-debug.conf` | `SWITCHBOARD_DEBUG_LOCK=5ms` — instrumentation, costs a `time.Now()` per `Apply`. It is on right now. Leave it, but know it is there. |
+### Deploy one verified release
 
 ```sh
-go build -o ~/.config/switchboard/bin/switchboard      ./cmd/switchboard
-go build -o ~/.config/switchboard/bin/switchboard-ctl  ./cmd/switchboard-ctl
-go build -o ~/go/bin/switchboard-waybar                ./cmd/switchboard-waybar
-systemctl --user restart switchboard
-systemctl --user restart switchboard-waybar    # whenever ctl or waybar changed
+scripts/deploy --status
+scripts/deploy
+scripts/deploy --status
 ```
 
-| task | changes | restart |
-|---|---|---|
-| #4.5, #6, #9 | daemon only | `switchboard` |
-| #5 | `internal/terminal` → daemon | `switchboard` |
-| #7 | waybar renderer + daemon | both |
-| #8 | `internal/rpc` (daemon **and** ctl) | both |
+The deploy builds all commands from one revision, stages them under
+`~/.local/share/switchboard/releases/`, atomically flips `current`, restarts the
+units, verifies the running daemon, and rolls back on failure. Use
+`--allow-dirty` only for an explicitly recorded measurement build. Do not
+manually restart one binary from a mixed revision.
 
 `switchboard-waybar.service` runs `switchboard-ctl bottombar watch`, which spawns
 the 10 `switchboard-waybar --slot N` processes. `switchboard-dashboard` invokes
@@ -210,7 +199,7 @@ effect there without a restart. There is a backup convention in that directory
 **A single capture is a sample, not a level.** Take your own control; do not
 compare against §1.4's numbers, which are from a build that is no longer running.
 
-1. Deploy `feat/mem-phase0` HEAD **unchanged** (Phase 0 only; behaviour matches
+1. Deploy the recovered Phase 0 HEAD **unchanged** (behaviour matches
    `main` apart from the telemetry line). Restart. Confirm it is your build.
 2. Capture the control: **≥3** `sb-mem-baseline` runs at the 15 s default a few
    minutes apart, plus **≥10 minutes** of `publish-stats`. Record the census —
@@ -289,7 +278,7 @@ issue #89's. Phase 2+ is `[FUTURE]`.
 ## Sequence and review gates
 
 ```
-control measurement → #4.5 → [GATE 1] → #5 #6 #7 #8 → [GATE 2] → #9 → [GATE 3] → #10
+control measurement → #4.5 → [GATE 1] → #5 #6+#7 #8 #8.5 → [GATE 2] → #9 → [GATE 3] → #10
 ```
 
 ### PR 1 — #4.5
@@ -315,10 +304,11 @@ ten-minute `fresh_until` oscillation, the floor no bucket in #6 can collapse.
 
 Judge this gate on **the oscillation being gone**, not on the rate.
 
-### PR 2 — #5 + #6 + #7 + #8
+### Stacked rollout — #5 + #6/#7 + #8 + #8.5
 
-They only make sense together: #6 needs #5's normalizer, **#6 without #7 is a
-correctness regression**, and #8 must reuse #6's key rather than invent a second.
+Review these as small stacked units but deploy them together for Gate 2. #6
+needs #5's normalizer, **#6 without #7 is a correctness regression**, #8 must
+reuse #6's key, and #8.5 preserves renderer clocks after suppression.
 
 **GATE 2:**
 1. `go test -race ./...` **fully green, `internal/conformance` included** — that
@@ -352,15 +342,11 @@ the tooltip's age rows — advances **only when a frame arrives**. Today the
 After #6 a quiet Claude session publishes nothing and its counter **freezes
 indefinitely**. `cmd/claude-tui` has the same shape.
 
-The fix is **client-side, not a daemon heartbeat** — a heartbeat reintroduces
-exactly the churn being removed. Add a ~1 Hz re-render to the waybar and tui
-loops. It is nearly free: `emitter.emit` (`cmd/switchboard-waybar/main.go:533`)
-already drops byte-identical lines, so a re-render that changes nothing writes
-nothing and waybar never relayouts.
-
-**Raise this with the owner and file it as a Phase-1 sibling of #10 before
-starting PR 2.** Do not discover it at #10's by-eye check, and do not weaken the
-gate.
+The fix is task #8.5 and is **client-side, not a daemon heartbeat**. Waybar now
+uses `durfmt.Coarse`, so its output changes at most once per minute; schedule the
+next visible boundary instead of polling at 1 Hz. The TUI can schedule second
+boundaries only while `durfmt.Compact` displays seconds, then coarsen. Existing
+output dedupe remains the last guard against unnecessary writes.
 
 ---
 

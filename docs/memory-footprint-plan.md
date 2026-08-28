@@ -1,9 +1,15 @@
 # Memory Footprint Reduction — orchestration plan
 
-> **Goal.** Cut the resident footprint of the switchboard process tree from
-> ~410 MB (cgroup-charged, measured 2026-08-26) to under ~120 MB with Codex
-> running and under ~60 MB without, by removing allocation *churn* rather than
-> retained state — the daemon's live heap is already only ~5–10 MB.
+> **Goal.** Cut Switchboard-attributable anonymous resident memory from roughly
+> 160 MB to under 120 MB with Codex running and under 60 MB without. The primary
+> total is `switchboard.service` cgroup anon + `switchboard-waybar.service` anon
+> **excluding the GTK Waybar process** + `switchboard-dashboard.service` anon.
+> GTK Waybar, file-backed cgroup charges, and out-of-scope services are reported
+> separately; they are not silently folded into this target. Full
+> `MemoryCurrent`, per-process RSS, and exclusions remain in every capture. The
+> original ~410 MB observation was full cgroup-charged memory and is not
+> comparable to the 120/60 MB target. The daemon's live heap is already only
+> ~5–10 MB; the work removes allocation churn rather than retained state.
 >
 > **Non-goal.** Deleting the bench fixtures under `~/.local/state/switchboard`
 > (issue #89). That is disk, not RAM, and #89 wants a full-day `MemoryPeak`
@@ -21,6 +27,12 @@
 > `05-corrections-to-the-plan.md`, which lists the places THIS document is wrong
 > or has stale line anchors. Several corrections are already applied inline
 > below; the rest are listed there.
+
+> **Recovery status (2026-08-28).** Phase 0 was transplanted onto current
+> `main` after PR #94. The recovered branch uses the immutable release deploy
+> (`scripts/deploy`) and distinguishes in-process Store subscribers from socket
+> connections. Phase 1 remains blocked until the recovered baseline is merged,
+> deployed, and re-measured on the current renderer and remote-state code.
 
 ---
 
@@ -518,8 +530,8 @@ Per-change verdict:
 |---|---|
 | Change-key normalization (Phase 1) | none — wire only |
 | Federation single-encode + gate (Phase 1) | none — wire only |
-| Lazy Codex app-server (Phase 2) | **touches** first-snapshot latency and would lose child events if the child were down while a root is live → written as an invariant with tests (#10, #11) |
-| Single renderer (Phase 3) | none |
+| Lazy Codex app-server (Phase 3) | **touches** first-snapshot latency and would lose child events if the child were down while a root is live → written as an invariant with tests (#11, #12) |
+| Single renderer (Phase 2) | none |
 | GOGC (Phase 4) | none |
 
 ---
@@ -541,7 +553,7 @@ grep -E 'VmRSS|RssAnon' /proc/$(systemctl --user show switchboard -p MainPID --v
 journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
 ```
 
-### Phase 0: Measurement apparatus [CURRENT]
+### Phase 0: Measurement apparatus [RECOVERED — validation pending]
 
 - [x] #1: `scripts/sb-mem-baseline` — one-shot footprint + churn report
   - **Prereqs**: none
@@ -563,7 +575,7 @@ journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
 - [x] #2: Daemon `publish-stats` telemetry line
   - **Prereqs**: none
   - **DoD**: Once per minute the daemon logs one line
-    `publish-stats: publishes=<n/min> suppressed=<n/min> subscribers=<n>
+    `publish-stats: publishes=<n/min> suppressed=<n/min> store_subscribers=<n>
     frame_bytes=<mean> heap_alloc_mb=<n> heap_sys_mb=<n> vm_hwm_mb=<n>`,
     same shape and placement as `fanout-seed`
     (`internal/fanout/seedtelemetry.go`). `suppressed` counts `Apply` calls
@@ -761,6 +773,23 @@ journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
     per subscriber despite `Broadcast.JSON` existing; fix it the same way in
     the same commit.
 
+- [ ] #8.5: Renderer-owned clock refresh
+  - **Prereqs**: #6 and #7 complete — only needed once clock-only daemon
+    publishes are suppressed
+  - **DoD**: `switchboard-waybar` and `claude-tui` retain the latest snapshot
+    and re-render when the next displayed duration can change, without a daemon
+    heartbeat or another socket read. Waybar uses the next minute/coarse-format
+    boundary (`durfmt.Coarse`); it must not poll at 1 Hz. The TUI may wake each
+    second while `durfmt.Compact` is displaying seconds, then schedules the next
+    minute/hour/day boundary. Existing byte/output dedupe remains authoritative.
+    Tests use an injected clock/timer and assert that a quiet snapshot advances
+    `idle · Nm`, that a Waybar render does not occur more than once per minute,
+    and that no refresh opens or reads a socket.
+  - **Phase**: 1
+  - **Notes**: Current `main` deliberately coarsens Waybar hover fields to minute
+    resolution to prevent hover dismissal. A fixed 1 Hz renderer ticker would
+    work functionally but would replace daemon churn with avoidable client churn.
+
 - [ ] #9: Separate rate limit for `windowtitlev2`
   - **Prereqs**: #6 complete — with the key normalized, the remaining cost of a
     title event is the fork pair, which is what this task bounds
@@ -780,16 +809,16 @@ journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
   - **Phase**: 1
 
 - [ ] #10: Phase 1 verification
-  - **Prereqs**: #6, #7, #8, #9 complete
+  - **Prereqs**: #6, #7, #8, #8.5, #9 complete
   - **DoD**: `sb-mem-baseline` with two Codex sessions spinning and the bottom
-    bar up shows publish rate < 0.5/s, daemon `RssAnon` steady < 25 MB over
+    bar up shows wire publish rate < 0.5/s, daemon mean `RssAnon` < 25 MB over
     10 min, `publish-stats` shows `suppressed` ≫ `publishes`; `state.json`
     mtime advances < 1/s. Bar behavior unchanged by eye: chips, tooltips,
     "idle · Nm" counters, stale marking, remote chips. Numbers recorded in
     §5. Issue #80 updated.
   - **Phase**: 1
 
-### Phase 2: Lazy Codex app-server [FUTURE — do not start]
+### Phase 3: Lazy Codex app-server [FUTURE — run after renderer consolidation]
 
 - [ ] #11: Supervisor holds a connection only while a root or hook binding exists
   - **Prereqs**: #3 (invariant guard) and #10 (Phase 1 verified) complete —
@@ -810,7 +839,7 @@ journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
     `should keep the child alive through the idle grace when a root returns`,
     `should close the child after the grace with no roots`,
     `should restart the child for a root that appears after shutdown`.
-  - **Phase**: 2
+  - **Phase**: 3
   - **Notes**: Today `ctx`/`cancel` are observer-lifetime; introduce a
     per-connection context so shutdown does not poison `Close()`. Keep the
     `EphemeralNamer` path working — check whether it opens its own connection
@@ -830,7 +859,7 @@ journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
     partial snapshot during spawn`. Live check: start a Codex session on a
     daemon that had none; the day-file shows the root's first
     `agent_state … source=codex_app_server` within 5 s of `session_start`.
-  - **Phase**: 2
+  - **Phase**: 3
 
 - [ ] #13: Journal categories + docs for child lifecycle
   - **Prereqs**: #11 complete
@@ -838,39 +867,42 @@ journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
     count=1` lines (content-free, like the others); `docs/codex-session-status/
     03-codex-app-server-observer.md` describes the lazy lifecycle and the
     `IdleShutdown` knob; `-codex-observer auto|off` unchanged.
-  - **Phase**: 2
+  - **Phase**: 3
 
-- [ ] #14: Phase 2 verification
+- [ ] #14: Phase 3 verification
   - **Prereqs**: #12, #13 complete
   - **DoD**: With no Codex process running for > 2 min, `switchboard.service`
     cgroup anon < 40 MB and no `codex app-server` in `cgroup.procs`; with Codex
     running, footprint equals Phase 1's. `publish-stats` unchanged. Numbers
     recorded in §5.
-  - **Phase**: 2
+  - **Phase**: 3
 
-### Phase 3: One renderer instead of eleven subscribers [FUTURE — do not start]
+### Phase 2: One renderer instead of eleven socket clients [NEXT AFTER PHASE 1]
 
 - [ ] #15: Interim env tuning in the bar config (zero code)
   - **Prereqs**: none — independent, ships the same day as Phase 0 if desired
   - **DoD**: Every `custom/claude-N.exec` in `~/.config/waybar/claude.jsonc`
-    is `env GOGC=25 GOMAXPROCS=1 /home/tjmisko/go/bin/switchboard-waybar --slot N`
+    is `env GOGC=25 GOMAXPROCS=1 /home/tjmisko/.local/share/switchboard/current/switchboard-waybar --slot N`
     (and `--width-px` if not already set, which also removes the 10 × `hyprctl`
     startup fork). `sb-mem-baseline` shows per-slot RSS ≤ 8 MB. Reverted by #17.
-  - **Phase**: 3
+  - **Phase**: 2
   - **Notes**: The dotfiles repo owns that file; note the change there.
 
 - [ ] #16: FIFO renderer spike
   - **Prereqs**: none
   - **DoD**: A throwaway prototype proves, on Waybar v0.15.0: a `custom`
     module with `exec: cat $XDG_RUNTIME_DIR/switchboard/slot-0` and
-    `restart-interval: 1` renders JSON lines written by a writer that holds
-    the FIFO open `O_RDWR` (no EOF, no blocking open); killing and restarting
-    waybar re-attaches without the writer noticing; killing the writer makes
-    `cat` exit and waybar restart it within `restart-interval`; the `cat`
-    process is ≤ 1.5 MB RSS. Findings written up in a `### 3.x spike` note
-    in this file, including any Waybar quirk (e.g. `exec-on-event` re-running
-    `cat` after a click — set it `false`).
-  - **Phase**: 3
+    `restart-interval: 1` renders JSON lines from a reconnecting nonblocking
+    writer. The writer opens `O_WRONLY|O_NONBLOCK` only while a reader exists,
+    caches one latest line per slot, and retries after `ENXIO`/`EPIPE`; it must
+    not hold an unread `O_RDWR` endpoint. Killing and restarting Waybar
+    re-attaches and receives exactly the latest line; killing the writer makes
+    `cat` exit and Waybar restart it within `restart-interval`. A sustained
+    reader absence long enough to exceed a pipe buffer leaves writer memory
+    bounded and never blocks another slot. The `cat` process is ≤ 1.5 MB RSS.
+    Findings go under a `### 3.x spike` note, including Waybar quirks such as
+    `exec-on-event` re-running `cat` after a click (set it `false`).
+  - **Phase**: 2
 
 - [ ] #17: Fold rendering into `switchboard-ctl bottombar watch`
   - **Prereqs**: #16 (design proven), #8 (single shared encode; otherwise the
@@ -888,8 +920,9 @@ journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
     `should keep FIFOs open across a waybar restart`, `should render the
     empty class for slots past the session count`, `should stop the bar and
     keep serving FIFOs when the last session ends` (or document that FIFOs
-    are torn down with the bar — pick one and test it).
-  - **Phase**: 3
+    are torn down with the bar — pick one and test it), and `should not let one
+    absent or stalled FIFO reader block another slot`.
+  - **Phase**: 2
   - **Notes**: `bottombar` runs before the daemon dial in `ctl main()` on
     purpose (must tolerate the daemon being down) — keep that.
 
@@ -901,10 +934,11 @@ journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
     `Environment=GOGC=50`; `docs/bars/*` describe the FIFO contract;
     `DONE.md` entry for #15 notes it is superseded. `sb-mem-baseline`:
     `switchboard-waybar.service` anon < 25 MB excluding the GTK `waybar`
-    process; exactly one `switchboard` subscriber on the socket
-    (`ss -xp | grep -c switchboard.sock` → 1, plus the dashboard if it is
-    ever changed to subscribe).
-  - **Phase**: 3
+    process; `sb-mem-baseline.socket_connections` shows exactly one persistent
+    renderer connection (plus any short-lived RPC present at the sample). The
+    `publish-stats store_subscribers` field is expected to remain at its normal
+    View floor and is not the Phase 2 metric.
+  - **Phase**: 2
 
 ### Phase 4: GC headroom [FUTURE — do not start]
 
@@ -934,8 +968,9 @@ journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
 
 ## 4. Landing order and session loop
 
-Order: #1 #2 #3 (parallel) → #4 → **#4.5** → #5 → #6 → #7 → #8 → #9 → #10 →
-#15 (any time) → #11 → #12 → #13 → #14 → #16 → #17 → #18 → #19 → #20.
+Order: #1 #2 #3 (parallel) → #4 → **#4.5** → #5 → #6+#7 → #8 → #8.5 → #9 →
+#10 → #15 (after the control capture, if desired) → #16 → #17 → #18 → #11 →
+#12 → #13 → #14 → #19 → #20.
 
 #4.5 was added after the §1.4 baseline: it is a prerequisite for #6, not an
 optimization on top of it. Until the hook overlay stops importing a 600 s
@@ -944,10 +979,10 @@ between two values ~10 minutes apart and no change-key bucketing can suppress
 it — the measured floor is ~2.45/s against #10's < 0.5/s DoD. Tune #6's bucket
 only against a capture taken after #4.5 has landed.
 
-Suggested PRs: Phase 0 (one PR); #4.5 (its own PR — it is the only Phase-0/1
-change that touches history content, and it needs a #83 cross-reference);
-#5+#6+#7+#8 (one PR — they only make sense together); #9; Phase 2; #16 findings
-as a doc commit; #17+#18; #19.
+Suggested PRs: recovered Phase 0; #4.5 (its own PR — it touches history content
+and needs a #83 cross-reference); stacked review units #5, #6+#7, #8, and #8.5,
+rolled out together before Gate 2; #9; #16 findings as a doc commit; #17+#18;
+Phase 3; #19.
 
 After completing each task:
 1. Tick the box here.
@@ -959,21 +994,22 @@ After completing each task:
    summarize — every phase boundary here is a live-deploy decision the owner
    makes.
 
-Deploy = `go install ./cmd/...` into `~/go/bin` plus copying into
-`~/.config/switchboard/bin/` (the unit's `SWITCHBOARD_BIN` is
-`%h/go/bin/switchboard`, but the running instance came from
-`~/.config/switchboard/bin/` — check `systemctl --user show switchboard -p
-ExecStart` before assuming), then `systemctl --user restart switchboard`.
-Note each restart resets `MemoryPeak`.
+Deploy with `scripts/deploy`. It builds one immutable release, atomically flips
+`~/.local/share/switchboard/current`, restarts the units, and verifies the
+running revision from `/proc`. Use `scripts/deploy --status` before and after a
+measurement. Do not copy binaries into `~/go/bin` or
+`~/.config/switchboard/bin`; those paths predate the current deployment model.
+Each daemon restart resets `MemoryPeak`.
 
 ---
 
 ## 5. Results
 
-| Milestone | Daemon anon | switchboard.service anon | waybar unit anon | publish/s | Date |
-|---|---|---|---|---|---|
-| Baseline | 42 MB | 62 MB (+33 MB codex child) | 100 MB | 9.4 | 2026-08-26 |
-| After Phase 1 | _tbd_ | _tbd_ | _tbd_ | _tbd_ | |
-| After Phase 2 (no Codex) | _tbd_ | _tbd_ | — | — | |
-| After Phase 3 | — | — | _tbd_ | — | |
-| Final | _tbd_ | _tbd_ | _tbd_ | _tbd_ | |
+| Milestone | Daemon anon | service anon | renderer anon excl. GTK | dashboard anon | attributable anon total | full MemoryCurrent | wire publish/s | Date |
+|---|---|---|---|---|---|---|---|---|
+| Baseline | 42 MB | 62 MB (+33 MB Codex child) | ~88 MB | 8.6 MB | ~159 MB | ~336 MB across the three units | 9.4 | 2026-08-26 |
+| After Phase 1 | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | |
+| After Phase 2 | — | — | _tbd_ | _tbd_ | _tbd_ | _tbd_ | — | |
+| After Phase 3 (no Codex) | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | — | |
+| Final with Codex | _tbd_ | _tbd_ | _tbd_ | _tbd_ | target <120 MB | _reported_ | _tbd_ | |
+| Final without Codex | _tbd_ | _tbd_ | _tbd_ | _tbd_ | target <60 MB | _reported_ | _tbd_ | |

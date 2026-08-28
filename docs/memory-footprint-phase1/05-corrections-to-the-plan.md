@@ -178,13 +178,13 @@ one on 2026-08-26**. Record the decision and the chosen mechanism (encode-time
    decisions**. The ablation and the target are stated against the wire rate.
    Say which, explicitly.
 2. **"'idle · Nm' counters unchanged by eye" will fail, and that means #6
-   worked.** `cmd/switchboard-waybar/main.go` has **no timer** — the loop is a
-   blocking `Recv` → `emit`, and `renderSlot` calls `time.Now()` internally
-   (`:229`), so counters advance only when a frame arrives. Today the churn being
-   removed is what keeps them ticking. Fix is client-side (~1 Hz re-render;
-   `emitter.emit` at `:533` already drops byte-identical lines so waybar never
-   relayouts), **not** a daemon heartbeat. File as a Phase-1 sibling of #10
-   before starting PR 2.
+   worked.** `cmd/switchboard-waybar/main.go` has no timer, so counters advance
+   only when a frame arrives. Current `main` now renders Waybar ages through
+   `durfmt.Coarse`, which changes at most once per minute. Task #8.5 therefore
+   uses adaptive display-boundary timers: minute boundaries for Waybar and
+   second boundaries only while the TUI visibly displays seconds. A fixed 1 Hz
+   Waybar ticker is stale advice and would add avoidable client churn. The fix
+   remains client-side, never a daemon heartbeat.
 
 ---
 
@@ -195,3 +195,32 @@ it gets fixed: the "~560/min baseline, Phase 1 targets < 30/min" figures were
 derived from the **wire** rate, which counts View publishes rather than
 `Store.Apply` decisions. #10 produces the first real calibration for that
 counter — update the table then.
+
+---
+
+## 13. Recovery onto current `main` (2026-08-28)
+
+The salvaged Phase 0 branch was originally based before PRs #90, #93, and #94.
+It has now been transplanted onto current `main`. Three old operating assumptions
+are invalid:
+
+1. Deploy only with `scripts/deploy`; manual copies into `~/go/bin` or
+   `~/.config/switchboard/bin` bypass the immutable-release verification model.
+2. `publish-stats store_subscribers` counts in-process `state.Store`
+   subscribers. Waybar clients subscribe through the unconditional federation
+   View and do not increase it. `sb-mem-baseline.socket_connections` is the
+   client-fan-out metric.
+3. The 120/60 MB goal is Switchboard-attributable **anonymous** memory excluding
+   the GTK Waybar process. Full cgroup `MemoryCurrent` remains reported but
+   cannot satisfy those thresholds because it includes GTK, file-backed charges,
+   and other fixed components.
+
+Phase 2 is now renderer consolidation and Phase 3 is lazy Codex startup: the
+renderer saves memory continuously and is required for the with-Codex target,
+whereas lazy startup saves memory only after Codex has been absent for its grace
+period and carries the higher history risk.
+
+The FIFO spike must not keep an unread `O_RDWR` descriptor. That design can fill
+the pipe while Waybar is absent and block the single renderer. Use reconnecting
+nonblocking writers with one cached latest line per slot, and prove prolonged
+reader absence cannot block another slot.
