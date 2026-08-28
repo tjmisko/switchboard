@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/tjmisko/switchboard/internal/agentgraph"
 )
 
 // goldenPath is the frozen state.json schema fixture. It is the public
@@ -102,6 +104,41 @@ func canonicalSnapshot() Snapshot {
 					SessionID:  "0199736b-b713-74e2-99a2-f015a1c42816",
 					Transcript: "/home/tjmisko/.codex/sessions/2026/05/28/rollout-2026-05-28T09-02-00-0199736b-b713-74e2-99a2-f015a1c42816.jsonl",
 					Status:     "idle",
+				},
+				AgentGraph: &AgentGraph{
+					RootID:     "0199736b-b713-74e2-99a2-f015a1c42816",
+					Source:     agentgraph.SourceCodexAppServer,
+					ObservedAt: time.Date(2026, 5, 28, 9, 4, 0, 0, time.UTC),
+					FreshUntil: time.Date(2026, 5, 28, 9, 4, 30, 0, time.UTC),
+					Complete:   true,
+					Summary: AgentGraphSummary{
+						Runtime: agentgraph.RuntimeIdle, Attention: agentgraph.AttentionNone,
+						Status: StatusIdle, Since: time.Date(2026, 5, 28, 9, 4, 0, 0, time.UTC),
+					},
+					Nodes: []AgentNode{
+						{
+							ID: "0199736b-b713-74e2-99a2-f015a1c42816", Nickname: "API maintenance",
+							Role: "root", Description: "Coordinate the API maintenance session",
+							Runtime: agentgraph.RuntimeIdle, Attention: agentgraph.AttentionNone,
+							Lifecycle: agentgraph.LifecycleRunning,
+							StartedAt: time.Date(2026, 5, 28, 9, 2, 0, 0, time.UTC),
+							UpdatedAt: time.Date(2026, 5, 28, 9, 4, 0, 0, time.UTC),
+						},
+						{
+							ID: "child-review", ParentID: "0199736b-b713-74e2-99a2-f015a1c42816",
+							Nickname: "reviewer", Role: "explorer", Description: "Review the API surface",
+							Runtime: agentgraph.RuntimeIdle, Attention: agentgraph.AttentionNone,
+							Lifecycle:   agentgraph.LifecycleCompleted,
+							StartedAt:   time.Date(2026, 5, 28, 9, 2, 30, 0, time.UTC),
+							UpdatedAt:   time.Date(2026, 5, 28, 9, 3, 30, 0, time.UTC),
+							CompletedAt: time.Date(2026, 5, 28, 9, 3, 30, 0, time.UTC),
+							Usage: AgentUsage{
+								InputTokens: 1200, CachedInputTokens: 800, CacheWriteInputTokens: 50,
+								OutputTokens: 300, ReasoningOutputTokens: 75, TotalTokens: 2425,
+								ModelContextWindow: 200000,
+							},
+						},
+					},
 				},
 			},
 			{
@@ -212,14 +249,7 @@ func TestBroadcastEncodingIsTheGoldenDocument(t *testing.T) {
 }
 
 func changeKeySnapshot() Snapshot {
-	snap := canonicalSnapshot()
-	at := time.Date(2026, 5, 28, 9, 4, 0, 0, time.UTC)
-	snap.Sessions[1].AgentGraph = &AgentGraph{
-		RootID: "root", ObservedAt: at, FreshUntil: at.Add(30 * time.Second), Complete: true,
-		Summary: AgentGraphSummary{Status: StatusIdle},
-		Nodes:   []AgentNode{{ID: "root", UpdatedAt: at}},
-	}
-	return snap
+	return canonicalSnapshot()
 }
 
 // TestChangeKeyIgnoresClocksOnly pins the exact boundary of the publish gate:

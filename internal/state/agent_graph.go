@@ -306,7 +306,9 @@ func hydrateAgentGraph(sess *Session, now time.Time) {
 	// request_user_input is an edge-owned, in-memory hook latch on the standard
 	// Codex path. After a daemon restart there is no exact pending tool_use_id to
 	// resolve, so a persisted red must fail unknown instead of pretending the
-	// question is still open for the remainder of its freshness window.
+	// question is still open for the remainder of its freshness window. A later
+	// JSON encode ceilings this timestamp, but the already-reduced summary stays
+	// unknown; publication cannot restore the expired latch's authority.
 	if provider == agentgraph.ProviderCodex && observation.Source == agentgraph.SourceHook {
 		for i := range observation.Nodes {
 			if observation.Nodes[i].ID == observation.RootID && observation.Nodes[i].Attention == agentgraph.AttentionUserInput {

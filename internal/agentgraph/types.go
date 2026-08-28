@@ -158,6 +158,8 @@ type Observation struct {
 
 // Fresh reports whether now lies within the caller-supplied half-open freshness
 // interval. Source and completeness intentionally do not affect freshness.
+// Observations are provider-owned in-process values and use the raw horizon;
+// state.AgentGraph applies its publication ceiling only at the JSON boundary.
 func (o Observation) Fresh(now time.Time) bool {
 	if o.ObservedAt.IsZero() || o.FreshUntil.IsZero() {
 		return false

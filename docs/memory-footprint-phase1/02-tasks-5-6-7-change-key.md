@@ -242,18 +242,16 @@ policy change. **Document this explicitly** — it is a genuine asymmetry, and a
 reader who assumes "in-memory is always raw" will be wrong for two real paths.
 Note also that `hydrateAgentGraph` deliberately sets
 `observation.FreshUntil = now` to expire a restored Codex user-input latch
-immediately; the ceiling pushes that out by ≤5 s. Harmless at 5 s; worth a
-comment there.
+immediately. The in-memory summary still expires immediately; a subsequent
+encode ceilings that already-grey graph's horizon by ≤5 s, which does not
+restore its authority.
 
-### The three staleness consumers
+### The current staleness consumers
 
-- **Unify the predicate, not the rendering.** Extract
-  `barlayout.SessionStale(s state.Session, now time.Time) bool`
-  (`s.Suspended || !s.AgentGraph.Fresh(now)`) and call it from
-  `cmd/switchboard-waybar/main.go:386` and `cmd/claude-tui/main.go:268`. The two
-  already share `internal/barlayout` for rows and state text; the stale rule is
-  the last duplicated line and they must not drift. Pango vs ANSI rendering stays
-  separate. **Drop this if the owner wants the minimal diff.**
+- **`cmd/claude-tui/main.go` is the only renderer that still calls
+  `AgentGraph.Fresh(now)`.** Current Waybar replaced its per-agent tree with an
+  event-driven fanout summary and has no stale marker to unify. Keep the minimal
+  direct TUI predicate; extracting a one-caller helper would obscure the seam.
 - **Leave `cmd/switchboard-ctl/diagnose.go:220-227` alone in this PR.** Its
   four-way `undated`/`not_yet_valid`/`expired`/`fresh` split is strictly finer
   than `Fresh`'s boolean and is its own output contract (pinned by
@@ -298,8 +296,8 @@ behavioural surface as the policy change *plus* a memory-vs-wire divergence.
 
 ## #6 — The change key
 
-`snapshotChangeKey` is at **`internal/state/state.go:670`** (the plan's `:656` is
-stale), doc comment at `:630-668`.
+`SnapshotChangeKey` is exported from `internal/state/state.go`; #8 reuses it for
+the aggregate View rather than inventing another comparator.
 
 ### Honour the doc comment's argument
 
@@ -517,24 +515,23 @@ New, all on a fixed clock `time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)`:
 
 ### `internal/state/golden_test.go`
 
-`TestChangeKeyIgnoresUpdatedAtOnly` (`:214`) → rename to
-`TestChangeKeyIgnoresClocksOnly`; extend the "must not move the key" table with
+`TestChangeKeyIgnoresClocksOnly` extends the "must not move the key" table with
 `observed_at` advancing and a node `updated_at` advancing, and keep every
 existing "must move the key" row. This becomes the pure-function complement to
 the `Apply`-level tests, built from the golden's own bytes so a newly added wire
 field is covered the moment the fixture is regenerated.
 
-### `cmd/switchboard-waybar/main_test.go`
+### `cmd/claude-tui/main_test.go`
 
-`TestShouldNotMarkTheTooltipStaleWhenTheDaemonSuppressedAWithinBucketRepublish` —
-the DoD test. Template is `TestAgentTooltipDistinguishesApprovalErrorStaleAndUsage`
-(`:158-180`), which already builds `ObservedAt`/`FreshUntil` at the exclusive
-endpoint and asserts `" · stale"`. `agentTooltip(s, now)` takes `now` explicitly,
-so **no clock injection**. Fixed clock `time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)`.
+`TestShouldNotMarkTheTUIStaleWhenTheDaemonSuppressedAWithinBucketRepublish` —
+the DoD test. Build a one-child graph and call `renderSnapshot` with its explicit
+`now`; no clock injection is needed. Fixed clock
+`time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)`.
 
 - Build the graph as a consumer receives it: observed at `t`, provider horizon
   `t+1s`, `FreshUntil: state.CeilFreshUntil(t.Add(time.Second))`.
-- Assert `agentTooltip(s, t.Add(state.FreshnessBucket - 100*time.Millisecond))`
+- Assert `renderSnapshot` at
+  `t.Add(state.FreshnessBucket - 100*time.Millisecond)`
   does **not** contain `" · stale"`, and does contain an age counter.
 - Assert at `t.Add(state.FreshnessBucket + 100*time.Millisecond)` that stale is
   **allowed** — a one-sided assertion, exactly as the DoD words it.
@@ -585,20 +582,16 @@ on it.
 
 ## The golden fixture
 
-**Neither #5 nor #7 changes the golden as it stands today, and that is itself the
-finding.** `canonicalSnapshot()` (`golden_test.go:30-116`) is hand-built and
-marshalled directly, never passing through the terminal seam, and its
-`window_title` is already spinner-free. More importantly the fixture has **no
-`agent_graph` block at all**, so it cannot pin `fresh_until` in any form — which
-already violates its own stated invariant at `golden_test.go:25-29` ("Every
-optional field MUST be set on at least one session here") and is the largest
-optional block on the wire.
+**Implemented in C4.** Neither #5 nor #7 changed any pre-existing golden line:
+`canonicalSnapshot()` is hand-built, its `window_title` was already
+spinner-free, and its prior timestamps were aligned. The fixture did, however,
+omit the largest optional wire block, `agent_graph`, despite its stated rule that
+every optional field be present somewhere.
 
-**Recommendation (part of C4):** add an `agent_graph` to the Codex session — root
-plus one child, summary populated, one node carrying `usage` — and regenerate.
-Choose timestamps on a **30 s** grid (e.g. `09:04:00Z` / `09:04:30Z`) so the
-fixture stays green for any bucket width dividing 30 s and the constant remains
-genuinely re-tunable.
+C4 adds a populated root-plus-child `agent_graph`, including every usage field,
+on a **30 s** grid (`09:04:00Z` / `09:04:30Z`). The fixture therefore stays
+green for any bucket width dividing 30 s and the constant remains genuinely
+re-tunable.
 
 How to be sure the diff is only what you intended:
 

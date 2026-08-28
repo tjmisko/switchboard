@@ -31,9 +31,12 @@ that changes nothing writes nothing: an idle reconcile tick re-derives the same
 state and is suppressed, so `updated_at` is the time of the last *change*, not
 the time of the last tick.
 
-`updated_at` is therefore advisory. **Do not treat a stale `updated_at` as a
-dead daemon** — on a quiet machine it is simply the age of the last real change.
-Use the RPC socket if you need liveness.
+Three timestamps are therefore advisory: top-level `updated_at`,
+`agent_graph.observed_at`, and `agent_graph.nodes[].updated_at`. They are carried
+on every frame that does publish but do not independently trigger a publish.
+**Do not treat a stale value in any of them as daemon or provider liveness** —
+on a quiet machine it is simply the value from the last actionable change. Use
+the RPC socket if you need daemon liveness and `fresh_until` for graph authority.
 
 Consumers that poll should treat the file as a whole-document replace, not a
 delta.
@@ -138,7 +141,7 @@ fields are always present when the block exists (no `omitempty`).
 | `pane_id` | integer | Pane id **within its mux's namespace** (not globally unique — always pair with `mux_socket`). |
 | `tab_id` | integer | Tab id within the mux. |
 | `window_id` | integer | wezterm GUI window id within the mux. |
-| `window_title` | string | The pane's window title. Best-effort join key to the WM window (`hyprland.title`). |
+| `window_title` | string | The pane's spinner-stripped window title. The daemon removes leading agent activity glyphs and surrounding whitespace at the terminal seam; the raw window title is not preserved on the wire. It remains a best-effort join key to the WM window (`hyprland.title`), whose independently sampled raw value is normalized before comparison. |
 
 ### `hyprland` (`HyprlandInfo`) — provisional
 
@@ -331,20 +334,28 @@ metadata.
 |-------|-----------|----------|---------|
 | `root_id` | string | always | Stable provider id of the root node. Exactly one element of `nodes` has this id and that node has no `parent_id`. |
 | `source` | string | omitted when empty | Structural graph authority: `codex_app_server`, `hook`, `claude_transcript`, `codex_rollout`, `restored_last_known`, or absent/unknown. A Codex graph whose child runtime/lifecycle was filled by an exact hook remains `codex_app_server`; bounded diagnostics expose overlay provenance without adding a wire field. Source precedence is daemon policy, not a confidence score consumers should recompute. |
-| `observed_at` | RFC 3339 timestamp | omitted when unknown | Start of the observation's authority interval. |
-| `fresh_until` | RFC 3339 timestamp | omitted when unknown | Exclusive end of the authority interval. A graph is fresh only when `observed_at <= now < fresh_until`. |
+| `observed_at` | RFC 3339 timestamp | omitted when unknown | Start of the observation's authority interval. Excluded from the publish gate: on a quiet graph it is the observation time as of the last actionable change. Its contractual role is the lower bound in `Fresh`, not a liveness signal. |
+| `fresh_until` | RFC 3339 timestamp | omitted when unknown | Exclusive end of the authority interval, rounded **up** to a 5-second boundary on publication. A graph is fresh only when `observed_at <= now < fresh_until`. The ceiling makes within-bucket publish suppression sound: a consumer cannot become falsely stale while the daemon still holds a fresh graph. |
 | `complete` | boolean | always | `true` means omission is authoritative for that observation; `false` means a partial view. Completeness does not imply freshness and freshness does not imply completeness. |
 | `summary` | object | always | Shared root-chip reduction described below. |
 | `nodes` | array | always | Root and descendants in deterministic root-first depth-first preorder. May contain retained terminal nodes. |
 
 Known `source` values are additive. Consumers must tolerate an absent or
-unrecognized value and should still use the explicit freshness timestamps.
+unrecognized value and should still use the explicit freshness timestamps,
+which carry the publish-suppression guarantee above.
+
+The live daemon evaluates local provider graphs against the provider's raw,
+unrounded horizon. The published ceiling can therefore lead local in-memory
+authority by less than five seconds. A graph decoded from `state.json` or a
+remote daemon has already crossed the JSON boundary and retains the ceiling in
+memory; the raw value cannot be reconstructed. This round-trip asymmetry is
+intentional in the wire-only design.
 
 ### `summary` (`AgentGraphSummary`)
 
 | Field | JSON type | Always present | Meaning |
 |-------|-----------|----------------|---------|
-| `runtime` | string | yes | Root runtime: `unknown`, `not_loaded`, `idle`, `active`, or `system_error`. Becomes `unknown` when the observation is not fresh or invalid. |
+| `runtime` | string | yes | Root runtime: `unknown`, `not_loaded`, `idle`, `active`, or `system_error`. Becomes `unknown` when the observation is not fresh or invalid, measured by the producing daemon against its in-memory horizon. A local daemon may therefore grey the summary less than five seconds before a consumer reaches the published ceiling. |
 | `attention` | string | yes | Folded wait reason: `none`, `approval`, or `user_input`. If both wait kinds exist, `approval` wins only in this compact field; the two counts below preserve both. |
 | `status` | string | yes | Legacy root-chip value: `working`, `idle`, `permission`, `delegating`, or `""` when no fresh rule produces a confident status. |
 | `live_children` | integer | yes | Descendants with positive liveness: pending/running lifecycle, active/idle runtime, or actionable approval/user-input attention. Terminal lifecycle always excludes a child. `runtime=unknown|not_loaded` plus `lifecycle=unknown` is visible topology but contributes zero. |
@@ -381,7 +392,7 @@ counts. Renderers grey the child detail and label it stale.
 | `attention` | string | always | `none`, `approval`, or `user_input`. Independent of runtime and lifecycle. |
 | `lifecycle` | string | always | `unknown`, `pending`, `running`, `completed`, `interrupted`, `errored`, `shutdown`, or `not_found`. |
 | `started_at` | RFC 3339 timestamp | omitted when unknown | Provider-reported node start time. |
-| `updated_at` | RFC 3339 timestamp | omitted when unknown | Best provider transition/update time. |
+| `updated_at` | RFC 3339 timestamp | omitted when unknown | Best provider transition/update time. Advisory and excluded from the publish gate: it is a display-age anchor, never a liveness or ordering key, and may lag until another actionable field publishes. |
 | `completed_at` | RFC 3339 timestamp | omitted when unknown | Terminal completion time when available. |
 | `usage` | object | omitted when wholly unmeasured | Optional token accounting; absence means unavailable, not measured zero. |
 
@@ -424,7 +435,9 @@ should read the graph when they need parentage or distinct wait reasons.
 
 These are complete `Snapshot` values and round-trip through the merged Go state
 types. Timestamps are illustrative; freshness is evaluated against the reader's
-current time, not `updated_at`.
+current time, not `updated_at`. The examples show published `fresh_until`
+ceilings and keep them five-second aligned; preserve that alignment if the
+bucket width changes.
 
 **Root only, no provider graph yet.** The session is discoverable and
 switchable, but its status is unknown.

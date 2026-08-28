@@ -63,6 +63,59 @@
         "session_id": "0199736b-b713-74e2-99a2-f015a1c42816",
         "transcript": "/home/tjmisko/.codex/sessions/2026/05/28/rollout-2026-05-28T09-02-00-0199736b-b713-74e2-99a2-f015a1c42816.jsonl",
         "status": "idle"
+      },
+      "agent_graph": {
+        "root_id": "0199736b-b713-74e2-99a2-f015a1c42816",
+        "source": "codex_app_server",
+        "observed_at": "2026-05-28T09:04:00Z",
+        "fresh_until": "2026-05-28T09:04:30Z",
+        "complete": true,
+        "summary": {
+          "runtime": "idle",
+          "attention": "none",
+          "status": "idle",
+          "live_children": 0,
+          "waiting_nodes": 0,
+          "approval_nodes": 0,
+          "user_input_nodes": 0,
+          "error_nodes": 0,
+          "since": "2026-05-28T09:04:00Z"
+        },
+        "nodes": [
+          {
+            "id": "0199736b-b713-74e2-99a2-f015a1c42816",
+            "nickname": "API maintenance",
+            "role": "root",
+            "description": "Coordinate the API maintenance session",
+            "runtime": "idle",
+            "attention": "none",
+            "lifecycle": "running",
+            "started_at": "2026-05-28T09:02:00Z",
+            "updated_at": "2026-05-28T09:04:00Z"
+          },
+          {
+            "id": "child-review",
+            "parent_id": "0199736b-b713-74e2-99a2-f015a1c42816",
+            "nickname": "reviewer",
+            "role": "explorer",
+            "description": "Review the API surface",
+            "runtime": "idle",
+            "attention": "none",
+            "lifecycle": "completed",
+            "started_at": "2026-05-28T09:02:30Z",
+            "updated_at": "2026-05-28T09:03:30Z",
+            "completed_at": "2026-05-28T09:03:30Z",
+            "usage": {
+              "input_tokens": 1200,
+              "cached_input_tokens": 800,
+              "cache_write_input_tokens": 50,
+              "output_tokens": 300,
+              "reasoning_output_tokens": 75,
+              "total_tokens": 2425,
+              "model_context_window": 200000
+            }
+          }
+        ]
       }
     },
     {

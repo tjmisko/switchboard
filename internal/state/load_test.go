@@ -3,6 +3,7 @@ package state_test
 import (
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/testsupport"
@@ -42,15 +43,21 @@ func TestLoadHydratesFromGolden(t *testing.T) {
 	if !byPID[4821].Focused {
 		t.Errorf("session 4821 should be focused per golden")
 	}
-	// The codex session hydrates with its kind and codex enrichment block intact.
+	// The Codex session keeps its identity and bounded graph structure. The
+	// golden's fixed graph horizon is intentionally expired, so hydration must
+	// clear its legacy status rather than resurrecting stale idle authority.
 	if s, ok := byPID[4999]; !ok {
 		t.Errorf("codex session 4999 not hydrated")
 	} else {
 		if s.Agent != state.AgentKindCodex {
 			t.Errorf("session 4999 agent = %q, want codex", s.Agent)
 		}
-		if s.Codex == nil || s.Codex.Status != "idle" {
-			t.Errorf("session 4999 codex block = %+v, want status=idle", s.Codex)
+		if s.Codex == nil || s.Codex.SessionID == "" || s.Codex.Status != "" {
+			t.Errorf("session 4999 codex block = %+v, want identity with expired status", s.Codex)
+		}
+		if s.AgentGraph == nil || len(s.AgentGraph.Nodes) != 2 || s.AgentGraph.Summary.Status != "" ||
+			s.AgentGraph.Fresh(time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)) {
+			t.Errorf("session 4999 expired graph was not retained safely: %+v", s.AgentGraph)
 		}
 		if s.Claude != nil {
 			t.Errorf("codex session 4999 should have nil Claude, got %+v", s.Claude)

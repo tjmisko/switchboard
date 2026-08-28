@@ -33,6 +33,10 @@
 > (`scripts/deploy`) and distinguishes in-process Store subscribers from socket
 > connections. Phase 1 remains blocked until the recovered baseline is merged,
 > deployed, and re-measured on the current renderer and remote-state code.
+> Implementation has nevertheless continued in reviewable stacked commits:
+> #4.5, #5, #7, and #6 now have deterministic and race coverage. Their task
+> boxes remain open until the unavailable live deployment/conformance/rate gates
+> are run; no measurement below treats those gates as passed.
 
 ---
 
@@ -72,7 +76,7 @@ the only fields that change:
 Chain: spinner tick → Hyprland `windowtitlev2` → `reresolveAll`
 (`cmd/switchboard/main.go:550`, rate-limited to 200 ms, each one forks
 `wezterm cli list` + `hyprctl clients`) → title differs →
-`snapshotChangeKey` (`internal/state/state.go:656`) includes the title →
+`SnapshotChangeKey` includes the title →
 `broadcast` + `persist(state.json)`.
 
 `rpc.subscribeAll` (`internal/rpc/rpc.go:462`) goes through `federation.View`,
@@ -263,7 +267,7 @@ the bucket asymptotes at 2.27/s — it never gets close.** Three conclusions:
   `View.publish()` (`internal/federation/view.go:320`) has no change gate at all,
   so 19 of the 231 frames are byte-identical to their predecessor under today's
   key and could not have come from the Store gate; the "today" row therefore
-  measures View, not `snapshotChangeKey`. (2) Session `[2]` is remote, and #6
+  measures View, not `SnapshotChangeKey`. (2) Session `[2]` is remote, and #6
   cannot gate it — restricting to goosebook sessions gives 83 changes (4.18/s)
   for Phase 1, so **#8 is load-bearing, not cosmetic.** (3) `View.Subscribe`
   coalesces with a 4-deep drop-oldest channel (`view.go:340`), so frames lost
@@ -665,9 +669,13 @@ journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
     cross-process clock comparison in `shouldApplyObservation` (§1.4.3).
 
 
-### Phase 1: Stop the publish storm [FUTURE — do not start until Phase 0 is in DONE.md]
+### Phase 1: Stop the publish storm [IMPLEMENTATION STACKED — live rollout gated on recovered Phase 0]
 
 - [ ] #5: Shared title normalization
+  - **Implementation status (2026-08-28)**: Complete at `ea06c36`. Unit, race,
+    mapping, label, terminal, and default conformance tests pass. The five-run
+    owned-pane conformance gate remains pending because this workspace cannot
+    connect to the live WezTerm/Hyprland Unix sockets.
   - **Prereqs**: none
   - **DECIDED 2026-08-26 (owner): option (b) — normalize at the
     `internal/terminal` boundary**, not only in the change key. §1.4.5 laid out
@@ -675,8 +683,10 @@ journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
     This supersedes #6's "the wire snapshot is unchanged" sentence for the title
     specifically: `window_title` now goes out stripped.
   - **DoD**: One package exports the spinner glyph table and a
-    `Normalize(title string) string` that strips one leading spinner rune plus
-    surrounding whitespace. The table is `internal/mapping.spinnerPrefixes`
+    `Normalize(title string) string` that repeatedly strips leading spinner
+    runes plus surrounding whitespace, making normalization a fixed point even
+    for a malformed multi-glyph prefix. The table is the former
+    `internal/mapping.spinnerPrefixes`
     (`◐◑◒◓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✳⠂⠐⠁⠈⠠⠄⡀⢀`) — verified a strict superset of
     `internal/label.spinnerPrefixes` (`✳ ⠂ ⠐ ⠁ ⠈ ⠠ ⠄ ⡀ ⢀`), so `label` gains
     coverage of the braille and circle spinners it currently misses.
@@ -708,30 +718,41 @@ journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
     assume.
 
 - [ ] #6: Normalize the publish change key
+  - **Implementation status (2026-08-28)**: Complete at `eeaf7de`, stacked on
+    #5 and #7. State, federation, remote-state, history, consumer, race, vet,
+    all-package compile, and the unchanged suppression-invariant tests pass.
+    Live publish-rate and persistence-rate measurements remain pending.
   - **Prereqs**: #5 (needs the shared normalizer), #3 (the invariant guard
     must exist before the gate gets stricter) complete
-  - **DoD**: `snapshotChangeKey` (`internal/state/state.go:656`) is computed
-    from a copy of the snapshot in which (a) every `Wezterm.WindowTitle` is
-    passed through `Normalize`, (b) `AgentGraph.ObservedAt` is dropped and
-    `AgentGraph.FreshUntil` is replaced by its value **rounded up** to a 5 s
-    bucket. Node-level `updated_at`, `Summary.Since`, status, pending writers
-    and everything else stay in the key. Tests:
+  - **DoD**: exported `SnapshotChangeKey` is computed from detached session,
+    graph, and node-slice copies in which `AgentGraph.ObservedAt` and node-level
+    `updated_at` are zeroed. Top-level `Snapshot.UpdatedAt` remains excluded as
+    before. `Summary.Since`, status, pending writers, runtime/lifecycle,
+    `started_at`, `completed_at`, and every other tagged field stay in the key.
+    `WindowTitle` and `FreshUntil` need no key-only rules: #5 normalizes the
+    title at construction, while #7's `AgentGraph.MarshalJSON` makes both the
+    key and wire encode the same freshness ceiling. Tests:
     `should not republish when only the title spinner rotates`,
     `should not republish when only observed_at advances within a bucket`,
     `should republish when fresh_until crosses a bucket boundary`,
     `should republish when a node runtime state changes`,
     `should republish when a session's label or status changes`.
-    Timestamps still go out raw on the frames that do publish. **The title does
-    not** — #5 was decided as option (b), so `window_title` is already
-    normalized at the `internal/terminal` boundary before it reaches the
-    snapshot, and the change key inherits that rather than re-normalizing.
-    Do NOT normalize the title a second time here.
+    `observed_at` and node `updated_at` still go out raw on frames that do
+    publish, with an aliasing regression test proving key construction cannot
+    mutate the frame or `state.json`. **The title does not** go out raw, and
+    `fresh_until` goes out ceilinged; both are boundary representations the key
+    inherits rather than re-normalizing.
   - **Phase**: 1
   - **Notes**: Keep the "fail open on encode error" behavior. The 5 s bucket
     means the bar can be at most 5 s behind on freshness; #7 makes that
     invisible.
 
 - [ ] #7: Freshness lease on the wire
+  - **Implementation status (2026-08-28)**: Complete at `66ef22d`, deliberately
+    committed before #6 so no revision can suppress a raw horizon. Fixed-point,
+    monotonic-time, in-memory-policy, JSON round-trip, state, federation,
+    remote-state, history, race, and TUI stale-boundary tests pass. Live
+    `heap_sys_mb` comparison remains pending.
   - **DECIDED 2026-08-26 (owner): the IN-MEMORY policy change is DEFERRED.**
     Two mechanisms reach this DoD. Applying the ceiling in `ProjectAgentGraph`
     would make every provider's freshness horizon genuinely longer by up to the
@@ -749,13 +770,13 @@ journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
   - **Prereqs**: #6 complete — only meaningful once republishes are suppressed
   - **DoD**: On the frames that are published, `agent_graph.fresh_until` is
     the bucket **ceiling** (never earlier than the true value), so a consumer
-    evaluating `AgentGraph.Fresh(now)` (`internal/state/agent_graph.go:80`,
-    used by `cmd/switchboard-waybar/main.go` `agentTooltip`) never reports
-    stale while the daemon holds a fresh graph. Test in the waybar package:
-    `should not mark the tooltip stale when the daemon suppressed a
-    within-bucket republish` (simulate: publish at t, no publish until t+4.9 s,
-    assert not stale; at t+5.1 s with no publish, stale is allowed).
-    `docs/state-schema.md` notes the ceiling semantics.
+    evaluating `AgentGraph.Fresh(now)` never reports stale while the daemon
+    holds a fresh graph. Current Waybar rolls the graph into event-driven counts
+    and no longer renders per-node stale state; the executable consumer test is
+    therefore in `cmd/claude-tui`, the renderer that still calls `Fresh(now)`:
+    `should not mark the TUI stale when the daemon suppressed a within-bucket
+    republish` (t+4.9 s stays fresh; t+5.1 s is stale).
+    `docs/state-schema.md` notes the ceiling and round-trip semantics.
   - **Phase**: 1
 
 - [ ] #8: Federation View — one encode per publish, change-gated

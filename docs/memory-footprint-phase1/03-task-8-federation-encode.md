@@ -335,12 +335,9 @@ passes `f.view` and needs **no edit**.
 
 ### The #6 dependency: one key function, not two
 
-**Rename `snapshotChangeKey` → `SnapshotChangeKey`** (`internal/state/state.go:670`),
-keeping its 40-line doc comment. Update `state.go:595`, `golden_test.go:224, 246`,
-`pending_test.go:43, 47`. Optionally move it plus the comment to
-`internal/state/changekey.go` — cosmetic, but it keeps #6's and #8's diffs from
-colliding in `state.go`. Recommended if #6 has already landed; skip if it
-complicates the merge.
+**Already complete in #6 (`eeaf7de`):** `SnapshotChangeKey` is exported from
+`internal/state/state.go`, and its detached-copy implementation carries the
+full soundness/aliasing comment. Use it directly.
 
 **Do not** create a second key in `federation`, and **do not** create a new
 package. `state` owns `Snapshot`; the key is a property of `Snapshot`.
@@ -490,10 +487,9 @@ In `internal/rpc/subscribe_test.go`:
 
 ## Implementation order (tree builds and tests green at every step)
 
-1. **`internal/state`, additive only.** Rename `snapshotChangeKey` →
-   `SnapshotChangeKey` (+4 test call sites); add `NewBroadcast` and refactor
-   `Store.broadcast` to use it. `go build ./... && go test ./internal/state/...`
-   green. No behaviour change.
+1. **`internal/state`, additive only.** Add `NewBroadcast` and refactor
+   `Store.broadcast` to use it; `SnapshotChangeKey` already exists from #6.
+   `go build ./... && go test ./internal/state/...` green. No behaviour change.
 2. **`internal/state`, the cache.** `lastBroadcast` + `frameMu`;
    cache-or-invalidate in `broadcast()`; `CurrentBroadcast()`; tests 5 and 6.
    Green, still no consumer.

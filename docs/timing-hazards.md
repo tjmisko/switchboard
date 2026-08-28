@@ -174,6 +174,12 @@ while it waits at the prompt. The resolver already re-samples every pane's
 title each reconcile tick (`Resolver.Reconcile` → `WeztermInfo.Title`, stamped
 with `TitleAt`).
 
+That pane-owned `PaneRef.Title` is deliberately raw. Only
+`PaneRef.WindowTitle`, the presentation/join field sent on the wire, is
+spinner-normalized. H9 depends on the first rune of the raw pane title; applying
+the window-title normalization to both fields would silently disable this
+recovery.
+
 The demotion rule (`case6-idle-title`, `selfHealStuckStatus`): a `working` chip
 is demoted to `idle` when **all** of
 

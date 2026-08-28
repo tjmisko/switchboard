@@ -128,7 +128,7 @@ Add a line saying so, so nobody reads it as a target.
 | plan says | actual |
 |---|---|
 | `drainWMEvents` at `main.go:580` | `cmd/switchboard/main.go:591` |
-| `snapshotChangeKey` at `state.go:656` | `internal/state/state.go:670` |
+| `snapshotChangeKey` at `state.go:656` | Exported as `state.SnapshotChangeKey` by task #6; do not rely on a line anchor. |
 | `Fresh` at `agent_graph.go:80` | `internal/state/agent_graph.go:79` (`:80` is the nil guard) |
 | `rpc.subscribeAll` at `rpc.go:467` | function starts `:462`; `:467` is the `Subscribe()` call |
 | `View.publish()` at `view.go:320` | correct **in this worktree**; on `main` it is `:324` |
