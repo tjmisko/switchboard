@@ -384,9 +384,13 @@ warn_stale_references() {
 	# SHIPPED default, which the host overlay overrides; that is intended and
 	# must not be reported. Excluding the whole systemd directory would instead
 	# hide real offenders like swayidle.service, so exclude only those two.
+	# Backups left by a migration are meant to hold the old paths; reporting
+	# them is noise that buries a real hit.
 	hits=$(grep -rlE "$pattern" "$HOME/.config" \
 		--exclude=switchboard.service \
-		--exclude=switchboard-waybar.service 2>/dev/null || true)
+		--exclude=switchboard-waybar.service \
+		--exclude='*.bak' --exclude='*.bak-*' --exclude='*.orig' --exclude='*~' \
+		2>/dev/null || true)
 	[ -n "$hits" ] || return 0
 	warn "deploy: these still reference ~/go/bin directly, so they will NOT follow a deploy:"
 	while IFS= read -r hit; do
