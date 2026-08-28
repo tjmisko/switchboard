@@ -371,9 +371,22 @@ install_command_links() {
 # directly instead of going through the links above. It only warns: these files
 # are the user's, not ours, and a deploy is no place to rewrite them.
 warn_stale_references() {
-	local hits
+	local hits pattern
 	[ -d "$HOME/.config" ] || return 0
-	hits=$(grep -rl --exclude-dir=systemd 'go/bin/switchboard' "$HOME/.config" 2>/dev/null || true)
+	# Match only the commands this script deploys. A neighbouring project's
+	# binary legitimately lives in ~/go/bin — switchboard-dashboard is one — and
+	# flagging it would train the reader to ignore this warning. The trailing
+	# class supplies the word boundary so "switchboard" does not match
+	# "switchboard-dashboard".
+	pattern=$(printf '%s|' "${commands[@]}")
+	pattern="go/bin/(${pattern%|})([^-a-zA-Z0-9_]|$)"
+	# switchboard.service and switchboard-waybar.service name ~/go/bin as their
+	# SHIPPED default, which the host overlay overrides; that is intended and
+	# must not be reported. Excluding the whole systemd directory would instead
+	# hide real offenders like swayidle.service, so exclude only those two.
+	hits=$(grep -rlE "$pattern" "$HOME/.config" \
+		--exclude=switchboard.service \
+		--exclude=switchboard-waybar.service 2>/dev/null || true)
 	[ -n "$hits" ] || return 0
 	warn "deploy: these still reference ~/go/bin directly, so they will NOT follow a deploy:"
 	while IFS= read -r hit; do
