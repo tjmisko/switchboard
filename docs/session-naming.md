@@ -87,9 +87,11 @@ Codex label precedence is:
 4. the cwd basename;
 5. `pid N`.
 
-Project prefixing happens after this choice. For example, a generated
-`context-aware-names` label in Switchboard renders as
-`sb-context-aware-names`.
+Whichever value wins is normalized at the display boundary to a lowercase,
+at-most-three-word kebab slug. The persisted display record and Codex's native
+name remain untouched. Project prefixing happens after normalization. For
+example, a native `Plan faster abstract extraction` in Lysilogy renders as
+`lysilogy-plan-faster-abstract`.
 
 Switchboard never mutates Codex's native name. When the read-only observer sees
 an authoritative native name, that value becomes the display record's baseline.

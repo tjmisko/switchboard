@@ -85,15 +85,33 @@ func TestRawName_CodexPrefersAppServerRootNameOverAnimatedTerminalTitle(t *testi
 		AgentGraph: &state.AgentGraph{
 			RootID: "01890f00-0000-7000-8000-000000000001",
 			Nodes: []state.AgentNode{{
-				ID: "01890f00-0000-7000-8000-000000000001", Nickname: "my-short-name",
+				ID: "01890f00-0000-7000-8000-000000000001", Nickname: "Plan faster abstract extraction",
 			}},
 		},
 	}
-	if got := RawName(s); got != "my-short-name" {
-		t.Errorf("RawName = %q, want my-short-name", got)
+	if got := RawName(s); got != "plan-faster-abstract" {
+		t.Errorf("RawName = %q, want plan-faster-abstract", got)
 	}
-	if got := Chip(projectname.DefaultConfig(), s); got != "sb-my-short-name" {
-		t.Errorf("Chip = %q, want sb-my-short-name", got)
+	if got := Chip(projectname.DefaultConfig(), s); got != "sb-plan-faster-abstract" {
+		t.Errorf("Chip = %q, want sb-plan-faster-abstract", got)
+	}
+}
+
+func TestCodexDisplaySlug(t *testing.T) {
+	for _, test := range []struct {
+		input string
+		want  string
+	}{
+		{"Plan faster abstract extraction", "plan-faster-abstract"},
+		{"  Fix__THE / API!!! later  ", "fix-the-api"},
+		{"Already-kebab-case-name", "already-kebab-case"},
+		{"Déboguer l’API vite", "déboguer-l-api"},
+		{"01", "01"},
+		{"---", ""},
+	} {
+		if got := codexDisplaySlug(test.input); got != test.want {
+			t.Errorf("codexDisplaySlug(%q) = %q, want %q", test.input, got, test.want)
+		}
 	}
 }
 
@@ -103,7 +121,7 @@ func TestRawName_CodexDisplayNamePrecedesMatchingNativeName(t *testing.T) {
 		PID: 4248, Agent: state.AgentKindCodex, CWD: "/home/u/Projects/switchboard",
 		Codex: &state.AgentInfo{SessionID: "thread-1"},
 		DisplayName: &state.DisplayName{
-			Value: "context-aware-names", Origin: state.DisplayNameGenerated,
+			Value: "Context Aware Session Names", Origin: state.DisplayNameGenerated,
 			ConversationID: "thread-1",
 		},
 		AgentGraph: &state.AgentGraph{
@@ -111,10 +129,10 @@ func TestRawName_CodexDisplayNamePrecedesMatchingNativeName(t *testing.T) {
 			Nodes:  []state.AgentNode{{ID: "thread-1", Nickname: "native-title"}},
 		},
 	}
-	if got := RawName(s); got != "context-aware-names" {
+	if got := RawName(s); got != "context-aware-session" {
 		t.Fatalf("RawName = %q, want generated display name", got)
 	}
-	if got := Chip(projectname.DefaultConfig(), s); got != "sb-context-aware-names" {
+	if got := Chip(projectname.DefaultConfig(), s); got != "sb-context-aware-session" {
 		t.Fatalf("Chip = %q, want project-prefixed display name", got)
 	}
 }
@@ -130,11 +148,21 @@ func TestRawName_CodexRejectsDisplayNameForAnotherConversation(t *testing.T) {
 		},
 		AgentGraph: &state.AgentGraph{
 			RootID: "thread-current",
-			Nodes:  []state.AgentNode{{ID: "thread-current", Nickname: "manual-native-name"}},
+			Nodes:  []state.AgentNode{{ID: "thread-current", Nickname: "Manual Native Name Here"}},
 		},
 	}
 	if got := RawName(s); got != "manual-native-name" {
 		t.Fatalf("RawName = %q, want current native name", got)
+	}
+}
+
+func TestRawName_CodexNormalizesCwdAndPIDFallbacks(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if got := RawName(state.Session{PID: 4250, Agent: state.AgentKindCodex, CWD: "/home/u/Projects/My Project Name Here"}); got != "my-project-name" {
+		t.Fatalf("cwd fallback RawName = %q, want my-project-name", got)
+	}
+	if got := RawName(state.Session{PID: 4251, Agent: state.AgentKindCodex}); got != "pid-4251" {
+		t.Fatalf("pid fallback RawName = %q, want pid-4251", got)
 	}
 }
 
