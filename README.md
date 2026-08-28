@@ -60,6 +60,13 @@ claude-tui
 root session with its cwd, status, nested agent rows, and (if resolved)
 workspace. No window manager, bar, or terminal integration required.
 
+`go install` is the right way to *try* Switchboard. It is the wrong way to
+**redeploy** a host that runs it as a service: it writes to `~/go/bin`, which a
+configured unit need not read, so the restart afterwards can succeed against the
+old binary and report `active` either way. Use `scripts/deploy` from a checkout
+once a host is managed — see
+[Deploying a release](docs/machine-configuration.md#deploying-a-release).
+
 ```
 switchboard · 3 sessions · navigate · wm=hyprland term=wezterm
 
