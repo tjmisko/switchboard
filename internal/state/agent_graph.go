@@ -1,10 +1,32 @@
 package state
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/agentgraph"
 )
+
+// FreshnessBucket is the quantum a published freshness horizon is rounded up
+// to. It bounds both publish suppression and how far a consumer's wire horizon
+// may lead the daemon's true horizon. Codex's shortest provider lease is 15s;
+// revisit every Fresh consumer before materially widening this bucket.
+const FreshnessBucket = 5 * time.Second
+
+// CeilFreshUntil rounds t up to the next FreshnessBucket boundary. Zero and
+// already-aligned values are returned unchanged. The latter preserves the
+// input's location and monotonic reading and makes repeated wire encoding a
+// fixed point across federation and persisted-state round trips.
+func CeilFreshUntil(t time.Time) time.Time {
+	if t.IsZero() {
+		return t
+	}
+	truncated := t.Truncate(FreshnessBucket)
+	if truncated.Equal(t) {
+		return t
+	}
+	return truncated.Add(FreshnessBucket)
+}
 
 // AgentGraph is the additive, provider-neutral wire projection attached to one
 // switchable root Session. It is a bounded current-session view, not history.
@@ -23,6 +45,22 @@ type AgentGraph struct {
 	// represented by Session.Agent on the wire, so duplicating it in agent_graph
 	// would add two sources of truth.
 	provider agentgraph.ProviderKind
+}
+
+// MarshalJSON publishes FreshUntil on its bucket ceiling so a consumer that
+// received no frame while the daemon suppressed a within-bucket republish still
+// evaluates Fresh correctly. In-memory semantics are untouched: Fresh continues
+// to use the provider's true horizon.
+//
+// Soundness: if the last published ceiling is L and the key has not changed,
+// the current true horizon F still satisfies ceil(F)=L. Whenever the daemon
+// considers the graph fresh, now < F <= L, so the consumer cannot become
+// falsely stale merely because an equivalent republish was suppressed.
+func (g AgentGraph) MarshalJSON() ([]byte, error) {
+	type wire AgentGraph
+	w := wire(g)
+	w.FreshUntil = CeilFreshUntil(g.FreshUntil)
+	return json.Marshal(w)
 }
 
 // AgentGraphSummary is the state-owned wire form of agentgraph.Summary. Status

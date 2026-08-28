@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -64,6 +65,99 @@ func graphObservation() agentgraph.Observation {
 				UpdatedAt: graphObserved.Add(-2 * time.Second),
 			},
 		},
+	}
+}
+
+func TestCeilFreshUntilRoundsUpAndIsIdempotent(t *testing.T) {
+	if got := state.CeilFreshUntil(time.Time{}); !got.IsZero() {
+		t.Fatalf("zero horizon became %v", got)
+	}
+
+	// Build an aligned value from time.Now so it retains a monotonic reading.
+	now := time.Now()
+	alignedWall := now.Truncate(state.FreshnessBucket)
+	aligned := now.Add(alignedWall.Sub(now))
+	if !strings.Contains(aligned.String(), "m=") {
+		t.Fatal("test precondition: aligned time lost its monotonic reading")
+	}
+	if got := state.CeilFreshUntil(aligned); got != aligned {
+		t.Fatalf("aligned horizon was not returned unchanged: got=%v want=%v", got, aligned)
+	}
+
+	location := time.FixedZone("test-zone", -7*60*60)
+	midBucket := time.Date(2026, 8, 21, 12, 0, 2, 250_000_000, location)
+	want := time.Date(2026, 8, 21, 12, 0, 5, 0, location)
+	got := state.CeilFreshUntil(midBucket)
+	if !got.Equal(want) || got.Location() != location {
+		t.Fatalf("CeilFreshUntil(%v) = %v (%v), want %v (%v)", midBucket, got, got.Location(), want, location)
+	}
+	if got.Before(midBucket) {
+		t.Fatalf("ceiling %v is before input %v", got, midBucket)
+	}
+	if second := state.CeilFreshUntil(got); !second.Equal(got) || second.Location() != got.Location() {
+		t.Fatalf("ceiling is not idempotent: first=%v second=%v", got, second)
+	}
+}
+
+func TestAgentGraphMarshalJSONPublishesTheCeiling(t *testing.T) {
+	graph := state.AgentGraph{
+		RootID: "root", ObservedAt: graphObserved,
+		FreshUntil: graphObserved.Add(2*time.Second + 250*time.Millisecond),
+		Nodes:      []state.AgentNode{{ID: "root"}},
+	}
+	encoded, err := json.Marshal(graph)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		FreshUntil time.Time `json:"fresh_until"`
+	}
+	if err := json.Unmarshal(encoded, &wire); err != nil {
+		t.Fatal(err)
+	}
+	want := state.CeilFreshUntil(graph.FreshUntil)
+	if !wire.FreshUntil.Equal(want) {
+		t.Fatalf("wire fresh_until = %v, want ceiling %v; JSON=%s", wire.FreshUntil, want, encoded)
+	}
+}
+
+func TestAgentGraphMarshalJSONLeavesTheInMemoryHorizonUntouched(t *testing.T) {
+	freshUntil := graphObserved.Add(2*time.Second + 250*time.Millisecond)
+	graph := state.AgentGraph{
+		RootID: "root", ObservedAt: graphObserved, FreshUntil: freshUntil,
+		Nodes: []state.AgentNode{{ID: "root"}},
+	}
+	probe := freshUntil.Add(-time.Nanosecond)
+	freshBefore := graph.Fresh(probe)
+	if _, err := json.Marshal(graph); err != nil {
+		t.Fatal(err)
+	}
+	if graph.FreshUntil != freshUntil || graph.Fresh(probe) != freshBefore {
+		t.Fatalf("marshal changed in-memory semantics: horizon=%v want=%v fresh=%v want=%v",
+			graph.FreshUntil, freshUntil, graph.Fresh(probe), freshBefore)
+	}
+}
+
+func TestAgentGraphMarshalJSONRoundTripIsStable(t *testing.T) {
+	graph := state.AgentGraph{
+		RootID: "root", ObservedAt: graphObserved,
+		FreshUntil: graphObserved.Add(2*time.Second + 250*time.Millisecond),
+		Nodes:      []state.AgentNode{{ID: "root"}},
+	}
+	first, err := json.Marshal(graph)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var roundTripped state.AgentGraph
+	if err := json.Unmarshal(first, &roundTripped); err != nil {
+		t.Fatal(err)
+	}
+	second, err := json.Marshal(roundTripped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Fatalf("agent graph wire encoding walked across a round trip:\nfirst:  %s\nsecond: %s", first, second)
 	}
 }
 
