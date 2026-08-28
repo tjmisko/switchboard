@@ -2,3 +2,8 @@
 *.log
 .worktrees/
 .bin/
+
+# Local credentials. Never commit these; they also keep `scripts/deploy` from
+# reporting a clean checkout as dirty, since its guard counts untracked files.
+.env
+.secrets
