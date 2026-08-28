@@ -48,6 +48,19 @@ type Session struct {
 	// pane, window, liveness, and StartedAt before acting. Host-local snapshots
 	// leave it false/omitted, preserving the durable schema.
 	Navigable bool `json:"navigable,omitempty"`
+	// LocalWorkspace is the Hyprland workspace ID, ON THIS MACHINE, of the
+	// window displaying this session. It is populated only on detached
+	// aggregate copies, and only for remote rows: a local session already
+	// carries its own workspace in Hyprland, while a remote one has its
+	// Hyprland block stripped precisely because those coordinates locate the
+	// REMOTE desktop and mean nothing here.
+	//
+	// The distinction matters to a reader deciding where to switch. "Which
+	// workspace is this session on" has two different answers for a federated
+	// row, and the only actionable one is this: the workspace whose window is
+	// showing it. Zero means unresolved (Hyprland workspace IDs are non-zero),
+	// which is the same convention workspaceID uses.
+	LocalWorkspace int `json:"local_workspace,omitempty"`
 
 	// Agent names the coding-agent CLI that owns this session: "claude" or
 	// "codex" (the AgentKind* constants). Set at discovery from the process. It

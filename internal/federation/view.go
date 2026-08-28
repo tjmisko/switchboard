@@ -165,6 +165,10 @@ func (v *View) Snapshot() state.Snapshot {
 			if routeWorkspace != nil {
 				if workspace, ok := routeWorkspace(host, session.PID, session.StartedAt); ok {
 					workspaces[chipKey{host: host, pid: session.PID}] = workspace
+					// Also published, not just sorted by: having stripped the
+					// remote desktop's own coordinates above, this is the only
+					// workspace a reader of this row could act on.
+					session.LocalWorkspace = workspace
 				}
 			}
 			session.Focused = session.Navigable && remoteFocusedLive && focused.host == host && focused.pid == session.PID &&

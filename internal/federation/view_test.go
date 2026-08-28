@@ -291,6 +291,22 @@ func TestViewOrdersRemoteRowsByTheLocalWorkspaceDisplayingThem(t *testing.T) {
 	if got[1].Hyprland != nil {
 		t.Fatalf("remote desktop window leaked into the aggregate: %+v", got[1].Hyprland)
 	}
+	// Having stripped the remote coordinates, the aggregate must still publish
+	// the workspace a reader could act on — otherwise a renderer has nothing to
+	// report but a dash.
+	if got[1].LocalWorkspace != 3 {
+		t.Errorf("displayed remote row LocalWorkspace = %d, want 3", got[1].LocalWorkspace)
+	}
+	if got[3].LocalWorkspace != 0 {
+		t.Errorf("unbound remote row LocalWorkspace = %d, want 0 (unresolved)", got[3].LocalWorkspace)
+	}
+	// Local rows keep carrying their own Hyprland block and must not be
+	// stamped with a federation-only field.
+	for _, s := range []state.Session{got[0], got[2]} {
+		if s.LocalWorkspace != 0 {
+			t.Errorf("local row %d got LocalWorkspace = %d, want 0", s.PID, s.LocalWorkspace)
+		}
+	}
 }
 
 func pids(sessions []state.Session) []int {
