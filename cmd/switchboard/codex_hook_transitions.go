@@ -239,8 +239,14 @@ func (c *agentCoordinator) handleCodexHookNow(ref provider.RootRef, req rpc.Requ
 	c.codexHookMu.Unlock()
 	ref.ProviderSessionID = rootID
 	observation, mapped := codexHookObservation(rootID, req, ref.StartedAt, now)
+	var hookFallback agentgraph.Observation
 	if mapped {
 		observation = applyCodexPendingAttention(observation, pendingAttention, now)
+		// Preserve the hook's own bounded deadline for a later app-server
+		// notLoaded snapshot. The published composed graph may correctly retain a
+		// live app-server's shorter horizon, but that must not shrink the hook
+		// fallback from minutes/hours to the provider's polling lease.
+		hookFallback = observation.Clone()
 		if current, ok := sessionForKey(c.store.Snapshot(), ref.Key()); ok {
 			if approvalDeferred && pendingAttention == agentgraph.AttentionNone && current.AgentGraph != nil &&
 				current.AgentGraph.Summary.Attention != agentgraph.AttentionNone {
@@ -253,7 +259,7 @@ func (c *agentCoordinator) handleCodexHookNow(ref provider.RootRef, req rpc.Requ
 		}
 	}
 	if mapped {
-		c.rememberCodexHookRootObservation(ref.Key(), observation)
+		c.rememberCodexHookRootObservation(ref.Key(), hookFallback)
 		generation := c.begin(ref.Key())
 		c.applyObservationWithHookOwnership(ref, generation, observation, claudeprovider.Compatibility{}, now, hookOwnsTransition)
 	}

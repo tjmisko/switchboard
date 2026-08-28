@@ -579,18 +579,27 @@ func shouldApplyObservation(observation agentgraph.Observation, current *state.A
 	return !observation.ObservedAt.Before(current.ObservedAt)
 }
 
-// overlayCodexHookObservation keeps the app-server's structural detail while
-// applying a newer hook's immediate root status. A hook is intentionally
-// partial: it must not erase the authoritative thread name or child graph.
+// overlayCodexHookObservation keeps the app-server's structural detail and
+// provenance while applying a newer hook's immediate root status. A hook is
+// intentionally partial: it must not erase the authoritative thread name,
+// child graph, completeness verdict, or freshness horizon. When app-server
+// evidence is absent, stale, or explicitly lacks the root runtime, the hook
+// remains the bounded fallback authority exactly as it was before composition.
 func overlayCodexHookObservation(hook agentgraph.Observation, current *state.AgentGraph) agentgraph.Observation {
 	if current == nil || current.RootID != hook.RootID || len(hook.Nodes) != 1 {
 		return hook
 	}
 	overlay := observationFromState(agentgraph.ProviderCodex, current)
-	overlay.Source = agentgraph.SourceHook
+	if !codexAppServerGraphOwnsHookHorizon(current, hook.ObservedAt) {
+		overlay.Source = agentgraph.SourceHook
+		overlay.FreshUntil = hook.FreshUntil
+		overlay.Complete = false
+	}
+	// Source is real provenance, not an internal routing bit. Mark every graph
+	// rebuilt from current state so downstream child composition does not treat
+	// its already-overlaid nodes as a fresh provider snapshot.
+	overlay.Diagnostic = codexComposedObservationDiagnostic
 	overlay.ObservedAt = hook.ObservedAt
-	overlay.FreshUntil = hook.FreshUntil
-	overlay.Complete = false
 	for i := range overlay.Nodes {
 		if overlay.Nodes[i].ID != hook.RootID {
 			continue
@@ -602,6 +611,15 @@ func overlayCodexHookObservation(hook agentgraph.Observation, current *state.Age
 		break
 	}
 	return overlay
+}
+
+// codexAppServerGraphOwnsHookHorizon reports whether a hook at hookAt composes
+// onto app-server evidence that is still authoritative. The source check is
+// load-bearing: codexAppServerRootUnavailable also returns false for graphs
+// whose source is not the app-server.
+func codexAppServerGraphOwnsHookHorizon(current *state.AgentGraph, hookAt time.Time) bool {
+	return current != nil && current.Source == agentgraph.SourceCodexAppServer &&
+		current.Fresh(hookAt) && !codexAppServerRootUnavailable(current)
 }
 
 func sourceRank(source agentgraph.SourceKind) int {
@@ -1044,10 +1062,9 @@ func authoritativeNativeName(sess state.Session, conversationID string) (string,
 			if graph.Source == agentgraph.SourceCodexAppServer && graph.Complete {
 				return name, true
 			}
-			// Hook observations cannot carry a native name. A nonempty name on a
-			// hook graph can only have survived overlayCodexHookObservation from
-			// the preceding complete app-server graph, so it remains authoritative
-			// display metadata even while the hook owns the current status edge.
+			// A hook-only graph cannot carry a native name. This branch remains for
+			// hydrated data written before composed hooks preserved app-server
+			// provenance; new composed graphs take the complete app-server branch.
 			if graph.Source == agentgraph.SourceHook && name != "" {
 				return name, true
 			}

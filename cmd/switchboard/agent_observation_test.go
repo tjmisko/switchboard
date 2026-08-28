@@ -337,7 +337,8 @@ func TestNewerCodexHookIsImmediateAndLaterAppServerCorrectsIt(t *testing.T) {
 	hookAt := now.Add(500 * time.Millisecond)
 	coordinator.HandleHook(rpc.Request{Agent: state.AgentKindCodex, Event: "PostToolUse", ObservedAt: hookAt}, store.Snapshot().Sessions[0])
 	graph := store.Snapshot().Sessions[0].AgentGraph
-	if graph.Source != agentgraph.SourceHook || graph.Summary.Status != state.StatusWorking {
+	if graph.Source != agentgraph.SourceCodexAppServer || !graph.Complete ||
+		!graph.FreshUntil.Equal(observation.FreshUntil) || graph.Summary.Status != state.StatusWorking {
 		t.Fatalf("newer hook did not provide its immediate transition: %#v", graph)
 	}
 	if len(graph.Nodes) != 2 || graph.Nodes[0].Nickname != "kept-name" {
