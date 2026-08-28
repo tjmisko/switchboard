@@ -279,7 +279,11 @@ func currentCodexGraph(snapshot state.Snapshot, key provider.RootKey) *state.Age
 	return session.AgentGraph
 }
 
-const codexChildHookOverlayDiagnostic = "codex child hook overlay"
+// codexComposedObservationDiagnostic marks an observation rebuilt from the
+// current graph rather than read directly from provider evidence. Source remains
+// the graph's real provenance; this internal marker prevents a second overlay
+// pass from treating already-composed nodes as a fresh provider snapshot.
+const codexComposedObservationDiagnostic = "codex composed observation"
 
 // enqueueCodexChildHook retains an exact child lifecycle edge until the
 // coordinator can validate it against a fresh app-server graph. Child ordering
@@ -506,7 +510,7 @@ func (c *agentCoordinator) applyCodexChildHookEdge(ref provider.RootRef, rootID 
 	c.codexHookMu.Unlock()
 
 	observation := observationFromState(agentgraph.ProviderCodex, graph)
-	observation.Diagnostic = codexChildHookOverlayDiagnostic
+	observation.Diagnostic = codexComposedObservationDiagnostic
 	if !applyCodexChildOverlay(&observation, edge.agentID, overlay) {
 		c.rollbackCodexChildHook(ref.Key(), rootID, edge, previousOverlay, hadOverlay, previousLast, hadLast)
 		return
@@ -593,12 +597,13 @@ func (c *agentCoordinator) rollbackCodexChildHook(key provider.RootKey, rootID s
 }
 
 // overlayCodexChildObservation fuses retained exact hook edges into a fresh
-// structural snapshot. It never changes attention, parentage, or graph source.
+// structural provider snapshot. It never changes attention, parentage, or graph source.
 // Concrete provider transitions that are at least as new retire the matching
-// field; a complete omission retires the whole child overlay.
+// field; a complete omission retires the whole child overlay. Observations
+// synthesized from the current graph are already composed and bypass this pass.
 func (c *agentCoordinator) overlayCodexChildObservation(key provider.RootKey, observation agentgraph.Observation, now time.Time) agentgraph.Observation {
 	if observation.Source != agentgraph.SourceCodexAppServer || observation.RootID == "" ||
-		observation.Diagnostic == codexChildHookOverlayDiagnostic {
+		observation.Diagnostic == codexComposedObservationDiagnostic {
 		return observation
 	}
 	c.codexHookMu.Lock()
@@ -713,7 +718,7 @@ func (c *agentCoordinator) expireCodexChildHookState(ref provider.RootRef, now t
 		return
 	}
 	observation := observationFromState(agentgraph.ProviderCodex, graph)
-	observation.Diagnostic = codexChildHookOverlayDiagnostic
+	observation.Diagnostic = codexComposedObservationDiagnostic
 	changed := false
 	for _, item := range expired {
 		for i := range observation.Nodes {
