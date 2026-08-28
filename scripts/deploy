@@ -46,6 +46,9 @@ commands=(switchboard switchboard-ctl switchboard-waybar)
 units=(switchboard.service switchboard-waybar.service)
 keep_releases=5
 version_ldflag_path=github.com/tjmisko/switchboard/internal/buildinfo.Version
+# Where the stable command names are published. Desktop config should reference
+# these, never a release directory and never ~/go/bin. Set empty to opt out.
+link_dir=${SWITCHBOARD_LINK_DIR-$HOME/.local/bin}
 
 dry_run=0
 allow_dirty=0
@@ -156,6 +159,19 @@ cmd_status() {
 	log "current:  $(current_target || true)"
 	log "deployed: $(live_revision || true)"
 	log "running:  $(running_revision || true)"
+	log "links:    ${link_dir:-(disabled)}"
+	if [ -n "$link_dir" ]; then
+		local cmd
+		for cmd in "${commands[@]}"; do
+			if [ -L "$link_dir/$cmd" ]; then
+				log "  $cmd -> $(readlink "$link_dir/$cmd")"
+			elif [ -e "$link_dir/$cmd" ]; then
+				log "  $cmd is a FILE, not a link — it will not follow a deploy"
+			else
+				log "  $cmd (absent)"
+			fi
+		done
+	fi
 	if [ -d "$releases_dir" ]; then
 		log "releases (newest first):"
 		# shellcheck disable=SC2012
@@ -316,6 +332,57 @@ assert_no_later_dropin_overrides() {
 	done
 }
 
+# install_command_links publishes stable, well-known names that point through
+# `current`.
+#
+# This is the seam that keeps desktop configuration decoupled from Switchboard.
+# A waybar module, a Hyprland bind or a wezterm hook should name a path that
+# belongs to the USER's conventions and never moves — not ~/go/bin, which
+# belongs to the Go toolchain, and not a release directory, which changes every
+# deploy. With these links in place, config is written once and this script
+# owns the indirection.
+#
+# $SWITCHBOARD_LINK_DIR relocates them; setting it empty turns them off for a
+# host that would rather manage its own.
+install_command_links() {
+	local dir=$link_dir cmd path
+	if [ -z "$dir" ]; then
+		log "  (command links disabled: SWITCHBOARD_LINK_DIR is empty)"
+		return 0
+	fi
+	log "  linking commands into $dir"
+	run mkdir -p "$dir"
+	for cmd in "${commands[@]}"; do
+		path=$dir/$cmd
+		# A regular file here is a COPY, and a copy is what silently goes stale
+		# behind a redeploy and serves old code forever. Never overwrite one
+		# blindly — say what it is and let a human decide.
+		if [ -e "$path" ] && [ ! -L "$path" ]; then
+			die "$path is a real file, not a symlink.
+    A copy on PATH does not follow a deploy: it keeps serving whatever
+    revision it was copied from. Remove or rename it, then re-run:
+      rm $path"
+		fi
+		run ln -sfn "$current_link/$cmd" "$path"
+	done
+}
+
+# warn_stale_references reports configuration that still names a binary
+# directly instead of going through the links above. It only warns: these files
+# are the user's, not ours, and a deploy is no place to rewrite them.
+warn_stale_references() {
+	local hits
+	[ -d "$HOME/.config" ] || return 0
+	hits=$(grep -rl --exclude-dir=systemd 'go/bin/switchboard' "$HOME/.config" 2>/dev/null || true)
+	[ -n "$hits" ] || return 0
+	warn "deploy: these still reference ~/go/bin directly, so they will NOT follow a deploy:"
+	while IFS= read -r hit; do
+		[ -n "$hit" ] || continue
+		warn "  ${hit#"$HOME"/}"
+	done <<<"$hits"
+	warn "  point them at $link_dir/<command> instead."
+}
+
 prune_releases() {
 	local keep=$1 current dir n=0
 	current=$(current_target || true)
@@ -397,6 +464,12 @@ cmd_deploy() {
 	log "deployed: ${live_rev:-(none)}"
 	log "shipping: $version"
 
+	# Publish the stable names before anything changes. They point through
+	# `current`, so they are correct whatever happens next — and refusing here
+	# means a stale copy on PATH is caught pre-flight rather than after the
+	# flip has already gone live.
+	install_command_links
+
 	target=$(release_path_for "$version")
 	if [ -d "$target" ]; then
 		log "reusing existing release $version"
@@ -419,6 +492,7 @@ cmd_deploy() {
 		die "deploy did NOT take effect; nothing about the unit's state would have told you"
 	fi
 
+	warn_stale_references
 	prune_releases "$keep_releases"
 	log "deployed ${live_rev:-(none)} -> $version"
 	if [ -n "$previous" ]; then
