@@ -16,8 +16,9 @@ import (
 )
 
 const (
-	DefaultRetryDelay = 2 * time.Second
-	MaxRetryDelay     = 30 * time.Second
+	DefaultRetryDelay      = 2 * time.Second
+	MaxRetryDelay          = 30 * time.Second
+	defaultRecoveryTimeout = 10 * time.Second
 
 	DiagnosticCommand       = "command"
 	DiagnosticStart         = "start"
@@ -28,6 +29,9 @@ const (
 	DiagnosticLocalHost     = "local_hostname"
 	DiagnosticHostnameFlip  = "hostname_changed"
 	DiagnosticDisconnected  = "disconnected"
+	// DiagnosticReconnecting means a previously live stream ended, but its rows
+	// remain visible while the owning worker makes one confirmation attempt.
+	DiagnosticReconnecting = "reconnecting"
 )
 
 // Process is the complete child-process seam. The production implementation is
@@ -71,8 +75,9 @@ type ManagerConfig struct {
 	OnDiagnostic func(Diagnostic)
 	// OnHostRemoved is the route/focus invalidation edge. Before it runs, the
 	// manager tombstones the host so Snapshot and concurrent publications omit
-	// it; after it returns, the owning disconnect publishes the removal. It may
-	// be called concurrently for different hosts.
+	// it; after it returns, the owning worker publishes the removal. A transport
+	// loss does not call it until one bounded reconnect attempt fails to produce
+	// a valid frame. It may be called concurrently for different hosts.
 	OnHostRemoved func(string)
 }
 
@@ -81,15 +86,16 @@ type ManagerConfig struct {
 // Hostname claims remain sticky across reconnects so duplicate SSH aliases
 // cannot exchange ownership during a brief disconnect gap.
 type Manager struct {
-	destinations  []string
-	localHostname string
-	commands      CommandFactory
-	readFrames    FrameReader
-	retryDelay    time.Duration
-	waitRetry     RetryWaiter
-	maxFrameBytes int
-	onDiagnostic  func(Diagnostic)
-	onHostRemoved func(string)
+	destinations    []string
+	localHostname   string
+	commands        CommandFactory
+	readFrames      FrameReader
+	retryDelay      time.Duration
+	recoveryTimeout time.Duration
+	waitRetry       RetryWaiter
+	maxFrameBytes   int
+	onDiagnostic    func(Diagnostic)
+	onHostRemoved   func(string)
 
 	mu          sync.RWMutex
 	live        map[string]state.Snapshot
@@ -147,20 +153,21 @@ func NewManager(config ManagerConfig) (*Manager, error) {
 		waitRetry = waitForRetry
 	}
 	return &Manager{
-		destinations:  destinations,
-		localHostname: localHostname,
-		commands:      commands,
-		readFrames:    readFrames,
-		retryDelay:    delay,
-		waitRetry:     waitRetry,
-		maxFrameBytes: limit,
-		onDiagnostic:  config.OnDiagnostic,
-		onHostRemoved: config.OnHostRemoved,
-		live:          make(map[string]state.Snapshot),
-		removing:      make(map[string]struct{}),
-		hostOwners:    make(map[string]string),
-		destHosts:     make(map[string]string),
-		subscribers:   make(map[chan map[string]state.Snapshot]struct{}),
+		destinations:    destinations,
+		localHostname:   localHostname,
+		commands:        commands,
+		readFrames:      readFrames,
+		retryDelay:      delay,
+		recoveryTimeout: defaultRecoveryTimeout,
+		waitRetry:       waitRetry,
+		maxFrameBytes:   limit,
+		onDiagnostic:    config.OnDiagnostic,
+		onHostRemoved:   config.OnHostRemoved,
+		live:            make(map[string]state.Snapshot),
+		removing:        make(map[string]struct{}),
+		hostOwners:      make(map[string]string),
+		destHosts:       make(map[string]string),
+		subscribers:     make(map[chan map[string]state.Snapshot]struct{}),
 	}, nil
 }
 
@@ -240,62 +247,185 @@ func (m *Manager) Run(ctx context.Context) error {
 }
 
 func (m *Manager) runWorker(ctx context.Context, destination string) {
+	recovering := false
 	for ctx.Err() == nil {
-		m.runAttempt(ctx, destination)
-		if ctx.Err() != nil || !m.waitRetry(ctx, m.retryDelay) {
+		recovering = m.runAttempt(ctx, destination, recovering)
+		if ctx.Err() != nil {
+			return
+		}
+		if !m.waitRetry(ctx, m.retryDelay) {
+			// A non-cancellation waiter refusal means there will be no confirmation
+			// attempt. Do not leave the last observation live indefinitely.
+			if ctx.Err() == nil && recovering {
+				m.removeLive(destination)
+			}
 			return
 		}
 	}
 }
 
-func (m *Manager) runAttempt(parent context.Context, destination string) {
+// attemptWatchResult records what unblocked the attempt's frame reader. Only the
+// watcher closes stdout; all state changes remain on the sequential worker.
+type attemptWatchResult int
+
+const (
+	watchReadEnded attemptWatchResult = iota
+	watchCanceled
+	watchRecoveryTimeout
+)
+
+func watchAttempt(ctx context.Context, stdout io.Closer, readDone, firstFrame <-chan struct{}, recoveryTimeout time.Duration) <-chan attemptWatchResult {
+	result := make(chan attemptWatchResult, 1)
+	go func() {
+		waitForEnd := func() attemptWatchResult {
+			select {
+			case <-ctx.Done():
+				_ = stdout.Close()
+				return watchCanceled
+			case <-readDone:
+				return watchReadEnded
+			}
+		}
+
+		if firstFrame == nil {
+			result <- waitForEnd()
+			return
+		}
+		timer := time.NewTimer(recoveryTimeout)
+		defer timer.Stop()
+		select {
+		case <-firstFrame:
+			timer.Stop()
+			result <- waitForEnd()
+		case <-ctx.Done():
+			_ = stdout.Close()
+			result <- watchCanceled
+		case <-readDone:
+			result <- watchReadEnded
+		case <-timer.C:
+			// A confirmation connection which never supplies its initial full
+			// snapshot cannot keep old rows alive forever. Closing only this
+			// attempt preserves worker serialization; the worker removes the host
+			// after ReadFrames returns and still joins the child below.
+			_ = stdout.Close()
+			result <- watchRecoveryTimeout
+		}
+	}()
+	return result
+}
+
+// runAttempt returns true when a previously live host lost transport after at
+// least one valid frame and should remain visible through one confirmation
+// attempt. A confirmation attempt which fails before its first valid frame
+// removes the host here, on the same sequential worker that accepted it.
+func (m *Manager) runAttempt(parent context.Context, destination string, recovering bool) bool {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	process, err := m.commands(ctx, destination)
 	if err != nil {
-		m.diagnose(destination, "", DiagnosticCommand)
-		return
+		if parent.Err() == nil {
+			if recovering {
+				m.removeLive(destination)
+			}
+			m.diagnose(destination, "", DiagnosticCommand)
+		}
+		return false
 	}
 	stdout, err := process.StdoutPipe()
 	if err != nil {
-		m.diagnose(destination, "", DiagnosticCommand)
-		return
+		if parent.Err() == nil {
+			if recovering {
+				m.removeLive(destination)
+			}
+			m.diagnose(destination, "", DiagnosticCommand)
+		}
+		return false
 	}
 	if err := process.Start(); err != nil {
 		_ = stdout.Close()
-		m.diagnose(destination, "", DiagnosticStart)
-		return
+		if parent.Err() == nil {
+			if recovering {
+				m.removeLive(destination)
+			}
+			m.diagnose(destination, "", DiagnosticStart)
+		}
+		return false
 	}
 
 	readDone := make(chan struct{})
-	watchResult := make(chan bool, 1)
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = stdout.Close()
-			watchResult <- true
-		case <-readDone:
-			watchResult <- false
-		}
-	}()
+	var firstFrame chan struct{}
+	if recovering {
+		firstFrame = make(chan struct{})
+	}
+	watchResult := watchAttempt(ctx, stdout, readDone, firstFrame, m.recoveryTimeout)
+	sawFrame := false
 	readErr := m.readFrames(stdout, m.maxFrameBytes, func(frame Frame) error {
-		return m.accept(destination, frame)
+		if err := m.accept(destination, frame); err != nil {
+			return err
+		}
+		if !sawFrame {
+			sawFrame = true
+			if firstFrame != nil {
+				close(firstFrame)
+			}
+		}
+		return nil
 	})
 	close(readDone)
+	watchOutcome := <-watchResult
 	cancel()
-	if closedByWatcher := <-watchResult; !closedByWatcher {
+	if watchOutcome == watchReadEnded {
 		_ = stdout.Close()
 	}
-	host, _ := m.removeLive(destination)
-	// The host is already non-actionable and absent before Wait: an SSH child
-	// can be slow to reap, but its dead stream must never leave stale live rows.
-	// The worker still waits below before returning to the retry loop, so child
-	// processes never overlap.
+
+	loss := classifyLoss(readErr)
+	host := m.destinationHost(destination)
+	confirmNext := false
+	if parent.Err() == nil {
+		switch {
+		case loss == lossProtocol:
+			host, _ = m.removeLive(destination)
+		case sawFrame:
+			// Even a confirmation connection can later fail. Because it supplied
+			// a valid full replacement first, that later failure starts a fresh
+			// confirmation cycle rather than proving the prior one permanent.
+			confirmNext = true
+		case recovering:
+			// The one confirmation attempt ended (or timed out) before proving
+			// recovery. This is the first observable disconnect edge.
+			host, _ = m.removeLive(destination)
+		}
+	}
+
+	// The visibility decision is made before Wait, but the worker still joins
+	// this child before starting another one, so attempts never overlap.
 	waitErr := process.Wait()
 	if parent.Err() != nil {
-		return
+		return false
 	}
-	m.diagnoseAttempt(destination, host, readErr, waitErr)
+	m.diagnoseAttempt(destination, host, readErr, waitErr, confirmNext, watchOutcome)
+	return confirmNext
+}
+
+type contactLoss int
+
+const (
+	lossTransport contactLoss = iota
+	lossProtocol
+)
+
+func classifyLoss(readErr error) contactLoss {
+	switch {
+	case errors.Is(readErr, ErrDuplicateHost), errors.Is(readErr, ErrLocalHostname),
+		errors.Is(readErr, ErrHostnameChanged), errors.Is(readErr, ErrSchemaMismatch),
+		errors.Is(readErr, ErrInvalidFrame), errors.Is(readErr, ErrFrameTooLarge):
+		return lossProtocol
+	default:
+		// EOF, ordinary read errors, and ErrTruncatedFrame all mean only that
+		// transport stopped carrying complete frames. A valid replacement on the
+		// next attempt is the evidence that distinguishes a transient gap.
+		return lossTransport
+	}
 }
 
 func (m *Manager) accept(destination string, frame Frame) error {
@@ -323,13 +453,27 @@ func (m *Manager) accept(destination string, frame Frame) error {
 		m.destHosts[destination] = frame.Host
 		m.hostOwners[frame.Host] = destination
 	}
-	// Only this hostname's owning sequential worker can reach this point. A
-	// reconnect adopts a fresh full frame and makes the host visible again.
+	// Only this hostname's owning sequential worker can reach this point. An
+	// observably identical first frame after a transport gap is recovery, not a
+	// state change, so adopting it must not wake aggregate consumers or redraw a
+	// TUI. A tombstoned host is always news because accepting it makes it visible.
+	prior, existed := m.live[frame.Host]
+	_, wasRemoving := m.removing[frame.Host]
+	changed := !existed || wasRemoving || !state.ObservablyEqual(prior, frame.Snapshot)
 	delete(m.removing, frame.Host)
 	m.live[frame.Host] = frame.Snapshot
-	m.publishLocked()
+	if changed {
+		m.publishLocked()
+	}
 	m.mu.Unlock()
 	return nil
+}
+
+func (m *Manager) destinationHost(destination string) string {
+	m.mu.RLock()
+	host := m.destHosts[destination]
+	m.mu.RUnlock()
+	return host
 }
 
 func (m *Manager) removeLive(destination string) (string, bool) {
@@ -378,8 +522,10 @@ func (m *Manager) removeLive(destination string) (string, bool) {
 	return host, true
 }
 
-func (m *Manager) diagnoseAttempt(destination, host string, readErr, waitErr error) {
+func (m *Manager) diagnoseAttempt(destination, host string, readErr, waitErr error, reconnecting bool, watchOutcome attemptWatchResult) {
 	switch {
+	case reconnecting:
+		m.diagnose(destination, host, DiagnosticReconnecting)
 	case errors.Is(readErr, ErrDuplicateHost):
 		m.diagnose(destination, "", DiagnosticDuplicateHost)
 	case errors.Is(readErr, ErrLocalHostname):
@@ -390,6 +536,8 @@ func (m *Manager) diagnoseAttempt(destination, host string, readErr, waitErr err
 		m.diagnose(destination, host, DiagnosticSchema)
 	case errors.Is(readErr, ErrInvalidFrame), errors.Is(readErr, ErrFrameTooLarge):
 		m.diagnose(destination, host, DiagnosticInvalidFrame)
+	case watchOutcome == watchRecoveryTimeout:
+		m.diagnose(destination, host, DiagnosticDisconnected)
 	case readErr != nil && !errors.Is(readErr, io.EOF):
 		m.diagnose(destination, host, DiagnosticRead)
 	case waitErr != nil:
@@ -405,8 +553,11 @@ func (m *Manager) diagnose(destination, host, category string) {
 	}
 }
 
-// Snapshot returns a detached, point-in-time full replacement map. Absence of
-// a hostname means its SSH stream is not currently live.
+// Snapshot returns a detached, point-in-time full replacement map. A present
+// host is its latest valid full observation; that observation may survive one
+// bounded reconnect-confirmation attempt without producing a subscriber edge.
+// Absence means the host never supplied a valid frame or that confirmation
+// failed and its routes were invalidated.
 func (m *Manager) Snapshot() map[string]state.Snapshot {
 	m.mu.RLock()
 	view := m.snapshotLocked()

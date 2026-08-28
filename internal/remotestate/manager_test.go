@@ -87,13 +87,14 @@ func TestNewManagerRejectsUnsafeAndDuplicateDestinations(t *testing.T) {
 	}
 }
 
-func TestManagerWorkerNeverOverlapsChildrenAndRemovesSnapshotBeforeRetry(t *testing.T) {
+func TestManagerWorkerConfirmsRecoveryWithoutFlickerAndNeverOverlapsChildren(t *testing.T) {
 	frame := encodedFrame(t, "buildbox", testSnapshot(42))
 	var mu sync.Mutex
 	active := false
 	attempts := 0
 	waits := 0
 	overlapped := false
+	removed := 0
 	factory := func(context.Context, string) (Process, error) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -121,6 +122,7 @@ func TestManagerWorkerNeverOverlapsChildrenAndRemovesSnapshotBeforeRetry(t *test
 			retries++
 			return retries == 1
 		},
+		OnHostRemoved: func(string) { removed++ },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -137,9 +139,11 @@ func TestManagerWorkerNeverOverlapsChildrenAndRemovesSnapshotBeforeRetry(t *test
 		t.Fatalf("attempts=%d waits=%d overlapped=%v; want 2, 2, false", gotAttempts, gotWaits, gotOverlap)
 	}
 	if live := manager.Snapshot(); len(live) != 0 {
-		t.Fatalf("snapshot retained after EOF: %+v", live)
+		t.Fatalf("snapshot retained after the worker declined another confirmation attempt: %+v", live)
 	}
-	for i, wantLive := range []bool{true, false, true, false} {
+	// The first EOF and the identical reconnect are both invisible. Only the
+	// initial observation and the final confirmed removal reach subscribers.
+	for i, wantLive := range []bool{true, false} {
 		select {
 		case update := <-updates:
 			_, live := update["buildbox"]
@@ -148,6 +152,238 @@ func TestManagerWorkerNeverOverlapsChildrenAndRemovesSnapshotBeforeRetry(t *test
 			}
 		default:
 			t.Fatalf("missing update %d", i)
+		}
+	}
+	select {
+	case update := <-updates:
+		t.Fatalf("unexpected flicker update after confirmed removal: %+v", update)
+	default:
+	}
+	if removed != 1 {
+		t.Fatalf("route invalidations = %d, want exactly 1", removed)
+	}
+}
+
+func TestManagerRecoveryPublishesOnlyRealStateChanges(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		second     state.Snapshot
+		wantUpdate bool
+	}{
+		{
+			name: "identical state with a fresh observation clock is invisible",
+			second: func() state.Snapshot {
+				snapshot := testSnapshot(42)
+				snapshot.UpdatedAt = snapshot.UpdatedAt.Add(time.Hour)
+				return snapshot
+			}(),
+		},
+		{
+			name: "an observable state change is published",
+			second: func() state.Snapshot {
+				snapshot := testSnapshot(42)
+				snapshot.Sessions[0].CWD = "/new-work"
+				return snapshot
+			}(),
+			wantUpdate: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			first := testSnapshot(42)
+			secondAccepted := make(chan struct{})
+			releaseSecond := make(chan struct{})
+			readCalls := 0
+			retries := 0
+			removed := 0
+			manager, err := NewManager(ManagerConfig{
+				Destinations: []string{"build"},
+				Commands: func(context.Context, string) (Process, error) {
+					return &fakeProcess{stdout: io.NopCloser(bytes.NewReader(nil))}, nil
+				},
+				ReadFrames: func(_ io.Reader, _ int, accept func(Frame) error) error {
+					readCalls++
+					snapshot := first
+					if readCalls == 2 {
+						snapshot = test.second
+					}
+					if err := accept(Frame{Host: "buildbox", Snapshot: snapshot}); err != nil {
+						return err
+					}
+					if readCalls == 2 {
+						close(secondAccepted)
+						<-releaseSecond
+					}
+					return io.EOF
+				},
+				WaitRetry: func(context.Context, time.Duration) bool {
+					retries++
+					return retries == 1
+				},
+				OnHostRemoved: func(string) { removed++ },
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			updates, cancelUpdates := manager.Subscribe()
+			defer cancelUpdates()
+			done := make(chan error, 1)
+			go func() { done <- manager.Run(context.Background()) }()
+
+			if initial := <-updates; len(initial) != 1 {
+				t.Fatalf("initial replacement = %+v, want one host", initial)
+			}
+			<-secondAccepted
+			if test.wantUpdate {
+				changed := <-updates
+				if got := changed["buildbox"].Sessions[0].CWD; got != test.second.Sessions[0].CWD {
+					t.Fatalf("changed recovery cwd = %q, want %q", got, test.second.Sessions[0].CWD)
+				}
+			} else {
+				select {
+				case update := <-updates:
+					t.Fatalf("identical recovery published an update: %+v", update)
+				default:
+				}
+			}
+			current := manager.Snapshot()["buildbox"]
+			if !current.UpdatedAt.Equal(test.second.UpdatedAt) {
+				t.Fatalf("manager did not adopt recovery frame: updated_at=%v want %v", current.UpdatedAt, test.second.UpdatedAt)
+			}
+			if removed != 0 {
+				t.Fatalf("routes invalidated during a successful recovery: %d", removed)
+			}
+
+			close(releaseSecond)
+			if final := <-updates; len(final) != 0 {
+				t.Fatalf("final replacement = %+v, want empty after retry was declined", final)
+			}
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			if removed != 1 {
+				t.Fatalf("route invalidations after final removal = %d, want 1", removed)
+			}
+		})
+	}
+}
+
+func TestManagerFailedConfirmationAttemptRemovesOnce(t *testing.T) {
+	initialFrame := encodedFrame(t, "buildbox", testSnapshot(42))
+	attempts := 0
+	retries := 0
+	removed := 0
+	manager, err := NewManager(ManagerConfig{
+		Destinations: []string{"build"},
+		Commands: func(context.Context, string) (Process, error) {
+			attempts++
+			body := []byte(nil)
+			if attempts == 1 {
+				body = initialFrame
+			}
+			return &fakeProcess{stdout: io.NopCloser(bytes.NewReader(body))}, nil
+		},
+		WaitRetry: func(context.Context, time.Duration) bool {
+			retries++
+			return retries == 1
+		},
+		OnHostRemoved: func(string) { removed++ },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updates, cancel := manager.Subscribe()
+	defer cancel()
+	if err := manager.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want initial plus one confirmation", attempts)
+	}
+	if live := <-updates; len(live) != 1 {
+		t.Fatalf("initial replacement = %+v, want live host", live)
+	}
+	if disconnected := <-updates; len(disconnected) != 0 {
+		t.Fatalf("confirmed disconnect = %+v, want empty", disconnected)
+	}
+	select {
+	case update := <-updates:
+		t.Fatalf("confirmed disconnect published more than once: %+v", update)
+	default:
+	}
+	if removed != 1 {
+		t.Fatalf("route invalidations = %d, want 1", removed)
+	}
+}
+
+func TestManagerBoundsAConfirmationAttemptThatNeverSendsAFrame(t *testing.T) {
+	initialFrame := encodedFrame(t, "buildbox", testSnapshot(42))
+	blockedReader, blockedWriter := io.Pipe()
+	defer blockedWriter.Close()
+	attempts := 0
+	retries := 0
+	removed := 0
+	var diagnostics []Diagnostic
+	manager, err := NewManager(ManagerConfig{
+		Destinations: []string{"build"},
+		Commands: func(context.Context, string) (Process, error) {
+			attempts++
+			if attempts == 1 {
+				return &fakeProcess{stdout: io.NopCloser(bytes.NewReader(initialFrame))}, nil
+			}
+			return &fakeProcess{stdout: blockedReader}, nil
+		},
+		WaitRetry: func(context.Context, time.Duration) bool {
+			retries++
+			return retries == 1
+		},
+		OnHostRemoved: func(string) { removed++ },
+		OnDiagnostic:  func(diagnostic Diagnostic) { diagnostics = append(diagnostics, diagnostic) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.recoveryTimeout = 20 * time.Millisecond
+	updates, cancel := manager.Subscribe()
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- manager.Run(context.Background()) }()
+
+	if live := <-updates; len(live) != 1 {
+		t.Fatalf("initial replacement = %+v, want live host", live)
+	}
+	select {
+	case disconnected := <-updates:
+		if len(disconnected) != 0 {
+			t.Fatalf("timeout replacement = %+v, want empty", disconnected)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("confirmation attempt did not time out")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("manager did not join the timed-out confirmation child")
+	}
+	if removed != 1 {
+		t.Fatalf("route invalidations = %d, want 1", removed)
+	}
+	if len(diagnostics) != 2 || diagnostics[0].Category != DiagnosticReconnecting || diagnostics[1].Category != DiagnosticDisconnected {
+		t.Fatalf("diagnostics = %+v, want reconnecting then disconnected", diagnostics)
+	}
+}
+
+func TestClassifyLossKeepsOnlyTransportFailuresRecoverable(t *testing.T) {
+	for _, err := range []error{io.EOF, ErrTruncatedFrame, errors.New("read: connection reset by peer")} {
+		if got := classifyLoss(err); got != lossTransport {
+			t.Fatalf("classifyLoss(%v) = %v, want lossTransport", err, got)
+		}
+	}
+	for _, err := range []error{ErrInvalidFrame, ErrFrameTooLarge, ErrSchemaMismatch, ErrDuplicateHost, ErrHostnameChanged, ErrLocalHostname} {
+		if got := classifyLoss(err); got != lossProtocol {
+			t.Fatalf("classifyLoss(%v) = %v, want lossProtocol", err, got)
 		}
 	}
 }
@@ -436,7 +672,69 @@ func TestManagerCancellationClosesReaderAndWaits(t *testing.T) {
 	}
 }
 
-func TestManagerPublishesDisconnectBeforeSlowWaitButDoesNotRetry(t *testing.T) {
+func TestManagerCancellationDuringConfirmationDoesNotPublishDisconnect(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer writer.Close()
+	started := make(chan struct{})
+	waited := make(chan struct{})
+	removed := 0
+	manager, err := NewManager(ManagerConfig{
+		Destinations: []string{"build"},
+		Commands: func(ctx context.Context, _ string) (Process, error) {
+			return &fakeProcess{
+				stdout: reader,
+				start:  func() error { close(started); return nil },
+				wait: func() error {
+					<-ctx.Done()
+					close(waited)
+					return ctx.Err()
+				},
+			}, nil
+		},
+		OnHostRemoved: func(string) { removed++ },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updates, cancelUpdates := manager.Subscribe()
+	defer cancelUpdates()
+	if err := manager.accept("build", Frame{Host: "buildbox", Snapshot: testSnapshot(42)}); err != nil {
+		t.Fatal(err)
+	}
+	<-updates // initial live replacement
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan bool, 1)
+	go func() { done <- manager.runAttempt(ctx, "build", true) }()
+	<-started
+	cancel()
+	select {
+	case recovering := <-done:
+		if recovering {
+			t.Fatal("canceled confirmation requested another retry")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("confirmation attempt did not stop after cancellation")
+	}
+	select {
+	case <-waited:
+	default:
+		t.Fatal("confirmation returned before joining its child")
+	}
+	if live := manager.Snapshot(); len(live) != 1 {
+		t.Fatalf("shutdown removed the last live observation: %+v", live)
+	}
+	if removed != 0 {
+		t.Fatalf("shutdown invalidated routes %d times", removed)
+	}
+	select {
+	case update := <-updates:
+		t.Fatalf("shutdown published a disconnect: %+v", update)
+	default:
+	}
+}
+
+func TestManagerRetainsRowsWhileDisconnectedChildReaps(t *testing.T) {
 	frame := encodedFrame(t, "buildbox", testSnapshot(42))
 	waitEntered := make(chan struct{})
 	releaseWait := make(chan struct{})
@@ -464,16 +762,24 @@ func TestManagerPublishesDisconnectBeforeSlowWaitButDoesNotRetry(t *testing.T) {
 	if live := <-updates; len(live) != 1 {
 		t.Fatalf("first replacement = %+v, want live host", live)
 	}
-	if disconnected := <-updates; len(disconnected) != 0 {
-		t.Fatalf("disconnect replacement = %+v, want empty", disconnected)
-	}
 	<-waitEntered
+	select {
+	case update := <-updates:
+		t.Fatalf("transport loss became visible before a confirmation attempt: %+v", update)
+	default:
+	}
+	if live := manager.Snapshot(); len(live) != 1 {
+		t.Fatalf("last observation disappeared while the old child was reaping: %+v", live)
+	}
 	select {
 	case err := <-done:
 		t.Fatalf("manager returned before child Wait was released: %v", err)
 	default:
 	}
 	close(releaseWait)
+	if disconnected := <-updates; len(disconnected) != 0 {
+		t.Fatalf("declining the confirmation retry published %+v, want empty", disconnected)
+	}
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}

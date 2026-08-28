@@ -276,11 +276,17 @@ Each destination runs one hardened, noninteractive command:
 ssh -n -T … <destination> switchboard-ctl remote-stream
 ```
 
-The remote command exports only that machine's complete local snapshots. It
-does not expose an action channel, and a disconnected host disappears from the
-aggregate immediately. The remote machine needs `switchboard` running and a
-compatible `switchboard-ctl` on its SSH `PATH`; ordinary SSH host-key checking
-and batch authentication must already work.
+The remote command exports only that machine's complete local snapshots and
+does not expose an action channel. A transport break leaves the last complete
+snapshot visible while one bounded reconnect attempt confirms whether the host
+is really gone. A valid replacement resumes without a remove/add flash; a
+failed confirmation removes the host and invalidates its action routes. The
+remote machine needs `switchboard` running and a compatible `switchboard-ctl`
+on its SSH `PATH`; ordinary SSH host-key checking and batch authentication must
+already work.
+
+The journal records the hidden confirmation edge as `category=reconnecting`;
+that diagnostic is informational and does not remove rows or routes.
 
 That `PATH` is the one used by a **noninteractive SSH command**, not necessarily
 the one in an interactive terminal. A `SWITCHBOARD_BIN` systemd override also

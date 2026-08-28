@@ -12,7 +12,8 @@ Keep the design deliberately small:
 1. The Switchboard daemon on each host remains the sole authority for that
    host's roots, status, and child-agent graph.
 2. The client runs one long-lived SSH subscription per configured host and
-   retains only the latest complete snapshot from each live connection.
+   retains only its latest complete snapshot, including through one bounded
+   reconnect-confirmation attempt after transport loss.
 3. A session is namespaced by `(hostname, pid)`. The existing `started_at` is
    carried on focus and binding operations as a best-effort stale-action fence.
 4. A remote daemon identifies a session's terminal by writing one bounded
@@ -148,8 +149,10 @@ Each configured SSH destination has one sequential worker:
 3. decode complete frames;
 4. after the first valid frame, claim its hostname;
 5. atomically replace that hostname's latest snapshot on every frame;
-6. on EOF or error, remove the hostname's sessions from the live view;
-7. wait briefly and reconnect only after the old child has exited.
+6. on a transport EOF or error, retain the last complete snapshot through one
+   bounded confirmation attempt;
+7. remove the hostname only if that attempt fails before its first valid frame,
+   and reconnect only after the old child has exited.
 
 Because a worker never overlaps two children, an old stream cannot race a new
 one. No connection generation is needed.
@@ -158,14 +161,18 @@ Use OpenSSH's ordinary host-key checking and noninteractive authentication.
 Bound half-open connections with `ServerAliveInterval`/`ServerAliveCountMax`
 through the user's SSH config or narrowly scoped process arguments.
 
-### 4.3 No stale remote rows initially
+### 4.3 Confirm transport loss before removing rows
 
-When the SSH stream dies, remove that host's sessions immediately. This is the
-simplest correct behavior: the UI never presents an old snapshot as live, and
-no application heartbeat or stale TTL is needed. The source may show one
-bounded disconnected diagnostic outside the session list.
+EOF proves that one transport stopped, not that the host or its sessions went
+away. Keep the last complete snapshot while the same sequential worker makes
+one bounded reconnect attempt. If that attempt supplies a valid full frame,
+adopt it and publish only if its observable state changed. If connection setup
+fails, no valid frame arrives before the bound, or the source violates the
+protocol, remove the host and invalidate its routes once.
 
-Reconnect supplies a fresh initial snapshot and restores the rows.
+This is a confirmation state, not a general stale-row TTL: it has one attempt,
+no background manager mutation, and no wire or aggregate-state field. A finite
+`reconnecting` diagnostic exposes the transport edge outside the session list.
 
 ### 4.4 Read-only aggregation
 
@@ -391,7 +398,7 @@ Additional rules:
 
 | Condition | First-version behavior |
 |---|---|
-| SSH stream unavailable | remove that host's rows; retry |
+| SSH stream unavailable | retain rows through one confirmation attempt, then remove and retry |
 | Remote daemon unavailable | same; local state remains healthy |
 | Malformed/schema-incompatible frame | reject the source |
 | Duplicate hostname | reject the second source |
@@ -457,7 +464,8 @@ an installed WezTerm and an ordinary SSH PTY pass the escape end to end.
 - Start one sequential SSH worker from the client daemon.
 - Keep one detached latest snapshot keyed by returned hostname.
 - Add a minimal `list-all`/`subscribe-all` view and host labels.
-- Remove remote rows on disconnect and reconnect with a small bounded delay.
+- Confirm a transport disconnect with one bounded reconnect attempt before
+  removing remote rows.
 
 Definition of done: one remote host appears and changes at the same latency as
 its local Switchboard subscription, while stopping SSH removes only those rows.
@@ -487,7 +495,7 @@ focus path, with no duplicate or cross-host selection.
 ### Later, only if wanted
 
 - tmux passthrough and multi-client policy;
-- grey stale rows instead of immediate removal;
+- grey reconnecting/stale rows in the aggregate schema;
 - explicit host IDs for duplicate-hostname topologies;
 - persistent source configuration;
 - transport optimization if one SSH process per host measures poorly.
@@ -505,7 +513,8 @@ focus path, with no duplicate or cross-host selection.
 | Pane closed | focus fails; no fallback guess |
 | Local daemon restart | remote stream re-announces live bindings |
 | Remote daemon restart | fresh snapshot and bindings replace prior state |
-| SSH EOF/half-open timeout | remote rows disappear; local rows remain |
+| Transient SSH EOF followed by a valid frame | no remove/add publication; routes remain live |
+| SSH EOF with failed bounded confirmation | remote rows disappear once; local rows remain |
 | Slow consumer | later full snapshot repairs skipped state |
 | Duplicate title without marker | not navigable |
 | WezTerm SSHMUX | same binding path yields local remapped pane |

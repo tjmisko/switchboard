@@ -682,6 +682,18 @@ func snapshotChangeKey(snap Snapshot) []byte {
 	return key
 }
 
+// ObservablyEqual reports whether two snapshots are indistinguishable to every
+// wire consumer. It uses the same key as Store.Apply so a caller cannot drift
+// from the publish gate when Session gains another JSON field. UpdatedAt and
+// other explicitly in-memory-only fields are intentionally ignored.
+//
+// An encoding failure compares unequal: one redundant publication is safer
+// than suppressing a real state change.
+func ObservablyEqual(a, b Snapshot) bool {
+	keyA, keyB := snapshotChangeKey(a), snapshotChangeKey(b)
+	return keyA != nil && keyB != nil && bytes.Equal(keyA, keyB)
+}
+
 // Snapshot returns a deep-ish copy of current state. Values are copied; the
 // pointer fields (Wezterm/Hyprland/Claude) are shared — fine for read-only
 // consumers.

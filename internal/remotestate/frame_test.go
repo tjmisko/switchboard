@@ -151,6 +151,27 @@ func TestReadFramesReadsCompleteReplacementsAndRejectsOversize(t *testing.T) {
 	}
 }
 
+func TestReadFramesReportsAnUnterminatedTailAsTransportTruncation(t *testing.T) {
+	complete := encodedFrame(t, "buildbox", testSnapshot(1))
+	partial := encodedFrame(t, "buildbox", testSnapshot(2))
+	input := append(append([]byte(nil), complete...), partial[:len(partial)/2]...)
+
+	var pids []int
+	err := ReadFrames(bytes.NewReader(input), 0, func(frame Frame) error {
+		pids = append(pids, frame.Snapshot.Sessions[0].PID)
+		return nil
+	})
+	if !errors.Is(err, ErrTruncatedFrame) {
+		t.Fatalf("ReadFrames error = %v, want ErrTruncatedFrame", err)
+	}
+	if !reflect.DeepEqual(pids, []int{1}) {
+		t.Fatalf("accepted pids = %v, want only the complete frame", pids)
+	}
+	if errors.Is(err, ErrInvalidFrame) {
+		t.Fatal("transport truncation also matched ErrInvalidFrame")
+	}
+}
+
 type fakeSubscriptionClient struct {
 	sent      []rpc.Request
 	responses []rpc.Response

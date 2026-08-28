@@ -250,6 +250,21 @@ func TestChangeKeyIgnoresUpdatedAtOnly(t *testing.T) {
 	}
 }
 
+func TestObservablyEqualSharesThePublishGateBoundary(t *testing.T) {
+	base := canonicalSnapshot()
+	restamped := base
+	restamped.UpdatedAt = base.UpdatedAt.Add(time.Hour)
+	if !ObservablyEqual(base, restamped) {
+		t.Fatal("updated_at alone made observably identical snapshots compare unequal")
+	}
+
+	changed := canonicalSnapshot()
+	changed.Sessions[0].Focused = !changed.Sessions[0].Focused
+	if ObservablyEqual(base, changed) {
+		t.Fatal("an observable focus change compared equal")
+	}
+}
+
 // TestUpdateGolden regenerates the golden from canonicalSnapshot. It is a
 // no-op unless UPDATE_GOLDEN is set, so it never fails CI; run
 // `UPDATE_GOLDEN=1 go test ./internal/state` to refresh after a deliberate
