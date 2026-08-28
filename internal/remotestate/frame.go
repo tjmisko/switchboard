@@ -28,9 +28,12 @@ const (
 )
 
 var (
-	ErrFrameTooLarge     = errors.New("remote snapshot frame too large")
-	ErrInvalidFrame      = errors.New("invalid remote snapshot frame")
-	ErrSchemaMismatch    = errors.New("remote snapshot schema mismatch")
+	ErrFrameTooLarge  = errors.New("remote snapshot frame too large")
+	ErrInvalidFrame   = errors.New("invalid remote snapshot frame")
+	ErrSchemaMismatch = errors.New("remote snapshot schema mismatch")
+	// ErrTruncatedFrame is a transport failure rather than a protocol verdict:
+	// the stream ended after a non-empty frame prefix but before its newline.
+	ErrTruncatedFrame    = errors.New("remote snapshot frame truncated")
 	ErrHostnameChanged   = errors.New("remote source changed hostname")
 	ErrDuplicateHost     = errors.New("remote hostname already claimed")
 	ErrLocalHostname     = errors.New("remote source claimed local hostname")
@@ -182,7 +185,9 @@ type FrameReader func(io.Reader, int, func(Frame) error) error
 
 // ReadFrames reads bounded JSONL objects until EOF or until validation or the
 // callback rejects a frame. It never allocates beyond the configured line
-// ceiling for peer-controlled input.
+// ceiling for peer-controlled input. Only newline-terminated frames are
+// decoded: a non-empty final prefix is ErrTruncatedFrame so the manager can
+// distinguish a cut transport from a malformed complete document.
 func ReadFrames(r io.Reader, maxBytes int, accept func(Frame) error) error {
 	limit, err := frameLimit(maxBytes)
 	if err != nil {
@@ -194,10 +199,12 @@ func ReadFrames(r io.Reader, maxBytes int, accept func(Frame) error) error {
 		if errors.Is(readErr, bufio.ErrBufferFull) || len(line) > limit+1 {
 			return ErrFrameTooLarge
 		}
-		if len(line) > 0 {
-			if line[len(line)-1] == '\n' {
-				line = line[:len(line)-1]
-			}
+		complete := len(line) > 0 && line[len(line)-1] == '\n'
+		if !complete && len(line) > 0 {
+			return ErrTruncatedFrame
+		}
+		if complete {
+			line = line[:len(line)-1]
 			if len(line) > limit {
 				return ErrFrameTooLarge
 			}

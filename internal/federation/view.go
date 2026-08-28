@@ -1,7 +1,7 @@
 // Package federation builds the read-only, live view shown by local clients.
 // The host-local state.Store remains the only owner of local discovery and
-// persistence; remote snapshots are detached copies and disappear as soon as
-// their transport disappears.
+// persistence; remote snapshots are detached copies and disappear only after
+// their source manager confirms that a lost transport did not recover.
 package federation
 
 import (
