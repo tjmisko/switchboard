@@ -120,6 +120,46 @@ func TestBroadcast_sharesOneEncodingAcrossSubscribers(t *testing.T) {
 	}
 }
 
+func TestCurrentBroadcastReturnsThePublishedEncoding(t *testing.T) {
+	store := state.New("")
+	ch, cancel := store.Subscribe()
+	defer cancel()
+	store.Apply(func(m map[int]*state.Session) {
+		m[42] = &state.Session{PID: 42, CWD: "/published", StartedAt: time.Unix(42, 0)}
+	})
+	published := recvBroadcast(t, ch)
+	current := store.CurrentBroadcast()
+	if len(published.JSON) == 0 || len(current.JSON) == 0 {
+		t.Fatal("published or current frame has no shared encoding")
+	}
+	if &published.JSON[0] != &current.JSON[0] {
+		t.Fatal("CurrentBroadcast rebuilt the latest published encoding")
+	}
+}
+
+func TestCurrentBroadcastRebuildsAfterAZeroSubscriberPublish(t *testing.T) {
+	store := state.New("")
+	ch, cancel := store.Subscribe()
+	store.Apply(func(m map[int]*state.Session) {
+		m[42] = &state.Session{PID: 42, CWD: "/before", StartedAt: time.Unix(42, 0)}
+	})
+	recvBroadcast(t, ch)
+	cancel()
+
+	store.Apply(func(m map[int]*state.Session) { m[42].CWD = "/after" })
+	current := store.CurrentBroadcast()
+	if got := current.Snapshot.Sessions[0].CWD; got != "/after" {
+		t.Fatalf("CurrentBroadcast returned %q after zero-subscriber publish, want /after", got)
+	}
+	var wire state.Snapshot
+	if err := json.Unmarshal(current.JSON, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if got := wire.Sessions[0].CWD; got != "/after" {
+		t.Fatalf("rebuilt encoding contains %q, want /after", got)
+	}
+}
+
 // The shared buffer is the wire body rpc splices into the response envelope
 // verbatim, so it has to be exactly the encoding of the snapshot it arrived with
 // — not of some earlier or later one.

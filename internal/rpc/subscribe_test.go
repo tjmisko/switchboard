@@ -74,6 +74,30 @@ func nextFrame(t *testing.T, r *bufio.Reader) []byte {
 	return line
 }
 
+func TestWriteSnapshotFrameSplicesTheSharedEncodingVerbatim(t *testing.T) {
+	snapshot := state.Snapshot{SchemaVersion: state.CurrentSchemaVersion, Sessions: []state.Session{{
+		PID: 7, CWD: "/x<y", StartedAt: time.Unix(7, 0),
+	}}}
+	want := encodeFrame(t, Response{Snapshot: &snapshot})
+	for _, test := range []struct {
+		name  string
+		frame state.Broadcast
+	}{
+		{name: "shared bytes", frame: state.NewBroadcast(snapshot)},
+		{name: "encode fallback", frame: state.Broadcast{Snapshot: snapshot}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var got bytes.Buffer
+			if err := writeSnapshotFrame(json.NewEncoder(&got), test.frame); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got.Bytes(), want) {
+				t.Fatalf("frame differs from canonical Response encoding\n got: %s\nwant: %s", got.Bytes(), want)
+			}
+		})
+	}
+}
+
 func TestLocalSubscribeTreatsQueuedBroadcastsAsNotifications(t *testing.T) {
 	store := state.New("")
 	updates, cancelUpdates := store.Subscribe()

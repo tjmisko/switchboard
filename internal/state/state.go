@@ -469,22 +469,37 @@ type Capabilities struct {
 }
 
 // Broadcast is one fan-out unit: a snapshot plus a shared JSON body for consumers
-// that can forward that exact generation. Federation-facing subscriptions use
-// these values only as wakeups and re-read Store.Snapshot, because a value queued
-// before their independent initial read may be older than it.
+// that can forward that exact generation. Store subscriptions use channel values
+// only as wakeups and re-read CurrentBroadcast, because a value queued before an
+// independent initial read may be older than it.
 type Broadcast struct {
 	Snapshot Snapshot
 	// JSON is the COMPACT encoding of Snapshot: exactly what json.Encoder writes,
 	// minus the trailing newline. It is paired with this particular broadcast;
-	// consumers which also take an independent initial Snapshot must treat the
-	// channel as a notification and re-read current state, because a queued value
-	// can predate that initial read. The RPC subscription does exactly that.
+	// consumers which also take an independent initial read must treat the channel
+	// as a notification and re-read CurrentBroadcast, because a queued value can
+	// predate that initial read. The RPC subscription does exactly that.
 	//
 	// It is nil when the encode failed. A subscriber must then encode Snapshot
 	// itself rather than send a truncated frame.
 	//
 	// Treat it as immutable: every subscriber holds this same backing array.
 	JSON []byte
+}
+
+// NewBroadcast builds one fan-out unit: the snapshot plus the single encoding
+// every subscriber for that publish shares. JSON is nil when the encode failed;
+// consumers must then encode Snapshot themselves rather than send a truncated
+// frame.
+func NewBroadcast(snap Snapshot) Broadcast {
+	b := Broadcast{Snapshot: snap}
+	js, err := marshalSnapshot(snap)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "state: broadcast encode failed: %v\n", err)
+		return b
+	}
+	b.JSON = js
+	return b
 }
 
 type Store struct {
@@ -508,6 +523,10 @@ type Store struct {
 	// never overwrite the newer full replacement in subscriber queues.
 	broadcastMu  sync.Mutex
 	broadcastGen uint64
+	// frameMu guards lastBroadcast independently of the store and publish-stats
+	// locks. The frame is immutable after publication and swapped before fanout.
+	frameMu       sync.RWMutex
+	lastBroadcast *Broadcast
 	// statsMu guards the publish-stats accumulator and NOTHING else. See
 	// publishstats.go for why it is its own lock rather than a few fields under
 	// s.mu.
@@ -902,6 +921,11 @@ func (s *Store) broadcast(snap Snapshot, gen uint64) {
 	subscribers := len(s.subscribers)
 	s.mu.RUnlock()
 	if subscribers == 0 {
+		// The cache backs a later subscriber's initial frame. Do not leave a
+		// pre-mutation frame there while the daemon temporarily has no clients.
+		s.frameMu.Lock()
+		s.lastBroadcast = nil
+		s.frameMu.Unlock()
 		return
 	}
 
@@ -910,19 +934,17 @@ func (s *Store) broadcast(snap Snapshot, gen uint64) {
 	// contention this package is being pulled apart to remove. A subscriber that
 	// arrives in the gap misses nothing: rpc.subscribe hands a brand-new connection
 	// its own full snapshot on connect, independently of this path.
-	b := Broadcast{Snapshot: snap}
-	if js, err := marshalSnapshot(snap); err == nil {
-		b.JSON = js
+	b := NewBroadcast(snap)
+	if len(b.JSON) != 0 {
 		// Counted here rather than at the publish decision because this is the only
 		// place a frame actually exists: the zero-subscriber return above skips the
 		// encode entirely, so those publishes have no size to average. publish-stats
 		// reports frame_bytes as the mean over frames ENCODED, not over publishes.
-		s.countFrame(len(js))
-	} else {
-		// Leave JSON nil and let the subscriber encode the snapshot itself; a bar
-		// falling back to a slower path beats a bar receiving a broken frame.
-		fmt.Fprintf(os.Stderr, "state: broadcast encode failed: %v\n", err)
+		s.countFrame(len(b.JSON))
 	}
+	s.frameMu.Lock()
+	s.lastBroadcast = &b
+	s.frameMu.Unlock()
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -943,6 +965,33 @@ func (s *Store) broadcast(snap Snapshot, gen uint64) {
 			}
 		}
 	}
+}
+
+// CurrentBroadcast returns the latest published frame. When no cached frame is
+// available (notably after a zero-subscriber publish), it builds one from the
+// current store state. The double-checked build is serialized with broadcast so
+// two readers or a concurrent fanout cannot walk the cache backward.
+func (s *Store) CurrentBroadcast() Broadcast {
+	s.frameMu.RLock()
+	b := s.lastBroadcast
+	s.frameMu.RUnlock()
+	if b != nil {
+		return *b
+	}
+
+	s.broadcastMu.Lock()
+	defer s.broadcastMu.Unlock()
+	s.frameMu.RLock()
+	b = s.lastBroadcast
+	s.frameMu.RUnlock()
+	if b != nil {
+		return *b
+	}
+	built := NewBroadcast(s.Snapshot())
+	s.frameMu.Lock()
+	s.lastBroadcast = &built
+	s.frameMu.Unlock()
+	return built
 }
 
 // marshalSnapshot produces the compact wire body a broadcast shares with every

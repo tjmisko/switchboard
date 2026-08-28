@@ -1,11 +1,14 @@
 package federation
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/agentgraph"
 	"github.com/tjmisko/switchboard/internal/state"
 )
 
@@ -189,12 +192,12 @@ func TestViewSaturationKeepsFinalReplacement(t *testing.T) {
 		})
 		view.publish()
 	}
-	var last state.Snapshot
-	for len(updates) > 0 {
-		last = <-updates
+	if len(updates) == 0 {
+		t.Fatal("saturated subscriber lost its wakeup")
 	}
-	if len(last.Sessions) != 1 || last.Sessions[0].PID != 9 {
-		t.Fatalf("last queued replacement = %+v", last.Sessions)
+	frame := view.CurrentFrame()
+	if len(frame.Snapshot.Sessions) != 1 || frame.Snapshot.Sessions[0].PID != 9 {
+		t.Fatalf("current frame = %+v", frame.Snapshot.Sessions)
 	}
 }
 
@@ -235,9 +238,13 @@ func TestRunReadyPublishesQuietStateThatPredatedSubscription(t *testing.T) {
 		t.Fatal("view never became ready")
 	}
 	select {
-	case snapshot := <-updates:
-		if len(snapshot.Sessions) != 1 || snapshot.Sessions[0].PID != 7 {
-			t.Fatalf("initial publication = %+v", snapshot.Sessions)
+	case <-updates:
+		frame := view.CurrentFrame()
+		if len(frame.Snapshot.Sessions) != 1 || frame.Snapshot.Sessions[0].PID != 7 {
+			t.Fatalf("initial publication = %+v", frame.Snapshot.Sessions)
+		}
+		if len(frame.JSON) == 0 {
+			t.Fatal("initial publication did not cache its shared encoding")
 		}
 	case <-time.After(time.Second):
 		t.Fatal("quiet pre-subscription state was never published")
@@ -306,6 +313,144 @@ func TestViewOrdersRemoteRowsByTheLocalWorkspaceDisplayingThem(t *testing.T) {
 		if s.LocalWorkspace != 0 {
 			t.Errorf("local row %d got LocalWorkspace = %d, want 0", s.PID, s.LocalWorkspace)
 		}
+	}
+}
+
+// Pointer identity is the only assertion that distinguishes one shared encode
+// from equal bytes independently encoded for each subscriber.
+func TestViewEncodesTheAggregateOncePerPublishRegardlessOfSubscriberCount(t *testing.T) {
+	remote := newFakeRemote()
+	remote.replace(map[string]state.Snapshot{
+		"remote": {Sessions: []state.Session{testSession(7, time.Unix(7, 0))}},
+	})
+	view, _ := NewView(state.New(""), "local", remote)
+	const subscribers = 10
+	updates := make([]<-chan struct{}, 0, subscribers)
+	for i := 0; i < subscribers; i++ {
+		ch, cancel := view.Subscribe()
+		defer cancel()
+		updates = append(updates, ch)
+	}
+
+	view.publish()
+	var shared []byte
+	for i, ch := range updates {
+		if len(ch) == 0 {
+			t.Fatalf("subscriber %d received no wakeup", i)
+		}
+		<-ch
+		frame := view.CurrentFrame()
+		if len(frame.JSON) == 0 {
+			t.Fatalf("subscriber %d read no shared encoding", i)
+		}
+		if i == 0 {
+			shared = frame.JSON
+		} else if &frame.JSON[0] != &shared[0] {
+			t.Fatalf("subscriber %d read a separately encoded frame", i)
+		}
+	}
+}
+
+func TestViewDoesNotFanOutARemoteFrameThatDiffersOnlyBySpinnerOrObservedAt(t *testing.T) {
+	at := time.Date(2026, 8, 28, 12, 0, 1, 0, time.UTC)
+	remote := newFakeRemote()
+	session := testSession(7, at.Add(-time.Hour))
+	session.Wezterm = &state.WeztermInfo{WindowTitle: "⠹ codex"}
+	session.AgentGraph = &state.AgentGraph{
+		RootID: "root", ObservedAt: at, FreshUntil: at.Add(time.Second), Complete: true,
+		Summary: state.AgentGraphSummary{Runtime: agentgraph.RuntimeIdle, Status: state.StatusIdle},
+		Nodes:   []state.AgentNode{{ID: "root", Runtime: agentgraph.RuntimeIdle, UpdatedAt: at}},
+	}
+	remote.replace(map[string]state.Snapshot{"remote": {Sessions: []state.Session{session}}})
+	view, _ := NewView(state.New(""), "local", remote)
+	updates, cancel := view.Subscribe()
+	defer cancel()
+	view.publish()
+	<-updates
+
+	// Remote terminal metadata is discarded by the aggregate projection, while
+	// SnapshotChangeKey deliberately ignores graph observation clocks and sees
+	// both freshness instants through the same five-second wire ceiling.
+	spun := session
+	spun.Wezterm = &state.WeztermInfo{WindowTitle: "⠸ codex"}
+	graph := *session.AgentGraph
+	graph.ObservedAt = at.Add(time.Second)
+	graph.FreshUntil = at.Add(2 * time.Second)
+	graph.Nodes = append([]state.AgentNode(nil), session.AgentGraph.Nodes...)
+	graph.Nodes[0].UpdatedAt = at.Add(time.Second)
+	spun.AgentGraph = &graph
+	remote.replace(map[string]state.Snapshot{"remote": {Sessions: []state.Session{spun}}})
+	view.publish()
+	if len(updates) != 0 {
+		t.Fatal("advisory remote clocks or discarded spinner metadata triggered fanout")
+	}
+
+	graph.Summary.Status = state.StatusWorking
+	spun.AgentGraph = &graph
+	remote.replace(map[string]state.Snapshot{"remote": {Sessions: []state.Session{spun}}})
+	view.publish()
+	if len(updates) == 0 {
+		t.Fatal("observable graph status change was suppressed")
+	}
+}
+
+func TestViewStillDeliversTheFinalFrameOnRemoteDisconnect(t *testing.T) {
+	remote := newFakeRemote()
+	view, _ := NewView(state.New(""), "local", remote)
+	updates, cancel := view.Subscribe()
+	defer cancel()
+	for pid := 1; pid <= 9; pid++ {
+		remote.replace(map[string]state.Snapshot{
+			"remote": {Sessions: []state.Session{testSession(pid, time.Unix(int64(pid), 0))}},
+		})
+		view.publish()
+	}
+	remote.replace(map[string]state.Snapshot{})
+	view.publish()
+	if len(updates) == 0 {
+		t.Fatal("saturated subscriber lost its wakeup")
+	}
+	if got := view.CurrentFrame().Snapshot.Sessions; len(got) != 0 {
+		t.Fatalf("final disconnect frame retained sessions: %+v", got)
+	}
+}
+
+func TestViewCurrentFrameNeverPrecedesAnEarlierRead(t *testing.T) {
+	remote := newFakeRemote()
+	view, _ := NewView(state.New(""), "local", remote)
+	updates, cancel := view.Subscribe()
+	defer cancel()
+	for pid := 1; pid <= 2; pid++ {
+		remote.replace(map[string]state.Snapshot{
+			"remote": {Sessions: []state.Session{testSession(pid, time.Unix(int64(pid), 0))}},
+		})
+		view.publish()
+	}
+	if got := view.CurrentFrame().Snapshot.Sessions[0].PID; got != 2 {
+		t.Fatalf("initial current frame PID = %d, want 2", got)
+	}
+	for len(updates) > 0 {
+		<-updates
+		if got := view.CurrentFrame().Snapshot.Sessions[0].PID; got != 2 {
+			t.Fatalf("queued wakeup moved current frame backward to PID %d", got)
+		}
+	}
+}
+
+func TestViewCurrentFrameEncodingMatchesItsSnapshot(t *testing.T) {
+	remote := newFakeRemote()
+	remote.replace(map[string]state.Snapshot{
+		"remote": {Sessions: []state.Session{testSession(9, time.Unix(9, 0))}},
+	})
+	view, _ := NewView(state.New(""), "local", remote)
+	view.publish()
+	frame := view.CurrentFrame()
+	want, err := json.Marshal(frame.Snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(frame.JSON, want) {
+		t.Fatalf("shared encoding does not match its snapshot\n got: %s\nwant: %s", frame.JSON, want)
 	}
 }
 

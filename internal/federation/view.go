@@ -5,6 +5,7 @@
 package federation
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"sort"
@@ -40,10 +41,15 @@ type View struct {
 
 	mu             sync.RWMutex
 	publishMu      sync.Mutex
-	subscribers    map[chan state.Snapshot]struct{}
+	subscribers    map[chan struct{}]struct{}
 	remoteFocus    sessionKey
 	routeReady     func(string, int, time.Time) bool
 	routeWorkspace func(string, int, time.Time) (int, bool)
+	// publishedKey is touched only while publishMu is held. frameMu guards the
+	// immutable latest published frame independently of view metadata.
+	publishedKey []byte
+	frameMu      sync.RWMutex
+	frame        *state.Broadcast
 }
 
 // chipKey identifies a row within one aggregate snapshot. (host,pid) is enough
@@ -67,7 +73,7 @@ func NewView(local *state.Store, hostname string, remote RemoteSource) (*View, e
 		local:       local,
 		remote:      remote,
 		hostname:    hostname,
-		subscribers: make(map[chan state.Snapshot]struct{}),
+		subscribers: make(map[chan struct{}]struct{}),
 	}, nil
 }
 
@@ -303,11 +309,11 @@ func (v *View) DropRemoteHost(host string) {
 // source snapshot mutation (for example, a late OSC pane binding).
 func (v *View) Refresh() { v.publish() }
 
-// Subscribe receives full-snapshot wakeups after changes. The caller should
-// subscribe, obtain Snapshot for its initial frame, and re-read Snapshot on
-// every receive; a value queued before the initial read may be older than it.
-func (v *View) Subscribe() (<-chan state.Snapshot, func()) {
-	ch := make(chan state.Snapshot, 4)
+// Subscribe receives payload-free wakeups after observable changes. Callers use
+// CurrentFrame for both the initial frame and every wakeup; a capacity of one is
+// sufficient because every read obtains the newest complete replacement.
+func (v *View) Subscribe() (<-chan struct{}, func()) {
+	ch := make(chan struct{}, 1)
 	v.mu.Lock()
 	v.subscribers[ch] = struct{}{}
 	v.mu.Unlock()
@@ -328,23 +334,59 @@ func (v *View) publish() {
 	v.publishMu.Lock()
 	defer v.publishMu.Unlock()
 	snapshot := v.Snapshot()
+	key := state.SnapshotChangeKey(snapshot)
+	if key != nil && bytes.Equal(key, v.publishedKey) {
+		return
+	}
+	v.publishedKey = key
+	frame := state.NewBroadcast(snapshot)
+	v.frameMu.Lock()
+	v.frame = &frame
+	v.frameMu.Unlock()
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 	for ch := range v.subscribers {
 		select {
-		case ch <- snapshot:
+		case ch <- struct{}{}:
 		default:
-			// Coalesce to the latest complete replacement. Dropping the new
-			// frame could leave a quiet subscriber permanently stale when this
-			// is the final update (notably, a remote disconnect).
-			select {
-			case <-ch:
-			default:
-			}
-			select {
-			case ch <- snapshot:
-			default:
-			}
+			// A full buffer already contains an unconsumed edge. The frame swap
+			// happened first, so that edge will lead the reader to this frame or
+			// a newer one without a drain-and-refill race.
 		}
 	}
+}
+
+// CurrentFrame returns the latest published aggregate frame. Subscription
+// clients use it for both their initial frame and every payload-free wakeup,
+// making replay of an older queued value unrepresentable. This is deliberately
+// the last published frame, not a fresh Snapshot rebuild: route/workspace
+// metadata that changes silently can therefore lag until the next source-driven
+// publish, matching the live stream's existing bounded behavior.
+func (v *View) CurrentFrame() state.Broadcast {
+	v.frameMu.RLock()
+	frame := v.frame
+	v.frameMu.RUnlock()
+	if frame != nil {
+		return *frame
+	}
+
+	// Only tests or future startup wiring can arrive before run's first publish;
+	// production starts views before serving. Build under publishMu and adopt the
+	// key while the cache is still empty. That prevents the first real publish
+	// from walking clients backward to an aggregate captured earlier.
+	v.publishMu.Lock()
+	defer v.publishMu.Unlock()
+	v.frameMu.RLock()
+	frame = v.frame
+	v.frameMu.RUnlock()
+	if frame != nil {
+		return *frame
+	}
+	snapshot := v.Snapshot()
+	v.publishedKey = state.SnapshotChangeKey(snapshot)
+	built := state.NewBroadcast(snapshot)
+	v.frameMu.Lock()
+	v.frame = &built
+	v.frameMu.Unlock()
+	return built
 }

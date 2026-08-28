@@ -170,6 +170,23 @@ type Response struct {
 	Error       string            `json:"error,omitempty"`
 }
 
+// rawSnapshotResponse splices an already-encoded snapshot into the response
+// envelope so subscriptions do not re-marshal it once per connection.
+type rawSnapshotResponse struct {
+	Snapshot json.RawMessage `json:"snapshot,omitempty"`
+}
+
+// writeSnapshotFrame forwards the shared encoding when available and fails open
+// to a fresh encode otherwise. Bytes produced by state.NewBroadcast already use
+// encoding/json's default HTML escaping, so RawMessage compaction is idempotent
+// and the resulting frame matches a normal Response encoding byte-for-byte.
+func writeSnapshotFrame(enc *json.Encoder, b state.Broadcast) error {
+	if len(b.JSON) == 0 {
+		return enc.Encode(Response{Snapshot: &b.Snapshot})
+	}
+	return enc.Encode(rawSnapshotResponse{Snapshot: b.JSON})
+}
+
 // AgentDiagnostic is a bounded, content-free health counter for provider
 // observation. Categories are finite implementation labels; messages, paths,
 // prompts, commands, and raw provider payloads never cross this RPC surface.
@@ -202,7 +219,8 @@ type AgentDiagnosticSource func() []AgentDiagnostic
 // the remote-stream source, preventing federation loops.
 type SnapshotView interface {
 	Snapshot() state.Snapshot
-	Subscribe() (<-chan state.Snapshot, func())
+	CurrentFrame() state.Broadcast
+	Subscribe() (<-chan struct{}, func())
 }
 
 type ExactFocusHandler func(context.Context, string, int, time.Time) error
@@ -467,8 +485,7 @@ func (s *Server) subscribeAll(ctx context.Context, conn net.Conn, enc *json.Enco
 	ch, cancel := s.view.Subscribe()
 	defer cancel()
 	disconnected := connectionClosed(conn)
-	snapshot := s.view.Snapshot()
-	if err := enc.Encode(Response{Snapshot: &snapshot}); err != nil {
+	if err := writeSnapshotFrame(enc, s.view.CurrentFrame()); err != nil {
 		return
 	}
 	for {
@@ -481,14 +498,10 @@ func (s *Server) subscribeAll(ctx context.Context, conn net.Conn, enc *json.Enco
 			if !ok {
 				return
 			}
-			// Aggregate publications span independent local, remote, focus, and
-			// route sources. A value queued before the initial Snapshot above can
-			// therefore be older than that initial frame. Treat the channel as a
-			// notification and re-read the current complete replacement so a quiet
-			// disconnect cannot be followed by—and strand the client on—a stale
-			// queued live snapshot.
-			snapshot := s.view.Snapshot()
-			if err := enc.Encode(Response{Snapshot: &snapshot}); err != nil {
+			// The channel carries no revision payload. Re-read the monotonic shared
+			// frame so an edge queued before the initial read cannot replay stale
+			// aggregate state afterward.
+			if err := writeSnapshotFrame(enc, s.view.CurrentFrame()); err != nil {
 				return
 			}
 		}
@@ -509,8 +522,7 @@ func (s *Server) subscribe(ctx context.Context, conn net.Conn, enc *json.Encoder
 // federating client's liveness and pane routes backward until another mutation.
 func (s *Server) streamLocalSnapshots(ctx context.Context, conn net.Conn, enc *json.Encoder, ch <-chan state.Broadcast) {
 	disconnected := connectionClosed(conn)
-	snap := s.store.Snapshot()
-	if err := enc.Encode(Response{Snapshot: &snap}); err != nil {
+	if err := writeSnapshotFrame(enc, s.store.CurrentBroadcast()); err != nil {
 		return
 	}
 	for {
@@ -523,11 +535,9 @@ func (s *Server) streamLocalSnapshots(ctx context.Context, conn net.Conn, enc *j
 			if !ok {
 				return
 			}
-			// The queued value is not a revision. Re-read after receiving the
-			// notification so an edge queued before the initial Snapshot cannot
-			// replay stale state after it.
-			snap := s.store.Snapshot()
-			if err := enc.Encode(Response{Snapshot: &snap}); err != nil {
+			// The queued value is not a revision. Re-read the latest cached frame so
+			// an edge queued before the initial read cannot replay stale state.
+			if err := writeSnapshotFrame(enc, s.store.CurrentBroadcast()); err != nil {
 				return
 			}
 		}

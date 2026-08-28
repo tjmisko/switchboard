@@ -16,7 +16,7 @@ import (
 type fakeSnapshotView struct {
 	mu       sync.RWMutex
 	snapshot state.Snapshot
-	updates  chan state.Snapshot
+	updates  chan struct{}
 }
 
 func (v *fakeSnapshotView) Snapshot() state.Snapshot {
@@ -24,13 +24,18 @@ func (v *fakeSnapshotView) Snapshot() state.Snapshot {
 	defer v.mu.RUnlock()
 	return v.snapshot
 }
+func (v *fakeSnapshotView) CurrentFrame() state.Broadcast {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return state.NewBroadcast(v.snapshot)
+}
 func (v *fakeSnapshotView) replace(snapshot state.Snapshot) {
 	v.mu.Lock()
 	v.snapshot = snapshot
 	v.mu.Unlock()
-	v.updates <- snapshot
+	v.updates <- struct{}{}
 }
-func (v *fakeSnapshotView) Subscribe() (<-chan state.Snapshot, func()) {
+func (v *fakeSnapshotView) Subscribe() (<-chan struct{}, func()) {
 	return v.updates, func() {}
 }
 
@@ -53,7 +58,7 @@ func TestAggregateRPCStaysSeparateFromLocalStream(t *testing.T) {
 	})
 	view := &fakeSnapshotView{snapshot: state.Snapshot{Sessions: []state.Session{{
 		PID: 2, Hostname: "remote", StartedAt: time.Unix(2, 0),
-	}}}, updates: make(chan state.Snapshot, 1)}
+	}}}, updates: make(chan struct{}, 1)}
 	server := New(store, "", terminal.NewNone(), wm.NewNone())
 	server.SetFederation(view, nil)
 	_, enc, dec := pipeServer(t, server)
@@ -78,7 +83,7 @@ func TestAggregateRPCStaysSeparateFromLocalStream(t *testing.T) {
 func TestSubscribeAllUsesAggregateUpdates(t *testing.T) {
 	view := &fakeSnapshotView{
 		snapshot: state.Snapshot{Sessions: []state.Session{{PID: 2, Hostname: "remote", StartedAt: time.Unix(2, 0)}}},
-		updates:  make(chan state.Snapshot, 1),
+		updates:  make(chan struct{}, 1),
 	}
 	server := New(state.New(""), "", terminal.NewNone(), wm.NewNone())
 	server.SetFederation(view, nil)
@@ -103,17 +108,14 @@ func TestSubscribeAllUsesAggregateUpdates(t *testing.T) {
 	}
 }
 
-func TestSubscribeAllTreatsQueuedValuesAsNotifications(t *testing.T) {
-	stale := state.Snapshot{Sessions: []state.Session{{
-		PID: 2, Hostname: "remote", StartedAt: time.Unix(2, 0),
-	}}}
+func TestSubscribeAllReReadsTheCurrentFrameOnEveryWakeup(t *testing.T) {
 	view := &fakeSnapshotView{
-		// Model a remote disconnect landing after an old live publication was
-		// queued but before subscribe-all reads its initial current snapshot.
+		// A wakeup queued before subscribe-all reads its initial frame must lead
+		// back to that same current shared frame, never a payload from the past.
 		snapshot: state.Snapshot{Sessions: []state.Session{}},
-		updates:  make(chan state.Snapshot, 1),
+		updates:  make(chan struct{}, 1),
 	}
-	view.updates <- stale
+	view.updates <- struct{}{}
 
 	server := New(state.New(""), "", terminal.NewNone(), wm.NewNone())
 	server.SetFederation(view, nil)
