@@ -24,7 +24,7 @@ func redInfoWithPending(writers ...string) *AgentInfo {
 	return info
 }
 
-// Trap 1, the one that silently costs the most. snapshotChangeKey JSON-encodes
+// Trap 1, the one that silently costs the most. SnapshotChangeKey JSON-encodes
 // every tagged field to decide whether to publish, so a projection built by
 // ranging the map would differ between snapshots of identical state — and the
 // daemon would republish to all ten waybar slots and rewrite state.json on every
@@ -40,11 +40,11 @@ func TestPendingWritersProjectionIsOrderStable(t *testing.T) {
 			})
 			return s.Snapshot()
 		}
-		want := snapshotChangeKey(snapshotOf())
+		want := SnapshotChangeKey(snapshotOf())
 		// Many rebuilds: each one re-inserts into a fresh map, so any range-order
 		// dependence shows up as a differing key within a handful of iterations.
 		for i := 0; i < 64; i++ {
-			if got := snapshotChangeKey(snapshotOf()); !bytes.Equal(got, want) {
+			if got := SnapshotChangeKey(snapshotOf()); !bytes.Equal(got, want) {
 				t.Fatalf("change key moved on rebuild %d with no state change:\n got %s\nwant %s", i, got, want)
 			}
 		}

@@ -220,7 +220,7 @@ type AgentInfo struct {
 	// (journal + agent transcript mtimes) and cleared when the last run drains,
 	// so a renderer can spell out WHY a chip is green ("workflow
 	// simplification-audit · 7/17 agents") rather than showing a bare
-	// delegating. Sorted by RunID — snapshotChangeKey JSON-encodes every tagged
+	// delegating. Sorted by RunID — SnapshotChangeKey JSON-encodes every tagged
 	// field to decide whether to publish, so an unstable order would republish
 	// identical state every tick.
 	Workflows []WorkflowStatus `json:"workflows,omitempty"`
@@ -271,7 +271,7 @@ type AgentInfo struct {
 	// for the rest of that prompt's life. Losing Tool/InputHash costs one reconcile
 	// tick of latency. Persist what guards the worse error; re-earn the rest (§9.5).
 	//
-	// The sort is load-bearing, not cosmetic: snapshotChangeKey JSON-encodes every
+	// The sort is load-bearing, not cosmetic: SnapshotChangeKey JSON-encodes every
 	// tagged field to decide whether to publish, so an unsorted slice built by
 	// ranging a map would differ between snapshots of identical state and republish
 	// to every waybar slot on every reconcile tick.
@@ -493,7 +493,7 @@ type Store struct {
 	sessions    map[int]*Session
 	subscribers map[chan Broadcast]struct{}
 	caps        *Capabilities
-	// publishedKey is snapshotChangeKey of the last snapshot Apply decided to
+	// publishedKey is SnapshotChangeKey of the last snapshot Apply decided to
 	// publish — the reference the change check compares against. nil before the
 	// first publish (and after a failed encode or a failed persist), which compares
 	// unequal to everything, so the next Apply publishes.
@@ -614,7 +614,7 @@ func (s *Store) Apply(fn func(map[int]*Session)) {
 // lock, which is microseconds against the milliseconds of terminal/WM I/O the
 // reconciler used to hold it for.
 func (s *Store) adoptPublishedLocked(snap Snapshot) (gen uint64, changed bool) {
-	key := snapshotChangeKey(snap)
+	key := SnapshotChangeKey(snap)
 	if key != nil && bytes.Equal(key, s.publishedKey) {
 		s.countDecision(false)
 		return s.publishedGen, false
@@ -649,10 +649,10 @@ func (s *Store) invalidatePublished(gen uint64) {
 	s.publishedKey = nil
 }
 
-// snapshotChangeKey encodes everything about a snapshot that a consumer can
-// observe, and nothing else. Two snapshots with equal keys are indistinguishable
-// both on the subscribe stream and in state.json, so publishing the second is
-// pure noise.
+// SnapshotChangeKey encodes everything about a snapshot that a consumer can act
+// on. Equal keys may still carry later advisory clock values on the raw wire;
+// suppressing those alone is intentional because they do not represent a state
+// edge or change freshness truth.
 //
 // It is a JSON encode rather than a hand-written field-by-field comparison on
 // purpose. A comparator's failure mode is silent: add a field to Session, forget
@@ -661,12 +661,18 @@ func (s *Store) invalidatePublished(gen uint64) {
 // carrying a JSON tag is compared by construction, and every in-memory-only
 // field (json:"-") is excluded by construction, now and for anything added later.
 //
-// UpdatedAt is the single field dropped by hand, and it is the whole reason a
-// naive equality check would never fire: snapshotLocked stamps it time.Now() on
-// EVERY snapshot, so two identical states differ there by definition and the
-// suppression would silently never trigger. The other fields re-stamped from the
-// wall clock rather than earned by a real change fall out for free, because they
-// are already json:"-" and so never reach an encode:
+// Three advertised clock fields are advisory and deliberately excluded:
+//
+//   - Snapshot.UpdatedAt is stamped by snapshotLocked on every snapshot.
+//   - AgentGraph.ObservedAt advances with provider polling. A lagging value only
+//     moves Fresh's lower bound earlier and cannot make a consumer falsely stale.
+//   - AgentNode.UpdatedAt is a provider poll/display-age anchor. Any actionable
+//     runtime, attention, lifecycle, usage, or completion change still moves its
+//     own encoded field and therefore the key.
+//
+// The key clears those clocks only on detached copies; the subscription frame
+// and state.json retain the real timestamps. Other values re-stamped from the
+// wall clock fall out for free because they are already json:"-":
 //
 //   - WeztermInfo.TitleAt — the resolver re-samples the pane title every reconcile
 //     tick and stamps it (mapping.weztermInfo), so it advances on a quiet machine.
@@ -675,6 +681,12 @@ func (s *Store) invalidatePublished(gen uint64) {
 //   - AgentInfo.PendingTool — transient red-onset state, not a clock but equally
 //     invisible to consumers. AgentInfo.Pending's correlator VALUES
 //     (Tool/InputHash/Since) fall out for the same reason.
+//
+// WindowTitle and AgentGraph.FreshUntil need no special key rule. Terminal
+// constructors normalize titles with panetitle.Normalize, and AgentGraph's JSON
+// boundary emits CeilFreshUntil, so the key automatically sees the same derived
+// values consumers receive. In particular FreshUntil must remain encoded: if
+// its ceiling moves, suppressing the frame could make a consumer falsely stale.
 //
 // AgentInfo.StatusSince is json:"-" too, but it is NOT a hidden field for this
 // purpose: snapshotLocked projects it onto StatusSinceWire (status_since), which
@@ -689,12 +701,32 @@ func (s *Store) invalidatePublished(gen uint64) {
 // `status != info.Status` guard, and each of the reconciler's self-heals stamps it
 // on the same line it assigns a new Status. It moves on a status edge and nowhere
 // else, so a moved status_since is a real change that must reach the bar.
-func snapshotChangeKey(snap Snapshot) []byte {
+func SnapshotChangeKey(snap Snapshot) []byte {
+	var sessions []Session
+	if snap.Sessions != nil {
+		sessions = make([]Session, len(snap.Sessions))
+		copy(sessions, snap.Sessions)
+	}
+	for i := range sessions {
+		if sessions[i].AgentGraph == nil {
+			continue
+		}
+		graph := *sessions[i].AgentGraph
+		graph.ObservedAt = time.Time{}
+		if graph.Nodes != nil {
+			graph.Nodes = make([]AgentNode, len(graph.Nodes))
+			copy(graph.Nodes, sessions[i].AgentGraph.Nodes)
+		}
+		for j := range graph.Nodes {
+			graph.Nodes[j].UpdatedAt = time.Time{}
+		}
+		sessions[i].AgentGraph = &graph
+	}
 	key, err := json.Marshal(struct {
 		SchemaVersion int           `json:"schema_version"`
 		Sessions      []Session     `json:"sessions"`
 		Capabilities  *Capabilities `json:"capabilities,omitempty"`
-	}{SchemaVersion: snap.SchemaVersion, Sessions: snap.Sessions, Capabilities: snap.Capabilities})
+	}{SchemaVersion: snap.SchemaVersion, Sessions: sessions, Capabilities: snap.Capabilities})
 	if err != nil {
 		// Not reachable today (Snapshot holds no unencodable field), but fail OPEN:
 		// a nil key compares unequal to everything, so a broken encode republishes
@@ -713,7 +745,7 @@ func snapshotChangeKey(snap Snapshot) []byte {
 // An encoding failure compares unequal: one redundant publication is safer
 // than suppressing a real state change.
 func ObservablyEqual(a, b Snapshot) bool {
-	keyA, keyB := snapshotChangeKey(a), snapshotChangeKey(b)
+	keyA, keyB := SnapshotChangeKey(a), SnapshotChangeKey(b)
 	return keyA != nil && keyB != nil && bytes.Equal(keyA, keyB)
 }
 

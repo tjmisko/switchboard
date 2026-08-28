@@ -9,8 +9,30 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/agentgraph"
+	"github.com/tjmisko/switchboard/internal/panetitle"
 	"github.com/tjmisko/switchboard/internal/state"
 )
+
+func publishGraphSession(at time.Time) *state.Session {
+	return &state.Session{
+		PID: 7, CWD: "/home/u/p", TTY: "/dev/pts/3", StartedAt: at.Add(-time.Hour),
+		Agent: state.AgentKindCodex,
+		DisplayName: &state.DisplayName{
+			Value: "before", Origin: state.DisplayNameGenerated, ConversationID: "root",
+		},
+		Codex: &state.AgentInfo{SessionID: "root", Status: state.StatusIdle, StatusSince: at},
+		AgentGraph: &state.AgentGraph{
+			RootID: "root", Source: agentgraph.SourceCodexAppServer,
+			ObservedAt: at, FreshUntil: at.Add(time.Second), Complete: true,
+			Summary: state.AgentGraphSummary{Runtime: agentgraph.RuntimeIdle, Status: state.StatusIdle, Since: at},
+			Nodes: []state.AgentNode{{
+				ID: "root", Runtime: agentgraph.RuntimeIdle, Attention: agentgraph.AttentionNone,
+				Lifecycle: agentgraph.LifecycleRunning, UpdatedAt: at,
+			}},
+		},
+	}
+}
 
 // recvBroadcast takes the next broadcast off a subscription, failing the test
 // rather than hanging when none arrives.
@@ -219,12 +241,14 @@ func TestApply_republishesWhenTheLastPersistFailed(t *testing.T) {
 // renders, and every one has to reach the subscriber and the on-disk mirror.
 func TestApply_publishesWhenAnObservableFieldChanges(t *testing.T) {
 	cases := map[string]func(*state.Session){
-		"a focus change":     func(s *state.Session) { s.Focused = true },
-		"a suspend":          func(s *state.Session) { s.Suspended = true },
-		"a status edge":      func(s *state.Session) { s.Claude.Status = state.StatusWorking },
-		"a subagent landing": func(s *state.Session) { s.Claude.InFlightSubagents = 2 },
-		"a workspace move":   func(s *state.Session) { s.Hyprland = &state.HyprlandInfo{WorkspaceID: 3} },
-		"a resolved cwd":     func(s *state.Session) { s.CWD = "/home/u/other" },
+		"a focus change":         func(s *state.Session) { s.Focused = true },
+		"a suspend":              func(s *state.Session) { s.Suspended = true },
+		"a status edge":          func(s *state.Session) { s.Claude.Status = state.StatusWorking },
+		"a graph summary status": func(s *state.Session) { s.AgentGraph.Summary.Status = state.StatusWorking },
+		"a display name":         func(s *state.Session) { s.DisplayName.Value = "after" },
+		"a subagent landing":     func(s *state.Session) { s.Claude.InFlightSubagents = 2 },
+		"a workspace move":       func(s *state.Session) { s.Hyprland = &state.HyprlandInfo{WorkspaceID: 3} },
+		"a resolved cwd":         func(s *state.Session) { s.CWD = "/home/u/other" },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -236,8 +260,16 @@ func TestApply_publishesWhenAnObservableFieldChanges(t *testing.T) {
 			store.Apply(func(m map[int]*state.Session) {
 				m[7] = &state.Session{
 					PID: 7, CWD: "/home/u/p", TTY: "/dev/pts/3", StartedAt: time.Unix(2000, 0),
-					Agent:  state.AgentKindClaude,
+					Agent: state.AgentKindClaude,
+					DisplayName: &state.DisplayName{
+						Value: "before", Origin: state.DisplayNameGenerated, ConversationID: "root",
+					},
 					Claude: &state.AgentInfo{Status: state.StatusIdle, StatusSince: time.Unix(2100, 0)},
+					AgentGraph: &state.AgentGraph{
+						RootID: "root", ObservedAt: time.Unix(2100, 0), FreshUntil: time.Unix(2160, 0),
+						Summary: state.AgentGraphSummary{Status: state.StatusIdle},
+						Nodes:   []state.AgentNode{{ID: "root"}},
+					},
 				}
 			})
 			recvBroadcast(t, ch)
@@ -346,4 +378,148 @@ func TestApply_publishesWhenCapabilitiesChange(t *testing.T) {
 	if b.Snapshot.Capabilities == nil || !b.Snapshot.Capabilities.Navigate {
 		t.Errorf("capabilities = %+v, want the newly detected Navigate tier", b.Snapshot.Capabilities)
 	}
+}
+
+func TestApply_shouldNotRepublishWhenOnlyTheTitleSpinnerRotates(t *testing.T) {
+	store := state.New("")
+	ch, cancel := store.Subscribe()
+	defer cancel()
+
+	store.Apply(func(m map[int]*state.Session) {
+		m[7] = &state.Session{
+			PID: 7, StartedAt: time.Unix(2000, 0),
+			Wezterm: &state.WeztermInfo{WindowTitle: panetitle.Normalize("⠋ project")},
+		}
+	})
+	recvBroadcast(t, ch)
+	store.Apply(func(m map[int]*state.Session) {
+		m[7].Wezterm.WindowTitle = panetitle.Normalize("⠙ project")
+	})
+	requireQuiet(t, ch, "a spinner-only title repaint normalized to the same wire title")
+}
+
+func TestApply_shouldNotRepublishWhenOnlyObservedAtAdvancesWithinABucket(t *testing.T) {
+	at := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "state.json")
+	store := state.New(path)
+	ch, cancel := store.Subscribe()
+	defer cancel()
+
+	store.Apply(func(m map[int]*state.Session) { m[7] = publishGraphSession(at) })
+	recvBroadcast(t, ch)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store.Apply(func(m map[int]*state.Session) {
+		m[7].AgentGraph.ObservedAt = at.Add(time.Second)
+	})
+	requireQuiet(t, ch, "agent_graph.observed_at is an advisory provider poll clock")
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("observed_at-only update rewrote state.json:\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+func TestApply_shouldRepublishWhenFreshUntilCrossesABucketBoundary(t *testing.T) {
+	at := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	store := state.New("")
+	ch, cancel := store.Subscribe()
+	defer cancel()
+	store.Apply(func(m map[int]*state.Session) { m[7] = publishGraphSession(at) })
+	recvBroadcast(t, ch)
+
+	newHorizon := at.Add(state.FreshnessBucket + time.Second)
+	store.Apply(func(m map[int]*state.Session) { m[7].AgentGraph.FreshUntil = newHorizon })
+	broadcast := recvBroadcast(t, ch)
+	var wire state.Snapshot
+	if err := json.Unmarshal(broadcast.JSON, &wire); err != nil {
+		t.Fatal(err)
+	}
+	got := wire.Sessions[0].AgentGraph.FreshUntil
+	want := state.CeilFreshUntil(newHorizon)
+	if !got.Equal(want) {
+		t.Fatalf("published fresh_until = %v, want new ceiling %v", got, want)
+	}
+}
+
+func TestApply_shouldRepublishWhenANodeRuntimeStateChanges(t *testing.T) {
+	at := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	store := state.New("")
+	ch, cancel := store.Subscribe()
+	defer cancel()
+	store.Apply(func(m map[int]*state.Session) { m[7] = publishGraphSession(at) })
+	recvBroadcast(t, ch)
+
+	updatedAt := at.Add(time.Second)
+	store.Apply(func(m map[int]*state.Session) { m[7].AgentGraph.Nodes[0].UpdatedAt = updatedAt })
+	requireQuiet(t, ch, "node updated_at alone is an advisory poll/display clock")
+
+	store.Apply(func(m map[int]*state.Session) {
+		m[7].AgentGraph.Nodes[0].Runtime = agentgraph.RuntimeActive
+	})
+	broadcast := recvBroadcast(t, ch)
+	if got := broadcast.Snapshot.Sessions[0].AgentGraph.Nodes[0]; got.Runtime != agentgraph.RuntimeActive || !got.UpdatedAt.Equal(updatedAt) {
+		t.Fatalf("runtime edge or retained wire timestamp missing from broadcast: %+v", got)
+	}
+}
+
+func TestSnapshotChangeKeyShouldLeaveTheFrameItKeysUntouched(t *testing.T) {
+	at := time.Date(2026, 8, 21, 12, 0, 2, 0, time.UTC)
+	snap := state.Snapshot{Sessions: []state.Session{*publishGraphSession(at)}}
+	if key := state.SnapshotChangeKey(snap); len(key) == 0 {
+		t.Fatal("SnapshotChangeKey returned no key")
+	}
+	graph := snap.Sessions[0].AgentGraph
+	if !graph.ObservedAt.Equal(at) || !graph.Nodes[0].UpdatedAt.Equal(at) {
+		t.Fatalf("key construction mutated its input frame: %+v", graph)
+	}
+
+	store := state.New("")
+	ch, cancel := store.Subscribe()
+	defer cancel()
+	store.Apply(func(m map[int]*state.Session) { m[7] = publishGraphSession(at) })
+	broadcast := recvBroadcast(t, ch)
+	stored := broadcast.Snapshot.Sessions[0].AgentGraph
+	if !stored.ObservedAt.Equal(at) || !stored.Nodes[0].UpdatedAt.Equal(at) {
+		t.Fatalf("broadcast snapshot lost advisory timestamps: %+v", stored)
+	}
+	var wire state.Snapshot
+	if err := json.Unmarshal(broadcast.JSON, &wire); err != nil {
+		t.Fatal(err)
+	}
+	wireGraph := wire.Sessions[0].AgentGraph
+	if !wireGraph.ObservedAt.Equal(at) || !wireGraph.Nodes[0].UpdatedAt.Equal(at) {
+		t.Fatalf("broadcast JSON lost advisory timestamps: %s", broadcast.JSON)
+	}
+}
+
+func TestPublishedCeilingCoversEverySuppressedInstant(t *testing.T) {
+	at := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	store := state.New("")
+	ch, cancel := store.Subscribe()
+	defer cancel()
+	store.Apply(func(m map[int]*state.Session) { m[7] = publishGraphSession(at) })
+	initial := recvBroadcast(t, ch)
+
+	var wire state.Snapshot
+	if err := json.Unmarshal(initial.JSON, &wire); err != nil {
+		t.Fatal(err)
+	}
+	publishedCeiling := wire.Sessions[0].AgentGraph.FreshUntil
+	for offset := 2 * time.Second; offset < state.FreshnessBucket; offset += time.Second {
+		trueHorizon := at.Add(offset)
+		store.Apply(func(m map[int]*state.Session) {
+			m[7].AgentGraph.ObservedAt = at.Add(offset - time.Second)
+			m[7].AgentGraph.FreshUntil = trueHorizon
+		})
+		if !publishedCeiling.After(trueHorizon) {
+			t.Fatalf("published ceiling %v does not cover suppressed true horizon %v", publishedCeiling, trueHorizon)
+		}
+	}
+	requireQuiet(t, ch, "all advancing horizons remained inside the published ceiling bucket")
 }

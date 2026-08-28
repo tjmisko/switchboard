@@ -211,28 +211,52 @@ func TestBroadcastEncodingIsTheGoldenDocument(t *testing.T) {
 	}
 }
 
-// TestChangeKeyIgnoresUpdatedAtOnly pins the exact boundary of the publish gate:
-// the change key must drop updated_at (snapshotLocked re-stamps it time.Now() on
-// every snapshot, so comparing it would make the gate a no-op) and must keep
-// everything else the golden document carries. Building it from the golden's own
-// bytes means a newly added wire field is covered the moment the fixture is
-// regenerated — the same tripwire that guards the file itself.
-func TestChangeKeyIgnoresUpdatedAtOnly(t *testing.T) {
-	base := canonicalSnapshot()
+func changeKeySnapshot() Snapshot {
+	snap := canonicalSnapshot()
+	at := time.Date(2026, 5, 28, 9, 4, 0, 0, time.UTC)
+	snap.Sessions[1].AgentGraph = &AgentGraph{
+		RootID: "root", ObservedAt: at, FreshUntil: at.Add(30 * time.Second), Complete: true,
+		Summary: AgentGraphSummary{Status: StatusIdle},
+		Nodes:   []AgentNode{{ID: "root", UpdatedAt: at}},
+	}
+	return snap
+}
 
-	restamped := base
+// TestChangeKeyIgnoresClocksOnly pins the exact boundary of the publish gate:
+// it drops snapshot updated_at plus the graph's advisory observation/poll clocks
+// while keeping every actionable field. Building the rest from the golden's own
+// bytes means a newly added wire field is covered when the fixture is regenerated.
+func TestChangeKeyIgnoresClocksOnly(t *testing.T) {
+	base := changeKeySnapshot()
+
+	restamped := changeKeySnapshot()
 	restamped.UpdatedAt = base.UpdatedAt.Add(5 * time.Second)
-	if !bytes.Equal(snapshotChangeKey(base), snapshotChangeKey(restamped)) {
+	if !bytes.Equal(SnapshotChangeKey(base), SnapshotChangeKey(restamped)) {
 		t.Error("a fresh updated_at changed the key; the publish gate would never suppress anything")
+	}
+	restamped = changeKeySnapshot()
+	restamped.Sessions[1].AgentGraph.ObservedAt = restamped.Sessions[1].AgentGraph.ObservedAt.Add(time.Second)
+	if !bytes.Equal(SnapshotChangeKey(base), SnapshotChangeKey(restamped)) {
+		t.Error("agent_graph.observed_at changed the key")
+	}
+	restamped = changeKeySnapshot()
+	restamped.Sessions[1].AgentGraph.Nodes[0].UpdatedAt = restamped.Sessions[1].AgentGraph.Nodes[0].UpdatedAt.Add(time.Second)
+	if !bytes.Equal(SnapshotChangeKey(base), SnapshotChangeKey(restamped)) {
+		t.Error("agent_graph.nodes[].updated_at changed the key")
 	}
 
 	// Every other kind of edit must move the key. status_since is the one to watch:
 	// it is stamped from a wall clock, but only on a status edge, so it is a real
-	// change and must NOT be excluded (see snapshotChangeKey).
+	// change and must NOT be excluded (see SnapshotChangeKey).
 	for name, mutate := range map[string]func(*Snapshot){
 		"a session appearing": func(s *Snapshot) { s.Sessions = append(s.Sessions, Session{PID: 9001}) },
 		"a focus change":      func(s *Snapshot) { s.Sessions[0].Focused = !s.Sessions[0].Focused },
 		"a status edge":       func(s *Snapshot) { s.Sessions[0].Claude.Status = StatusIdle },
+		"a graph status edge": func(s *Snapshot) { s.Sessions[1].AgentGraph.Summary.Status = StatusWorking },
+		"a node runtime edge": func(s *Snapshot) { s.Sessions[1].AgentGraph.Nodes[0].Runtime = "active" },
+		"a freshness bucket edge": func(s *Snapshot) {
+			s.Sessions[1].AgentGraph.FreshUntil = s.Sessions[1].AgentGraph.FreshUntil.Add(FreshnessBucket)
+		},
 		"status_since moving": func(s *Snapshot) { s.Sessions[0].Claude.StatusSinceWire = timePtr(base.UpdatedAt) },
 		"a display name":      func(s *Snapshot) { s.Sessions[1].DisplayName.Value = "new-display-name" },
 		"a subagent landing":  func(s *Snapshot) { s.Sessions[0].Claude.InFlightSubagents++ },
@@ -242,9 +266,9 @@ func TestChangeKeyIgnoresUpdatedAtOnly(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			changed := canonicalSnapshot()
+			changed := changeKeySnapshot()
 			mutate(&changed)
-			if bytes.Equal(snapshotChangeKey(base), snapshotChangeKey(changed)) {
+			if bytes.Equal(SnapshotChangeKey(base), SnapshotChangeKey(changed)) {
 				t.Errorf("%s did not move the change key; the bar would never see it", name)
 			}
 		})
@@ -252,17 +276,33 @@ func TestChangeKeyIgnoresUpdatedAtOnly(t *testing.T) {
 }
 
 func TestObservablyEqualSharesThePublishGateBoundary(t *testing.T) {
-	base := canonicalSnapshot()
-	restamped := base
+	base := changeKeySnapshot()
+	restamped := changeKeySnapshot()
 	restamped.UpdatedAt = base.UpdatedAt.Add(time.Hour)
+	restamped.Sessions[1].AgentGraph.ObservedAt = restamped.Sessions[1].AgentGraph.ObservedAt.Add(time.Second)
+	restamped.Sessions[1].AgentGraph.Nodes[0].UpdatedAt = restamped.Sessions[1].AgentGraph.Nodes[0].UpdatedAt.Add(time.Second)
 	if !ObservablyEqual(base, restamped) {
-		t.Fatal("updated_at alone made observably identical snapshots compare unequal")
+		t.Fatal("advisory clocks alone made observably equivalent snapshots compare unequal")
 	}
 
-	changed := canonicalSnapshot()
+	changed := changeKeySnapshot()
 	changed.Sessions[0].Focused = !changed.Sessions[0].Focused
 	if ObservablyEqual(base, changed) {
 		t.Fatal("an observable focus change compared equal")
+	}
+}
+
+func TestSnapshotChangeKeyPreservesNilAndEmptyWireShapes(t *testing.T) {
+	nilSessions := Snapshot{Sessions: nil}
+	emptySessions := Snapshot{Sessions: []Session{}}
+	if bytes.Equal(SnapshotChangeKey(nilSessions), SnapshotChangeKey(emptySessions)) {
+		t.Fatal("change-key copy collapsed sessions [] to null")
+	}
+
+	nilNodes := Snapshot{Sessions: []Session{{PID: 1, AgentGraph: &AgentGraph{RootID: "root"}}}}
+	emptyNodes := Snapshot{Sessions: []Session{{PID: 1, AgentGraph: &AgentGraph{RootID: "root", Nodes: []AgentNode{}}}}}
+	if bytes.Equal(SnapshotChangeKey(nilNodes), SnapshotChangeKey(emptyNodes)) {
+		t.Fatal("change-key copy collapsed agent_graph.nodes [] to null")
 	}
 }
 

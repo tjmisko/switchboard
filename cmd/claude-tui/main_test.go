@@ -62,6 +62,30 @@ func TestRenderSnapshotMarksExpiredAndSuspendedChildrenStale(t *testing.T) {
 	}
 }
 
+func TestShouldNotMarkTheTUIStaleWhenTheDaemonSuppressedAWithinBucketRepublish(t *testing.T) {
+	base := graphRenderNow
+	graph := &state.AgentGraph{
+		RootID: "root", ObservedAt: base,
+		FreshUntil: state.CeilFreshUntil(base.Add(time.Second)), Complete: true,
+		Nodes: []state.AgentNode{
+			{ID: "root"},
+			{ID: "child", ParentID: "root", Runtime: agentgraph.RuntimeActive,
+				Lifecycle: agentgraph.LifecycleRunning, UpdatedAt: base},
+		},
+	}
+	snap := state.Snapshot{Sessions: []state.Session{{PID: 1, CWD: "/tmp/x", AgentGraph: graph}}}
+
+	covered := renderSnapshot(snap, "/home/u", false, base.Add(state.FreshnessBucket-100*time.Millisecond), nil)
+	if strings.Contains(covered, " · stale") || !strings.Contains(covered, "4s") {
+		t.Fatalf("ceiling-covered consumer frame became stale or lost its age counter:\n%s", covered)
+	}
+
+	expired := renderSnapshot(snap, "/home/u", false, base.Add(state.FreshnessBucket+100*time.Millisecond), nil)
+	if !strings.Contains(expired, " · stale") {
+		t.Fatalf("frame remained fresh after the published ceiling:\n%s", expired)
+	}
+}
+
 func TestRenderSnapshotBoundsAgentRows(t *testing.T) {
 	nodes := []state.AgentNode{{ID: "root"}}
 	for i := 0; i < maxAgentRows+3; i++ {
