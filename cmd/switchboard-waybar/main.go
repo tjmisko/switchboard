@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/barlayout"
+	"github.com/tjmisko/switchboard/internal/buildinfo"
 	"github.com/tjmisko/switchboard/internal/durfmt"
 	sblabel "github.com/tjmisko/switchboard/internal/label"
 	"github.com/tjmisko/switchboard/internal/projectname"
@@ -46,7 +47,12 @@ func main() {
 	socketPath := flag.String("socket", defaultSocketPath(), "daemon socket")
 	slot := flag.Int("slot", -1, "emit JSON for Nth session only (waybar slot mode)")
 	widthPx := flag.Float64("width-px", 0, "usable bar width in px; 0 auto-detects via hyprctl")
+	showVersion := flag.Bool("version", false, "print the build revision and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(buildinfo.Get())
+		return
+	}
 
 	// The abbreviation budget is the monitor's usable width against fixed chip
 	// metrics. Width is stable for the bar's lifetime, so resolve it once.
