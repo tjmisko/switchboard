@@ -315,6 +315,16 @@ downtime. `list`, Waybar, the TUI, cycle, attention and the picker use the
 aggregate view; the transport itself stays on the original host-local
 `subscribe` endpoint so two federating clients cannot recurse.
 
+Session names are resolved by the machine that owns the process. This matters
+for Claude: `/name` and `/rename` update a PID-keyed file on that machine, and a
+federating client must not look up the same numeric PID in its own home
+directory. The remote snapshot therefore carries Claude's resolved name and the
+client prefers it over prompt-derived graph/title fallbacks. Codex names are
+already conversation-bound on the wire; its generated display name is cleared
+when an authoritative native `/rename` arrives, locally or remotely. Deploy the
+same revision to the remote daemon/control binary and the local daemon/renderers
+to enable the Claude projection.
+
 Exact remote focus requires the WezTerm module in
 [`integrations/wezterm/switchboard.lua`](integrations/wezterm/switchboard.lua).
 See its adjacent README for the small `setup` and sole `format-window-title`

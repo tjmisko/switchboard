@@ -222,6 +222,37 @@ func TestRemoteClaudeNameNeverUsesLocalPIDNamespace(t *testing.T) {
 	}
 }
 
+func TestRemoteClaudePrefersNameResolvedByProviderHost(t *testing.T) {
+	writeSessionFile(t, 4247, "unrelated-local-name")
+	remote := state.Session{
+		PID: 4247, Hostname: "buildbox", Remote: true,
+		Agent: state.AgentKindClaude, CWD: "/srv/remote-project",
+		ResolvedName: "manual-remote-name",
+		AgentGraph: &state.AgentGraph{
+			RootID: "root", Nodes: []state.AgentNode{{ID: "root", Nickname: "i-d-like"}},
+		},
+	}
+	if got := RawName(remote); got != "manual-remote-name" {
+		t.Fatalf("remote RawName = %q, want provider-host manual name", got)
+	}
+	if got := (&NameCache{}).RawName(remote); got != "manual-remote-name" {
+		t.Fatalf("cached remote RawName = %q, want provider-host manual name", got)
+	}
+}
+
+func TestRemoteCodexUsesFederatedNativeRename(t *testing.T) {
+	remote := state.Session{
+		PID: 4248, Hostname: "buildbox", Remote: true, Agent: state.AgentKindCodex,
+		Codex: &state.AgentInfo{SessionID: "thread-1"},
+		AgentGraph: &state.AgentGraph{
+			RootID: "thread-1", Nodes: []state.AgentNode{{ID: "thread-1", Nickname: "Manual Native Name"}},
+		},
+	}
+	if got := RawName(remote); got != "manual-native-name" {
+		t.Fatalf("remote RawName = %q, want federated native rename", got)
+	}
+}
+
 func TestRemoteChipUsesRemoteCWDLexically(t *testing.T) {
 	root := t.TempDir()
 	if err := os.Mkdir(filepath.Join(root, ".git"), 0o755); err != nil {

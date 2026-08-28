@@ -96,6 +96,7 @@ enrichment, graph, and display-name fields are omitted when unavailable.
 | `local_workspace` | integer | omitted when unresolved | Federated aggregate only, and only on remote rows: the Hyprland workspace id **on the reading machine** of the window displaying this session. A remote row's own `hyprland` block is stripped (its coordinates locate the other desktop), so this is the only workspace a local reader can act on — it is what the bottom bar reports and what places the chip in workspace order. `0` means unresolved, the same convention as `workspace_id`. |
 | `agent` | string | omitted until known | `claude` or `codex`; selects the matching enrichment block. |
 | `display_name` | object | omitted when absent | Switchboard-owned Codex display metadata, valid only for its exact conversation. It never changes the native Codex thread. |
+| `resolved_name` | string | omitted until resolved | Provider host's current Claude session name before project prefixing. Federated readers prefer this projection because only the provider host can safely resolve PID-keyed Claude metadata. It carries Claude `/name` or `/rename`; Codex generated and native names already travel in conversation-bound `display_name`/`agent_graph` state. |
 | `mem_agent_bytes` | integer | omitted when unmeasured | Root process PSS + SwapPss. |
 | `mem_tree_bytes` | integer | omitted when unmeasured | PSS + SwapPss for the root and all descendants. |
 | `wezterm` | object | optional | Wezterm locator data. |
