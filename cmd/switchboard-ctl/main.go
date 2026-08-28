@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/buildinfo"
 	sblabel "github.com/tjmisko/switchboard/internal/label"
 	"github.com/tjmisko/switchboard/internal/projectname"
 	"github.com/tjmisko/switchboard/internal/rpc"
@@ -25,8 +26,17 @@ import (
 func main() {
 	socketPath := flag.String("socket", defaultSocketPath(), "daemon socket")
 	jsonOut := flag.Bool("json", false, "emit JSON instead of human-friendly text")
+	showVersion := flag.Bool("version", false, "print the build revision and exit")
 	flag.Usage = usage
 	flag.Parse()
+
+	// -version answers before the argument check and before any dial: a deploy
+	// script must be able to ask a staged binary what it is without a daemon
+	// running, and without supplying a command it does not want to execute.
+	if *showVersion {
+		fmt.Println(buildinfo.Get())
+		return
+	}
 
 	args := flag.Args()
 	if len(args) == 0 {

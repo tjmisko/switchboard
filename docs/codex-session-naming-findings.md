@@ -99,6 +99,10 @@ Codex session labels resolve in this order:
 
 Project prefixing is applied afterward.
 
+Before prefixing, the selected value is normalized by the shared label consumer
+to a lowercase, at-most-three-word kebab slug. This applies equally to generated
+records, native names, and cwd/PID fallbacks without mutating their source data.
+
 A read-only app-server observer may bind only from an exact hook-supplied thread
 ID. It can read the root and descendants and consume native-name notifications;
 it has no visible-thread mutation path.

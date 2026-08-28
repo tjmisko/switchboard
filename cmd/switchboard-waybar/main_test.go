@@ -63,12 +63,12 @@ func TestRenderSlotCodexExplicitNameReplacesShortID(t *testing.T) {
 		PID: 1, CWD: "/irrelevant/switchboard", Agent: state.AgentKindCodex,
 		AgentGraph: &state.AgentGraph{
 			RootID: rootID, Summary: state.AgentGraphSummary{Status: state.StatusIdle},
-			Nodes: []state.AgentNode{{ID: rootID, Nickname: "my-short-name"}},
+			Nodes: []state.AgentNode{{ID: rootID, Nickname: "Plan faster abstract extraction"}},
 		},
 	}
 	out := renderSlot(state.Snapshot{Sessions: []state.Session{s}}, 0, testAvail, testMetrics, &nameConfig{}, &sblabel.NameCache{})
-	if out.Text != "sb-my-short-name" {
-		t.Fatalf("renamed Codex chip = %q, want sb-my-short-name", out.Text)
+	if out.Text != "sb-plan-faster-abstract" {
+		t.Fatalf("renamed Codex chip = %q, want sb-plan-faster-abstract", out.Text)
 	}
 }
 

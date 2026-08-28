@@ -150,19 +150,19 @@ func TestObserveLabelTracksCodexDisplayNameAndNativeOverrideOncePerVisibleChange
 		PID: 424244, Agent: state.AgentKindCodex, CWD: "/home/u/proj",
 		Codex: &state.AgentInfo{SessionID: "thread-1"},
 		AgentGraph: &state.AgentGraph{
-			RootID: "thread-1", Nodes: []state.AgentNode{{ID: "thread-1", Nickname: "initial-native"}},
+			RootID: "thread-1", Nodes: []state.AgentNode{{ID: "thread-1", Nickname: "Initial Native Name Extra"}},
 		},
 	}
 
 	rs.observeLabel(sink, sess, sess.Codex, time.Now())
 	rs.observeLabel(sink, sess, sess.Codex, time.Now())
 	sess.DisplayName = &state.DisplayName{
-		Value: "generated-display-name", Origin: state.DisplayNameGenerated, ConversationID: "thread-1",
+		Value: "Generated Display Name Extra", Origin: state.DisplayNameGenerated, ConversationID: "thread-1",
 	}
 	rs.observeLabel(sink, sess, sess.Codex, time.Now())
 	rs.observeLabel(sink, sess, sess.Codex, time.Now())
 	sess.DisplayName = nil
-	sess.AgentGraph.Nodes[0].Nickname = "manual-native-name"
+	sess.AgentGraph.Nodes[0].Nickname = "Manual Native Name Extra"
 	rs.observeLabel(sink, sess, sess.Codex, time.Now())
 	rs.observeLabel(sink, sess, sess.Codex, time.Now())
 	sink.Close()
@@ -171,7 +171,7 @@ func TestObserveLabelTracksCodexDisplayNameAndNativeOverrideOncePerVisibleChange
 	if len(labels) != 3 {
 		t.Fatalf("got %d session_label events, want one per visible change: %+v", len(labels), labels)
 	}
-	want := []string{"initial-native", "generated-display-name", "manual-native-name"}
+	want := []string{"initial-native-name", "generated-display-name", "manual-native-name"}
 	for i := range want {
 		if labels[i].Label != want[i] || labels[i].SessionID != "thread-1" {
 			t.Fatalf("label[%d] = %+v, want %q on thread-1", i, labels[i], want[i])

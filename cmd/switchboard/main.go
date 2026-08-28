@@ -20,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/tjmisko/switchboard/internal/agentgraph"
+	"github.com/tjmisko/switchboard/internal/buildinfo"
 	"github.com/tjmisko/switchboard/internal/detect"
 	"github.com/tjmisko/switchboard/internal/discovery"
 	"github.com/tjmisko/switchboard/internal/fanout"
@@ -83,12 +84,23 @@ func main() {
 	historyDir := flag.String("history-dir", "", "activity-log directory (default $XDG_STATE_HOME/switchboard/history)")
 	codexObserverFlag := flag.String("codex-observer", string(defaultCodexObserverMode), "Codex app-server observer: auto|off")
 	codexDisplayNameModel := flag.String("codex-autoname-model", codexprovider.DefaultDisplayNameModel, "model for isolated Codex display-name generation")
+	showVersion := flag.Bool("version", false, "print the build revision and exit")
 	flag.Var(&remoteFlags, "remote", "SSH destination to observe (repeatable)")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(buildinfo.Get())
+		return
+	}
 	codexMode, err := parseCodexObserverMode(*codexObserverFlag)
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	// The first line of every run names the build. A deploy that silently kept
+	// the old binary is otherwise indistinguishable from one that worked: the
+	// unit reports active either way. This line is what makes the journal a
+	// record of which revision actually ran, and for how long.
+	log.Printf("build: version=%s", buildinfo.Get())
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()

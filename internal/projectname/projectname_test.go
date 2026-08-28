@@ -145,8 +145,31 @@ func TestProjectRoot_gitFileWorktree(t *testing.T) {
 
 func TestProjectRoot_noGitReturnsDirItself(t *testing.T) {
 	dir := t.TempDir()
+	requireNoAncestorGit(t, dir)
 	if got := ProjectRoot(dir); got != dir {
 		t.Errorf("ProjectRoot(no .git) = %q, want %q", got, dir)
+	}
+}
+
+// requireNoAncestorGit skips when some ancestor of dir holds a .git, because
+// this test's premise — that the walk finds nothing — is then unsatisfiable
+// and ProjectRoot returning that ancestor is correct behaviour, not a bug.
+//
+// The temp directory lives under $TMPDIR, which the test does not own. A stray
+// /tmp/.git (an empty directory is enough: ProjectRoot stats, it does not
+// validate) otherwise fails this test with a comparison that names the
+// offending path only by accident.
+func requireNoAncestorGit(t *testing.T, dir string) {
+	t.Helper()
+	for cur := filepath.Dir(filepath.Clean(dir)); ; {
+		if _, err := os.Stat(filepath.Join(cur, ".git")); err == nil {
+			t.Skipf("%s exists, so no temp directory under it can lack a git root; remove it to run this test", filepath.Join(cur, ".git"))
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return
+		}
+		cur = parent
 	}
 }
 

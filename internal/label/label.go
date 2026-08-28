@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/tjmisko/switchboard/internal/projectname"
 	"github.com/tjmisko/switchboard/internal/state"
@@ -33,11 +34,14 @@ var spinnerPrefixes = []string{"✳ ", "⠂ ", "⠐ ", "⠁ ", "⠈ ", "⠠ ", "
 
 // RawName picks the human name for a session before project prefixing. Codex
 // uses a conversation-matching Switchboard display name, then an authoritative
-// native graph name, then the first two characters of its stable thread ID. It
-// deliberately never uses its terminal title, whose configurable branch/model
-// fields and activity spinner do not belong in a session label. Claude prefers its authoritative
-// ~/.claude/sessions/<pid>.json name, then a spinner-stripped terminal title.
-// Both providers fall back to cwd and finally pid.
+// native graph name, then the first two characters of its stable thread ID. The
+// selected Codex value is normalized for display to a lowercase kebab slug with
+// at most three words; the native and persisted source values remain untouched.
+// It deliberately never uses the Codex terminal title, whose configurable
+// branch/model fields and activity spinner do not belong in a session label.
+// Claude prefers its authoritative ~/.claude/sessions/<pid>.json name, then a
+// spinner-stripped terminal title. Both providers fall back to cwd and finally
+// pid.
 func RawName(s state.Session) string {
 	return rawName(s, claudeSessionName)
 }
@@ -54,24 +58,8 @@ func Chip(cfg projectname.Config, s state.Session) string {
 // cached and uncached paths cannot drift apart.
 func rawName(s state.Session, claudeName func(pid int) string) string {
 	if s.Agent == state.AgentKindCodex {
-		conversationID := codexConversationID(s)
-		if s.DisplayName.ValidFor(conversationID) {
-			return strings.TrimSpace(s.DisplayName.Value)
-		}
-		if (conversationID == "" || (s.AgentGraph != nil && s.AgentGraph.RootID == conversationID)) && graphRootName(s.AgentGraph) != "" {
-			return graphRootName(s.AgentGraph)
-		}
-		if conversationID != "" {
-			return shortCodexSessionID(conversationID)
-		}
-		if n := graphRootName(s.AgentGraph); n != "" {
-			return n
-		}
-		if s.AgentGraph != nil && s.AgentGraph.RootID != "" {
-			return shortCodexSessionID(s.AgentGraph.RootID)
-		}
-		if info := s.Enrichment(); info != nil && info.SessionID != "" {
-			return shortCodexSessionID(info.SessionID)
+		if name := codexRawName(s); name != "" {
+			return name
 		}
 	} else if s.Remote {
 		// A remote PID is not a process namespace on this machine. Use only
@@ -96,9 +84,79 @@ func rawName(s state.Session, claudeName func(pid int) string) string {
 		}
 	}
 	if s.CWD != "" {
-		return filepath.Base(s.CWD)
+		name := filepath.Base(s.CWD)
+		if s.Agent == state.AgentKindCodex {
+			if slug := codexDisplaySlug(name); slug != "" {
+				return slug
+			}
+		}
+		return name
 	}
-	return fmt.Sprintf("pid %d", s.PID)
+	name := fmt.Sprintf("pid %d", s.PID)
+	if s.Agent == state.AgentKindCodex {
+		return codexDisplaySlug(name)
+	}
+	return name
+}
+
+func codexRawName(s state.Session) string {
+	conversationID := codexConversationID(s)
+	if s.DisplayName.ValidFor(conversationID) {
+		if name := codexDisplaySlug(s.DisplayName.Value); name != "" {
+			return name
+		}
+	}
+	rootName := graphRootName(s.AgentGraph)
+	if conversationID == "" || (s.AgentGraph != nil && s.AgentGraph.RootID == conversationID) {
+		if name := codexDisplaySlug(rootName); name != "" {
+			return name
+		}
+	}
+	if conversationID != "" {
+		return codexDisplaySlug(shortCodexSessionID(conversationID))
+	}
+	if name := codexDisplaySlug(rootName); name != "" {
+		return name
+	}
+	if s.AgentGraph != nil && s.AgentGraph.RootID != "" {
+		return codexDisplaySlug(shortCodexSessionID(s.AgentGraph.RootID))
+	}
+	if info := s.Enrichment(); info != nil && info.SessionID != "" {
+		return codexDisplaySlug(shortCodexSessionID(info.SessionID))
+	}
+	return ""
+}
+
+const maxCodexDisplayWords = 3
+
+// codexDisplaySlug normalizes an untrusted Codex name at the display boundary.
+// Codex's native name is intentionally free-form (and may be changed with
+// /rename), while Switchboard's generated record can outlive naming-policy
+// revisions. Keeping normalization here gives every renderer the same stable
+// contract without mutating either source of truth.
+func codexDisplaySlug(value string) string {
+	words := make([]string, 0, maxCodexDisplayWords)
+	var word strings.Builder
+	flush := func() {
+		if word.Len() == 0 || len(words) == maxCodexDisplayWords {
+			word.Reset()
+			return
+		}
+		words = append(words, word.String())
+		word.Reset()
+	}
+	for _, r := range strings.ToLower(value) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			word.WriteRune(r)
+			continue
+		}
+		flush()
+		if len(words) == maxCodexDisplayWords {
+			break
+		}
+	}
+	flush()
+	return strings.Join(words, "-")
 }
 
 func remoteProjectBase(dir string) string {

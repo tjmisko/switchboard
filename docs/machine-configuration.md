@@ -52,7 +52,7 @@ can override them without replacing the service command:
 ```ini
 # ~/.config/systemd/user/switchboard.service.d/20-machine.conf
 [Service]
-Environment=SWITCHBOARD_BIN=/home/alice/.config/switchboard/bin/switchboard
+Environment=SWITCHBOARD_BIN=/home/alice/.local/share/switchboard/current/switchboard
 Environment="SWITCHBOARD_ARGS=-remote buildbox -remote user@gpu-box"
 ```
 
@@ -72,7 +72,7 @@ ssh -n -T <destination> switchboard-ctl remote-stream
 The remote `switchboard-ctl` must therefore resolve by its bare name in the
 login shell's **noninteractive SSH path**. An interactive shell finding the
 binary is not sufficient. Neither is a remote systemd override such as
-`SWITCHBOARD_BIN=/home/alice/.config/switchboard/bin/switchboard`: that setting
+`SWITCHBOARD_BIN=/home/alice/.local/share/switchboard/current/switchboard`: that setting
 selects the daemon executable only and does not change the SSH command's path.
 
 First inspect the actual command environment from the client host. The printed
@@ -93,7 +93,7 @@ existing-path check deliberately refuses to overwrite an unrelated command:
 
 ```bash
 (
-    switchboard_ctl_target="$HOME/.config/switchboard/bin/switchboard-ctl"
+    switchboard_ctl_target="$HOME/.local/share/switchboard/current/switchboard-ctl"
     switchboard_ctl_link="$HOME/.local/bin/switchboard-ctl"
 
     if [ ! -x "$switchboard_ctl_target" ]; then
@@ -119,7 +119,7 @@ therefore refuses to replace an existing command:
 
 ```bash
 (
-    switchboard_ctl_target="$HOME/.config/switchboard/bin/switchboard-ctl"
+    switchboard_ctl_target="$HOME/.local/share/switchboard/current/switchboard-ctl"
     if [ ! -x "$switchboard_ctl_target" ]; then
         echo "missing executable $switchboard_ctl_target" >&2
         exit 1
@@ -150,42 +150,20 @@ batch-authentication failure. Exit 2 accompanied by usage text which omits
 `remote-stream` means the remote `switchboard-ctl` is older than the federation
 feature or otherwise mismatched with the daemon.
 
-For a private development install, build both remote binaries from the same
-checkout and replace their stable targets atomically. Staging inside the target
-directory keeps each final rename on one filesystem, so existing symlinks remain
-valid and no running executable is truncated in place:
+On the remote host, deploy the same way as anywhere else — from a checkout of
+this repository:
 
 ```bash
-(
-    set -eu
-    switchboard_repo="$HOME/Projects/switchboard"
-    switchboard_bin_dir="$HOME/.config/switchboard/bin"
-
-    if [ ! -f "$switchboard_repo/cmd/switchboard-ctl/remote_stream.go" ]; then
-        echo "checkout predates SSH federation: $switchboard_repo" >&2
-        exit 1
-    fi
-
-    install -d -m 0755 "$switchboard_bin_dir"
-    switchboard_stage="$(mktemp -d "$switchboard_bin_dir/.deploy.XXXXXX")"
-    cd "$switchboard_repo"
-    go build -o "$switchboard_stage/switchboard" ./cmd/switchboard
-    go build -o "$switchboard_stage/switchboard-ctl" ./cmd/switchboard-ctl
-    chmod 0755 "$switchboard_stage/switchboard" \
-        "$switchboard_stage/switchboard-ctl"
-    mv -T "$switchboard_stage/switchboard" "$switchboard_bin_dir/switchboard"
-    mv -T "$switchboard_stage/switchboard-ctl" \
-        "$switchboard_bin_dir/switchboard-ctl"
-    rmdir "$switchboard_stage"
-)
+cd ~/Projects/switchboard && scripts/deploy
 ```
 
-Restart the remote daemon after both renames:
+That builds the daemon and the control client from one revision, stages them so
+each rename stays on one filesystem, flips `current`, restarts the unit and then
+verifies the running process. See [Deploying a release](#deploying-a-release).
 
-```bash
-systemctl --user daemon-reload
-systemctl --user restart switchboard.service
-```
+Deploying both halves from one revision matters here specifically: a
+`switchboard-ctl` older than the daemon is what produces the exit-2 usage output
+described above.
 
 The client-side SSH worker needs no restart: its next retry executes the new
 control binary. Before a first frame arrives, the client journal shows repeated
@@ -221,7 +199,7 @@ If this host runs a development `switchboard-ctl`, override only the value:
 ```ini
 # ~/.config/systemd/user/switchboard-waybar.service.d/20-machine.conf
 [Service]
-Environment=SWITCHBOARD_CTL=/home/alice/.config/switchboard/bin/switchboard-ctl
+Environment=SWITCHBOARD_CTL=/home/alice/.local/share/switchboard/current/switchboard-ctl
 ```
 
 Build that helper alongside the daemon selected by `SWITCHBOARD_BIN`. The
@@ -252,6 +230,141 @@ systemctl --user start graphical-session.target
 ```
 
 Do not also launch `polybar -c ... switchboard` from i3 once the unit owns it.
+
+## Deploying a release
+
+A deployment is one immutable directory per revision plus a `current` symlink:
+
+```text
+~/.local/share/switchboard/
+  releases/42485f2/{switchboard,switchboard-ctl,switchboard-waybar}
+  releases/2f60aef/…
+  current -> releases/42485f2
+```
+
+Everything that runs a Switchboard binary resolves through `current`, so one
+atomic rename moves the whole set together and a rollback is the same rename
+backwards. Nothing is written in place, so no running executable is truncated
+and the daemon and its control client can never be left as a half-updated pair.
+
+Deploy with `scripts/deploy`. It builds every command with the revision stamped
+in, installs the shared units and this host's overlay, flips `current`, restarts
+the units, and then **verifies the running process** before reporting success:
+
+```bash
+scripts/deploy            # build, install, flip, restart, verify
+scripts/deploy --dry-run  # print every action, change nothing
+scripts/deploy --status   # what is deployed, running, and linked
+scripts/deploy --rollback # flip to the previous release and restart
+```
+
+### Why the script verifies instead of trusting the restart
+
+`systemctl restart` reports `active` whether or not new code landed. A deploy
+that quietly kept the old binary produces a healthy unit, a clean journal, and
+no signal of any kind. Ordering a restart is therefore not evidence, and the
+script treats it as such — it asks the live process what it is:
+
+```bash
+pid=$(systemctl --user show switchboard.service -p MainPID --value)
+"$(readlink -f "/proc/$pid/exe")" -version
+```
+
+Reading the answer from `/proc` means neither the unit file, the symlink, nor
+the deploy's own expectations can launder it. When it disagrees with the
+revision being shipped, the script flips back to the previous release and exits
+non-zero. Four checks guard a deploy, in order:
+
+1. **Wrong tree.** Refuses when the live revision is absent from the repository
+   being built. More than one clone of this module can exist on a machine, with
+   the same module path and the same command names, so building in the wrong
+   directory replaces the right binaries at exit 0. A tree that cannot account
+   for what is already deployed is the signature of exactly that.
+2. **Downgrade.** Refuses when the new revision is an ancestor of the live one.
+3. **Stamp.** Every staged binary must report the revision it was built with, so
+   a broken `-ldflags` path is caught before anything goes live rather than
+   silently disabling version reporting.
+4. **Running process.** The check above.
+
+Pass `--allow-downgrade` or `--allow-dirty` to override the first three
+deliberately. Dirtiness is asked of `git status`, never read from the build
+stamp: Go marks a *clean* linked worktree as modified, so under a
+worktree-per-branch workflow that stamp is true almost always and cannot gate
+anything.
+
+### Stable command names
+
+`scripts/deploy` publishes the commands into `~/.local/bin` as symlinks pointing
+through `current`:
+
+```text
+~/.local/bin/switchboard-ctl -> ~/.local/share/switchboard/current/switchboard-ctl
+```
+
+Desktop configuration should reference **these** paths — a waybar module, a
+Hyprland bind, a wezterm hook, a swayidle timeout. The point is ownership:
+`~/go/bin` belongs to the Go toolchain and a release directory changes every
+deploy, so neither is a name configuration should have to know. Pointing at the
+published link means config is written once and the deploy owns the indirection.
+
+`SWITCHBOARD_LINK_DIR` relocates the links, or disables them when set empty.
+
+The links must be **symlinks, never copies**. A copy does not follow a deploy;
+it keeps serving whatever revision it was copied from, indefinitely and
+silently. `scripts/deploy` refuses to proceed when one of these names is a
+regular file, and warns about any file under `~/.config` still naming a
+deployed command in `~/go/bin`.
+
+Do not use `go install` to deploy this project. It writes to `~/go/bin`, which
+no unit reads, so the restart afterwards succeeds against the old binary.
+
+## Deployed layout on goosebook
+
+Recorded 2026-08-27 at `42485f2`. This host is Hyprland + Waybar;
+`switchboard-polybar.service` is not installed.
+
+| What | Path |
+| --- | --- |
+| Releases | `~/.local/share/switchboard/releases/<rev>/` |
+| Live release | `~/.local/share/switchboard/current` |
+| Published commands | `~/.local/bin/switchboard{,-ctl,-waybar}` |
+| Host overlay (in repo) | `hosts/goosebook/systemd/` |
+
+Both units take their values from the installed overlay:
+
+```ini
+# ~/.config/systemd/user/switchboard.service.d/20-machine.conf
+[Service]
+Environment=SWITCHBOARD_BIN=%h/.local/share/switchboard/current/switchboard
+Environment="SWITCHBOARD_ARGS=-remote nlessfun"
+```
+
+```ini
+# ~/.config/systemd/user/switchboard-waybar.service.d/20-machine.conf
+[Service]
+Environment=SWITCHBOARD_CTL=%h/.local/share/switchboard/current/switchboard-ctl
+```
+
+The federation peer belongs in that overlay and not in
+`systemd/switchboard.service`: that file is shared across machines, its shipped
+`SWITCHBOARD_ARGS` is pinned empty by `systemd/service_test.go`, and
+`install -Dm644` reverts an in-place edit without a word. `hosts/hosts_test.go`
+pins that the overlay keeps carrying a peer, and that no host ever points a unit
+at `~/go/bin` or at a release directory — pinning a release would defeat the
+flip.
+
+### Drop-in ordering is a hazard
+
+systemd merges drop-ins in **lexical filename order**, so a leftover file wins
+on its name alone. `local-binary.conf` sorts after `20-machine.conf` and would
+be applied last, holding both units on the previous binary path while the deploy
+reported success. `scripts/deploy` detects a later drop-in setting
+`SWITCHBOARD_BIN` or `SWITCHBOARD_CTL` and refuses with the removal command.
+
+Keep one host's values in one drop-in for the same reason: splitting the binary
+path and the argument list across two files makes the effective configuration
+depend on their filenames.
+
 
 ## Switching a host
 
