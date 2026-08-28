@@ -32,14 +32,15 @@ func canonicalSnapshot() Snapshot {
 		SchemaVersion: CurrentSchemaVersion,
 		Sessions: []Session{
 			{
-				PID:       4821,
-				CWD:       "/home/tjmisko/Projects/switchboard",
-				TTY:       "/dev/pts/3",
-				StartedAt: time.Date(2026, 5, 28, 9, 0, 0, 0, time.UTC),
-				Focused:   true,
-				Suspended: true,
-				Headless:  true,
-				Agent:     AgentKindClaude,
+				PID:          4821,
+				CWD:          "/home/tjmisko/Projects/switchboard",
+				TTY:          "/dev/pts/3",
+				StartedAt:    time.Date(2026, 5, 28, 9, 0, 0, 0, time.UTC),
+				Focused:      true,
+				Suspended:    true,
+				Headless:     true,
+				Agent:        AgentKindClaude,
+				ResolvedName: "manual-session-name",
 				Wezterm: &WeztermInfo{
 					MuxPID:      4790,
 					MuxSocket:   "/run/user/1000/wezterm/gui-sock-4790",

@@ -70,6 +70,15 @@ type Session struct {
 	// DisplayName is Switchboard-owned Codex display metadata. It is valid only
 	// for its exact conversation_id and never changes Codex's native thread name.
 	DisplayName *DisplayName `json:"display_name,omitempty"`
+	// ResolvedName is the provider host's current display name before project
+	// prefixing. The host that owns the process is the only machine that can
+	// safely resolve Claude's PID-keyed session file; federated consumers carry
+	// this projection instead of looking up the same PID in their local process
+	// namespace. Codex does not need this projection: its generated display name
+	// and authoritative native /rename already travel in provider state. It is
+	// refreshed by the reconciler and omitted until the first successful naming
+	// pass.
+	ResolvedName string `json:"resolved_name,omitempty"`
 
 	Wezterm  *WeztermInfo  `json:"wezterm,omitempty"`
 	Hyprland *HyprlandInfo `json:"hyprland,omitempty"`

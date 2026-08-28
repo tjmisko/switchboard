@@ -10,6 +10,7 @@
       "suspended": true,
       "headless": true,
       "agent": "claude",
+      "resolved_name": "manual-session-name",
       "wezterm": {
         "mux_pid": 4790,
         "mux_socket": "/run/user/1000/wezterm/gui-sock-4790",

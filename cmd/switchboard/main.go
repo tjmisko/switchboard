@@ -877,6 +877,16 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 		item.dead = sessionDead(stack.OSProc, before.PID)
 		if !item.dead {
 			resolveSession(ctx, resolver, &item.after, panes, clients, now)
+			// Resolve the session name on the machine that owns the process. In
+			// particular, Claude's authoritative file is keyed only by PID, so a
+			// federated reader cannot safely repeat this lookup in its own namespace.
+			if item.after.Agent == state.AgentKindClaude {
+				item.after.ResolvedName = rstate.names.RawName(item.after)
+			} else {
+				// Codex naming state is already conversation-bound on the wire. Clear
+				// any value hydrated from a build that projected every provider.
+				item.after.ResolvedName = ""
+			}
 			if processState, err := proc.State(before.PID); err == nil {
 				suspended := proc.Suspended(processState)
 				item.suspended = &suspended
@@ -917,6 +927,7 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 			// Only detached, already-resolved values are copied under the lock.
 			sess.Wezterm = item.after.Wezterm
 			sess.Hyprland = item.after.Hyprland
+			sess.ResolvedName = item.after.ResolvedName
 			// Refresh job-control suspension (Ctrl-Z). On ErrGone the sweep above has
 			// already dropped the session, so this only ever sees a live pid; leave
 			// the last-known value on any other read error rather than flapping. A
