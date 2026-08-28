@@ -33,6 +33,14 @@ func TestTmuxPaneRefShouldCarryTheHandleAndTTY(t *testing.T) {
 	}
 }
 
+func TestTmuxPaneRefShouldStripTheSpinnerFromTheWindowTitle(t *testing.T) {
+	first := tmuxPaneRef(tmuxPane{TTY: "/dev/pts/5", PaneID: "%3", WindowName: "⠋ project"})
+	second := tmuxPaneRef(tmuxPane{TTY: "/dev/pts/5", PaneID: "%3", WindowName: "⠙ project"})
+	if first != second || first.WindowTitle != "project" {
+		t.Fatalf("spinner-only tmux window-name change produced distinct refs: first=%+v second=%+v", first, second)
+	}
+}
+
 // Activate refuses a ref with no pane handle rather than running a bogus tmux
 // command.
 func TestTmuxActivateRequiresHandle(t *testing.T) {

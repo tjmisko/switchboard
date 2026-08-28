@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/tjmisko/switchboard/internal/panetitle"
 )
 
 // tmuxLocator drives the `tmux` CLI. A claude running inside tmux has its
@@ -103,7 +105,7 @@ func tmuxPaneRef(p tmuxPane) PaneRef {
 	return PaneRef{
 		Backend:     "tmux",
 		Handle:      p.PaneID,
-		WindowTitle: p.WindowName,
+		WindowTitle: panetitle.Normalize(p.WindowName),
 		TTY:         p.TTY,
 		CWD:         p.CWD,
 	}

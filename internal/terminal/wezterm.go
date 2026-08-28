@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/tjmisko/switchboard/internal/panetitle"
 	"github.com/tjmisko/switchboard/internal/wezterm"
 )
 
@@ -76,7 +77,7 @@ func weztermPaneRef(p wezterm.Pane) PaneRef {
 		TabID:       p.TabID,
 		WindowID:    p.WindowID,
 		Title:       p.Title,
-		WindowTitle: p.WindowTitle,
+		WindowTitle: panetitle.Normalize(p.WindowTitle),
 		TTY:         p.TTYName,
 		CWD:         decodeCWD(p.CWDURL),
 	}

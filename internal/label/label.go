@@ -23,14 +23,11 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/tjmisko/switchboard/internal/panetitle"
 	"github.com/tjmisko/switchboard/internal/projectname"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/transcript"
 )
-
-// spinnerPrefixes are the leading glyphs Claude Code writes onto the wezterm
-// window title while working; we strip them so the bare name shows.
-var spinnerPrefixes = []string{"✳ ", "⠂ ", "⠐ ", "⠁ ", "⠈ ", "⠠ ", "⠄ ", "⡀ ", "⢀ "}
 
 // RawName picks the human name for a session before project prefixing. Codex
 // uses a conversation-matching Switchboard display name, then an authoritative
@@ -83,15 +80,10 @@ func rawName(s state.Session, claudeName func(pid int) string) string {
 		if n := claudeName(s.PID); n != "" {
 			return n
 		}
-		if s.Wezterm != nil && s.Wezterm.WindowTitle != "" {
-			title := s.Wezterm.WindowTitle
-			for _, p := range spinnerPrefixes {
-				if rest, ok := strings.CutPrefix(title, p); ok {
-					title = rest
-					break
-				}
+		if s.Wezterm != nil {
+			if title := panetitle.Normalize(s.Wezterm.WindowTitle); title != "" {
+				return title
 			}
-			return title
 		}
 	}
 	if s.CWD != "" {

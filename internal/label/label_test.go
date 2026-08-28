@@ -59,13 +59,29 @@ func TestRawName_prefersClaudeSessionName(t *testing.T) {
 func TestRawName_fallsBackToWindowTitleStrippingSpinner(t *testing.T) {
 	// HOME points at an empty temp dir, so there is no sessions file.
 	t.Setenv("HOME", t.TempDir())
+	for _, title := range []string{"✳ assess-npm", "⠹ assess-npm"} {
+		t.Run(title, func(t *testing.T) {
+			s := state.Session{
+				PID:     4243,
+				CWD:     "/home/u/Projects/Arachne",
+				Wezterm: &state.WeztermInfo{WindowTitle: title},
+			}
+			if got := RawName(s); got != "assess-npm" {
+				t.Errorf("RawName = %q, want assess-npm", got)
+			}
+		})
+	}
+}
+
+func TestRawName_fallsBackToCwdWhenWindowTitleIsOnlySpinners(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	s := state.Session{
 		PID:     4243,
 		CWD:     "/home/u/Projects/Arachne",
-		Wezterm: &state.WeztermInfo{WindowTitle: "✳ assess-npm"},
+		Wezterm: &state.WeztermInfo{WindowTitle: "⠋ ⠙"},
 	}
-	if got := RawName(s); got != "assess-npm" {
-		t.Errorf("RawName = %q, want assess-npm", got)
+	if got := RawName(s); got != "Arachne" {
+		t.Errorf("RawName = %q, want cwd fallback Arachne", got)
 	}
 }
 

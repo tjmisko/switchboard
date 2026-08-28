@@ -98,6 +98,17 @@ func TestMatchUniqueClientNormalizesActivitySpinners(t *testing.T) {
 	}
 }
 
+func TestMatchUniqueClientJoinsAnAlreadyNormalizedPaneTitleToASpinningWMTitle(t *testing.T) {
+	// The terminal seam already normalizes the pane title. A malformed double
+	// spinner on the independently sampled WM side still has to reach the same
+	// fixed point or the legacy join fails.
+	clients := []wm.Window{{Address: "win", PID: 10, Title: "⠋ ⠙ Build Polybar"}}
+	got := matchUniqueClient(clients, 10, 0, "Build Polybar")
+	if got == nil || got.Address != "win" {
+		t.Fatalf("normalized pane title did not join spinning WM title: %+v", got)
+	}
+}
+
 // mapLocator serves a pre-built pane table the same way a live locator serves
 // the terminal: an unowned tty resolves to no pane, without error (the
 // terminal.Locator contract, behavior-spec §13.3). It exists so the equivalence

@@ -67,6 +67,26 @@ func TestWeztermPaneRefShouldCarryTheMuxIdentityAndDecodedCWD(t *testing.T) {
 	}
 }
 
+func TestWeztermPaneRefShouldStripTheSpinnerFromTheWindowTitle(t *testing.T) {
+	first := weztermPaneRef(wezterm.Pane{Title: "⠋ pane status", WindowTitle: "⠋ project"})
+	second := weztermPaneRef(wezterm.Pane{Title: "⠋ pane status", WindowTitle: "⠙ project"})
+	if first != second || first.WindowTitle != "project" {
+		t.Fatalf("spinner-only window-title change produced distinct refs: first=%+v second=%+v", first, second)
+	}
+}
+
+func TestWeztermPaneRefShouldLeaveThePaneOwnTitleRaw(t *testing.T) {
+	// H9's idle-glyph recovery in cmd/switchboard/main.go reads the first rune
+	// of PaneRef.Title. Normalizing it would strand a stale working chip.
+	got := weztermPaneRef(wezterm.Pane{Title: "⠋ pane status", WindowTitle: "⠋ project"})
+	if got.Title != "⠋ pane status" {
+		t.Fatalf("PaneRef.Title = %q, want the raw pane-owned title", got.Title)
+	}
+	if got.WindowTitle != "project" {
+		t.Fatalf("PaneRef.WindowTitle = %q, want normalized join title", got.WindowTitle)
+	}
+}
+
 // The none backend resolves no tty and reports focus unsupported, never erroring
 // on Locate so the daemon stays in the Observe tier.
 func TestNoneLocator(t *testing.T) {

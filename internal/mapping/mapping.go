@@ -13,10 +13,10 @@ import (
 	"context"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/tjmisko/switchboard/internal/osproc"
 	"github.com/tjmisko/switchboard/internal/panebind"
+	"github.com/tjmisko/switchboard/internal/panetitle"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/terminal"
 	"github.com/tjmisko/switchboard/internal/wm"
@@ -264,9 +264,9 @@ func matchUniqueClient(clients []wm.Window, muxPID, windowID int, windowTitle st
 		return marked.one // nil when a duplicate marker makes the exact join ambiguous
 	}
 
-	wantTitle := normalizeTitle(windowTitle)
+	wantTitle := panetitle.Normalize(windowTitle)
 	legacy := uniqueClient(clients, func(c wm.Window) bool {
-		return c.PID == muxPID && normalizeTitle(c.Title) == wantTitle
+		return c.PID == muxPID && panetitle.Normalize(c.Title) == wantTitle
 	})
 	return legacy.one
 }
@@ -290,21 +290,4 @@ func uniqueClient(clients []wm.Window, matches func(wm.Window) bool) clientMatch
 		}
 	}
 	return result
-}
-
-// spinnerPrefixes contains the leading activity glyphs coding agents place in
-// pane/window titles. The terminal and WM seams sample independently, so a
-// spinner can advance between the two reads; it is presentation, not identity.
-const spinnerPrefixes = "◐◑◒◓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✳⠂⠐⠁⠈⠠⠄⡀⢀"
-
-func normalizeTitle(title string) string {
-	title = strings.TrimSpace(title)
-	if title == "" {
-		return ""
-	}
-	r, size := utf8.DecodeRuneInString(title)
-	if strings.ContainsRune(spinnerPrefixes, r) {
-		title = title[size:]
-	}
-	return strings.TrimSpace(title)
 }
