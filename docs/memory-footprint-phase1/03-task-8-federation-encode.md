@@ -3,6 +3,13 @@
 **PR 2, with #5/#6/#7. Prereq: #6 must land first** — #8 must reuse its key, and
 gating against an un-normalized key suppresses nothing.
 
+**Implementation status (2026-08-28): complete at `f0a4448`.** The targeted
+state, federation, and in-memory RPC tests pass normally and under the race
+detector; affected-package vet, all-package compilation, and the unchanged
+publish/history invariant suite pass. The full real-socket RPC test and live
+rollout remain pending because this workspace cannot open the required Unix
+socket.
+
 ---
 
 ## Why this is not a federation-only optimization

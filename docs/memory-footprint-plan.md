@@ -780,6 +780,14 @@ journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
   - **Phase**: 1
 
 - [ ] #8: Federation View — one encode per publish, change-gated
+  - **Implementation status (2026-08-28)**: Complete at `f0a4448`, stacked on
+    #5/#7/#6. The View now change-gates one cached aggregate frame, its
+    payload-free wakeups cannot replay an older revision, and both local and
+    aggregate RPC streams splice the shared bytes. State/federation normal and
+    race suites, targeted RPC normal and race suites, affected-package vet,
+    all-package compile, and the unchanged suppression/history invariants pass.
+    The full RPC socket test and live rollout remain pending because this
+    workspace cannot open the required Unix socket.
   - **Prereqs**: #6 complete — the View must reuse the same normalized key,
     not invent a second one
   - **DoD**: `federation.View.publish()` (`internal/federation/view.go:320`)
