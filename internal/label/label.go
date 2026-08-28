@@ -57,6 +57,17 @@ func Chip(cfg projectname.Config, s state.Session) string {
 // rawName is RawName's fallback chain with the disk lookup injected, so the
 // cached and uncached paths cannot drift apart.
 func rawName(s state.Session, claudeName func(pid int) string) string {
+	// A federated PID belongs to another process namespace. Its daemon has
+	// already resolved the name against the right provider metadata and carries
+	// that answer on the snapshot. Prefer it over every local or reconstructed
+	// fallback so manual /name and /rename choices survive federation. Codex's
+	// conversation-bound display/native metadata is already federation-safe and
+	// continues through codexRawName below.
+	if s.Remote && s.Agent != state.AgentKindCodex {
+		if name := strings.TrimSpace(s.ResolvedName); name != "" {
+			return name
+		}
+	}
 	if s.Agent == state.AgentKindCodex {
 		if name := codexRawName(s); name != "" {
 			return name

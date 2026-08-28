@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -210,6 +213,60 @@ func TestShouldFallBackToPerSessionResolveWhenTheBackendCannotBatch(t *testing.T
 	snap := store.Snapshot()
 	if len(snap.Sessions) != 1 || snap.Sessions[0].PID != 6000 {
 		t.Fatalf("session did not survive a no-batch tick: %+v", snap.Sessions)
+	}
+}
+
+func TestReconcilePublishesClaudeManualNameForFederatedReaders(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sessionsDir := filepath.Join(home, ".claude", "sessions")
+	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const pid = 6001
+	namePath := filepath.Join(sessionsDir, fmt.Sprintf("%d.json", pid))
+	writeName := func(name string) {
+		t.Helper()
+		if err := os.WriteFile(namePath, []byte(fmt.Sprintf(`{"name":%q}`, name)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeName("first-manual-name")
+
+	store := state.New("")
+	startedAt := time.Now()
+	store.Apply(func(m map[int]*state.Session) {
+		m[pid] = &state.Session{
+			PID: pid, Agent: state.AgentKindClaude, CWD: "/home/test", StartedAt: startedAt,
+			Claude: &state.AgentInfo{SessionID: "session-1"},
+			AgentGraph: &state.AgentGraph{
+				RootID: "session-1", Nodes: []state.AgentNode{{ID: "session-1", Nickname: "i-d-like"}},
+			},
+		}
+	})
+	loc := terminal.NewNone()
+	manager := stubManager{}
+	stack := detect.Stack{OSProc: fakeProcSource{st: map[int]procState{pid: procAlive}}, Terminal: loc, WM: manager}
+	resolver := mapping.NewResolver(loc, manager)
+	rstate := newReconcileState(fanout.NewObserver(t.TempDir()))
+	tick := func() {
+		reconcileOnce(context.Background(), store, resolver, manager, stack,
+			statustune.Default(), nil, rstate, func(int) {})
+	}
+
+	tick()
+	if got := store.Snapshot().Sessions[0].ResolvedName; got != "first-manual-name" {
+		t.Fatalf("resolved_name = %q, want first manual name", got)
+	}
+
+	writeName("second-manual-name")
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(namePath, future, future); err != nil {
+		t.Fatal(err)
+	}
+	tick()
+	if got := store.Snapshot().Sessions[0].ResolvedName; got != "second-manual-name" {
+		t.Fatalf("resolved_name after /rename = %q, want second manual name", got)
 	}
 }
 
