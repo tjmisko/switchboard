@@ -49,30 +49,6 @@ type Session struct {
 	// leave it false/omitted, preserving the durable schema.
 	Navigable bool `json:"navigable,omitempty"`
 
-	// Stale is populated only on detached aggregate copies of REMOTE rows. It
-	// says the row is being held from the last frame its host actually sent:
-	// contact is currently lost, so the values below were true when last
-	// observed and are not being refreshed. It is deliberately NOT set for the
-	// first few seconds of a lost stream — see remotestate's quiet window — so
-	// an SSH hiccup that reconnects before anything could have changed produces
-	// no visible edge at all. Renderers dim a stale chip; it stays navigable,
-	// because the LOCAL pane displaying that session is still exactly where it
-	// was and focusing it is still the right answer.
-	Stale bool `json:"stale,omitempty"`
-	// LastContact is the CLIENT's clock at the last frame accepted from this
-	// row's host, stamped only while Stale is set. It is a local observation
-	// timestamp, never a remote one: cross-host clocks are not comparable, and
-	// the only honest thing the aggregate can say is how long IT has been out of
-	// touch. A pointer so it omits cleanly on every other row, and so it is
-	// encoded exactly like started_at.
-	//
-	// Only stamped on stale rows on purpose: a freshness stamp on every remote
-	// row would move on every frame, and snapshotChangeKey compares every tagged
-	// field — so it would republish the whole aggregate to every waybar slot on
-	// every remote tick. Stamped at the stale edge, it moves exactly twice per
-	// disconnect.
-	LastContact *time.Time `json:"last_contact,omitempty"`
-
 	// Agent names the coding-agent CLI that owns this session: "claude" or
 	// "codex" (the AgentKind* constants). Set at discovery from the process. It
 	// selects which enrichment block (claude/codex) hooks write and how a
@@ -677,27 +653,6 @@ func (s *Store) invalidatePublished(gen uint64) {
 // `status != info.Status` guard, and each of the reconciler's self-heals stamps it
 // on the same line it assigns a new Status. It moves on a status edge and nowhere
 // else, so a moved status_since is a real change that must reach the bar.
-// ObservablyEqual reports whether two snapshots are indistinguishable to any
-// consumer — the same test Apply uses to decide whether publishing is pure
-// noise, exported for the one other place that has to make it: the federated
-// client, deciding whether a re-sent remote keepalive frame carries news.
-//
-// It is deliberately the SAME function rather than a second comparator written
-// against the same struct. A remote frame arrives as JSON and is re-encoded to
-// compare, so a field added to Session is covered here by construction, exactly
-// as it is for the local publish gate.
-//
-// Encode failure compares unequal (see snapshotChangeKey): a keepalive is then
-// treated as news and republished, which costs one redundant frame rather than
-// silently freezing a bar on a stale row.
-func ObservablyEqual(a, b Snapshot) bool {
-	keyA, keyB := snapshotChangeKey(a), snapshotChangeKey(b)
-	if keyA == nil || keyB == nil {
-		return false
-	}
-	return bytes.Equal(keyA, keyB)
-}
-
 func snapshotChangeKey(snap Snapshot) []byte {
 	key, err := json.Marshal(struct {
 		SchemaVersion int           `json:"schema_version"`

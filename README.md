@@ -245,9 +245,10 @@ ssh -n -T … <destination> switchboard-ctl remote-stream
 ```
 
 The remote command exports only that machine's complete local snapshots. It
-does not expose an action channel. The remote machine needs `switchboard`
-running and a compatible `switchboard-ctl` on its SSH `PATH`; ordinary SSH
-host-key checking and batch authentication must already work.
+does not expose an action channel, and a disconnected host disappears from the
+aggregate immediately. The remote machine needs `switchboard` running and a
+compatible `switchboard-ctl` on its SSH `PATH`; ordinary SSH host-key checking
+and batch authentication must already work.
 
 That `PATH` is the one used by a **noninteractive SSH command**, not necessarily
 the one in an interactive terminal. A `SWITCHBOARD_BIN` systemd override also
@@ -260,47 +261,6 @@ directory on that exact noninteractive path as described in
 If the command resolves but prints usage which omits `remote-stream` and exits
 2, the remote `switchboard-ctl` predates federation; deploy the daemon and
 control binary from the same current revision.
-
-### Held remote rows
-
-An SSH stream's health and a remote session's existence are different facts. A
-flaky link used to erase both: any disconnect removed every row that stream
-carried, so a two-second reconnect blanked and restored a whole host's chips.
-
-The client now answers two questions separately.
-
-**Did the peer say it was going away?** `switchboard-ctl remote-stream` writes a
-final *closeout* frame when it is signalled to stop — which is what a host
-shutdown and a manual stop both look like — and the client drops that host's
-rows at once. This is the responsive path, and it is why a machine going down
-does not linger on the bar.
-
-It deliberately does **not** close out when its own daemon socket drops. A
-`systemctl restart switchboard` on the remote leaves every agent session on that
-machine running, so the client should keep showing them across the gap.
-
-**Or did we merely stop being able to hear it?** Then the host's last
-observation is held, and passes through three phases:
-
-| Phase | Window | What you see |
-|---|---|---|
-| quiet | 0 – `-remote-quiet` (6s) | nothing at all. A reconnect inside this window is invisible. |
-| stale | up to `-remote-hold` (45s) | rows held, dimmed, tooltip reads `stale (no contact 12s)`. Still clickable. |
-| dropped | at `-remote-hold` | rows removed and their routes invalidated. |
-
-A held row stays navigable on purpose: what a click focuses is the **local**
-terminal pane displaying that SSH session, and losing the state stream says
-nothing about where that window is. Losing contact is precisely when you are
-most likely to want to look at it.
-
-Set `-remote-hold 0` to restore immediate removal.
-
-Because holding absorbs a disconnect, the client can afford to *detect* one
-faster: SSH keepalives are set to declare a dead link in ~15s, and a remote
-re-sends its current snapshot every 10s so a silent black hole marks rows stale
-without waiting for SSH to give up. Fast detection and hysteresis are
-complements, not alternatives. A remote too old to send those keepalives is
-fully supported — it simply falls back to transport-level detection.
 
 Sessions are live-namespaced by `(hostname,pid)`. Actions also carry
 `started_at`, Switchboard's discovery timestamp, as a best-effort stale-action
@@ -522,18 +482,6 @@ A chip whose `claude` process is job-control-stopped (Ctrl-Z) gains the
 ```css
 #custom-claude-0.suspended, #custom-claude-1.suspended, /* … through -9 */ {
   opacity: 0.4;
-}
-```
-
-A remote chip whose SSH stream has gone quiet gains the `stale` class — the
-client is holding that host's last observation while it tries to reconnect (see
-[Held remote rows](#held-remote-rows)). Keep the status colour and take the
-certainty away:
-
-```css
-#custom-claude-0.stale, #custom-claude-1.stale, /* … through -9 */ {
-  opacity: 0.55;
-  border-style: dashed;
 }
 ```
 

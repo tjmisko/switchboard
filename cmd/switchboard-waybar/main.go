@@ -224,13 +224,6 @@ func renderSlot(snap state.Snapshot, slot int, availPx float64, metrics barlayou
 	if s.Hostname != "" && !s.Navigable {
 		classes = append(classes, "unnavigable")
 	}
-	// A held remote row: the values are the last ones its host actually sent and
-	// nothing is refreshing them. The chip keeps its status color — the honest
-	// report is "this WAS working", not "this is unknown" — and the CSS dims it.
-	// It stays clickable, because the local pane it focuses has not moved.
-	if s.Stale {
-		classes = append(classes, "stale")
-	}
 	return waybarOutput{
 		Text:    labels[slot],
 		Tooltip: sessionTooltip(cfg, cache, s, time.Now()),
@@ -346,14 +339,6 @@ func sessionTooltip(cfg projectname.Config, cache *sblabel.NameCache, s state.Se
 	}
 	if s.Suspended {
 		statusText += " · suspended"
-	}
-	// Say it before every other annotation: the reader needs to know the whole
-	// line describes the past before they read what it says.
-	if s.Stale {
-		statusText += " · stale"
-		if d := durfmt.Since(s.LastContact, now); d != "" {
-			statusText += " (no contact " + d + ")"
-		}
 	}
 	if s.Headless {
 		statusText += " · headless (claude -p)"
