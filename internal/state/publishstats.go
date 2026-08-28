@@ -49,19 +49,19 @@ type publishCounters struct {
 
 // PublishStats is one closed window of publish accounting plus the process
 // memory figures sampled when the window closed. Every count is scoped to the
-// window; Subscribers and the three memory figures are instantaneous readings
+// window; StoreSubscribers and the three memory figures are instantaneous readings
 // at sample time, because neither a mean subscriber count nor a mean heap is a
 // number anyone would act on.
 type PublishStats struct {
-	Window      time.Duration
-	Publishes   uint64
-	Suppressed  uint64
-	Subscribers int
-	Frames      uint64
-	FrameBytes  uint64 // total over Frames; see MeanFrameBytes
-	HeapAllocMB uint64
-	HeapSysMB   uint64
-	VmHWMMB     uint64
+	Window           time.Duration
+	Publishes        uint64
+	Suppressed       uint64
+	StoreSubscribers int
+	Frames           uint64
+	FrameBytes       uint64 // total over Frames; see MeanFrameBytes
+	HeapAllocMB      uint64
+	HeapSysMB        uint64
+	VmHWMMB          uint64
 }
 
 // MeanFrameBytes is the mean size of the frames actually encoded in the window,
@@ -85,8 +85,8 @@ func (p PublishStats) MeanFrameBytes() uint64 {
 // any other interval (a test's, or a future flag's) and exposes a tick the
 // scheduler delayed.
 func (p PublishStats) Line() string {
-	return fmt.Sprintf("publish-stats: publishes=%d suppressed=%d subscribers=%d frame_bytes=%d heap_alloc_mb=%d heap_sys_mb=%d vm_hwm_mb=%d window=%s",
-		p.Publishes, p.Suppressed, p.Subscribers, p.MeanFrameBytes(),
+	return fmt.Sprintf("publish-stats: publishes=%d suppressed=%d store_subscribers=%d frame_bytes=%d heap_alloc_mb=%d heap_sys_mb=%d vm_hwm_mb=%d window=%s",
+		p.Publishes, p.Suppressed, p.StoreSubscribers, p.MeanFrameBytes(),
 		p.HeapAllocMB, p.HeapSysMB, p.VmHWMMB, p.Window.Round(time.Second))
 }
 
@@ -159,12 +159,12 @@ func (s *Store) SamplePublishStats() PublishStats {
 		Window:      now.Sub(window.since),
 		Publishes:   window.publishes,
 		Suppressed:  window.suppressed,
-		Subscribers: subscribers,
-		Frames:      window.frames,
-		FrameBytes:  window.frameBytes,
-		HeapAllocMB: ms.HeapAlloc >> 20,
-		HeapSysMB:   ms.HeapSys >> 20,
-		VmHWMMB:     uint64(proc.VmHWMKB()) >> 10,
+		StoreSubscribers: subscribers,
+		Frames:           window.frames,
+		FrameBytes:       window.frameBytes,
+		HeapAllocMB:      ms.HeapAlloc >> 20,
+		HeapSysMB:        ms.HeapSys >> 20,
+		VmHWMMB:          uint64(proc.VmHWMKB()) >> 10,
 	}
 }
 

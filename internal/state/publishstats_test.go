@@ -94,24 +94,24 @@ func TestSamplePublishStats_reportsZeroCountsWhenNothingAppliedSinceTheLastSampl
 	}
 }
 
-// Subscribers is an instantaneous reading, and it is the number that says
+// StoreSubscribers is an instantaneous reading, and it is the number that says
 // whether a publish costs one encode and N wakeups or nothing at all.
 func TestSamplePublishStats_reportsTheCurrentSubscriberCount(t *testing.T) {
 	store := state.New("")
-	if got := store.SamplePublishStats(); got.Subscribers != 0 {
-		t.Fatalf("Subscribers = %d on a fresh store, want 0", got.Subscribers)
+	if got := store.SamplePublishStats(); got.StoreSubscribers != 0 {
+		t.Fatalf("StoreSubscribers = %d on a fresh store, want 0", got.StoreSubscribers)
 	}
 
 	_, cancelA := store.Subscribe()
 	_, cancelB := store.Subscribe()
-	if got := store.SamplePublishStats(); got.Subscribers != 2 {
-		t.Errorf("Subscribers = %d, want 2", got.Subscribers)
+	if got := store.SamplePublishStats(); got.StoreSubscribers != 2 {
+		t.Errorf("StoreSubscribers = %d, want 2", got.StoreSubscribers)
 	}
 
 	cancelA()
 	cancelB()
-	if got := store.SamplePublishStats(); got.Subscribers != 0 {
-		t.Errorf("Subscribers = %d after both cancels, want 0", got.Subscribers)
+	if got := store.SamplePublishStats(); got.StoreSubscribers != 0 {
+		t.Errorf("StoreSubscribers = %d after both cancels, want 0", got.StoreSubscribers)
 	}
 }
 
@@ -188,10 +188,10 @@ func TestSamplePublishStats_reportsTheElapsedWindowSinceTheLastSample(t *testing
 // parsing it (journalctl -g, docs/telemetry.md) reads these exact keys.
 func TestPublishStatsLine_rendersEveryFieldInOrder(t *testing.T) {
 	stats := state.PublishStats{
-		Window: 60 * time.Second, Publishes: 3, Suppressed: 281, Subscribers: 11,
+		Window: 60 * time.Second, Publishes: 3, Suppressed: 281, StoreSubscribers: 11,
 		Frames: 3, FrameBytes: 41100, HeapAllocMB: 5, HeapSysMB: 33, VmHWMMB: 51,
 	}
-	want := "publish-stats: publishes=3 suppressed=281 subscribers=11 frame_bytes=13700 heap_alloc_mb=5 heap_sys_mb=33 vm_hwm_mb=51 window=1m0s"
+	want := "publish-stats: publishes=3 suppressed=281 store_subscribers=11 frame_bytes=13700 heap_alloc_mb=5 heap_sys_mb=33 vm_hwm_mb=51 window=1m0s"
 	if got := stats.Line(); got != want {
 		t.Errorf("Line() =\n  %s\nwant\n  %s", got, want)
 	}
@@ -201,7 +201,7 @@ func TestPublishStatsLine_rendersEveryFieldInOrder(t *testing.T) {
 // the daemon is gone, never that it is idle.
 func TestPublishStatsLine_rendersZeroesForAWindowWithNoActivity(t *testing.T) {
 	line := state.PublishStats{Window: time.Minute}.Line()
-	for _, want := range []string{"publishes=0", "suppressed=0", "subscribers=0", "frame_bytes=0"} {
+	for _, want := range []string{"publishes=0", "suppressed=0", "store_subscribers=0", "frame_bytes=0"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("Line() = %q, want it to contain %q", line, want)
 		}

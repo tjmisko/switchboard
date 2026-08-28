@@ -23,9 +23,9 @@
 #              Every newline-delimited JSON object is one published frame. The
 #              daemon sends one snapshot on connect before any publish, so the
 #              publish rate subtracts that first frame; mean frame bytes is
-#              over all frames. Multiply the byte rate by the subscriber count
-#              for what the daemon actually encodes: with -remote configured
-#              every subscriber rebuilds and re-encodes the aggregate itself
+#              over all frames. Multiply the byte rate by the socket-connection
+#              count for an upper bound on what clients collectively encode:
+#              every subscribe-all client rebuilds and re-encodes the aggregate
 #              (`rpc.subscribeAll`, internal/rpc/rpc.go).
 #
 # HAZARD — the capture must hold its write half open for the whole window.
@@ -58,7 +58,7 @@
 # BASELINE — 2026-08-26T17:00:08-07:00, goosebook (Asahi arm64, 16K pages,
 # Go 1.26.5, 15.2 GiB RAM), default 15 s capture, capture_status=ok.
 # CENSUS: 7 sessions (4 claude, 3 codex; 3 of them remote over the nlessfun
-# federation link), 11 subscribers (10 waybar slots + bottombar watch), bottom
+# federation link), 11 socket connections (10 waybar slots + bottombar watch), bottom
 # bar up, both local Codex TUIs actively spinning.
 #
 #   units      switchboard.service            109.4 MB cur / 199.0 MB peak / 63.8 MB anon
@@ -69,7 +69,7 @@
 #              49.3 MB, remote_stream 9.2 MB, 10 waybar slots 10.7 MB each,
 #              GTK waybar 25.6 MB, bottombar watch 11.1 MB
 #   churn      7.9 publishes/s, 19.8 KB mean frame, 158.6 KB/s encoded per
-#              subscriber, 1.7 MB/s across 11 subscribers
+#              connection, 1.7 MB/s across 11 socket connections
 #
 # Plan §1.2 recorded 9.4/s at 13.7 KB with 2 Codex sessions and fewer sessions
 # in the snapshot; the frame has grown with the session count since. That is
@@ -363,9 +363,9 @@ awk -F'\t' -v barfile="$bar_procs" -v wantpid="$socket_pid" '
 # `encoded ... xN` line overstates fan-out by ~1/N. Treat it as an upper bound.
 # Field 5 is the local address; matching it exactly rather than by substring
 # keeps a neighbouring socket (`<path>.old`, `<path>2`) from being counted.
-subscribers='-'
+socket_connections='-'
 if command -v ss >/dev/null 2>&1; then
-	subscribers=$(ss -x 2>/dev/null | awk -v p="$socket" '$2 == "ESTAB" && $5 == p' | wc -l)
+	socket_connections=$(ss -x 2>/dev/null | awk -v p="$socket" '$2 == "ESTAB" && $5 == p' | wc -l)
 fi
 
 timestamp=$(date -Is)
@@ -499,9 +499,9 @@ awk -F'\t' '
 	}
 ' "$tmp/units.tsv" "$tmp/procs.tsv"
 
-printf '\nchurn  %ss subscribe-all, %s live subscribers, %s\n' "$elapsed" "$subscribers" "$census_label"
+printf '\nchurn  %ss subscribe-all, %s live socket connections, %s\n' "$elapsed" "$socket_connections" "$census_label"
 awk -v n="$frames" -v pub="$publishes" -v rate="$rate" -v mean="$mean" \
-	-v total="$total_bytes" -v el="$elapsed" -v subs="$subscribers" -v st="$capture_status" '
+	-v total="$total_bytes" -v el="$elapsed" -v conns="$socket_connections" -v st="$capture_status" '
 	function hum(b,   u, i) {
 		u[1] = "B"; u[2] = "KB"; u[3] = "MB"; u[4] = "GB"
 		i = 1
@@ -517,9 +517,9 @@ awk -v n="$frames" -v pub="$publishes" -v rate="$rate" -v mean="$mean" \
 		printf "  captured        %8s\n", hum(total)
 		if (st == "ok" && el + 0 > 0) {
 			per = total / el
-			printf "  encoded         %8s /s per subscriber", hum(per)
-			if (subs != "-" && subs + 0 > 0)
-				printf "   x%d = %s /s", subs, hum(per * subs)
+			printf "  encoded         %8s /s per connection", hum(per)
+			if (conns != "-" && conns + 0 > 0)
+				printf "   x%d = %s /s", conns, hum(per * conns)
 			printf "\n"
 		}
 	}'
@@ -531,7 +531,7 @@ jq -cn \
 	--arg timestamp "$timestamp" \
 	--arg host "$(uname -n)" \
 	--arg socket "$socket" \
-	--arg subscribers "$subscribers" \
+	--arg socket_connections "$socket_connections" \
 	--arg duration "$elapsed" \
 	--arg frames "$frames" \
 	--arg publishes "$publishes" \
@@ -547,7 +547,7 @@ jq -cn \
 		timestamp: $timestamp,
 		host: $host,
 		socket: $socket,
-		subscribers: ($subscribers | n),
+		socket_connections: ($socket_connections | n),
 		sessions: $sessions,
 		units: ($units | rows | map({key: .[0], value: {
 			state: .[1],
