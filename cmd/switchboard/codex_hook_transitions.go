@@ -840,9 +840,21 @@ func codexRootStateUnavailable(runtime agentgraph.RuntimeState, attention agentg
 		(runtime == agentgraph.RuntimeUnknown || runtime == agentgraph.RuntimeNotLoaded)
 }
 
+// reduceCodexPendingInput owns the human-input prompts this root is holding.
+// The predicate here must stay exactly as wide as isCodexHumanInputPermission,
+// which is what codexHookObservation uses to raise the red: a prompt that raises
+// a red but enters no pending record is owned by nobody, so applyCodexPendingAttention
+// never re-asserts it and the next active edge from any writer republishes
+// attention=none over a live question — a silent missed RED.
+//
+// Both onset edges count. AskUserQuestion may reach the daemon as a
+// PermissionRequest and never as a PreToolUse, so widening only one edge would
+// look landed while latching nothing; opening on either is idempotent because
+// both edges key on the same tool_use_id, or on the same composite when the id
+// is absent.
 func reduceCodexPendingInput(state *codexHookRootState, req rpc.Request) (agentgraph.AttentionState, bool) {
 	ownedTransition := false
-	if req.Event == "PreToolUse" && isCodexUserInputTool(req.ToolName) {
+	if (req.Event == "PreToolUse" || req.Event == "PermissionRequest") && isCodexHumanInputPermission(req.ToolName) {
 		pending := codexPendingInput{
 			turnID: req.TurnID, toolUseID: req.ToolUseID, writer: req.AgentID,
 			toolName: req.ToolName, inputHash: req.ToolInputHash,
@@ -850,7 +862,7 @@ func reduceCodexPendingInput(state *codexHookRootState, req rpc.Request) (agentg
 		state.pending[codexPendingInputKey(pending)] = pending
 		ownedTransition = true
 	}
-	if req.Event == "PostToolUse" && isCodexUserInputTool(req.ToolName) {
+	if req.Event == "PostToolUse" && isCodexHumanInputPermission(req.ToolName) {
 		for key, pending := range state.pending {
 			if codexPendingInputMatches(pending, req) {
 				delete(state.pending, key)
@@ -860,7 +872,13 @@ func reduceCodexPendingInput(state *codexHookRootState, req rpc.Request) (agentg
 	}
 	if req.Event == "Stop" {
 		for key, pending := range state.pending {
-			if req.TurnID == "" || pending.turnID == "" || (pending.turnID == req.TurnID && pending.writer == req.AgentID) {
+			// A Stop is evidence only about its own writer's turn. Without the
+			// writer guard a sibling's Stop — which routinely carries no turn id —
+			// releases another writer's live prompt and paints a false green.
+			if pending.writer != req.AgentID {
+				continue
+			}
+			if req.TurnID == "" || pending.turnID == "" || pending.turnID == req.TurnID {
 				delete(state.pending, key)
 				ownedTransition = true
 			}
@@ -915,13 +933,23 @@ func (c *agentCoordinator) reduceCodexPendingApprovalLocked(
 		}
 	case "Stop":
 		for key, pending := range state.approvals {
-			if req.TurnID == "" || pending.turnID == "" ||
-				(pending.turnID == req.TurnID && pending.writer == req.AgentID) {
+			// Writer-scoped for the same reason as the pending-input sweep: a
+			// sibling's Stop is not evidence that this writer's gate was decided.
+			if pending.writer != req.AgentID {
+				continue
+			}
+			if req.TurnID == "" || pending.turnID == "" || pending.turnID == req.TurnID {
 				resolved = append(resolved, key)
 			}
 		}
 	case "SessionStart", "UserPromptSubmit":
-		for key := range state.approvals {
+		// A new turn from one writer says nothing about a gate another writer is
+		// still sitting at. Conversation rotation, which really does invalidate
+		// every writer, goes through clearCodexApprovalsLocked instead.
+		for key, pending := range state.approvals {
+			if pending.writer != req.AgentID {
+				continue
+			}
 			resolved = append(resolved, key)
 		}
 	}
@@ -1026,12 +1054,20 @@ func codexPendingApprovalKey(pending *codexPendingApproval) string {
 	if pending.inputHash != "" {
 		return "hash:" + pending.writer + "\x00" + pending.turnID + "\x00" + pending.toolName + "\x00" + pending.inputHash
 	}
-	return "episode:" + strconv.FormatUint(pending.episode, 10)
+	// The episode counter is already unique per root; the writer rides along so
+	// the key names the owner the writer-scoped sweeps route on.
+	return "episode:" + pending.writer + "\x00" + strconv.FormatUint(pending.episode, 10)
 }
 
+// codexPendingApprovalMatches conjoins the two id tests deliberately. Reading
+// them as a disjunction takes the id branch whenever *either* side carries an
+// id, and then fails equality against the empty one — so the composite fallback
+// is unreachable exactly when it is needed, the moment a pending opened without
+// an id meets an id-bearing edge. That silently converts a stale red into one
+// that sticks until Stop.
 func codexPendingApprovalMatches(pending *codexPendingApproval, req rpc.Request) bool {
-	if pending.toolUseID != "" || req.ToolUseID != "" {
-		return pending.toolUseID != "" && pending.toolUseID == req.ToolUseID
+	if pending.toolUseID != "" && req.ToolUseID != "" {
+		return pending.toolUseID == req.ToolUseID
 	}
 	return pending.inputHash != "" && pending.inputHash == req.ToolInputHash &&
 		pending.writer == req.AgentID && pending.turnID == req.TurnID && pending.toolName == req.ToolName
@@ -1072,9 +1108,12 @@ func codexPendingInputKey(pending codexPendingInput) string {
 	return "fallback:" + pending.writer + "\x00" + pending.turnID + "\x00" + pending.toolName + "\x00" + pending.inputHash
 }
 
+// codexPendingInputMatches conjoins the id tests for the reason spelled out on
+// codexPendingApprovalMatches. It matters more here: a PermissionRequest-opened
+// question may carry no id at all, and its PostToolUse does.
 func codexPendingInputMatches(pending codexPendingInput, req rpc.Request) bool {
-	if pending.toolUseID != "" || req.ToolUseID != "" {
-		return pending.toolUseID != "" && pending.toolUseID == req.ToolUseID
+	if pending.toolUseID != "" && req.ToolUseID != "" {
+		return pending.toolUseID == req.ToolUseID
 	}
 	return pending.inputHash != "" && pending.inputHash == req.ToolInputHash &&
 		pending.writer == req.AgentID && pending.turnID == req.TurnID && pending.toolName == req.ToolName

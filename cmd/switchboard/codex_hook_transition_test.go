@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"sort"
 	"testing"
 	"time"
 
@@ -412,5 +413,281 @@ func TestCodexCompactSessionStartRemainsWorking(t *testing.T) {
 	})
 	if graph := codexGraph(t, store); graph.Summary.Status != state.StatusWorking {
 		t.Fatalf("compact SessionStart created an idle edge: %#v", graph.Summary)
+	}
+}
+
+// A Codex AskUserQuestion raises the red through isCodexHumanInputPermission,
+// which is strictly wider than the isCodexUserInputTool predicate that opens a
+// pending record. Without an owner the question is re-asserted by nobody, so the
+// next hook edge mapping to active — from any writer — republishes
+// attention=none over a person who is still being asked a question. That is a
+// missed RED: silent, and it costs the user however long they stay away.
+func TestCodexQuestionShouldSurviveUnrelatedWriterProgressWhenOpenedByPermissionRequest(t *testing.T) {
+	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
+	base := time.Now()
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PermissionRequest", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "question-1",
+		ToolName: "AskUserQuestion", ObservedAt: base,
+	})
+	if graph := codexGraph(t, store); graph.Summary.Status != state.StatusPermission ||
+		graph.Summary.Attention != agentgraph.AttentionUserInput {
+		t.Fatalf("AskUserQuestion permission did not become waiting-for-user: %#v", graph.Summary)
+	}
+
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PostToolUse", SessionID: "thread-1", TurnID: "turn-1", AgentID: "sibling-writer",
+		ToolUseID: "exec-1", ToolName: "exec_command", ObservedAt: base.Add(time.Millisecond),
+	})
+	if graph := codexGraph(t, store); graph.Summary.Status != state.StatusPermission ||
+		graph.Summary.Attention != agentgraph.AttentionUserInput {
+		t.Fatalf("an unrelated writer's progress erased the question red: %#v", graph.Summary)
+	}
+}
+
+func codexPendingWriters(t *testing.T, coordinator *agentCoordinator, store *state.Store) []string {
+	t.Helper()
+	ref, ok := providerRootRef(store.Snapshot().Sessions[0])
+	if !ok {
+		t.Fatal("session has no provider root ref")
+	}
+	coordinator.codexHookMu.Lock()
+	defer coordinator.codexHookMu.Unlock()
+	rootState := coordinator.codexHookRoots[ref.Key()]
+	if rootState == nil {
+		return nil
+	}
+	writers := make([]string, 0, len(rootState.pending))
+	for _, pending := range rootState.pending {
+		writers = append(writers, pending.writer)
+	}
+	sort.Strings(writers)
+	return writers
+}
+
+func codexApprovalWriters(t *testing.T, coordinator *agentCoordinator, store *state.Store) []string {
+	t.Helper()
+	ref, ok := providerRootRef(store.Snapshot().Sessions[0])
+	if !ok {
+		t.Fatal("session has no provider root ref")
+	}
+	coordinator.codexHookMu.Lock()
+	defer coordinator.codexHookMu.Unlock()
+	rootState := coordinator.codexHookRoots[ref.Key()]
+	if rootState == nil {
+		return nil
+	}
+	writers := make([]string, 0, len(rootState.approvals))
+	for _, pending := range rootState.approvals {
+		writers = append(writers, pending.writer)
+	}
+	sort.Strings(writers)
+	return writers
+}
+
+func TestCodexQuestionShouldClearWhenItsOwnPostToolUseIDMatches(t *testing.T) {
+	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
+	base := time.Now()
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PermissionRequest", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "question-1",
+		ToolName: "AskUserQuestion", ObservedAt: base,
+	})
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PostToolUse", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "question-other",
+		ToolName: "AskUserQuestion", ObservedAt: base.Add(time.Millisecond),
+	})
+	if graph := codexGraph(t, store); graph.Summary.Status != state.StatusPermission {
+		t.Fatalf("another question's answer cleared this one: %#v", graph.Summary)
+	}
+
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PostToolUse", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "question-1",
+		ToolName: "AskUserQuestion", ObservedAt: base.Add(2 * time.Millisecond),
+	})
+	if graph := codexGraph(t, store); graph.Summary.Status != state.StatusWorking ||
+		graph.Summary.Attention != agentgraph.AttentionNone {
+		t.Fatalf("the answered question did not resume working: %#v", graph.Summary)
+	}
+	if writers := codexPendingWriters(t, coordinator, store); len(writers) != 0 {
+		t.Fatalf("answered question stayed owned: %v", writers)
+	}
+}
+
+// The red is bounded rather than latched: without this the question would hold
+// idle for the full 24h codexHookAttentionFreshness window when the person
+// answers in the TUI in a way that emits no PostToolUse, or interrupts.
+func TestCodexQuestionShouldClearOnItsOwnWriterStopWhenNoPostToolUseArrives(t *testing.T) {
+	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
+	base := time.Now()
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PermissionRequest", SessionID: "thread-1", TurnID: "turn-1", AgentID: "writer-a",
+		ToolUseID: "question-1", ToolName: "AskUserQuestion", ObservedAt: base,
+	})
+	if graph := codexGraph(t, store); graph.Summary.Attention != agentgraph.AttentionUserInput {
+		t.Fatalf("AskUserQuestion permission did not become waiting-for-user: %#v", graph.Summary)
+	}
+
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "Stop", SessionID: "thread-1", TurnID: "turn-1", AgentID: "writer-a",
+		ObservedAt: base.Add(time.Millisecond),
+	})
+	if graph := codexGraph(t, store); graph.Summary.Status != state.StatusIdle ||
+		graph.Summary.Attention != agentgraph.AttentionNone {
+		t.Fatalf("the owning writer's Stop did not release the question: %#v", graph.Summary)
+	}
+	if writers := codexPendingWriters(t, coordinator, store); len(writers) != 0 {
+		t.Fatalf("the owning writer's Stop left the question owned: %v", writers)
+	}
+}
+
+func TestCodexQuestionShouldSurviveSiblingStopWhenThatStopCarriesNoTurnID(t *testing.T) {
+	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
+	base := time.Now()
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PermissionRequest", SessionID: "thread-1", TurnID: "turn-1", AgentID: "writer-a",
+		ToolUseID: "question-1", ToolName: "AskUserQuestion", ObservedAt: base,
+	})
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "Stop", SessionID: "thread-1", AgentID: "writer-b", ObservedAt: base.Add(time.Millisecond),
+	})
+	if graph := codexGraph(t, store); graph.Summary.Attention != agentgraph.AttentionUserInput {
+		t.Fatalf("a sibling's turnless Stop erased another writer's question: %#v", graph.Summary)
+	}
+	if want := []string{"writer-a"}; !equalStrings(codexPendingWriters(t, coordinator, store), want) {
+		t.Fatalf("sibling Stop changed pending writers: %v, want %v", codexPendingWriters(t, coordinator, store), want)
+	}
+}
+
+func TestCodexApprovalShouldSurviveSiblingSweepsFromOtherWriters(t *testing.T) {
+	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
+	coordinator.codexApprovalGrace = time.Minute
+	base := time.Now()
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PermissionRequest", SessionID: "thread-1", TurnID: "turn-1", AgentID: "writer-a",
+		ToolUseID: "approval-1", ToolName: "exec_command", ObservedAt: base,
+	})
+	want := []string{"writer-a"}
+	if got := codexApprovalWriters(t, coordinator, store); !equalStrings(got, want) {
+		t.Fatalf("permission request was not owned: %v, want %v", got, want)
+	}
+
+	sweeps := []rpc.Request{
+		{Event: "Stop", SessionID: "thread-1", AgentID: "writer-b"},
+		{Event: "UserPromptSubmit", SessionID: "thread-1", TurnID: "turn-2", AgentID: "writer-b"},
+		{Event: "SessionStart", SessionID: "thread-1", HookSource: "compact", AgentID: "writer-b"},
+	}
+	for i, sweep := range sweeps {
+		sweep.ObservedAt = base.Add(time.Duration(i+1) * time.Millisecond)
+		sendCodexHook(coordinator, store, sweep)
+		if got := codexApprovalWriters(t, coordinator, store); !equalStrings(got, want) {
+			t.Fatalf("%s from another writer resolved writer-a's gate: %v, want %v", sweep.Event, got, want)
+		}
+	}
+
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "Stop", SessionID: "thread-1", AgentID: "writer-a", ObservedAt: base.Add(time.Second),
+	})
+	if got := codexApprovalWriters(t, coordinator, store); len(got) != 0 {
+		t.Fatalf("the owning writer's Stop did not resolve its own gate: %v", got)
+	}
+}
+
+func TestCodexPendingMatchersShouldFallBackToTheCompositeWhenOnlyOneSideCarriesAnID(t *testing.T) {
+	cases := []struct {
+		name    string
+		pending codexPendingInput
+		req     rpc.Request
+		want    bool
+	}{
+		{
+			name:    "should match on the id alone when both sides carry one",
+			pending: codexPendingInput{toolUseID: "call-1", writer: "a", turnID: "t1", toolName: "AskUserQuestion"},
+			req:     rpc.Request{ToolUseID: "call-1", AgentID: "b", TurnID: "t2", ToolName: "other"},
+			want:    true,
+		},
+		{
+			name:    "should reject on the id alone when both sides carry different ones",
+			pending: codexPendingInput{toolUseID: "call-1", writer: "a", turnID: "t1", toolName: "AskUserQuestion", inputHash: "h"},
+			req:     rpc.Request{ToolUseID: "call-2", AgentID: "a", TurnID: "t1", ToolName: "AskUserQuestion", ToolInputHash: "h"},
+			want:    false,
+		},
+		{
+			name:    "should match on the composite when only the request carries an id",
+			pending: codexPendingInput{writer: "a", turnID: "t1", toolName: "AskUserQuestion", inputHash: "h"},
+			req:     rpc.Request{ToolUseID: "call-1", AgentID: "a", TurnID: "t1", ToolName: "AskUserQuestion", ToolInputHash: "h"},
+			want:    true,
+		},
+		{
+			name:    "should match on the composite when only the pending carries an id",
+			pending: codexPendingInput{toolUseID: "call-1", writer: "a", turnID: "t1", toolName: "AskUserQuestion", inputHash: "h"},
+			req:     rpc.Request{AgentID: "a", TurnID: "t1", ToolName: "AskUserQuestion", ToolInputHash: "h"},
+			want:    true,
+		},
+		{
+			name:    "should reject the composite when the writer differs",
+			pending: codexPendingInput{writer: "a", turnID: "t1", toolName: "AskUserQuestion", inputHash: "h"},
+			req:     rpc.Request{ToolUseID: "call-1", AgentID: "b", TurnID: "t1", ToolName: "AskUserQuestion", ToolInputHash: "h"},
+			want:    false,
+		},
+		{
+			name:    "should reject the composite when neither side carries a hash",
+			pending: codexPendingInput{writer: "a", turnID: "t1", toolName: "AskUserQuestion"},
+			req:     rpc.Request{ToolUseID: "call-1", AgentID: "a", TurnID: "t1", ToolName: "AskUserQuestion"},
+			want:    false,
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := codexPendingInputMatches(testCase.pending, testCase.req); got != testCase.want {
+				t.Fatalf("codexPendingInputMatches = %t, want %t", got, testCase.want)
+			}
+			approval := &codexPendingApproval{
+				turnID: testCase.pending.turnID, toolUseID: testCase.pending.toolUseID,
+				writer: testCase.pending.writer, toolName: testCase.pending.toolName,
+				inputHash: testCase.pending.inputHash,
+			}
+			if got := codexPendingApprovalMatches(approval, testCase.req); got != testCase.want {
+				t.Fatalf("codexPendingApprovalMatches = %t, want %t", got, testCase.want)
+			}
+		})
+	}
+}
+
+// request_user_input already had an owner before this phase. Its onset, its
+// exact close and its sibling-proofing must be unchanged, or the fix for
+// AskUserQuestion has been paid for out of the path that already worked.
+func TestCodexRequestUserInputLifecycleShouldBeUnchangedWhenOpenedByPreToolUse(t *testing.T) {
+	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
+	base := time.Now()
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PreToolUse", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "question-1",
+		ToolName: "request_user_input", ObservedAt: base,
+	})
+	steps := []struct {
+		req        rpc.Request
+		wantStatus string
+	}{
+		{rpc.Request{
+			Event: "PreToolUse", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "exec-1",
+			ToolName: "exec_command",
+		}, state.StatusPermission},
+		{rpc.Request{
+			Event: "PostToolUse", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "exec-1",
+			ToolName: "exec_command",
+		}, state.StatusPermission},
+		{rpc.Request{
+			Event: "PostToolUse", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "question-other",
+			ToolName: "request_user_input",
+		}, state.StatusPermission},
+		{rpc.Request{
+			Event: "PostToolUse", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "question-1",
+			ToolName: "functions.request_user_input",
+		}, state.StatusWorking},
+	}
+	for i, step := range steps {
+		step.req.ObservedAt = base.Add(time.Duration(i+1) * time.Millisecond)
+		sendCodexHook(coordinator, store, step.req)
+		if got := codexGraph(t, store).Summary.Status; got != step.wantStatus {
+			t.Fatalf("step %d (%s %s) status = %q, want %q", i, step.req.Event, step.req.ToolName, got, step.wantStatus)
+		}
 	}
 }
