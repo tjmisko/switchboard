@@ -346,6 +346,93 @@ byte-identical call still holds. A declined question exits to idle, not green.
     the id at open time and retiring the latch for those tools — **only if** both
     probes pass. Widen further only on measurement.
 
+### 4a. Addendum — what actually landed in Phases 1–3
+
+Written by the cross-phase audit, after the three phases were reviewed together
+against the code. The numbered steps above are left as written so the plan stays
+auditable; this section records where the code and the plan diverge, and which
+DoD lines are still open. **Where they disagree, the code is right and the reason
+is at the line.**
+
+**D1 — Phase 1 step 3 landed inverted, and should have.** The plan asked to
+writer-scope the three sweeps. The `Stop` sweeps are now writer-*blind*: the
+`pending.writer == req.AgentID` conjunct the code already carried was removed
+(`codex_hook_transitions.go:897,957`). Two facts verified at the line make the
+plan's version a missed RED rather than a fix. `HandleHook` diverts
+`SubagentStart`/`SubagentStop` to `enqueueCodexChildHook` before the reducer runs
+(`agent_observation.go:830`), so every `Stop` that reaches the reducer is the root
+turn boundary — there is no sibling `Stop` for the guard to catch. And Codex does
+not guarantee `agent_id` on child tool hooks, so the guard is either inert (every
+writer is `""`) or it *strands*: a record opened by an `agent_id`-bearing hook
+would have no release edge at all, and `overlayCodexPendingObservation` re-asserts
+that red on every snapshot until conversation rotation or the 24 h freshness
+expiry. Pinned by `TestCodexQuestionShouldClearOnTheRootStopWhenTheOpeningHookNamedAWriter`.
+Consequence: **§2.3's "cross-writer sweeps" finding has no Codex instance**, and
+the Phase 1 DoD clause "survives an unrelated writer's `Stop`" is not met and
+should not be. The cross-writer erasure it guards against is Claude-shaped, and is
+pinned there by `internal/rpc/writer_match_test.go`.
+
+Step 3's "put the writer in the `episode:` key" was also not done, and is
+unnecessary: `codexPendingApprovalKey` reaches the `episode:` form only when the
+record carries neither an id nor an input hash, and `codexWaitEpisode` is already
+a monotonic per-coordinator counter.
+
+**D2 — Phase 1 step 1 is not `||` → `&&`.** It landed as
+`if pending.toolUseID != "" { return pending.toolUseID == req.ToolUseID }`. A plain
+conjunction over-clears in the other direction: a pending that already names its
+call would also be released by an id-less edge sharing only writer, turn, tool and
+hash — a sibling call of the same shape — which §4 of
+[status-color-state-model.md](status-color-state-model.md) forbids trading toward.
+The asymmetric form keeps the composite as a fallback only for a pending that
+never got an id, which is exactly the `PermissionRequest`-opened case §2.3 needs.
+
+**D3 — Phase 1 landed one fix the plan did not ask for.** The approval grace used
+to *delete* a pending gate when the chip was already red for something else
+(`hook_approval_suppressed_existing_attention`). That is a missed RED: answering
+the question would then paint green over an approval modal nobody has decided. It
+now defers — re-arms a fresh record for another grace — and the diagnostic is
+renamed `hook_approval_deferred_existing_attention`. Note the counter's meaning
+changed with it: it counts grace periods survived (one per 30 s per held gate),
+not gates suppressed.
+
+**Verified: Phase 1's "write the current false green as a failing test first" was
+done.** Six of the seven new Codex tests fail against `main`'s
+`codex_hook_transitions.go`, including the M1 false green itself. The two that pass
+on `main` do so by construction — one is the `request_user_input` byte-identity
+pin, which must pass on both, and the root-`Stop` strand cannot exist on `main`
+because `AskUserQuestion` opened no record there at all.
+
+**U1 — Phase 3 DoD "`switchboard-ctl diagnose` names the real rule again" is NOT
+met.** `diagnose` parses `rule=` out of the *journal* via
+`statustune.ParseDecision`, and the only `statustune.Decision{}.Log()` call sites
+are the legacy reconciler (`cmd/switchboard/main.go:1136,1153,1422`) and the legacy
+hook path (`internal/rpc/rpc.go:840`). The provider-graph landing path emits no
+decision line at all, so `diagnose` is blind to every Claude edge — before this
+phase and after it. What Phase 3 *did* deliver is the real rule on the history
+transition, which is where P4 and P5 read it. Closing this line needs a
+`Decision{}.Log()` on `applyObservationWithRule`; it is a separate change and was
+not attempted here.
+
+**U2 — Phase 3 DoD "how many of a writer's calls are holding it" is NOT met.**
+`HookResult.PromptDepth` exists and is correct, but its only consumer is the P1
+counter. `state.AgentInfo.PendingSummary` (`state.go:386`) still renders `"%s+%d"`
+from `len(a.Pending)`, a *writer* count, and the compatibility block still carries
+one prompt per writer, so no user-visible surface can say "this writer is blocked
+on three calls." Phase 2's deliberately-accepted stale red therefore still has no
+explanation the user can see.
+
+**Phase 2's DoD is met in full.** One residual worth carrying into Phase 4:
+`openPendingPrompt` dedupes on whole-struct equality *including* `Since`, so two
+prompts identical to the nanosecond would collapse into one — the missed-RED
+direction. It requires two separate `switchboard-ctl` invocations to stamp the
+same nanosecond, so it is theoretical rather than live, and step 7's call identity
+removes it.
+
+**No bad cross-phase interaction was found.** Phase 3 records only rule ids Phases
+1 and 2 actually emit, every one resolves to a `ruleKnobs` entry, and the
+vocabulary is Claude-only by design — every Codex transition still records
+`agent_graph_authority`, which is what its knob hint says it means.
+
 ---
 
 ## 5. The probes that settle what nobody established
