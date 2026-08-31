@@ -1,0 +1,354 @@
+# The `AskUserQuestion` prompt model — reconciled gameplan
+
+> Three independent studies of the same defect, from three vantages: transcript
+> **resolution semantics**, the hook **protocol**, and the **state model** of
+> prompt ownership. This document reconciles them adversarially — where they
+> agree the finding is load-bearing, where they conflict one of them is wrong,
+> and in two places all three are wrong together.
+>
+> Diagnosis this builds on: [attention-latency-report.md](attention-latency-report.md).
+> Navigation half of that report is already shipped:
+> [attention-ring-plan.md](attention-ring-plan.md).
+
+---
+
+## 0. The headline
+
+The latency we set out to fix (median 17 s of stale red on `AskUserQuestion`) is
+real, and its mechanism is confirmed by all three studies at the line. But it is
+**no longer the most expensive thing found.** Two *missed REDs* — the error class
+the whole colour model is built to avoid — fell out of the study:
+
+| # | Defect | Provider | Class | Cost |
+|---|---|---|---|---|
+| **M1** | A Codex question-shaped prompt is published red but enters no pending record, so the next hook edge from *any* writer erases it | Codex | **missed RED** | silent, minutes–hours |
+| **M2** | `rs.pending` holds one prompt per writer, so a second parallel prompt overwrites the first; clearing the survivor clears the chip while the other still blocks | Claude | **missed RED** | silent, minutes–hours |
+| L1 | The measured 17 s stale red on `AskUserQuestion` | Claude | stale RED | loud, seconds |
+
+M1 and M2 outrank L1 under §4 of
+[status-color-state-model.md](status-color-state-model.md). The plan is ordered
+accordingly, which is *not* the order any of the three reports proposed.
+
+---
+
+## 1. Unanimous findings
+
+Where all three studies independently agree, treat it as settled.
+
+- **D2/D3 confirmed verbatim.** `promptMatches` (`internal/provider/claude/observer.go:567`)
+  rejects on hash inequality; `AskUserQuestion`'s `PostToolUse` input is a strict
+  superset of its `PermissionRequest` input, so the fast path is never taken and
+  resolution falls to `resolutionKindOf` (`internal/transcript/transcript.go:495`),
+  which accepts only an assistant message or an interrupt — i.e. model latency.
+- **R4's plumbing claim is wrong, and all three caught it.** `tool_use_id` is
+  already parsed for every agent (`cmd/switchboard-ctl/main.go:614,639`) and
+  already on the wire (`internal/rpc/rpc.go:88`). It dies at one struct literal:
+  `HookSignal` (`observer.go:42`) has no such field, so
+  `cmd/switchboard/agent_observation.go:755` cannot pass it. **Three lines, not a
+  pipeline.** The report overprices this by an order of magnitude.
+- **R4's hook-time transcript read must not be built.** It breaks `ApplyHook`'s
+  documented no-I/O contract (`observer.go:243`) and, decisively, it is ~5 s too
+  early: the pending `tool_use` lands on disk **+4.56 / +4.88 / +5.02 s after the
+  hook** (`subagent-permission-plan.md:576-640`). It would look implemented and
+  latch nothing.
+- **An id-matched `tool_result` is the right second signal (R5).** It lands
+  20–101 ms after the user hits enter, and it is *strictly narrower* than the
+  bare-`tool_result` rule already rejected at `transcript.go:461` — a sibling's
+  result carries a different id, a teammate's is in a different file.
+- **The fanout floor (`observer.go:318`) may be lifted for id-matched clears
+  only**, and all three flag the same precondition: assert `tool_use_id`
+  uniqueness across parent and subagent transcripts *before* lifting it.
+- **Rejected unanimously:** subset-stable hashing; shortening `PermissionDecayTTL`;
+  R6's adaptive tick as a substitute for the id path; porting a transcript
+  backstop to Codex.
+
+---
+
+## 2. The conflicts, adjudicated
+
+### 2.1 How the call id is obtained — the one real design fork
+
+|  | Mechanism | Rests on |
+|---|---|---|
+| **protocol** | Register `PreToolUse` (matcher-limited to `AskUserQuestion\|ExitPlanMode`), join back to `PermissionRequest` by `(writer, tool, hash)` | the hash being **stable** across `PreToolUse→PermissionRequest`, both pre-decision |
+| **resolution** | Lazily latch the id on the `Observe` tick from the writer's own unmatched `tool_use` | the pending `tool_use` being on disk, unmatched, for the whole wait |
+| **graph** | Same lazy latch; `PreToolUse` listed as an optional later step, "measure first" | same |
+
+A 2–1 vote is not the argument. The argument is that **the two proposals do not
+rest on evidence of the same quality.**
+
+resolution's premise is *already measured in this repo* — `transcript.go:531`
+states the main jsonl carries the pending `tool_use` within ~5 s of the hook and
+keeps it unmatched for the whole wait, with V4 evidence behind it. And the ~5 s
+flush lag is irrelevant against the measured user think-time (45–300 s in the
+report's own table): the latch lands long before the answer does.
+
+protocol's premise is *unverified, and protocol says so itself* — it flags hash
+stability across `PreToolUse→PermissionRequest` as "the one empirical claim my
+design rests on… worth a live probe before landing." Reading the schema doc adds
+a second unverified assumption it did not flag: `docs/claude-code-hook-schema.md`
+documents that `PreToolUse` *carries* the id, but nowhere establishes that it
+fires **before** the permission prompt rather than after approval. If it fires
+after, the join cannot open a red at all and the whole mechanism is inert.
+
+**Adjudication: build the lazy latch. Keep `PreToolUse` as a measured upgrade, not
+a dependency.** Also note the disagreement is narrower than it reads — resolution
+rejects *unmatched* `PreToolUse` registration, which protocol rejects too. The
+live question is only matcher-limited registration, and it can be settled later
+by probe without redesigning anything.
+
+The three-line hook wiring is worth doing regardless: with the id on `HookSignal`,
+an id-matched `PostToolUse` clears in <500 ms instead of ≤5 s.
+
+### 2.2 The container — where graph is right for the wrong reason
+
+graph alone spotted that `rs.pending` is `map[string]PendingPrompt`
+(`observer.go:109`) — **one prompt per writer** — while every correlator in the
+system names a *call*. It argues R4 landed on that map is a missed-RED generator,
+because an id-matched `PostToolUse` deletes the writer's whole entry.
+
+That is right, and it understates the problem. graph writes that "today the hash
+mismatch accidentally protects it." **It does not.** Tracing the current code:
+
+```
+prompt A opens   → rs.pending[""] = A          (observer.go:286, unconditional overwrite)
+prompt B opens   → rs.pending[""] = B          A is now forgotten; Since resets to B's
+user answers B   → PostToolUse(B) matches B    → delete(rs.pending, "")  (observer.go:321)
+                 → chip leaves red
+prompt A is still unanswered and the agent is still blocked.
+```
+
+For two gated `Bash` calls the hashes *do* match, so the survivor clears cleanly
+and the chip goes green with A outstanding. **M2 is live today**, independent of
+R4. R4 widens it to tools whose hashes don't match; it does not create it.
+
+Is the shape real? I measured it against the 25 largest transcripts on this
+machine, counting entries per assistant `message.id` (Claude Code writes each
+`tool_use` block as its own transcript entry — counting blocks-per-entry
+undercounts by construction and gives a misleading ~0):
+
+| Parallel calls in one assistant turn | Turns |
+|---|---|
+| 1 | 5217 |
+| 2 | 385 |
+| 3 | 33 |
+| 4–8 | 9 |
+
+**427 of 5644 tool-using turns (7.6 %) dispatch two or more calls in parallel, up
+to 8-way.** That is the exposed population. It also independently vindicates
+`BlockedByPendingTool`'s "any unmatched `tool_use`, never the trailing one".
+
+One step remains unproven and it is the *only* thing standing between "M2 is a
+live missed RED" and "M2 is a latent one": parallel *dispatch* is not the same as
+two concurrent *permission prompts*, and none of the three studies established
+that Claude Code presents a second `PermissionRequest` while the first is
+unanswered. §5 gives the one-counter probe that settles it. **The container fix is
+justified either way** — it costs little, and it is a hard precondition for the id
+path — but the probe decides whether it ships as an urgent fix or as hygiene.
+
+Also confirmed while checking: `prior` at `observer.go:281` feeds only change
+detection, so the overwrite silently resets `Since` and restarts the stale-cap
+clock. No study named that.
+
+### 2.3 Codex — three studies, three different defects, all real
+
+This is where independence paid. Each study found something the others missed;
+none found all three.
+
+**M1 — the ownership gap (resolution and protocol, independently).** Confirmed
+directly: `reduceCodexPendingInput` (`codex_hook_transitions.go:843`) opens a
+pending only for `req.Event == "PreToolUse" && isCodexUserInputTool(...)`, and
+`isCodexUserInputTool` (`:1083`) normalizes to `requestuserinput` only. But
+`isCodexHumanInputPermission` (`:1040`) — which is what raises the red — is
+`request_user_input` **or `AskUserQuestion`**. So a Codex `AskUserQuestion` red is
+owned by nobody, `applyCodexPendingAttention` never re-asserts it, and the next
+hook edge mapping to active republishes `attention=none`. **This is the
+2026-08-05 oscillation shape reproduced on the other provider**, and it is a
+missed RED.
+
+The two studies propose *different* fixes and the difference matters:
+
+- protocol: widen the `PreToolUse` branch predicate at `:845`. One line.
+- resolution: open the pending on the **`PermissionRequest`** edge for
+  `isCodexHumanInputPermission`.
+
+protocol's one-liner is only sufficient if Codex emits `PreToolUse` for
+`AskUserQuestion`. If that tool arrives as a `PermissionRequest` only — which is
+precisely why `isCodexHumanInputPermission` exists as a separate predicate from
+`isCodexUserInputTool` — the one-liner latches nothing and the missed RED
+survives, while the change *looks* landed. **Take the union: open on either edge.**
+
+**The coupled matcher bug (resolution only).** `codexPendingInputMatches:1076` and
+`codexPendingApprovalMatches:1033` both read
+`if pending.toolUseID != "" || req.ToolUseID != ""` and then require id equality —
+so when only *one* side carries an id, the id branch is taken and returns false,
+and the composite fallback is unreachable. Today that fails safe. The moment a
+`PermissionRequest`-opened pending (no id) meets an id-bearing `PostToolUse`, it
+converts M1 from a missed RED into a red that sticks until `Stop`. **These two
+changes must land together**, `||` → `&&`. resolution is the only study that saw
+this, and it is what makes protocol's "nothing else changes; the close path
+already handles it" wrong.
+
+**The cross-writer sweeps (graph only).** `Stop` deletes every pending when
+`req.TurnID == "" || pending.turnID == ""` (`:861-866`) regardless of writer;
+`SessionStart`/`UserPromptSubmit` resolve every approval regardless of writer.
+Confirmed at the line. A `Stop` from writer B erases writer A's live red — a false
+green, and a missed RED when A is a human-input wait. graph is right, and this is
+a *separate* defect from M1 that survives fixing it.
+
+**Convergence verdict.** All three independently reached the same answer and it
+should be recorded: **two models, one shared vocabulary and test corpus, no shared
+code.** Claude's authority is a transcript of record; Codex's is hook edges plus
+the app-server overlay. Claude needs Codex's call identity; Codex needs Claude's
+ownership record. A shared struct would be a lowest-common-denominator with two
+disjoint halves, and would invite the exact reflex — "the Claude fix ports" — that
+produced M1.
+
+### 2.4 Persistence of the latched id — minor, graph wins
+
+protocol and resolution both persist `CallID` to `state.PendingPrompt`; graph
+rejects it as schema plus federation churn for ~5 s once per restart, and would
+re-earn it from the transcript. graph is right: re-latching is one `Observe` tick
+and reflects what actually happened across the restart.
+
+But resolution found a real persistence bug in the same area that *should* be
+fixed: `compatibilityFromState` (`agent_observation.go:682`) hardcodes
+`Attention: agentgraph.AttentionApproval`, because `state.PendingPrompt` carries
+only `{Tool, InputHash, Since}`. Every question-red re-publishes as approval-red
+across a daemon restart. Same colour today, a silent downgrade for anything that
+later distinguishes them — and this plan distinguishes them. **Persist
+`Attention`, not `CallID`.**
+
+---
+
+## 3. Where each study was wrong
+
+Recorded so the reconciliation is auditable, not just averaged.
+
+- **graph** — claimed the hash mismatch "accidentally protects" the scalar map. It
+  does not; M2 is live today (§2.2). Also claimed Codex "already has the container
+  right" and missed M1 entirely, which is the single most expensive finding in the
+  study.
+- **protocol** — its Codex one-liner is insufficient and possibly inert (§2.3),
+  and its "nothing else changes" is wrong because of the coupled `||`/`&&` bug. Its
+  Claude mechanism rests on two unverified emitter assumptions, one of which it did
+  not notice it was making (hook ordering, not just hash stability).
+- **resolution** — rejected `PreToolUse` on a cost argument ("fires on every tool
+  call") that does not apply to the matcher-limited form it was not asked about;
+  the honest answer is "unnecessary given the transcript latch," not "too
+  expensive." It also missed the container defect entirely, and its own `CallID`
+  proposal inherits M2 unless the container is fixed first.
+- **All three** — none established whether two concurrent permission prompts per
+  writer actually occur, though two of them build models whose correctness depends
+  on it. None priced M1 and M2 against L1 to reorder the work; all three led with
+  the latency fix.
+
+---
+
+## 4. The gameplan
+
+Ordered by cost class, not by discovery order. Phases 1 and 2 are independent and
+can land in either order.
+
+### Phase 1 — Codex ownership (fixes M1, a missed RED)
+
+1. `codex_hook_transitions.go:1033,1076` — `||` → `&&`, so the composite fallback
+   is reachable when only one side carries an id. **Must precede or accompany 2.**
+2. `codex_hook_transitions.go:843` — open a `codexPendingInput` for
+   `isCodexHumanInputPermission` on **either** `PreToolUse` or `PermissionRequest`,
+   keyed by `tool_use_id` when present and by the composite otherwise.
+3. `codex_hook_transitions.go:861,918,925` — writer-scope the three sweeps: require
+   `pending.writer == req.AgentID` when the turn id is absent. Put the writer in the
+   `episode:` key.
+
+**DoD.** A Codex `AskUserQuestion` red survives an unrelated writer's `PreToolUse`,
+`PostToolUse` and `Stop`; it clears on its own id-matched `PostToolUse`, and on
+`Stop` from its own writer if that never arrives. `request_user_input` behaviour is
+byte-identical. Write the current false green as a failing test first.
+
+### Phase 2 — Claude container (fixes M2, a missed RED) — **hard precondition for Phase 4**
+
+4. `rs.pending` becomes `map[string][]PendingPrompt`, ordered by `Since`, capped
+   (8/writer). `PermissionRequest` **appends** rather than overwrites; every read
+   becomes `len(...) > 0` or first-by-`Since`; node attention folds as max over the
+   writer's open prompts; the chip leaves red only at `len == 0`.
+   Touches `observer.go:109,281-287,318-322,401-457` and `projection.go:145-200`.
+   No wire change.
+
+**DoD.** Two open prompts for one writer; answering one holds red; answering both
+clears it. The compatibility projection's key set and `PendingTool` derivation stay
+byte-identical.
+
+### Phase 3 — Observability (R3; makes 4–5 measurable)
+
+5. Thread `HookResult.Rule` and `promptResolution.Reason` into the recorded
+   transition, replacing the blanket `agent_graph_authority`
+   (`agent_observation.go:528,759`).
+
+**DoD.** `switchboard-ctl diagnose` names the real rule again; a held red says why.
+
+### Phase 4 — Call identity (fixes L1, the 17 s)
+
+6. `ToolUseID` on `HookSignal` (`observer.go:42`), set from `req.ToolUseID`
+   (`agent_observation.go:755`). Three lines, inert until 7.
+7. `transcript.PendingCall(path, tool, maxBytes)` beside `BlockedByPendingTool`;
+   latch lazily in `resolvePending` for unbound prompts. Bind **only** on a unique
+   unmatched `tool_use` of that tool name in the writer's own file; on ambiguity stay
+   unbound forever rather than guess.
+8. `promptMatches` (`observer.go:567`) — id equality wins; both present and unequal
+   ⇒ hold (a real negative, unlike a hash mismatch); either absent ⇒ today's rule
+   verbatim.
+9. Lift the fanout floor (`observer.go:318`) **for id-matched clears only**, after
+   the uniqueness assertion in §5 passes.
+10. `ResolveKindFor(path, since, callID, maxBytes)` with a `ResolutionDeclined`
+    kind; an id-matched user `tool_result` is decisive — approve when clean, decline
+    on `is_error` / "User rejected tool use". `ResolveKind` stays as the
+    `callID == ""` wrapper so every existing caller is byte-identical. Add
+    `IsError` to `block` (`transcript.go:164`); `block.ToolUseID` is already parsed.
+11. Persist `Attention` (not `CallID`) on `state.PendingPrompt`, fixing the
+    restore-time downgrade at `agent_observation.go:682`.
+
+**DoD.** An answered `AskUserQuestion` clears in <500 ms with the hook, within one
+`Observe` tick without it, with four teammates in flight. A teammate's
+byte-identical call still holds. A declined question exits to idle, not green.
+
+### Phase 5 — Optional, gated on §5's probes
+
+12. Register `PreToolUse` matcher-limited to `AskUserQuestion|ExitPlanMode`, giving
+    the id at open time and retiring the latch for those tools — **only if** both
+    probes pass. Widen further only on measurement.
+
+---
+
+## 5. The probes that settle what nobody established
+
+Cheap, and each one decides a real branch above.
+
+| Probe | Settles | Method |
+|---|---|---|
+| **P1** Count writers holding >1 open prompt, and the ordering `PermissionRequest`(A), `PermissionRequest`(B) before either `PostToolUse` | Whether M2 is live or latent — urgency of Phase 2 | One counter in `applyHookLocked` at the append site; read after a day |
+| **P2** Log `pretooluse_join = hit\|miss\|ambiguous` per `PermissionRequest`, and whether `PreToolUse` precedes it at all | Whether Phase 5 is possible; kills it if the hook fires post-approval | Register `PreToolUse` behind the matcher in a scratch settings file for one day |
+| **P3** Assert no `tool_use_id` is claimed by two writers | Precondition for step 9 | `internal/fanout/observer.go:60` already keys `resultDone` by id; count violations |
+| **P4** Rate of "id-clear followed within 30 s by a new `PermissionRequest` for the same writer+tool" | False-green proxy for the id path; target <1 % | From the history stream once Phase 3 lands |
+| **P5** `answer→clear` p50/p95 for `AskUserQuestion`, and red episodes <2 s | Proves L1 fixed without a premature-clear regression | Re-run the report's §1 query |
+
+---
+
+## 6. Rejected
+
+- **R4 as written** — both halves. The plumbing is already built; the hook-time
+  transcript read is ~5 s too early and breaks the no-I/O contract.
+- **R4 or the id path landed before Phase 2** — converts a stale red into a missed
+  red on the 7.6 % parallel-dispatch population.
+- **protocol's Codex one-liner alone** — insufficient, possibly inert, and unsafe
+  without the `||`/`&&` fix.
+- **Subset-stable hashing** — rescues one tool by weakening the sibling
+  discriminator on every tool.
+- **Persisting `CallID`** — re-earned in one tick; costs a schema field and
+  federation churn.
+- **Registering `PreToolUse` unmatched** — pay the matcher-limited price first.
+- **R6 adaptive tick** — after an exact id match there is nothing left to buy.
+- **One shared prompt package for both providers** — unanimous, and M1 is what
+  that reflex already cost.
+- **Clearing red on `UserPromptSubmit`** — queued messages during a pending prompt
+  are common.
