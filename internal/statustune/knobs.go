@@ -85,6 +85,81 @@ const (
 	RuleIdleTitle = "case6-idle-title"
 )
 
+// The provider-graph rule ids. Since 784e3a8 (2026-08-21) the agent graph is the
+// sole authority for Claude, so these — not the case* ids above — are what
+// actually decides a Claude chip today. internal/provider/claude computes them
+// and cmd/switchboard writes them to the `rule` field of a history transition.
+//
+// The two vocabularies coexist on purpose. A case* id says the legacy
+// reconciler decided (it still runs for a session with no graph); a graph id
+// says the provider adapter decided. That distinction is the first thing a
+// diagnosis needs, so merging the two sets would destroy exactly the fact you
+// start from. What they share is this file: an id nobody can look up is an id
+// that points a complaint at nothing.
+const (
+	// RuleGraphAuthority — the fallback, and the only honest thing to record when
+	// the layer that produced an observation attributed no rule to it: a Codex
+	// edge (that provider has no rule vocabulary yet), a restore, or a Claude
+	// observation whose transition came from fanout topology rather than a prompt.
+	// It was, until Phase 3, stamped on EVERY graph transition.
+	RuleGraphAuthority = "agent_graph_authority"
+
+	// RuleGraphPermissionRecorded — a PermissionRequest opened a prompt owned by
+	// the writer that raised it. The edge that takes the chip red.
+	RuleGraphPermissionRecorded = "permission_recorded_for_writer"
+	// RuleGraphToolMatchCleared — a PostToolUse from the prompt's OWN writer named
+	// the pending tool with a compatible correlator, so exactly that one prompt
+	// closed. The writer's other open calls survive it.
+	RuleGraphToolMatchCleared = "writer_tool_match_cleared"
+	// RuleGraphPromptHeld — the writer that fired the event holds an open prompt
+	// the event did not resolve: a different call, a rewritten input hash, or the
+	// main thread with teammates in flight (the fanout floor). The graph's
+	// missed-RED guard, and the analogue of case12-hold-input-mismatch.
+	RuleGraphPromptHeld = "writer_prompt_held"
+	// RuleGraphNonOwnerHeld — the event's writer holds no prompt at all, so it
+	// carries no evidence about the red another writer is blocked on. The graph's
+	// analogue of case12-hold-teammate-collision.
+	RuleGraphNonOwnerHeld = "non_owner_prompt_held"
+
+	// RuleGraphSessionStarted — a SessionStart put the root at idle.
+	RuleGraphSessionStarted = "root_session_started"
+	// RuleGraphPromptSubmitted — a UserPromptSubmit from the main thread started a
+	// turn (and with it the turn boundary the fanout cohort is measured against).
+	RuleGraphPromptSubmitted = "root_prompt_submitted"
+	// RuleGraphRootStopped — a Stop from the main thread ended the turn.
+	RuleGraphRootStopped = "root_stopped"
+	// RuleGraphChildActivity — a subagent's own UserPromptSubmit/Stop moved that
+	// child's overlay runtime. A child hook never moves the root: the root's
+	// status follows the reducer's fold over the whole graph.
+	RuleGraphChildActivity = "child_activity_only"
+	// RuleGraphFanoutRescan — SubagentStart/Stop only invalidate the cached
+	// snapshot; the directory/journal scan stays authoritative for spawn and
+	// completion, so the hook itself decides nothing.
+	RuleGraphFanoutRescan = "fanout_rescan_requested"
+	// RuleGraphHookNoChange — the edge was recognized and carried no consequence
+	// for the summary. Present so an unattributed hook edge is still named.
+	RuleGraphHookNoChange = "hook_no_summary_change"
+
+	// RuleGraphChildTerminal — reconciler exit: the writer holding the prompt is a
+	// subagent whose lifecycle is terminal, so nothing can ever answer it.
+	RuleGraphChildTerminal = "child_terminal"
+	// RuleGraphWriterResumed — reconciler exit: the writer's OWN transcript showed
+	// the turn advanced past the prompt.
+	RuleGraphWriterResumed = "writer_resumed"
+	// RuleGraphWriterInterrupted — reconciler exit: the writer's own transcript
+	// showed the prompt was interrupted or declined.
+	RuleGraphWriterInterrupted = "writer_interrupted"
+	// RuleGraphMainUnreadableTTL — reconciler exit: the MAIN transcript could not
+	// be read and the TTL elapsed. The graph's case 15, and deliberately still
+	// main-only: an absent agent-<id>.jsonl is the normal state of a fresh
+	// teammate, so applying this to a child would be a missed RED.
+	RuleGraphMainUnreadableTTL = "main_unreadable_ttl"
+	// RuleGraphStaleBackstop — reconciler exit: the writer's own file reads fine
+	// and has not moved past the stale cap, and its tail carries no unanswered
+	// tool, so the prompt is unanswerable. The graph's case 19.
+	RuleGraphStaleBackstop = "writer_stale_backstop"
+)
+
 // KnobHint names the Tuning field that governs a rule's outcome, with a one-line
 // description of what moving it does. Field is "" for a rule that has no knob —
 // either an intentional guard (the missed-RED hold) or a pure transcript-signal
@@ -118,6 +193,29 @@ var ruleKnobs = map[string]KnobHint{
 	RuleResumeActivity:        {"", "pure transcript-signal edge (idle→working on fresh activity); not tunable — adjust upstream signal classification in package transcript if it misfires"},
 	RuleInterrupt:             {"", "pure transcript-signal edge (working→idle on an interrupt notice); not tunable — see package transcript"},
 	RuleIdleTitle:             {"IdleTitleDemotionEnabled", "set false to never demote a green chip on an idle pane title; IdleTitleGrace delays it, IdleTitleGlyphs names the glyphs that count as idle"},
+
+	// The provider-graph vocabulary. Most of these have no knob because the graph
+	// path reads only three Tuning fields (TailBytes, PermissionDecayTTL,
+	// PendingWriterStaleCap); the rest of the table governs the legacy reconciler,
+	// which no longer runs for a Claude session. Saying so in the What is the
+	// point — "there is no knob for this" is an answer, and it is the one the
+	// §10 operating table currently gets wrong.
+	RuleGraphAuthority:          {"", "no rule was attributed to this edge, so there is nothing specific to tune. A Codex transition always reads this (that provider has no rule vocabulary yet), and so does a restore or a Claude edge that came from fanout topology rather than a prompt. On a Claude PROMPT edge it now means a rule was lost on the way to the record — that is a bug in the threading, not a knob"},
+	RuleGraphPermissionRecorded: {"", "not tunable, and deliberately unconditional: a PermissionRequest is the agent telling you it is blocked, so the red opens on the hook with no policy in between. What it opens is one prompt per CALL, so a writer with parallel gated calls holds several and the chip leaves red only when the last is answered"},
+	RuleGraphToolMatchCleared:   {"EarlyClearApproveByToolName", "the graph's fast clear. It is strictly narrower than the legacy case9-approve-toolmatch it replaced — it matches (writer, tool, input hash) AND closes only the single prompt that matched, leaving the writer's other open calls red. The knob is the legacy path's; the graph does not read it today, so turning it off does NOT slow this path down. Change the correlator, not a threshold"},
+	RuleGraphPromptHeld:         {"", "intentional missed-RED guard: the event came from the writer that owns the red but does not resolve it — a different call, an input hash rewritten on approval, or the main thread while teammates are in flight and nothing identifies the writer. No knob; the writer's own next matching event, or its own transcript on the reconcile tick, is what clears it. Seeing this repeatedly on one red is the signature of a correlator that cannot name the call (plan Phase 4)"},
+	RuleGraphNonOwnerHeld:       {"", "intentional missed-RED guard: the event's writer holds no prompt, so it says nothing about the red another writer is blocked on. No knob — a sibling must never clear a sibling's prompt, whatever tool it just ran"},
+	RuleGraphSessionStarted:     {"", "a SessionStart is an exact lifecycle fact, not a policy decision; nothing to tune"},
+	RuleGraphPromptSubmitted:    {"", "a UserPromptSubmit is an exact lifecycle fact; nothing to tune. It deliberately does NOT clear a pending prompt — queueing a message while a prompt waits is common (plan Q6)"},
+	RuleGraphRootStopped:        {"", "a Stop is an exact lifecycle fact; nothing to tune. Like every non-tool event it may not repaint a red it carries no evidence about"},
+	RuleGraphChildActivity:      {"", "a child's own hook moved only that child's node; the root's color is the reducer's fold over the whole graph, not this edge. Nothing to tune"},
+	RuleGraphFanoutRescan:       {"", "SubagentStart/Stop only invalidate the cached fanout snapshot — the directory/journal scan stays authoritative for spawn and completion. Nothing to tune"},
+	RuleGraphHookNoChange:       {"", "the edge was recognized and changed nothing in the summary. Nothing to tune; it is recorded so an unattributed edge is still named"},
+	RuleGraphChildTerminal:      {"", "not tunable: a prompt owned by a subagent that has finished can never be answered, so it is retired rather than left to nag. A prompt opened AFTER the scan saw that lifecycle survives, because it is the newer evidence"},
+	RuleGraphWriterResumed:      {"ResumeExitStatus", "the graph's transcript clear: the writer's own file showed the turn advanced past the prompt. The exit color is the reducer's, not this field — ResumeExitStatus governs the legacy reconciler — so what you can actually change here is TailBytes, how far back the tail is read"},
+	RuleGraphWriterInterrupted:  {"InterruptExitStatus", "the writer's own transcript showed the prompt interrupted or declined. As with writer_resumed the exit color comes from the reducer rather than this legacy field; TailBytes is the knob that changes what the tail can see"},
+	RuleGraphMainUnreadableTTL:  {"PermissionDecayTTL", "how long a red waits when the MAIN transcript cannot be read at all before the backstop releases it (default 30s). It stays main-only on purpose: a missing agent-<id>.jsonl is the normal state of a just-spawned teammate, so extending this to a child would release reds nobody answered"},
+	RuleGraphStaleBackstop:      {"PendingWriterStaleCap", "how long one writer's transcript may sit quiescent before its prompt is dropped as unanswerable (default 30m). Applies ONLY to a writer whose tail carries no unanswered tool — one that still does is demonstrably blocked and is held red regardless. Raise it to let an abandoned teammate's red nag longer"},
 }
 
 // RuleKnob returns the tuning hint for a rule id. An unknown rule yields a zero

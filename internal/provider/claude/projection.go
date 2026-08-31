@@ -42,6 +42,25 @@ func (o *Observer) DrainLegacyEvents(key provider.RootKey) []history.Event {
 	return events
 }
 
+// DrainResolutionRule returns and forgets the rule id of the transcript
+// resolution the most recent Observe applied for key, or "" when that Observe
+// resolved nothing. It is the Observe-tick counterpart of HookResult.Rule, and
+// it is drained rather than read so one resolution can explain at most one
+// recorded transition: a rule that outlived its tick would eventually be
+// stamped on an edge it had nothing to do with, which is worse than the blanket
+// id it replaces — a wrong explanation costs more than an absent one.
+func (o *Observer) DrainResolutionRule(key provider.RootKey) string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	rs := o.roots[key]
+	if o.closed || rs == nil {
+		return ""
+	}
+	rule := rs.resolvedRule
+	rs.resolvedRule = ""
+	return rule
+}
+
 // Compatibility contains the legacy fields C5/C6 must continue projecting
 // while the graph runs in shadow. Pending is keyed by normalized bare writer ID;
 // the empty key is the main thread. It carries at most one prompt per writer —

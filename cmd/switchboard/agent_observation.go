@@ -17,6 +17,7 @@ import (
 	codexprovider "github.com/tjmisko/switchboard/internal/provider/codex"
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
+	"github.com/tjmisko/switchboard/internal/statustune"
 )
 
 const (
@@ -34,6 +35,7 @@ type claudeObserver interface {
 	ApplyHook(claudeprovider.HookSignal) claudeprovider.HookResult
 	Restore(provider.RootRef, claudeprovider.Compatibility, time.Time) (agentgraph.Observation, error)
 	Projection(provider.RootKey) claudeprovider.Compatibility
+	DrainResolutionRule(provider.RootKey) string
 	DrainLegacyEvents(provider.RootKey) []history.Event
 }
 
@@ -388,11 +390,15 @@ func (c *agentCoordinator) observe(ctx context.Context, ref provider.RootRef) {
 		c.expireCurrent(ref, generation, now)
 		return
 	}
-	compat := claudeprovider.Compatibility{}
+	compat, rule := claudeprovider.Compatibility{}, ""
 	if ref.Provider == agentgraph.ProviderClaude {
 		compat = c.claude.Projection(ref.Key())
+		// Drained unconditionally, whether or not this tick moves the chip: the
+		// rule belongs to the tick that computed it, and leaving it behind would
+		// let it explain some later edge instead.
+		rule = c.claude.DrainResolutionRule(ref.Key())
 	}
-	if c.applyObservation(ref, generation, observation, compat, now) && ref.Provider == agentgraph.ProviderClaude {
+	if c.applyObservationWithRule(ref, generation, observation, compat, now, rule, false) && ref.Provider == agentgraph.ProviderClaude {
 		for _, event := range c.claude.DrainLegacyEvents(ref.Key()) {
 			c.sink.Record(event)
 		}
@@ -440,10 +446,24 @@ func (c *agentCoordinator) current(key provider.RootKey, generation uint64) bool
 }
 
 func (c *agentCoordinator) applyObservation(ref provider.RootRef, generation uint64, observation agentgraph.Observation, compat claudeprovider.Compatibility, now time.Time) bool {
-	return c.applyObservationWithHookOwnership(ref, generation, observation, compat, now, false)
+	return c.applyObservationWithRule(ref, generation, observation, compat, now, "", false)
 }
 
 func (c *agentCoordinator) applyObservationWithHookOwnership(ref provider.RootRef, generation uint64, observation agentgraph.Observation, compat claudeprovider.Compatibility, now time.Time, hookOwnsTransition bool) bool {
+	return c.applyObservationWithRule(ref, generation, observation, compat, now, "", hookOwnsTransition)
+}
+
+// applyObservationWithRule is the landing path. rule is the content-free id of
+// the decision that produced this observation — a hook edge's HookResult.Rule or
+// an Observe tick's drained resolution reason — and is recorded on the
+// transition, if any, that the observation causes. An empty rule falls back to
+// RuleGraphAuthority: the provider attributed nothing, which is the honest
+// record for a Codex edge, a restore, or a Claude observation whose transition
+// came from fanout topology rather than from a prompt.
+//
+// The rule EXPLAINS the transition; it never decides one. Nothing below reads it
+// except the history event.
+func (c *agentCoordinator) applyObservationWithRule(ref provider.RootRef, generation uint64, observation agentgraph.Observation, compat claudeprovider.Compatibility, now time.Time, rule string, hookOwnsTransition bool) bool {
 	if ref.Provider == agentgraph.ProviderCodex {
 		observation = c.overlayCodexHookRootObservation(ref.Key(), observation, now)
 		observation = c.overlayCodexPendingObservation(ref.Key(), observation, now)
@@ -525,11 +545,22 @@ func (c *agentCoordinator) applyObservationWithHookOwnership(ref provider.RootRe
 			Ts: now, Type: history.EventTransition, SessionID: observation.RootID,
 			PID: ref.PID, Agent: string(ref.Provider), CWD: ref.CWD,
 			From: beforeStatus, To: graph.Summary.Status,
-			Rule: "agent_graph_authority", DurPrevMs: history.HeldMs(beforeSince, now),
+			Rule: transitionRule(rule), DurPrevMs: history.HeldMs(beforeSince, now),
 			Subagents: graph.Summary.LiveChildren,
 		})
 	}
 	return true
+}
+
+// transitionRule is what a transition records as its `rule`. An unattributed
+// edge keeps the blanket id rather than an empty field, so `switchboard-ctl
+// history` and diagnose can always tell "no rule reached the record" apart from
+// "this line predates the rule field".
+func transitionRule(rule string) string {
+	if rule == "" {
+		return statustune.RuleGraphAuthority
+	}
+	return rule
 }
 
 func observationRootName(observation agentgraph.Observation) (string, bool) {
@@ -783,7 +814,10 @@ func (c *agentCoordinator) HandleHook(req rpc.Request, sess state.Session) {
 		if !comparison.Match {
 			c.recordDiagnostic(ref.Provider, comparison.Rule, now)
 		}
-		c.applyObservation(ref, generation, result.Observation, result.Projection, now)
+		// result.Rule names the edge the adapter just decided by — the red opening,
+		// one call's clear, a hold that left it red — and is the whole point of
+		// Phase 3: a transition recorded without it says only that the graph spoke.
+		c.applyObservationWithRule(ref, generation, result.Observation, result.Projection, now, result.Rule, false)
 	case agentgraph.ProviderCodex:
 		rootID := req.SessionID
 		if rootID == "" {

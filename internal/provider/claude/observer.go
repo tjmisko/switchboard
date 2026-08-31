@@ -141,6 +141,14 @@ type rootState struct {
 	// an empty slice is never stored.
 	pending  map[string][]PendingPrompt
 	overlays map[string]childOverlay
+	// resolvedRule names the transcript rule the most recent Observe actually
+	// applied, held only until the coordinator drains it onto the transition that
+	// resolution produced (DrainResolutionRule). It is the Observe-tick half of
+	// HookResult.Rule: without it every red released by the transcript is recorded
+	// as the blanket "the graph said so", which is what made the 17s stale red
+	// invisible in the history for a week (docs/attention-latency-report.md §2.3).
+	// A content-free rule id, never a writer, a tool or a path.
+	resolvedRule string
 
 	fanout        fanout.Snapshot
 	known         map[string]fanout.Lifecycle
@@ -248,11 +256,22 @@ func (o *Observer) Observe(ctx context.Context, root provider.RootRef, now time.
 	if !rs.observation.ObservedAt.IsZero() && now.Before(rs.observation.ObservedAt) {
 		return rs.observation.Clone(), ErrSuperseded
 	}
+	// The rule is this tick's, and only this tick's: a resolution that was fenced
+	// out below explains nothing, and a rule left over from an earlier tick would
+	// mislabel whatever transition happens to land next.
+	rs.resolvedRule = ""
 	for _, resolution := range resolutions {
 		if current, ok := rs.pending[resolution.Writer]; !ok || !slices.Equal(current, resolution.Prompts) {
 			continue // a newer hook opened or closed a prompt while the scan ran
 		}
 		delete(rs.pending, resolution.Writer)
+		if rs.resolvedRule == "" {
+			// resolutions is sorted by writer and the main thread's key is "", so
+			// when several writers resolve on one tick the main thread's rule is the
+			// one kept. It is the writer whose resolution most often flips the chip,
+			// and one id per transition is all the record has room for.
+			rs.resolvedRule = resolution.Rule
+		}
 		if resolution.Writer == "" {
 			rs.runtime = resolution.Runtime
 			rs.runtimeAt = now
@@ -263,7 +282,12 @@ func (o *Observer) Observe(ctx context.Context, root provider.RootRef, now time.
 	}
 	if scanErr == nil {
 		o.mergeFanoutLocked(rs, structured.Snapshot)
-		clearTerminalPrompts(rs, structured.Snapshot.ObservedAt)
+		if clearTerminalPrompts(rs, structured.Snapshot.ObservedAt) && rs.resolvedRule == "" {
+			// The same reason resolvePending gives, reached by the other door: this
+			// sweep runs against the freshly merged snapshot, so it retires a
+			// terminal child's prompt that the pre-merge scan could not see.
+			rs.resolvedRule = statustune.RuleGraphChildTerminal
+		}
 	}
 	observation, err := o.rebuildLocked(rs, now, agentgraph.SourceClaudeTranscript, scanErr == nil && structured.Snapshot.Complete)
 	if err != nil {
@@ -312,7 +336,7 @@ func (o *Observer) ApplyHook(signal HookSignal) HookResult {
 func (o *Observer) applyHookLocked(rs *rootState, signal HookSignal) (bool, string, int) {
 	writer := signal.AgentID
 	changed := false
-	rule := "hook_no_summary_change"
+	rule := statustune.RuleGraphHookNoChange
 
 	if signal.Event == "PermissionRequest" {
 		next := PendingPrompt{
@@ -328,7 +352,7 @@ func (o *Observer) applyHookLocked(rs *rootState, signal HookSignal) (bool, stri
 			overlay.UpdatedAt = signal.At
 			rs.overlays[writer] = overlay
 		}
-		return opened, "permission_recorded_for_writer", len(prompts)
+		return opened, statustune.RuleGraphPermissionRecorded, len(prompts)
 	}
 
 	depth := 0
@@ -337,7 +361,7 @@ func (o *Observer) applyHookLocked(rs *rootState, signal HookSignal) (bool, stri
 		if rs.runtime != agentgraph.RuntimeIdle {
 			rs.runtime, rs.runtimeAt, changed = agentgraph.RuntimeIdle, signal.At, true
 		}
-		rule = "root_session_started"
+		rule = statustune.RuleGraphSessionStarted
 	case "UserPromptSubmit":
 		if writer == "" {
 			rs.turnStartedAt = signal.At
@@ -346,10 +370,10 @@ func (o *Observer) applyHookLocked(rs *rootState, signal HookSignal) (bool, stri
 				changed = true
 			}
 			rs.runtime, rs.runtimeAt = agentgraph.RuntimeActive, signal.At
-			rule = "root_prompt_submitted"
+			rule = statustune.RuleGraphPromptSubmitted
 		} else {
 			changed = setChildRuntime(rs, writer, signal.AgentType, agentgraph.RuntimeActive, signal.At)
-			rule = "child_activity_only"
+			rule = statustune.RuleGraphChildActivity
 		}
 	case "PostToolUse":
 		// The call closes the prompt, so a match removes exactly the prompt it
@@ -360,11 +384,11 @@ func (o *Observer) applyHookLocked(rs *rootState, signal HookSignal) (bool, stri
 			!(writer == "" && rs.fanout.InFlight > 0) {
 			setPendingPrompts(rs.pending, writer, closePendingPromptAt(prompts, index))
 			changed = true
-			rule = "writer_tool_match_cleared"
+			rule = statustune.RuleGraphToolMatchCleared
 		} else if len(prompts) > 0 {
-			rule = "writer_prompt_held"
+			rule = statustune.RuleGraphPromptHeld
 		} else {
-			rule = "non_owner_prompt_held"
+			rule = statustune.RuleGraphNonOwnerHeld
 		}
 		depth = len(rs.pending[writer])
 		if writer == "" {
@@ -381,15 +405,15 @@ func (o *Observer) applyHookLocked(rs *rootState, signal HookSignal) (bool, stri
 				changed = true
 			}
 			rs.runtime, rs.runtimeAt = agentgraph.RuntimeIdle, signal.At
-			rule = "root_stopped"
+			rule = statustune.RuleGraphRootStopped
 		} else {
 			changed = setChildRuntime(rs, writer, signal.AgentType, agentgraph.RuntimeIdle, signal.At)
-			rule = "child_activity_only"
+			rule = statustune.RuleGraphChildActivity
 		}
 	case "SubagentStart", "SubagentStop":
 		// Directory/journal scan remains authoritative for spawn and completion.
 		// These hooks only invalidate the cached snapshot.
-		rule = "fanout_rescan_requested"
+		rule = statustune.RuleGraphFanoutRescan
 	}
 	return changed, rule, depth
 }
@@ -515,7 +539,11 @@ func (o *Observer) mergeFanoutLocked(rs *rootState, snapshot fanout.Snapshot) {
 	rs.hasFanout = true
 }
 
-func clearTerminalPrompts(rs *rootState, observedAt time.Time) {
+// clearTerminalPrompts retires the prompts of children the merged snapshot shows
+// as finished, and reports whether it retired any — the caller records that as
+// the reason the red closed.
+func clearTerminalPrompts(rs *rootState, observedAt time.Time) bool {
+	retired := false
 	for _, child := range rs.fanout.Children {
 		prompts := rs.pending[child.ID]
 		if !child.LifecycleTerminal() || len(prompts) == 0 {
@@ -526,8 +554,12 @@ func clearTerminalPrompts(rs *rootState, observedAt time.Time) {
 		kept := slices.DeleteFunc(slices.Clone(prompts), func(prompt PendingPrompt) bool {
 			return !prompt.Since.After(observedAt)
 		})
+		if len(kept) != len(prompts) {
+			retired = true
+		}
 		setPendingPrompts(rs.pending, child.ID, kept)
 	}
+	return retired
 }
 
 func (o *Observer) rebuildLocked(rs *rootState, now time.Time, source agentgraph.SourceKind, complete bool) (agentgraph.Observation, error) {
@@ -739,28 +771,28 @@ func resolvePending(mainTranscript string, pending map[string][]PendingPrompt, s
 		}
 		since := newestPromptSince(prompts)
 		if terminal[writer] {
-			resolutions = append(resolutions, promptResolution{writer, prompts, agentgraph.RuntimeIdle, "child_terminal"})
+			resolutions = append(resolutions, promptResolution{writer, prompts, agentgraph.RuntimeIdle, statustune.RuleGraphChildTerminal})
 			continue
 		}
 		path := transcript.SubagentPath(mainTranscript, writer)
 		kind, err := transcript.ResolveKind(path, since, tuning.TailBytes)
 		switch kind {
 		case transcript.ResolutionResumed:
-			resolutions = append(resolutions, promptResolution{writer, prompts, agentgraph.RuntimeActive, "writer_resumed"})
+			resolutions = append(resolutions, promptResolution{writer, prompts, agentgraph.RuntimeActive, statustune.RuleGraphWriterResumed})
 			continue
 		case transcript.ResolutionInterrupted:
-			resolutions = append(resolutions, promptResolution{writer, prompts, agentgraph.RuntimeIdle, "writer_interrupted"})
+			resolutions = append(resolutions, promptResolution{writer, prompts, agentgraph.RuntimeIdle, statustune.RuleGraphWriterInterrupted})
 			continue
 		}
 		if err != nil && writer == "" && !since.IsZero() && now.Sub(since) >= tuning.PermissionDecayTTL {
-			resolutions = append(resolutions, promptResolution{writer, prompts, agentgraph.RuntimeIdle, "main_unreadable_ttl"})
+			resolutions = append(resolutions, promptResolution{writer, prompts, agentgraph.RuntimeIdle, statustune.RuleGraphMainUnreadableTTL})
 			continue
 		}
 		if evidence, evidenceErr := transcript.BlockedByPendingTool(path, tuning.TailBytes); evidenceErr == nil && evidence == transcript.BlockedYes {
 			continue
 		}
 		if writerQuiescentPastCap(path, since, now, tuning.PendingWriterStaleCap) {
-			resolutions = append(resolutions, promptResolution{writer, prompts, agentgraph.RuntimeIdle, "writer_stale_backstop"})
+			resolutions = append(resolutions, promptResolution{writer, prompts, agentgraph.RuntimeIdle, statustune.RuleGraphStaleBackstop})
 		}
 	}
 	sort.Slice(resolutions, func(i, j int) bool { return resolutions[i].Writer < resolutions[j].Writer })

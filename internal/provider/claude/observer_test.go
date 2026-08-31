@@ -13,6 +13,7 @@ import (
 
 	"github.com/tjmisko/switchboard/internal/agentgraph"
 	"github.com/tjmisko/switchboard/internal/provider"
+	"github.com/tjmisko/switchboard/internal/statustune"
 )
 
 var _ provider.Observer = (*Observer)(nil)
@@ -567,6 +568,67 @@ func TestFirstObservationUsesKnownParentTurnBoundaryForTerminalChildren(t *testi
 			t.Fatalf("current-turn terminal %q missing: %+v", id, observation.Nodes)
 		}
 	}
+}
+
+// resolvePending has always computed a reason and thrown it away, so a red
+// released by the transcript reached the record as "the graph said so" and the
+// stale-red latency in docs/attention-latency-report.md was invisible for a
+// week. The reason now survives the tick that computed it, and no longer.
+func TestObserveNamesTheRuleThatResolvedAPromptAndDrainsItOnce(t *testing.T) {
+	t.Run("should attribute nothing when a tick resolves no prompt", func(t *testing.T) {
+		o, root, now := newTestObserver(t)
+		defer o.Close()
+		o.ApplyHook(HookSignal{Root: root, Event: "PermissionRequest", ToolName: "Bash", At: now})
+		if _, err := o.Observe(context.Background(), root, now.Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if rule := o.DrainResolutionRule(root.Key()); rule != "" {
+			t.Fatalf("unresolved prompt claimed rule %q; an unexplained hold must not borrow one", rule)
+		}
+	})
+
+	t.Run("should name the resuming writer's rule when its own transcript releases the red", func(t *testing.T) {
+		o, root, now := newTestObserver(t)
+		defer o.Close()
+		o.ApplyHook(HookSignal{Root: root, Event: "PermissionRequest", ToolName: "Bash", At: now})
+		appendClaudeLine(t, root.Transcript,
+			`{"type":"assistant","timestamp":"`+now.Add(time.Second).Format(time.RFC3339Nano)+`","message":{"role":"assistant","content":[]}}`)
+
+		observation, err := o.Observe(context.Background(), root, now.Add(2*time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if observation.Nodes[0].Attention != agentgraph.AttentionNone {
+			t.Fatalf("the resume did not release the red: %+v", observation.Nodes[0])
+		}
+		if rule := o.DrainResolutionRule(root.Key()); rule != statustune.RuleGraphWriterResumed {
+			t.Fatalf("resolution rule = %q, want %q", rule, statustune.RuleGraphWriterResumed)
+		}
+		// Drained, not read: a rule that outlived its tick would be stamped on
+		// whatever edge landed next, and a wrong explanation is worse than none.
+		if rule := o.DrainResolutionRule(root.Key()); rule != "" {
+			t.Fatalf("rule survived its drain: %q", rule)
+		}
+	})
+
+	t.Run("should forget the previous tick's rule when a later tick resolves nothing", func(t *testing.T) {
+		o, root, now := newTestObserver(t)
+		defer o.Close()
+		o.ApplyHook(HookSignal{Root: root, Event: "PermissionRequest", ToolName: "Bash", At: now})
+		appendClaudeLine(t, root.Transcript,
+			`{"type":"assistant","timestamp":"`+now.Add(time.Second).Format(time.RFC3339Nano)+`","message":{"role":"assistant","content":[]}}`)
+		if _, err := o.Observe(context.Background(), root, now.Add(2*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		// The coordinator never drained that one — a tick that moves no chip does
+		// not record a transition — so the NEXT tick has to clear it itself.
+		if _, err := o.Observe(context.Background(), root, now.Add(3*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if rule := o.DrainResolutionRule(root.Key()); rule != "" {
+			t.Fatalf("stale rule %q survived a tick that resolved nothing", rule)
+		}
+	})
 }
 
 func TestObserveReturnsDeepCopiesAndLifecycleMethodsAreIdempotent(t *testing.T) {
