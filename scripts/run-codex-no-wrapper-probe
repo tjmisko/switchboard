@@ -2,6 +2,10 @@
 set -Eeuo pipefail
 
 probe_commit=c3dfe25c462bd7ddcff430262021a8f8ea5a86a7
+# See scripts/deploy: an inherited CDPATH makes `cd` echo its target and lets a
+# relative operand resolve against a foreign tree, poisoning both captures below.
+unset CDPATH
+
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_dir=$(cd -- "$script_dir/.." && pwd)
 go_bin=/home/tjmisko/go/bin
