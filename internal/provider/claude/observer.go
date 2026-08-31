@@ -37,17 +37,25 @@ var (
 
 const defaultFreshness = 15 * time.Second
 
-// maxPendingPromptsPerWriter bounds one writer's open prompt set. A single
-// assistant turn dispatches at most 8 parallel calls in the measured corpus
-// (askuserquestion-model-plan.md §2.2), so overflow means the record has
-// desynchronized from reality rather than that the agent is genuinely blocked
-// nine ways. On overflow the OLDEST record is dropped: it is the one most
-// likely to be a leak — a prompt whose clear we already missed (an unmatched
-// hash, a lost PostToolUse) — and the one the writer_stale_backstop was about
-// to sweep anyway, while the newest is the one most likely still blocking the
-// agent right now. Dropping the newest would discard live evidence, which is
-// the missed-RED direction.
-const maxPendingPromptsPerWriter = 8
+// maxPendingPromptsPerWriter bounds one writer's open prompt set so a leak
+// cannot grow without limit. It is a backstop, NOT a model of dispatch width:
+// the widest parallel turn in the measured corpus is 8
+// (askuserquestion-model-plan.md §2.2), but that is an observed maximum, not a
+// limit Claude Code enforces, and nothing in the emitter caps parallel tool_use.
+// Setting the ceiling AT the observed maximum would make the first 9-way turn
+// evict a live prompt from that same turn — the surviving 8 get answered, the
+// set empties, and the chip goes green while the evicted call still blocks the
+// agent. That is a missed RED, silent and costing the whole remaining wait, and
+// eviction cannot tell it apart from the leak this bound exists to catch.
+//
+// So the ceiling is set far outside anything observed. A PendingPrompt is four
+// words; 32 costs nothing and buys 4x headroom over the corpus. Overflow past
+// that is no longer plausibly one turn's parallel dispatch, and the OLDEST
+// record is dropped: it is the one most likely to be a leak — a prompt whose
+// clear we already missed (an unmatched hash, a lost PostToolUse) — and the one
+// writer_stale_backstop was about to sweep anyway, while the newest is the one
+// most likely still blocking the agent right now.
+const maxPendingPromptsPerWriter = 32
 
 // HookSignal is the provider-owned hook envelope C6 translates the existing RPC
 // payload into. ToolInputHash is a correlator only; raw tool input is never

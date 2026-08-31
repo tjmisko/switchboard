@@ -279,13 +279,35 @@ byte-identical. Write the current false green as a failing test first.
 clears it. The compatibility projection's key set and `PendingTool` derivation stay
 byte-identical.
 
+**Two holes this phase deliberately leaves open**, both consequences of "no
+state-schema change" and both belonging to later phases. Recorded here so they are
+not lost:
+
+- **Restart collapses the set.** `projectedPending` keeps the newest prompt,
+  `state.PendingPrompt` persists `{Tool,InputHash,Since}`, and `restoredPending`
+  rebuilds exactly one prompt per writer. Every older parallel prompt is forgotten
+  across a daemon restart, and no hook re-opens it — `PermissionRequest` fires once
+  per call — so M2's missed RED returns for the window between the restart and the
+  writer's next transcript evidence. Answer the surviving prompt first and the chip
+  goes green with the others still blocking. **Fix it in step 11**, which already
+  reopens `state.PendingPrompt`: persist the set, not the scalar.
+- **Every count downstream is a WRITER count.** `state.AgentInfo.PendingSummary`
+  (`state.go:385`) renders `"%s+%d"` from `len(a.Pending)` and
+  `internal/label/label.go:262` names writers from `PendingWriters`; neither can say
+  "this one writer is blocked on three calls". The stale red this phase deliberately
+  accepts — chip still red after you answered one of three — therefore has no
+  explanation on any surface the user can see. **Phase 3 owns this**: a held red
+  should be able to say how many calls are holding it.
+
 ### Phase 3 — Observability (R3; makes 4–5 measurable)
 
 5. Thread `HookResult.Rule` and `promptResolution.Reason` into the recorded
    transition, replacing the blanket `agent_graph_authority`
    (`agent_observation.go:528,759`).
 
-**DoD.** `switchboard-ctl diagnose` names the real rule again; a held red says why.
+**DoD.** `switchboard-ctl diagnose` names the real rule again; a held red says why —
+including *how many* of a writer's calls are holding it, which the Phase 2 container
+knows and no surface currently renders.
 
 ### Phase 4 — Call identity (fixes L1, the 17 s)
 
@@ -306,7 +328,13 @@ byte-identical.
     `callID == ""` wrapper so every existing caller is byte-identical. Add
     `IsError` to `block` (`transcript.go:164`); `block.ToolUseID` is already parsed.
 11. Persist `Attention` (not `CallID`) on `state.PendingPrompt`, fixing the
-    restore-time downgrade at `agent_observation.go:682`.
+    restore-time downgrade at `agent_observation.go:682`. **Persist the prompt set,
+    not one prompt per writer**, in the same change: Phase 2 left the restart
+    collapse open (see its note above) and this is the one moment the schema is
+    already being reopened. Until it lands, step 7's lazy latch must refuse to bind
+    an id to a restored prompt — a restored record stands for a writer's residual
+    red, not for its open set, and an id-matched clear against it would turn a
+    single honest red into a green with real calls still blocking.
 
 **DoD.** An answered `AskUserQuestion` clears in <500 ms with the hook, within one
 `Observe` tick without it, with four teammates in flight. A teammate's
@@ -327,6 +355,14 @@ Cheap, and each one decides a real branch above.
 | Probe | Settles | Method |
 |---|---|---|
 | **P1** Count writers holding >1 open prompt, and the ordering `PermissionRequest`(A), `PermissionRequest`(B) before either `PostToolUse` | Whether M2 is live or latent — urgency of Phase 2 | One counter in `applyHookLocked` at the append site; read after a day |
+
+**P1 as landed** is `claude:prompt_parallel_episode` (`switchboard-ctl n`). It counts
+*episodes*, not edges: it fires only on the 1→2 transition, so an 8-way dispatch
+counts once, and only when the append actually opened a prompt, so a verbatim
+redelivery does not re-count. One upward bias remains and needs call identity to
+remove — a hook registered in both the user and the project `settings.json` fires the
+same edge twice with different wall-clock stamps, which is not a verbatim redelivery
+and so opens a second prompt. Read the number with that in mind.
 | **P2** Log `pretooluse_join = hit\|miss\|ambiguous` per `PermissionRequest`, and whether `PreToolUse` precedes it at all | Whether Phase 5 is possible; kills it if the hook fires post-approval | Register `PreToolUse` behind the matcher in a scratch settings file for one day |
 | **P3** Assert no `tool_use_id` is claimed by two writers | Precondition for step 9 | `internal/fanout/observer.go:60` already keys `resultDone` by id; count violations |
 | **P4** Rate of "id-clear followed within 30 s by a new `PermissionRequest` for the same writer+tool" | False-green proxy for the id path; target <1 % | From the history stream once Phase 3 lands |

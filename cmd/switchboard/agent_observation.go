@@ -759,13 +759,25 @@ func (c *agentCoordinator) HandleHook(req rpc.Request, sess state.Session) {
 		if !result.Applied {
 			return
 		}
-		if req.Event == "PermissionRequest" && result.PromptDepth > 1 {
+		if req.Event == "PermissionRequest" && result.Changed && result.PromptDepth == 2 {
 			// P1 (askuserquestion-model-plan.md §5): parallel dispatch is measured
 			// at 7.6% of tool-using turns, but nobody established how often that
-			// becomes two concurrent permission prompts for one writer. Count only
-			// the opening edge so one wait is counted once. Content-free: a bounded
-			// category and a count, never a tool name or its input.
-			c.recordDiagnostic(ref.Provider, "prompt_parallel_per_writer", now)
+			// becomes two concurrent permission prompts for one writer. The counter
+			// must therefore read as EPISODES, not edges, so it is gated twice:
+			// depth == 2 fires only on the 1->2 transition, so an 8-way dispatch
+			// counts once rather than seven times; Changed excludes the dedupe path,
+			// where a verbatim redelivery returns the writer's unchanged depth and
+			// would otherwise re-count an episode that opened nothing.
+			//
+			// One upward bias survives and cannot be removed without call identity:
+			// a hook registered twice (a user settings.json and a project one) fires
+			// the same edge with two different wall-clock stamps, which is not a
+			// verbatim redelivery and so opens a second prompt. Phase 4's id-matched
+			// open is what makes those two edges one prompt.
+			//
+			// Content-free: a bounded category and a count, never a tool name or its
+			// input.
+			c.recordDiagnostic(ref.Provider, "prompt_parallel_episode", now)
 		}
 		comparison := claudeprovider.CompareShadow(result.Projection.Status, result.Observation, agentgraph.Summary{}, now)
 		if !comparison.Match {

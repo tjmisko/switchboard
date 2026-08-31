@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -581,4 +582,82 @@ func TestUpdateStormDoesNotStarvePeriodicReconciliation(t *testing.T) {
 	if observes < 2 {
 		t.Fatalf("Observe calls = %d, want initial/event work plus a periodic backstop", observes)
 	}
+}
+
+// claudeDiagnosticCount reads one of the Claude provider's bounded diagnostic
+// counters by category (diagnosticCount is the Codex-scoped twin).
+func claudeDiagnosticCount(coordinator *agentCoordinator, category string) uint64 {
+	for _, diagnostic := range coordinator.Diagnostics() {
+		if diagnostic.Provider == string(agentgraph.ProviderClaude) && diagnostic.Category == category {
+			return diagnostic.Count
+		}
+	}
+	return 0
+}
+
+// P1 (docs/askuserquestion-model-plan.md §5) must count parallel EPISODES, not
+// PermissionRequest edges. The plan branches on this number — it decides whether
+// the container fix ships as an urgent fix or as hygiene — so an N-way dispatch
+// counting N-1 times, or a redelivered hook counting at all, reports an inflated
+// exposure that nobody can tell from a real one.
+func TestParallelPromptProbeCountsOneEpisodePerWriterNotOneEdgePerCall(t *testing.T) {
+	store := state.New("")
+	started := time.Now().Add(-time.Hour)
+	ref := seedCoordinatorSession(store, 4801, started, state.AgentKindClaude, "claude-root", "/project")
+	coordinator := newAgentCoordinator(store, nil, claudeprovider.NewObserver(t.TempDir()), nil)
+	coordinator.refreshTrackedRoots()
+	defer coordinator.Close()
+
+	now := time.Now()
+	permission := func(hash string, at time.Time) {
+		sess, ok := sessionForKey(store.Snapshot(), ref.Key())
+		if !ok {
+			t.Fatalf("Claude root discovery was lost before the %q hook", hash)
+		}
+		coordinator.HandleHook(rpc.Request{
+			Agent: state.AgentKindClaude, Event: "PermissionRequest", SessionID: "claude-root",
+			ToolName: "Bash", ToolInputHash: hash, ObservedAt: at,
+		}, sess)
+	}
+	count := func() uint64 {
+		return claudeDiagnosticCount(coordinator, "prompt_parallel_episode")
+	}
+
+	t.Run("should not fire when a writer holds only one prompt", func(t *testing.T) {
+		permission("call-1", now)
+		if got := count(); got != 0 {
+			t.Fatalf("episodes after a single prompt = %d, want 0", got)
+		}
+	})
+
+	t.Run("should fire once when one turn dispatches four gated calls", func(t *testing.T) {
+		for i := 2; i <= 4; i++ {
+			permission("call-"+strconv.Itoa(i), now.Add(time.Duration(i)*time.Millisecond))
+		}
+		if got := count(); got != 1 {
+			t.Fatalf("episodes after a 4-way dispatch = %d, want 1", got)
+		}
+	})
+
+	t.Run("should not fire again when a hook edge is redelivered verbatim", func(t *testing.T) {
+		// Answer down to one open prompt, reopen the second, then redeliver that
+		// exact edge: the redelivery opens nothing, so it must not re-count.
+		sess, _ := sessionForKey(store.Snapshot(), ref.Key())
+		for i := 2; i <= 4; i++ {
+			coordinator.HandleHook(rpc.Request{
+				Agent: state.AgentKindClaude, Event: "PostToolUse", SessionID: "claude-root",
+				ToolName: "Bash", ToolInputHash: "call-" + strconv.Itoa(i),
+				ObservedAt: now.Add(time.Duration(10+i) * time.Millisecond),
+			}, sess)
+		}
+		reopened := now.Add(time.Second)
+		permission("call-5", reopened)
+		if got := count(); got != 2 {
+			t.Fatalf("episodes after a second parallel wait opened = %d, want 2", got)
+		}
+		permission("call-5", reopened)
+		if got := count(); got != 2 {
+			t.Fatalf("a verbatim redelivery re-counted the episode: %d, want 2", got)
+		}
+	})
 }

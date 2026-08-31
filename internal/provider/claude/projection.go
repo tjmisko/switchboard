@@ -203,9 +203,24 @@ func derivedPendingTool(pending map[string]PendingPrompt) string {
 }
 
 // restoredPending rebuilds the in-memory open sets from a persisted legacy
-// block. That block carries one prompt per writer, so a restored writer starts
-// with a single open prompt; a second parallel call is re-learned from its own
-// hook edge or resolved by the writer's transcript, never invented here.
+// block. That block carries one prompt per writer, so a writer that was blocked
+// on three parallel calls comes back holding ONE, and the other two are gone —
+// M2's missed RED, reinstated for the window between the restart and whatever
+// transcript evidence resolves the survivor.
+//
+// Nothing re-learns them from hooks. PermissionRequest fires exactly once per
+// call (docs/claude-code-hook-schema.md §2), so no later edge re-opens a prompt
+// that was already open when the daemon went down; the writer's transcript is
+// the only recovery path, and its rules resolve the whole set at once rather
+// than naming the forgotten calls. Persisting the SET instead of the scalar is
+// the fix, and it belongs with the state-schema change already scheduled for
+// Phase 4 step 11 (askuserquestion-model-plan.md §4).
+//
+// Until then a restored record is one writer's residual red, NOT a stand-in for
+// its open set. Anything that later binds a call identity to it — the lazy latch
+// in Phase 4 step 7 — must not then let that one id clear the writer's red, or
+// the restore path converts today's honest single red into a green with real
+// calls still blocking.
 func restoredPending(restored Compatibility, at time.Time) map[string][]PendingPrompt {
 	prompts := clonePending(restored.Pending)
 	if len(prompts) == 0 {
