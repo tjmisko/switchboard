@@ -515,7 +515,12 @@ func TestCodexQuestionShouldClearWhenItsOwnPostToolUseIDMatches(t *testing.T) {
 // The red is bounded rather than latched: without this the question would hold
 // idle for the full 24h codexHookAttentionFreshness window when the person
 // answers in the TUI in a way that emits no PostToolUse, or interrupts.
-func TestCodexQuestionShouldClearOnItsOwnWriterStopWhenNoPostToolUseArrives(t *testing.T) {
+//
+// The unrelated-progress step in the middle is load-bearing. Without it the test
+// passes on a source where AskUserQuestion opens no pending at all — the shape
+// this phase exists to fix — because the observation edges alone happen to land
+// on the same colours.
+func TestCodexQuestionShouldClearOnTheTurnStopWhenNoPostToolUseArrives(t *testing.T) {
 	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
 	base := time.Now()
 	sendCodexHook(coordinator, store, rpc.Request{
@@ -527,68 +532,172 @@ func TestCodexQuestionShouldClearOnItsOwnWriterStopWhenNoPostToolUseArrives(t *t
 	}
 
 	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PostToolUse", SessionID: "thread-1", TurnID: "turn-1", AgentID: "writer-a",
+		ToolUseID: "exec-1", ToolName: "exec_command", ObservedAt: base.Add(time.Millisecond),
+	})
+	if graph := codexGraph(t, store); graph.Summary.Attention != agentgraph.AttentionUserInput {
+		t.Fatalf("unrelated progress erased the question before the Stop: %#v", graph.Summary)
+	}
+
+	sendCodexHook(coordinator, store, rpc.Request{
 		Event: "Stop", SessionID: "thread-1", TurnID: "turn-1", AgentID: "writer-a",
-		ObservedAt: base.Add(time.Millisecond),
+		ObservedAt: base.Add(2 * time.Millisecond),
 	})
 	if graph := codexGraph(t, store); graph.Summary.Status != state.StatusIdle ||
 		graph.Summary.Attention != agentgraph.AttentionNone {
-		t.Fatalf("the owning writer's Stop did not release the question: %#v", graph.Summary)
+		t.Fatalf("the turn Stop did not release the question: %#v", graph.Summary)
 	}
 	if writers := codexPendingWriters(t, coordinator, store); len(writers) != 0 {
-		t.Fatalf("the owning writer's Stop left the question owned: %v", writers)
+		t.Fatalf("the turn Stop left the question owned: %v", writers)
 	}
 }
 
-func TestCodexQuestionShouldSurviveSiblingStopWhenThatStopCarriesNoTurnID(t *testing.T) {
+// Every Stop that reaches the reducer is the root turn boundary: HandleHook
+// diverts SubagentStart/SubagentStop to enqueueCodexChildHook, and a child has no
+// other stop edge. So a pending opened by a hook that happened to carry an
+// agent_id must still be released by it. Scoping the sweep to the pending's own
+// writer strands the record instead — no release edge exists at all, and
+// overlayCodexPendingObservation re-asserts the red on every subsequent snapshot
+// until conversation rotation or the 24h freshness expiry.
+func TestCodexQuestionShouldClearOnTheRootStopWhenTheOpeningHookNamedAWriter(t *testing.T) {
 	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
 	base := time.Now()
 	sendCodexHook(coordinator, store, rpc.Request{
-		Event: "PermissionRequest", SessionID: "thread-1", TurnID: "turn-1", AgentID: "writer-a",
+		Event: "PermissionRequest", SessionID: "thread-1", TurnID: "turn-1", AgentID: "child-1",
 		ToolUseID: "question-1", ToolName: "AskUserQuestion", ObservedAt: base,
 	})
-	sendCodexHook(coordinator, store, rpc.Request{
-		Event: "Stop", SessionID: "thread-1", AgentID: "writer-b", ObservedAt: base.Add(time.Millisecond),
-	})
 	if graph := codexGraph(t, store); graph.Summary.Attention != agentgraph.AttentionUserInput {
-		t.Fatalf("a sibling's turnless Stop erased another writer's question: %#v", graph.Summary)
+		t.Fatalf("AskUserQuestion permission did not become waiting-for-user: %#v", graph.Summary)
 	}
-	if want := []string{"writer-a"}; !equalStrings(codexPendingWriters(t, coordinator, store), want) {
-		t.Fatalf("sibling Stop changed pending writers: %v, want %v", codexPendingWriters(t, coordinator, store), want)
+
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "Stop", SessionID: "thread-1", ObservedAt: base.Add(time.Millisecond),
+	})
+	if graph := codexGraph(t, store); graph.Summary.Status != state.StatusIdle ||
+		graph.Summary.Attention != agentgraph.AttentionNone {
+		t.Fatalf("the root Stop did not release a child-attributed question: %#v", graph.Summary)
+	}
+	if writers := codexPendingWriters(t, coordinator, store); len(writers) != 0 {
+		t.Fatalf("the root Stop left a child-attributed question owned: %v", writers)
 	}
 }
 
-func TestCodexApprovalShouldSurviveSiblingSweepsFromOtherWriters(t *testing.T) {
+// A denied or interrupted gate emits no PreToolUse and no PostToolUse, so the
+// conversation-level sweeps are its only cancelling edge. Scoping them to the
+// gate's own writer leaves it armed, and the grace timer then publishes an
+// approval red over work the user has already resumed — the oscillation shape.
+func TestCodexApprovalShouldResolveOnTheNextTurnWhenTheGateNamedAWriter(t *testing.T) {
 	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
-	coordinator.codexApprovalGrace = time.Minute
+	coordinator.codexApprovalGrace = 40 * time.Millisecond
 	base := time.Now()
 	sendCodexHook(coordinator, store, rpc.Request{
-		Event: "PermissionRequest", SessionID: "thread-1", TurnID: "turn-1", AgentID: "writer-a",
-		ToolUseID: "approval-1", ToolName: "exec_command", ObservedAt: base,
+		Event: "PermissionRequest", SessionID: "thread-1", TurnID: "turn-1", AgentID: "child-1",
+		ToolUseID: "gate-1", ToolName: "exec_command", ObservedAt: base,
 	})
-	want := []string{"writer-a"}
-	if got := codexApprovalWriters(t, coordinator, store); !equalStrings(got, want) {
-		t.Fatalf("permission request was not owned: %v, want %v", got, want)
-	}
-
-	sweeps := []rpc.Request{
-		{Event: "Stop", SessionID: "thread-1", AgentID: "writer-b"},
-		{Event: "UserPromptSubmit", SessionID: "thread-1", TurnID: "turn-2", AgentID: "writer-b"},
-		{Event: "SessionStart", SessionID: "thread-1", HookSource: "compact", AgentID: "writer-b"},
-	}
-	for i, sweep := range sweeps {
-		sweep.ObservedAt = base.Add(time.Duration(i+1) * time.Millisecond)
-		sendCodexHook(coordinator, store, sweep)
-		if got := codexApprovalWriters(t, coordinator, store); !equalStrings(got, want) {
-			t.Fatalf("%s from another writer resolved writer-a's gate: %v, want %v", sweep.Event, got, want)
-		}
+	if want := []string{"child-1"}; !equalStrings(codexApprovalWriters(t, coordinator, store), want) {
+		t.Fatalf("permission request was not owned: %v, want %v", codexApprovalWriters(t, coordinator, store), want)
 	}
 
 	sendCodexHook(coordinator, store, rpc.Request{
-		Event: "Stop", SessionID: "thread-1", AgentID: "writer-a", ObservedAt: base.Add(time.Second),
+		Event: "UserPromptSubmit", SessionID: "thread-1", TurnID: "turn-2", ObservedAt: base.Add(time.Millisecond),
 	})
 	if got := codexApprovalWriters(t, coordinator, store); len(got) != 0 {
-		t.Fatalf("the owning writer's Stop did not resolve its own gate: %v", got)
+		t.Fatalf("a new user prompt left the abandoned gate armed: %v", got)
 	}
+
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if graph := codexGraph(t, store); graph.Summary.Attention != agentgraph.AttentionNone {
+			t.Fatalf("the abandoned gate published a red over resumed work: %#v", graph.Summary)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// One question announcing itself on both onset edges must leave one record. When
+// the edges disagree about carrying a tool_use_id their keys differ, and the
+// id-less twin has no exact close edge: the answer clears the id-keyed record and
+// the chip stays red for the whole remainder of the turn while the agent works.
+func TestCodexQuestionShouldOpenOneRecordWhenBothOnsetEdgesDescribeTheSameCall(t *testing.T) {
+	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
+	base := time.Now()
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PreToolUse", SessionID: "thread-1", TurnID: "turn-1",
+		ToolName: "AskUserQuestion", ToolInputHash: "ask-hash", ObservedAt: base,
+	})
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PermissionRequest", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "call-1",
+		ToolName: "AskUserQuestion", ToolInputHash: "ask-hash", ObservedAt: base.Add(time.Millisecond),
+	})
+	if writers := codexPendingWriters(t, coordinator, store); len(writers) != 1 {
+		t.Fatalf("one question opened %d records: %v", len(writers), writers)
+	}
+
+	// The answer's PostToolUse input is a strict superset of the question's, so
+	// its hash differs; only the id can close this record.
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PostToolUse", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "call-1",
+		ToolName: "AskUserQuestion", ToolInputHash: "answer-hash", ObservedAt: base.Add(2 * time.Millisecond),
+	})
+	if graph := codexGraph(t, store); graph.Summary.Attention != agentgraph.AttentionNone {
+		t.Fatalf("the answered question stayed red: %#v", graph.Summary)
+	}
+	if writers := codexPendingWriters(t, coordinator, store); len(writers) != 0 {
+		t.Fatalf("the answered question stayed owned: %v", writers)
+	}
+}
+
+// A generic gate that comes up while a question red is already published cannot
+// be distinguished on the chip, but discarding it is a missed RED: answering the
+// question would then paint green over an approval modal nobody has decided.
+func TestCodexApprovalShouldOutliveAQuestionRedRatherThanBeDiscarded(t *testing.T) {
+	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
+	coordinator.codexApprovalGrace = 20 * time.Millisecond
+	base := time.Now()
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PermissionRequest", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "question-1",
+		ToolName: "AskUserQuestion", ObservedAt: base,
+	})
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PermissionRequest", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "gate-1",
+		ToolName: "exec_command", ObservedAt: base.Add(time.Millisecond),
+	})
+
+	// Past the grace the gate is deferred, not forgotten, because the question red
+	// is still up.
+	deadline := time.Now().Add(time.Second)
+	for len(codexApprovalWriters(t, coordinator, store)) > 0 && time.Now().Before(deadline) {
+		if graph := codexGraph(t, store); graph.Summary.Attention != agentgraph.AttentionUserInput {
+			t.Fatalf("the question red was disturbed while the gate waited: %#v", graph.Summary)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := codexApprovalWriters(t, coordinator, store); len(got) != 1 {
+		t.Fatalf("the gate was discarded under the question red: %v", got)
+	}
+
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PostToolUse", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "question-1",
+		ToolName: "AskUserQuestion", ObservedAt: base.Add(2 * time.Millisecond),
+	})
+	graph := waitForCodexAttention(t, store, agentgraph.AttentionApproval)
+	if graph.Summary.Status != state.StatusPermission {
+		t.Fatalf("the surviving gate did not reach red once the question cleared: %#v", graph.Summary)
+	}
+}
+
+func waitForCodexAttention(t *testing.T, store *state.Store, attention agentgraph.AttentionState) *state.AgentGraph {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if graph := store.Snapshot().Sessions[0].AgentGraph; graph != nil && graph.Summary.Attention == attention {
+			return graph
+		}
+		time.Sleep(time.Millisecond)
+	}
+	graph := store.Snapshot().Sessions[0].AgentGraph
+	t.Fatalf("Codex graph never reached attention=%q: %#v", attention, graph)
+	return nil
 }
 
 func TestCodexPendingMatchersShouldFallBackToTheCompositeWhenOnlyOneSideCarriesAnID(t *testing.T) {
@@ -617,10 +726,14 @@ func TestCodexPendingMatchersShouldFallBackToTheCompositeWhenOnlyOneSideCarriesA
 			want:    true,
 		},
 		{
-			name:    "should match on the composite when only the pending carries an id",
+			// The composite is the fallback for a pending that never got an id, not a
+			// second way to close one that has it. Matching here would let an id-less
+			// edge from a sibling call of the same shape release a gate the user has
+			// not decided — the missed-RED direction.
+			name:    "should reject when the pending names a call and the request does not",
 			pending: codexPendingInput{toolUseID: "call-1", writer: "a", turnID: "t1", toolName: "AskUserQuestion", inputHash: "h"},
 			req:     rpc.Request{AgentID: "a", TurnID: "t1", ToolName: "AskUserQuestion", ToolInputHash: "h"},
-			want:    true,
+			want:    false,
 		},
 		{
 			name:    "should reject the composite when the writer differs",

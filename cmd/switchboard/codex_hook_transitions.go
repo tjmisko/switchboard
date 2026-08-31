@@ -849,9 +849,16 @@ func codexRootStateUnavailable(runtime agentgraph.RuntimeState, attention agentg
 //
 // Both onset edges count. AskUserQuestion may reach the daemon as a
 // PermissionRequest and never as a PreToolUse, so widening only one edge would
-// look landed while latching nothing; opening on either is idempotent because
-// both edges key on the same tool_use_id, or on the same composite when the id
-// is absent.
+// look landed while latching nothing.
+//
+// Opening on either edge is *not* idempotent by keying alone: the two edges need
+// not agree on whether they carry a tool_use_id, and codexPendingInputKey keys on
+// the id when it is present and on the composite otherwise, so one question would
+// leave two records — and only the id-keyed one has an exact close edge, so the
+// other would hold the red to the turn Stop. codexPendingInputFold collapses
+// them. Where neither edge carries an id nor an input hash there is nothing left
+// to correlate on, and the record is released by the turn Stop; that is the
+// honest bound, and it is the stale-red side of the trade.
 func reduceCodexPendingInput(state *codexHookRootState, req rpc.Request) (agentgraph.AttentionState, bool) {
 	ownedTransition := false
 	if (req.Event == "PreToolUse" || req.Event == "PermissionRequest") && isCodexHumanInputPermission(req.ToolName) {
@@ -859,7 +866,7 @@ func reduceCodexPendingInput(state *codexHookRootState, req rpc.Request) (agentg
 			turnID: req.TurnID, toolUseID: req.ToolUseID, writer: req.AgentID,
 			toolName: req.ToolName, inputHash: req.ToolInputHash,
 		}
-		state.pending[codexPendingInputKey(pending)] = pending
+		codexPendingInputFold(state, pending, req)
 		ownedTransition = true
 	}
 	if req.Event == "PostToolUse" && isCodexHumanInputPermission(req.ToolName) {
@@ -871,13 +878,22 @@ func reduceCodexPendingInput(state *codexHookRootState, req rpc.Request) (agentg
 		}
 	}
 	if req.Event == "Stop" {
+		// On Codex a Stop that reaches this reducer is always the root turn
+		// boundary, never a sibling's: HandleHook diverts SubagentStart/SubagentStop
+		// to enqueueCodexChildHook before the reducer runs, and children have no
+		// other stop edge. So this sweep is deliberately writer-blind.
+		//
+		// Writer-scoping it looks safer and is not. Codex is documented as *not*
+		// guaranteeing agent_id on child tool hooks
+		// (docs/codex-session-status/05-daemon-state-integration.md), so the guard
+		// is either inert — every writer is "" — or it strands: a pending opened by
+		// a hook that did carry an agent_id would have no release edge at all,
+		// because that writer's own Stop never arrives, and
+		// overlayCodexPendingObservation would re-assert the red on every snapshot
+		// until conversation rotation or the 24h freshness expiry. The cross-writer
+		// erasure that guard defends against is a Claude-shaped hazard, pinned
+		// there by internal/rpc/writer_match_test.go; it has no Codex instance.
 		for key, pending := range state.pending {
-			// A Stop is evidence only about its own writer's turn. Without the
-			// writer guard a sibling's Stop — which routinely carries no turn id —
-			// releases another writer's live prompt and paints a false green.
-			if pending.writer != req.AgentID {
-				continue
-			}
 			if req.TurnID == "" || pending.turnID == "" || pending.turnID == req.TurnID {
 				delete(state.pending, key)
 				ownedTransition = true
@@ -932,24 +948,22 @@ func (c *agentCoordinator) reduceCodexPendingApprovalLocked(
 			}
 		}
 	case "Stop":
+		// Writer-blind for the reason spelled out on reduceCodexPendingInput's Stop
+		// sweep: every Stop here is the root turn boundary, and scoping it to the
+		// gate's own writer would leave any gate opened by an agent_id-bearing hook
+		// with no cancelling edge, so the grace timer would publish an approval red
+		// long after the boundary was abandoned.
 		for key, pending := range state.approvals {
-			// Writer-scoped for the same reason as the pending-input sweep: a
-			// sibling's Stop is not evidence that this writer's gate was decided.
-			if pending.writer != req.AgentID {
-				continue
-			}
 			if req.TurnID == "" || pending.turnID == "" || pending.turnID == req.TurnID {
 				resolved = append(resolved, key)
 			}
 		}
 	case "SessionStart", "UserPromptSubmit":
-		// A new turn from one writer says nothing about a gate another writer is
-		// still sitting at. Conversation rotation, which really does invalidate
-		// every writer, goes through clearCodexApprovalsLocked instead.
-		for key, pending := range state.approvals {
-			if pending.writer != req.AgentID {
-				continue
-			}
+		// A new prompt or session start is conversation-level evidence that every
+		// in-flight gate in this conversation is moot, whoever opened it. This is
+		// the only cancelling edge a gate has when the user denies or interrupts it,
+		// so no PreToolUse or PostToolUse for that call ever arrives.
+		for key := range state.approvals {
 			resolved = append(resolved, key)
 		}
 	}
@@ -995,10 +1009,29 @@ func (c *agentCoordinator) startCodexApprovalTimerLocked(state *codexHookRootSta
 		}
 		now := time.Now()
 		if existingAttention {
-			delete(current.approvals, key)
+			// The chip is already red for something else, so publishing this gate
+			// would say nothing new — but forgetting it is a missed RED. The other
+			// wait clears on its own edge, and if this boundary is still undecided
+			// then nothing would be left to publish it and answering the first
+			// prompt would paint green over a live approval modal. Defer instead:
+			// re-arm the same episode and re-evaluate after another grace. The
+			// cancelling edges (progress on this call, the turn Stop, a new prompt,
+			// rotation) all still resolve it in the meantime.
+			//
+			// A fresh record is required rather than re-arming this one: finish is a
+			// sync.Once, so a second Add on the same pending could never be balanced
+			// and Close would block on codexTimerWG forever.
+			deferred := &codexPendingApproval{
+				turnID: pending.turnID, toolUseID: pending.toolUseID, writer: pending.writer,
+				toolName: pending.toolName, inputHash: pending.inputHash, episode: pending.episode,
+				startedAt: pending.startedAt, redPublishedAt: pending.redPublishedAt,
+				ref: pending.ref, sessionID: pending.sessionID,
+			}
+			current.approvals[key] = deferred
+			c.startCodexApprovalTimerLocked(current, key, deferred)
 			c.codexHookMu.Unlock()
-			logCodexHookWait("resolved", pending, "existing_human_attention", now)
-			c.recordDiagnostic(agentgraph.ProviderCodex, "hook_approval_suppressed_existing_attention", now)
+			logCodexHookWait("deferred", deferred, "existing_human_attention", now)
+			c.recordDiagnostic(agentgraph.ProviderCodex, "hook_approval_deferred_existing_attention", now)
 			return
 		}
 		if appServerSettled {
@@ -1054,19 +1087,26 @@ func codexPendingApprovalKey(pending *codexPendingApproval) string {
 	if pending.inputHash != "" {
 		return "hash:" + pending.writer + "\x00" + pending.turnID + "\x00" + pending.toolName + "\x00" + pending.inputHash
 	}
-	// The episode counter is already unique per root; the writer rides along so
-	// the key names the owner the writer-scoped sweeps route on.
-	return "episode:" + pending.writer + "\x00" + strconv.FormatUint(pending.episode, 10)
+	return "episode:" + strconv.FormatUint(pending.episode, 10)
 }
 
-// codexPendingApprovalMatches conjoins the two id tests deliberately. Reading
-// them as a disjunction takes the id branch whenever *either* side carries an
-// id, and then fails equality against the empty one — so the composite fallback
-// is unreachable exactly when it is needed, the moment a pending opened without
-// an id meets an id-bearing edge. That silently converts a stale red into one
-// that sticks until Stop.
+// codexPendingApprovalMatches resolves on the call id when the pending names one
+// and falls back to the composite only when it does not. The asymmetry is the
+// point, and it is the whole reason this is not `pending.toolUseID != "" ||
+// req.ToolUseID != ""` and not a plain conjunction either:
+//
+//   - a disjunction takes the id branch whenever *either* side carries an id and
+//     then fails equality against the empty one, so the composite fallback is
+//     unreachable exactly when it is needed — the moment a pending opened without
+//     an id meets an id-bearing edge — converting a stale red into one that
+//     sticks until Stop;
+//   - a conjunction over-clears in the other direction: a pending that already
+//     names its call would also be released by an id-less edge that merely shares
+//     writer, turn, tool and hash — a sibling call of the same shape — which is
+//     the missed-RED direction and the one §4 of docs/status-color-state-model.md
+//     forbids trading toward.
 func codexPendingApprovalMatches(pending *codexPendingApproval, req rpc.Request) bool {
-	if pending.toolUseID != "" && req.ToolUseID != "" {
+	if pending.toolUseID != "" {
 		return pending.toolUseID == req.ToolUseID
 	}
 	return pending.inputHash != "" && pending.inputHash == req.ToolInputHash &&
@@ -1108,15 +1148,50 @@ func codexPendingInputKey(pending codexPendingInput) string {
 	return "fallback:" + pending.writer + "\x00" + pending.turnID + "\x00" + pending.toolName + "\x00" + pending.inputHash
 }
 
-// codexPendingInputMatches conjoins the id tests for the reason spelled out on
-// codexPendingApprovalMatches. It matters more here: a PermissionRequest-opened
-// question may carry no id at all, and its PostToolUse does.
+// codexPendingInputMatches applies the rule spelled out on
+// codexPendingApprovalMatches: the call id decides whenever the pending names
+// one, and the composite is the fallback only for a pending that never got an
+// id. That fallback matters more here than for approvals — a
+// PermissionRequest-opened question may carry no id at all while its PostToolUse
+// does.
 func codexPendingInputMatches(pending codexPendingInput, req rpc.Request) bool {
-	if pending.toolUseID != "" && req.ToolUseID != "" {
+	if pending.toolUseID != "" {
 		return pending.toolUseID == req.ToolUseID
 	}
+	return codexPendingInputComposite(pending, req)
+}
+
+// codexPendingInputComposite is the id-free correlation: the same writer, in the
+// same turn, calling the same tool with the same input. It is what the close path
+// falls back to, and what codexPendingInputFold uses to recognise that two onset
+// edges describe one question.
+func codexPendingInputComposite(pending codexPendingInput, req rpc.Request) bool {
 	return pending.inputHash != "" && pending.inputHash == req.ToolInputHash &&
 		pending.writer == req.AgentID && pending.turnID == req.TurnID && pending.toolName == req.ToolName
+}
+
+// codexPendingInputFold stores one onset edge, collapsing any record that
+// describes the same call. A question can announce itself twice — PreToolUse and
+// PermissionRequest — and the two edges need not agree on whether they carry a
+// tool_use_id, so their keys differ and one question would otherwise leave two
+// records, of which only the id-keyed one is closable by an exact PostToolUse.
+//
+// "The same call" is deliberately the composite and nothing wider: two genuinely
+// different questions differ in their input hash and still get their own records.
+// The id-bearing record always wins, because it is the only one a PostToolUse can
+// close exactly; an id-less edge for a call already named is dropped.
+func codexPendingInputFold(state *codexHookRootState, pending codexPendingInput, req rpc.Request) {
+	key := codexPendingInputKey(pending)
+	for existingKey, existing := range state.pending {
+		if existingKey == key || !codexPendingInputComposite(existing, req) {
+			continue
+		}
+		if existing.toolUseID != "" && pending.toolUseID == "" {
+			return
+		}
+		delete(state.pending, existingKey)
+	}
+	state.pending[key] = pending
 }
 
 func isCodexUserInputTool(tool string) bool {
