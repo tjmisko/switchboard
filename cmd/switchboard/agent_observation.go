@@ -759,6 +759,14 @@ func (c *agentCoordinator) HandleHook(req rpc.Request, sess state.Session) {
 		if !result.Applied {
 			return
 		}
+		if req.Event == "PermissionRequest" && result.PromptDepth > 1 {
+			// P1 (askuserquestion-model-plan.md §5): parallel dispatch is measured
+			// at 7.6% of tool-using turns, but nobody established how often that
+			// becomes two concurrent permission prompts for one writer. Count only
+			// the opening edge so one wait is counted once. Content-free: a bounded
+			// category and a count, never a tool name or its input.
+			c.recordDiagnostic(ref.Provider, "prompt_parallel_per_writer", now)
+		}
 		comparison := claudeprovider.CompareShadow(result.Projection.Status, result.Observation, agentgraph.Summary{}, now)
 		if !comparison.Match {
 			c.recordDiagnostic(ref.Provider, comparison.Rule, now)

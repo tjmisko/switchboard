@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -36,6 +37,18 @@ var (
 
 const defaultFreshness = 15 * time.Second
 
+// maxPendingPromptsPerWriter bounds one writer's open prompt set. A single
+// assistant turn dispatches at most 8 parallel calls in the measured corpus
+// (askuserquestion-model-plan.md §2.2), so overflow means the record has
+// desynchronized from reality rather than that the agent is genuinely blocked
+// nine ways. On overflow the OLDEST record is dropped: it is the one most
+// likely to be a leak — a prompt whose clear we already missed (an unmatched
+// hash, a lost PostToolUse) — and the one the writer_stale_backstop was about
+// to sweep anyway, while the newest is the one most likely still blocking the
+// agent right now. Dropping the newest would discard live evidence, which is
+// the missed-RED direction.
+const maxPendingPromptsPerWriter = 8
+
 // HookSignal is the provider-owned hook envelope C6 translates the existing RPC
 // payload into. ToolInputHash is a correlator only; raw tool input is never
 // accepted, retained, diagnosed, or projected.
@@ -52,9 +65,15 @@ type HookSignal struct {
 // HookResult is a detached post-hook view suitable for shadow comparison and a
 // compatibility projection. Rule is a finite, content-free decision name.
 type HookResult struct {
-	Applied     bool
-	Changed     bool
-	Rule        string
+	Applied bool
+	Changed bool
+	Rule    string
+	// PromptDepth is how many prompts the signal's writer still holds open after
+	// an edge that touches prompt ownership (PermissionRequest, PostToolUse), and
+	// zero on every other edge. It is a small bounded integer, never content: it
+	// exists so the P1 probe can size how often one writer really blocks on two
+	// calls at once (askuserquestion-model-plan.md §5).
+	PromptDepth int
 	Root        provider.RootKey
 	Observation agentgraph.Observation
 	Projection  Compatibility
@@ -106,8 +125,14 @@ type rootState struct {
 	ref       provider.RootRef
 	runtime   agentgraph.RuntimeState
 	runtimeAt time.Time
-	pending   map[string]PendingPrompt
-	overlays  map[string]childOverlay
+	// pending maps a writer ("" is the main thread) to every prompt that writer
+	// currently holds open, ordered oldest-first by Since. The writer routes
+	// evidence — no sibling may ever clear another writer's prompt — but the
+	// individual call closes the prompt, so one writer's parallel calls must not
+	// collapse onto one record. A writer with no open prompt has no key at all;
+	// an empty slice is never stored.
+	pending  map[string][]PendingPrompt
+	overlays map[string]childOverlay
 
 	fanout        fanout.Snapshot
 	known         map[string]fanout.Lifecycle
@@ -126,9 +151,14 @@ type childOverlay struct {
 	UpdatedAt time.Time
 }
 
+// promptResolution is transcript evidence about a writer, not about one call:
+// "this writer resumed", "this writer is terminal", "this writer has been quiet
+// past the cap". Such evidence closes every prompt the writer held. Prompts
+// carries the exact open set the scan reasoned about so the merge can detect a
+// hook that opened or closed a prompt while the I/O was in flight.
 type promptResolution struct {
 	Writer  string
-	Since   time.Time
+	Prompts []PendingPrompt
 	Runtime agentgraph.RuntimeState
 	Rule    string
 }
@@ -172,7 +202,7 @@ func (o *Observer) Observe(ctx context.Context, root provider.RootRef, now time.
 		return agentgraph.Observation{}, ErrClosed
 	}
 	rs := o.ensureRootLocked(root)
-	pending := clonePending(rs.pending)
+	pending := clonePendingSets(rs.pending)
 	runtime, runtimeAt := rs.runtime, rs.runtimeAt
 	tuning := o.tuning
 	o.mu.Unlock()
@@ -211,8 +241,8 @@ func (o *Observer) Observe(ctx context.Context, root provider.RootRef, now time.
 		return rs.observation.Clone(), ErrSuperseded
 	}
 	for _, resolution := range resolutions {
-		if current, ok := rs.pending[resolution.Writer]; !ok || current.Since != resolution.Since {
-			continue // a newer hook replaced this prompt while the scan ran
+		if current, ok := rs.pending[resolution.Writer]; !ok || !slices.Equal(current, resolution.Prompts) {
+			continue // a newer hook opened or closed a prompt while the scan ran
 		}
 		delete(rs.pending, resolution.Writer)
 		if resolution.Writer == "" {
@@ -262,28 +292,27 @@ func (o *Observer) ApplyHook(signal HookSignal) HookResult {
 		return HookResult{Root: signal.Root.Key()}
 	}
 	rs := o.ensureRootLocked(signal.Root)
-	changed, rule := o.applyHookLocked(rs, signal)
+	changed, rule, depth := o.applyHookLocked(rs, signal)
 	observation, _ := o.rebuildLocked(rs, signal.At, agentgraph.SourceHook, rs.hasFanout && rs.fanout.Complete)
 	o.updates.Signal(signal.Root.Key())
 	return HookResult{
-		Applied: true, Changed: changed, Rule: rule, Root: signal.Root.Key(),
+		Applied: true, Changed: changed, Rule: rule, PromptDepth: depth, Root: signal.Root.Key(),
 		Observation: observation.Clone(), Projection: rs.projection.Clone(),
 	}
 }
 
-func (o *Observer) applyHookLocked(rs *rootState, signal HookSignal) (bool, string) {
+func (o *Observer) applyHookLocked(rs *rootState, signal HookSignal) (bool, string, int) {
 	writer := signal.AgentID
 	changed := false
 	rule := "hook_no_summary_change"
 
 	if signal.Event == "PermissionRequest" {
-		attention := attentionForTool(signal.ToolName)
-		prior, exists := rs.pending[writer]
 		next := PendingPrompt{
 			Tool: signal.ToolName, InputHash: signal.ToolInputHash,
-			Attention: attention, Since: signal.At,
+			Attention: attentionForTool(signal.ToolName), Since: signal.At,
 		}
-		rs.pending[writer] = next
+		prompts, opened := openPendingPrompt(rs.pending[writer], next)
+		setPendingPrompts(rs.pending, writer, prompts)
 		if writer != "" {
 			overlay := rs.overlays[writer]
 			overlay.AgentType = firstNonempty(signal.AgentType, overlay.AgentType)
@@ -291,10 +320,10 @@ func (o *Observer) applyHookLocked(rs *rootState, signal HookSignal) (bool, stri
 			overlay.UpdatedAt = signal.At
 			rs.overlays[writer] = overlay
 		}
-		changed = !exists || prior != next
-		return changed, "permission_recorded_for_writer"
+		return opened, "permission_recorded_for_writer", len(prompts)
 	}
 
+	depth := 0
 	switch signal.Event {
 	case "SessionStart":
 		if rs.runtime != agentgraph.RuntimeIdle {
@@ -315,16 +344,21 @@ func (o *Observer) applyHookLocked(rs *rootState, signal HookSignal) (bool, stri
 			rule = "child_activity_only"
 		}
 	case "PostToolUse":
-		if pending, owns := rs.pending[writer]; owns && promptMatches(pending, signal) &&
+		// The call closes the prompt, so a match removes exactly the prompt it
+		// names and leaves the writer's other open calls blocking. Answering one
+		// of two parallel calls must not take the chip out of red.
+		prompts := rs.pending[writer]
+		if index := matchingPromptIndex(prompts, signal); index >= 0 &&
 			!(writer == "" && rs.fanout.InFlight > 0) {
-			delete(rs.pending, writer)
+			setPendingPrompts(rs.pending, writer, closePendingPromptAt(prompts, index))
 			changed = true
 			rule = "writer_tool_match_cleared"
-		} else if owns {
+		} else if len(prompts) > 0 {
 			rule = "writer_prompt_held"
 		} else {
 			rule = "non_owner_prompt_held"
 		}
+		depth = len(rs.pending[writer])
 		if writer == "" {
 			if rs.runtime != agentgraph.RuntimeActive {
 				changed = true
@@ -349,7 +383,82 @@ func (o *Observer) applyHookLocked(rs *rootState, signal HookSignal) (bool, stri
 		// These hooks only invalidate the cached snapshot.
 		rule = "fanout_rescan_requested"
 	}
-	return changed, rule
+	return changed, rule, depth
+}
+
+// openPendingPrompt inserts next into a writer's open set, keeping it ordered
+// oldest-first by Since, and reports whether the set actually changed. A hook
+// redelivered verbatim — same tool, correlator and instant — is the same prompt
+// rather than a second one, so it is deduped: a retry must not inflate the open
+// set into a red nothing can ever clear.
+func openPendingPrompt(prompts []PendingPrompt, next PendingPrompt) ([]PendingPrompt, bool) {
+	if slices.Contains(prompts, next) {
+		return prompts, false
+	}
+	index := sort.Search(len(prompts), func(i int) bool { return prompts[i].Since.After(next.Since) })
+	opened := slices.Insert(slices.Clip(prompts), index, next)
+	if len(opened) > maxPendingPromptsPerWriter {
+		opened = opened[len(opened)-maxPendingPromptsPerWriter:]
+	}
+	return opened, true
+}
+
+// closePendingPromptAt removes exactly one prompt, never the writer's entry.
+func closePendingPromptAt(prompts []PendingPrompt, index int) []PendingPrompt {
+	return slices.Delete(slices.Clone(prompts), index, index+1)
+}
+
+// setPendingPrompts stores a writer's open set, dropping the key entirely once
+// the set is empty. Callers rely on `len(pending)` counting blocked writers, so
+// an empty slice must never be left behind.
+func setPendingPrompts(pending map[string][]PendingPrompt, writer string, prompts []PendingPrompt) {
+	if len(prompts) == 0 {
+		delete(pending, writer)
+		return
+	}
+	pending[writer] = prompts
+}
+
+// matchingPromptIndex returns the oldest prompt the signal resolves, or -1. The
+// oldest match is taken because prompts are answered in the order they were
+// presented, and because it leaves the newest Since in place — the backstop
+// clock then runs from the most recent evidence, which is the stale-red
+// direction rather than the missed-red one.
+func matchingPromptIndex(prompts []PendingPrompt, signal HookSignal) int {
+	for i, prompt := range prompts {
+		if promptMatches(prompt, signal) {
+			return i
+		}
+	}
+	return -1
+}
+
+// foldPromptAttention reduces a writer's open prompts to the one attention its
+// node carries, using the neutral reducer's own precedence (approval ahead of
+// user_input) so a node folds the same way the summary does.
+func foldPromptAttention(prompts []PendingPrompt) agentgraph.AttentionState {
+	folded := agentgraph.AttentionNone
+	for _, prompt := range prompts {
+		if prompt.Attention == agentgraph.AttentionApproval {
+			return agentgraph.AttentionApproval
+		}
+		if prompt.Attention == agentgraph.AttentionUserInput {
+			folded = agentgraph.AttentionUserInput
+		}
+	}
+	return folded
+}
+
+// newestPromptSince is the instant the writer's most recent prompt opened. Every
+// writer-scoped backstop dates from it rather than from the oldest prompt: an
+// assistant message between two parallel prompts is usually the turn that
+// dispatched the second one, so resolving the older prompt against it would
+// clear a red the agent is still blocked on.
+func newestPromptSince(prompts []PendingPrompt) time.Time {
+	if len(prompts) == 0 {
+		return time.Time{}
+	}
+	return prompts[len(prompts)-1].Since
 }
 
 func (o *Observer) mergeFanoutLocked(rs *rootState, snapshot fanout.Snapshot) {
@@ -400,20 +509,22 @@ func (o *Observer) mergeFanoutLocked(rs *rootState, snapshot fanout.Snapshot) {
 
 func clearTerminalPrompts(rs *rootState, observedAt time.Time) {
 	for _, child := range rs.fanout.Children {
-		prompt, pending := rs.pending[child.ID]
-		if child.LifecycleTerminal() && pending && !prompt.Since.After(observedAt) {
-			delete(rs.pending, child.ID)
+		prompts := rs.pending[child.ID]
+		if !child.LifecycleTerminal() || len(prompts) == 0 {
+			continue
 		}
+		// A prompt opened after the scan is newer evidence than the terminal
+		// lifecycle the scan saw, so it survives; the rest are retired per prompt.
+		kept := slices.DeleteFunc(slices.Clone(prompts), func(prompt PendingPrompt) bool {
+			return !prompt.Since.After(observedAt)
+		})
+		setPendingPrompts(rs.pending, child.ID, kept)
 	}
 }
 
 func (o *Observer) rebuildLocked(rs *rootState, now time.Time, source agentgraph.SourceKind, complete bool) (agentgraph.Observation, error) {
-	rootAttention := agentgraph.AttentionNone
-	if pending, ok := rs.pending[""]; ok {
-		rootAttention = pending.Attention
-	}
 	nodes := []agentgraph.Node{{
-		ID: rs.ref.ProviderSessionID, Runtime: rs.runtime, Attention: rootAttention,
+		ID: rs.ref.ProviderSessionID, Runtime: rs.runtime, Attention: foldPromptAttention(rs.pending[""]),
 		Lifecycle: agentgraph.LifecycleRunning, StartedAt: rs.ref.StartedAt,
 		UpdatedAt: rs.runtimeAt,
 	}}
@@ -427,12 +538,12 @@ func (o *Observer) rebuildLocked(rs *rootState, now time.Time, source agentgraph
 	for id, child := range rs.retained {
 		byID[id] = child
 	}
-	for writer := range rs.pending {
+	for writer, prompts := range rs.pending {
 		if writer == "" {
 			continue
 		}
 		child, exists := byID[writer]
-		if !exists || (child.LifecycleTerminal() && rs.pending[writer].Since.After(rs.fanout.ObservedAt)) {
+		if !exists || (child.LifecycleTerminal() && newestPromptSince(prompts).After(rs.fanout.ObservedAt)) {
 			byID[writer] = fanout.Child{ID: writer, Lifecycle: fanout.LifecycleRunning}
 		}
 	}
@@ -452,8 +563,8 @@ func (o *Observer) rebuildLocked(rs *rootState, now time.Time, source agentgraph
 				node.UpdatedAt = overlay.UpdatedAt
 			}
 		}
-		if pending, ok := rs.pending[id]; ok && !node.Lifecycle.Terminal() {
-			node.Attention = pending.Attention
+		if prompts := rs.pending[id]; len(prompts) > 0 && !node.Lifecycle.Terminal() {
+			node.Attention = foldPromptAttention(prompts)
 		}
 		nodes = append(nodes, node)
 	}
@@ -530,7 +641,7 @@ func (o *Observer) ensureRootLocked(root provider.RootRef) *rootState {
 	}
 	rs = &rootState{
 		ref: root, runtime: agentgraph.RuntimeUnknown,
-		pending: make(map[string]PendingPrompt), overlays: make(map[string]childOverlay),
+		pending: make(map[string][]PendingPrompt), overlays: make(map[string]childOverlay),
 		known: make(map[string]fanout.Lifecycle), retained: make(map[string]fanout.Child),
 		legacyEvents: carriedEvents,
 	}
@@ -577,7 +688,7 @@ func promptMatches(pending PendingPrompt, signal HookSignal) bool {
 func setChildRuntime(rs *rootState, id, agentType string, runtime agentgraph.RuntimeState, at time.Time) bool {
 	// A non-attention hook is a cross-check, not an authoritative spawn source.
 	// Retain it only for a child already established by fanout or prompt ownership.
-	if _, pending := rs.pending[id]; !pending {
+	if len(rs.pending[id]) == 0 {
 		if _, known := rs.known[id]; !known {
 			return false
 		}
@@ -602,36 +713,46 @@ func lifecycleTerminal(lifecycle fanout.Lifecycle) bool {
 	return lifecycle == fanout.LifecycleCompleted || lifecycle == fanout.LifecycleInterrupted
 }
 
-func resolvePending(mainTranscript string, pending map[string]PendingPrompt, snapshot fanout.Snapshot, now time.Time, tuning statustune.Tuning) []promptResolution {
+// resolvePending turns transcript evidence into writer-scoped resolutions. Every
+// rule here reads a whole file — none of them can name which of a writer's
+// parallel calls was answered — so each is evaluated against the writer's NEWEST
+// prompt and closes the writer's whole open set when it fires. Dating the rules
+// from the newest prompt is what keeps that safe: evidence younger than the last
+// prompt to open cannot prove the older ones resolved.
+func resolvePending(mainTranscript string, pending map[string][]PendingPrompt, snapshot fanout.Snapshot, now time.Time, tuning statustune.Tuning) []promptResolution {
 	terminal := make(map[string]bool, len(snapshot.Children))
 	for _, child := range snapshot.Children {
 		terminal[child.ID] = child.LifecycleTerminal()
 	}
 	var resolutions []promptResolution
-	for writer, prompt := range pending {
+	for writer, prompts := range pending {
+		if len(prompts) == 0 {
+			continue
+		}
+		since := newestPromptSince(prompts)
 		if terminal[writer] {
-			resolutions = append(resolutions, promptResolution{writer, prompt.Since, agentgraph.RuntimeIdle, "child_terminal"})
+			resolutions = append(resolutions, promptResolution{writer, prompts, agentgraph.RuntimeIdle, "child_terminal"})
 			continue
 		}
 		path := transcript.SubagentPath(mainTranscript, writer)
-		kind, err := transcript.ResolveKind(path, prompt.Since, tuning.TailBytes)
+		kind, err := transcript.ResolveKind(path, since, tuning.TailBytes)
 		switch kind {
 		case transcript.ResolutionResumed:
-			resolutions = append(resolutions, promptResolution{writer, prompt.Since, agentgraph.RuntimeActive, "writer_resumed"})
+			resolutions = append(resolutions, promptResolution{writer, prompts, agentgraph.RuntimeActive, "writer_resumed"})
 			continue
 		case transcript.ResolutionInterrupted:
-			resolutions = append(resolutions, promptResolution{writer, prompt.Since, agentgraph.RuntimeIdle, "writer_interrupted"})
+			resolutions = append(resolutions, promptResolution{writer, prompts, agentgraph.RuntimeIdle, "writer_interrupted"})
 			continue
 		}
-		if err != nil && writer == "" && !prompt.Since.IsZero() && now.Sub(prompt.Since) >= tuning.PermissionDecayTTL {
-			resolutions = append(resolutions, promptResolution{writer, prompt.Since, agentgraph.RuntimeIdle, "main_unreadable_ttl"})
+		if err != nil && writer == "" && !since.IsZero() && now.Sub(since) >= tuning.PermissionDecayTTL {
+			resolutions = append(resolutions, promptResolution{writer, prompts, agentgraph.RuntimeIdle, "main_unreadable_ttl"})
 			continue
 		}
 		if evidence, evidenceErr := transcript.BlockedByPendingTool(path, tuning.TailBytes); evidenceErr == nil && evidence == transcript.BlockedYes {
 			continue
 		}
-		if writerQuiescentPastCap(path, prompt.Since, now, tuning.PendingWriterStaleCap) {
-			resolutions = append(resolutions, promptResolution{writer, prompt.Since, agentgraph.RuntimeIdle, "writer_stale_backstop"})
+		if writerQuiescentPastCap(path, since, now, tuning.PendingWriterStaleCap) {
+			resolutions = append(resolutions, promptResolution{writer, prompts, agentgraph.RuntimeIdle, "writer_stale_backstop"})
 		}
 	}
 	sort.Slice(resolutions, func(i, j int) bool { return resolutions[i].Writer < resolutions[j].Writer })
@@ -668,6 +789,14 @@ func reconcileRootRuntime(path string, runtime agentgraph.RuntimeState, since ti
 		return agentgraph.RuntimeIdle
 	}
 	return runtime
+}
+
+func clonePendingSets(pending map[string][]PendingPrompt) map[string][]PendingPrompt {
+	clone := make(map[string][]PendingPrompt, len(pending))
+	for writer, prompts := range pending {
+		clone[writer] = slices.Clone(prompts)
+	}
+	return clone
 }
 
 func clonePending(pending map[string]PendingPrompt) map[string]PendingPrompt {

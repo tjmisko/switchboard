@@ -14,8 +14,11 @@ import (
 // thread writer key.
 const PendingWriterMain = "main"
 
-// PendingPrompt is one writer-owned attention wait. Correlators remain
-// in-memory compatibility state and never enter the neutral graph.
+// PendingPrompt is one call's attention wait, owned by the writer that raised
+// it. A writer may hold several at once — one assistant turn can dispatch
+// parallel gated calls — so the writer routes evidence while the individual
+// call closes the prompt. Correlators remain in-memory compatibility state and
+// never enter the neutral graph.
 type PendingPrompt struct {
 	Tool      string
 	InputHash string
@@ -41,7 +44,10 @@ func (o *Observer) DrainLegacyEvents(key provider.RootKey) []history.Event {
 
 // Compatibility contains the legacy fields C5/C6 must continue projecting
 // while the graph runs in shadow. Pending is keyed by normalized bare writer ID;
-// the empty key is the main thread.
+// the empty key is the main thread. It carries at most one prompt per writer —
+// the legacy block's shape — while the adapter tracks the writer's whole open
+// set; the KEY SET, which is what the wire and the chip consume, is the same
+// either way (see projectedPending).
 type Compatibility struct {
 	SessionID         string
 	Transcript        string
@@ -135,10 +141,29 @@ func projectCompatibility(rs *rootState, summary agentgraph.Summary) Compatibili
 		Status: summary.LegacyStatus, StatusSince: statusSince,
 		InFlightSubagents: rs.fanout.InFlight,
 		Workflows:         append([]fanout.Workflow(nil), rs.fanout.Workflows...),
-		Pending:           clonePending(rs.pending),
+		Pending:           projectedPending(rs.pending),
 	}
-	projection.PendingWriters = pendingWritersForProjection(rs.pending)
-	projection.PendingTool = derivedPendingTool(rs.pending)
+	projection.PendingWriters = pendingWritersForProjection(projection.Pending)
+	projection.PendingTool = derivedPendingTool(projection.Pending)
+	return projection
+}
+
+// projectedPending collapses each writer's open set to the one prompt the legacy
+// compatibility block can carry. The key set — which is what the wire, the chip
+// and the restore path actually consume — is unchanged, and for the single-prompt
+// case the value is byte-identical to the pre-container projection.
+//
+// The newest prompt is the one kept. Only one survives a daemon restart, and the
+// newest Since is the one that keeps the restored red alive longest under the
+// stale backstop; keeping the oldest would let a restart shorten a live red.
+func projectedPending(pending map[string][]PendingPrompt) map[string]PendingPrompt {
+	projection := make(map[string]PendingPrompt, len(pending))
+	for writer, prompts := range pending {
+		if len(prompts) == 0 {
+			continue
+		}
+		projection[writer] = prompts[len(prompts)-1]
+	}
 	return projection
 }
 
@@ -177,25 +202,30 @@ func derivedPendingTool(pending map[string]PendingPrompt) string {
 	return pending[writers[0]].Tool
 }
 
-func restoredPending(restored Compatibility, at time.Time) map[string]PendingPrompt {
-	pending := clonePending(restored.Pending)
-	if len(pending) == 0 {
-		pending = make(map[string]PendingPrompt, len(restored.PendingWriters))
+// restoredPending rebuilds the in-memory open sets from a persisted legacy
+// block. That block carries one prompt per writer, so a restored writer starts
+// with a single open prompt; a second parallel call is re-learned from its own
+// hook edge or resolved by the writer's transcript, never invented here.
+func restoredPending(restored Compatibility, at time.Time) map[string][]PendingPrompt {
+	prompts := clonePending(restored.Pending)
+	if len(prompts) == 0 {
+		prompts = make(map[string]PendingPrompt, len(restored.PendingWriters))
 		for _, writer := range restored.PendingWriters {
 			if writer == PendingWriterMain {
 				writer = ""
 			}
-			pending[writer] = PendingPrompt{Attention: agentgraph.AttentionApproval, Since: at}
+			prompts[writer] = PendingPrompt{Attention: agentgraph.AttentionApproval, Since: at}
 		}
 	}
-	for writer, prompt := range pending {
+	pending := make(map[string][]PendingPrompt, len(prompts))
+	for writer, prompt := range prompts {
 		if prompt.Attention == "" || !prompt.Attention.Valid() {
 			prompt.Attention = attentionForTool(prompt.Tool)
 		}
 		if prompt.Since.IsZero() {
 			prompt.Since = at
 		}
-		pending[writer] = prompt
+		pending[writer] = []PendingPrompt{prompt}
 	}
 	return pending
 }

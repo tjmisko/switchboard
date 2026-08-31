@@ -130,6 +130,132 @@ func TestChildAttentionOwnershipAndWriterCollision(t *testing.T) {
 	assertSummary(t, result.Observation, now.Add(4*time.Second), agentgraph.LegacyPermission, agentgraph.AttentionUserInput)
 }
 
+// Two gated calls dispatched in one assistant turn are two prompts, not one.
+// Answering either must hold the chip red while the other still blocks the
+// agent: a chip that goes green here is a missed RED — silent, and it costs the
+// user the entire remaining wait (askuserquestion-model-plan.md §2.2, M2).
+func TestParallelPromptsFromOneWriterHoldRedUntilEveryCallIsAnswered(t *testing.T) {
+	o, root, now := newTestObserver(t)
+	defer o.Close()
+	o.ApplyHook(HookSignal{Root: root, Event: "SessionStart", At: now})
+
+	first := o.ApplyHook(HookSignal{
+		Root: root, Event: "PermissionRequest", ToolName: "Bash",
+		ToolInputHash: "call-a", At: now.Add(time.Second),
+	})
+	if first.PromptDepth != 1 {
+		t.Fatalf("first prompt depth = %d, want 1", first.PromptDepth)
+	}
+	second := o.ApplyHook(HookSignal{
+		Root: root, Event: "PermissionRequest", ToolName: "Bash",
+		ToolInputHash: "call-b", At: now.Add(2 * time.Second),
+	})
+	if second.PromptDepth != 2 {
+		t.Fatalf("parallel prompt depth = %d, want 2", second.PromptDepth)
+	}
+	if !second.Projection.StatusSince.Equal(now.Add(time.Second)) {
+		t.Fatalf("second parallel prompt restarted the episode clock at %v", second.Projection.StatusSince)
+	}
+
+	// The user answers the second call. The first is still blocking.
+	result := o.ApplyHook(HookSignal{
+		Root: root, Event: "PostToolUse", ToolName: "Bash",
+		ToolInputHash: "call-b", At: now.Add(3 * time.Second),
+	})
+	if result.Rule != "writer_tool_match_cleared" || result.PromptDepth != 1 {
+		t.Fatalf("answering one parallel call = rule %q depth %d, want one prompt still open", result.Rule, result.PromptDepth)
+	}
+	if got := sortedPendingWriters(result.Projection.Pending); !reflect.DeepEqual(got, []string{""}) {
+		t.Fatalf("first parallel prompt lost its owner: %v", got)
+	}
+	assertSummary(t, result.Observation, now.Add(3*time.Second), agentgraph.LegacyPermission, agentgraph.AttentionApproval)
+
+	// Only the last answer may take the chip out of red.
+	result = o.ApplyHook(HookSignal{
+		Root: root, Event: "PostToolUse", ToolName: "Bash",
+		ToolInputHash: "call-a", At: now.Add(4 * time.Second),
+	})
+	if result.PromptDepth != 0 || len(result.Projection.Pending) != 0 || result.Projection.PendingTool != "" {
+		t.Fatalf("last answer did not clear the writer: depth %d projection %+v", result.PromptDepth, result.Projection)
+	}
+	assertSummary(t, result.Observation, now.Add(4*time.Second), agentgraph.LegacyWorking, agentgraph.AttentionNone)
+}
+
+// A writer's node attention is the fold over its open prompts and must use the
+// reducer's own precedence: approval outranks user_input, so the folded value
+// only relaxes as prompts are actually answered.
+func TestWriterAttentionFoldsApprovalAheadOfUserInputWhilePromptsAreOpen(t *testing.T) {
+	o, root, now := newTestObserver(t)
+	defer o.Close()
+	o.ApplyHook(HookSignal{Root: root, Event: "SessionStart", At: now})
+	o.ApplyHook(HookSignal{
+		Root: root, Event: "PermissionRequest", ToolName: "AskUserQuestion",
+		ToolInputHash: "ask-1", At: now.Add(time.Second),
+	})
+	result := o.ApplyHook(HookSignal{
+		Root: root, Event: "PermissionRequest", ToolName: "Bash",
+		ToolInputHash: "call-a", At: now.Add(2 * time.Second),
+	})
+	if got := result.Observation.Nodes[0].Attention; got != agentgraph.AttentionApproval {
+		t.Fatalf("folded attention with an open approval = %q, want approval", got)
+	}
+
+	result = o.ApplyHook(HookSignal{
+		Root: root, Event: "PostToolUse", ToolName: "Bash",
+		ToolInputHash: "call-a", At: now.Add(3 * time.Second),
+	})
+	if got := result.Observation.Nodes[0].Attention; got != agentgraph.AttentionUserInput {
+		t.Fatalf("folded attention after the approval closed = %q, want user_input", got)
+	}
+	if got := result.Projection.PendingTool; got != "AskUserQuestion" {
+		t.Fatalf("projected pending tool = %q, want the surviving question", got)
+	}
+
+	result = o.ApplyHook(HookSignal{
+		Root: root, Event: "PostToolUse", ToolName: "AskUserQuestion",
+		ToolInputHash: "ask-1", At: now.Add(4 * time.Second),
+	})
+	if got := result.Observation.Nodes[0].Attention; got != agentgraph.AttentionNone {
+		t.Fatalf("attention after every prompt closed = %q, want none", got)
+	}
+}
+
+func TestParallelPromptSetIsBoundedAndDedupesRedeliveredHooks(t *testing.T) {
+	o, root, now := newTestObserver(t)
+	defer o.Close()
+	o.ApplyHook(HookSignal{Root: root, Event: "SessionStart", At: now})
+
+	// A verbatim redelivery of one hook edge is the same prompt, not a second.
+	signal := HookSignal{
+		Root: root, Event: "PermissionRequest", ToolName: "Bash",
+		ToolInputHash: "call-0", At: now.Add(time.Second),
+	}
+	o.ApplyHook(signal)
+	repeat := o.ApplyHook(signal)
+	if repeat.Changed || repeat.PromptDepth != 1 {
+		t.Fatalf("redelivered hook = changed %v depth %d, want the same single prompt", repeat.Changed, repeat.PromptDepth)
+	}
+
+	var result HookResult
+	for i := 1; i <= maxPendingPromptsPerWriter; i++ {
+		result = o.ApplyHook(HookSignal{
+			Root: root, Event: "PermissionRequest", ToolName: "Bash",
+			ToolInputHash: "call-" + string(rune('a'+i)), At: now.Add(time.Duration(i+1) * time.Second),
+		})
+	}
+	if result.PromptDepth != maxPendingPromptsPerWriter {
+		t.Fatalf("prompt depth = %d, want the cap %d", result.PromptDepth, maxPendingPromptsPerWriter)
+	}
+	// The oldest record is the one dropped, so its answer no longer matches.
+	result = o.ApplyHook(HookSignal{
+		Root: root, Event: "PostToolUse", ToolName: "Bash",
+		ToolInputHash: "call-0", At: now.Add(time.Minute),
+	})
+	if result.Rule != "writer_prompt_held" || result.PromptDepth != maxPendingPromptsPerWriter {
+		t.Fatalf("overflow eviction = rule %q depth %d, want the oldest dropped", result.Rule, result.PromptDepth)
+	}
+}
+
 func TestMainToolMatchHoldsWithLiveTeammateAndHashMismatch(t *testing.T) {
 	o, root, now := newTestObserver(t)
 	defer o.Close()
