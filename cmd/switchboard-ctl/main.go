@@ -490,120 +490,79 @@ func cycleTargetPID(sessions []state.Session, direction string) (int, bool) {
 	return target.PID, ok
 }
 
-// cmdAttention jumps to a session that needs the user. Priority mirrors the
-// waybar chip colors: sessions waiting on a permission prompt (red) outrank
-// idle sessions (orange). Among the top-priority tier, focus cycles — each
-// press advances from the currently focused session to the next member of that
-// tier, wrapping around, so repeated presses visit every red (or, if there are
-// no reds, every orange) in turn. When nothing needs attention but every
-// session is working (green), the green sessions become the tier so the
-// shortcut still does something useful — it cycles through the running
-// sessions. It is a no-op only when a session is unknown (grey), or when there
-// are no sessions at all. Bound to mod+Shift+a in Hyprland.
+// cmdAttention advances one step around the attention ring, so the shortcut
+// always moves the focus rightward and never lands back on the window the key
+// was pressed in. Bound to mod+Shift+a in Hyprland.
 func cmdAttention(c *rpc.Client) {
-	snap := mustList(c)
-
-	// The focused session anchors the cycle, so a repeat press steps to the
-	// next member of the tier instead of re-focusing the same one. 0 (no PID)
-	// when nothing is focused, which pickAttention treats as "outside the tier".
-	var focused *state.Session
-	for _, s := range snap.Sessions {
-		if s.Focused {
-			copy := s
-			focused = &copy
-			break
-		}
-	}
-
-	target := pickAttentionExact(snap.Sessions, focused)
+	target := nextAttentionTarget(mustList(c).Sessions)
 	if target == nil {
 		return
 	}
 	focusSession(c, *target)
 }
 
-func pickAttentionExact(sessions []state.Session, focused *state.Session) *state.Session {
-	tier := topAttentionTier(sessions)
-	if len(tier) == 0 {
-		return nil
-	}
-	for i, session := range tier {
-		if focused != nil && sameExactSession(*session, *focused) {
-			return tier[(i+1)%len(tier)]
-		}
-	}
-	return tier[0]
-}
-
-func sameExactSession(a, b state.Session) bool {
-	return a.Hostname == b.Hostname && a.PID == b.PID && a.StartedAt.Equal(b.StartedAt)
-}
-
-// pickAttention returns the next session needing attention, cycling within the
-// highest-priority tier. The tier is the permission sessions (red) if any
-// exist, otherwise the idle sessions (orange), otherwise — only when every
-// session is working — the green sessions; an unknown (grey) session is never
-// a target and suppresses the all-green fallback. Members keep snapshot order
-// (oldest-first per state.Snapshot).
-// When focusedPID names a tier member, the next member is returned, wrapping
-// around — so repeated calls cycle through the whole tier, and a single-member
-// tier stays put. When the focused session is outside the tier (or nothing is
-// focused), the first member is returned, so one press jumps in. Returns nil
-// when no session needs attention.
-func pickAttention(sessions []state.Session, focusedPID int) *state.Session {
-	tier := topAttentionTier(sessions)
-	if len(tier) == 0 {
-		return nil
-	}
-
-	current := -1
-	for i, s := range tier {
-		if s.PID == focusedPID {
-			current = i
-			break
-		}
-	}
-	if current == -1 {
-		return tier[0]
-	}
-	return tier[(current+1)%len(tier)]
-}
-
-// topAttentionTier returns the highest-priority group of sessions needing
-// attention — all permission sessions if any exist, otherwise all idle
-// sessions — in snapshot order. As a last resort, when *every* session is
-// working (green), all of them form the tier so the shortcut still has
-// somewhere to go and instead cycles through the running sessions. A single
-// unknown (grey) session suppresses the green tier, so a half-discovered
-// snapshot stays a no-op rather than jumping somewhere arbitrary. Returns nil
-// when nothing needs attention.
-func topAttentionTier(sessions []state.Session) []*state.Session {
+// attentionRing orders every navigable session into the ring `attention`
+// walks: permission (red) first, then idle (orange), then working and
+// delegating (green), each in snapshot order. Unknown (grey) sessions are
+// excluded — they are not actionable, and `cycle next|prev` already reaches
+// every session regardless of colour. Headless and unbound-remote rows are
+// excluded by sessionNavigable.
+func attentionRing(sessions []state.Session) []*state.Session {
 	var permission, idle, working []*state.Session
-	// Headless claude -p runs are never attention targets (nothing to focus)
-	// and do not count against the all-green fallback's denominator.
-	considered := 0
 	for i := range sessions {
 		if !sessionNavigable(sessions[i]) {
 			continue
 		}
-		considered++
 		switch sessionStatus(sessions[i]) {
-		case "permission":
+		case state.StatusPermission:
 			permission = append(permission, &sessions[i])
-		case "idle":
+		case state.StatusIdle:
 			idle = append(idle, &sessions[i])
-		case "working":
+		case state.StatusWorking, state.StatusDelegating:
 			working = append(working, &sessions[i])
 		}
 	}
-	if len(permission) > 0 {
-		return permission
+	ring := make([]*state.Session, 0, len(permission)+len(idle)+len(working))
+	ring = append(ring, permission...)
+	ring = append(ring, idle...)
+	ring = append(ring, working...)
+	return ring
+}
+
+// nextAttentionTarget returns the session `attention` should focus: one step
+// clockwise around the ring from the focused session, skipping every session
+// that is ALREADY focused so the key always moves. Because the ring is
+// tier-major, "there is nothing below me in this level" and "pop out to the
+// next level" are the same step — the last red advances to the first orange,
+// and the last green wraps back to the first red.
+//
+// Skipping (rather than merely advancing past) the focused set is what makes
+// the wezterm split case safe. Focused is a WINDOW flag today, so two sessions
+// sharing one window both report it; skipping the whole set lands the press on
+// a genuinely different window instead of on a sibling pane, which would look
+// like another dead key.
+//
+// Returns nil only when the ring is empty, or when every ring member is
+// already focused — the "nothing below, nothing beyond" terminal case.
+func nextAttentionTarget(sessions []state.Session) *state.Session {
+	ring := attentionRing(sessions)
+	if len(ring) == 0 {
+		return nil
 	}
-	if len(idle) > 0 {
-		return idle
+	// No ring member focused (a browser window is active, or the focused
+	// session is grey or non-navigable) leaves start at 0 — the most urgent
+	// member, so one press jumps in.
+	start := 0
+	for i, session := range ring {
+		if session.Focused {
+			start = i + 1
+			break
+		}
 	}
-	if len(working) > 0 && len(working) == considered {
-		return working
+	for step := 0; step < len(ring); step++ {
+		if candidate := ring[(start+step)%len(ring)]; !candidate.Focused {
+			return candidate
+		}
 	}
 	return nil
 }
@@ -910,11 +869,12 @@ commands:
   status                  one-line summary
   pick                    emit exact-token<TAB>label<TAB>ws<TAB>cwd for fzf
   cycle next|prev         focus the next/previous session, wrapping
-  attention               jump to a session needing attention, cycling within
-                            the top tier: permission (red), else idle (orange),
-                            else — only if all are green — working sessions;
-                            repeated presses visit each member in turn;
-                            no-op if any session is unknown (grey)
+  attention               advance one step around the attention ring:
+                            permission (red), then idle (orange), then green
+                            (working/delegating), each in snapshot order.
+                            Always moves and wraps at the end; unknown (grey)
+                            sessions are not members. No-op only when there is
+                            nowhere else to go.
   agent-diagnostics       show bounded provider diagnostic counters; --json
                             emits the raw content-free array
   name <sub>              project names: resolve --cwd --name, abbrev --cwd,

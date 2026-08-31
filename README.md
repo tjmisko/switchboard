@@ -79,7 +79,9 @@ switchboard · 3 sessions · navigate · wm=hyprland term=wezterm
 
 Only the root lines are navigation targets. Child agents do not own independent
 terminal targets or Switchboard sessions; they appear as indented, non-focusable
-rows in the TUI, and as a one-line roll-up in the Waybar hover.
+rows in the TUI, and as a one-line roll-up in the Waybar hover. Unknown (grey)
+root sessions are reachable with `cycle next|prev` but are not members of the
+`attention` ring — nothing is waiting on them.
 
 Prefer your own UI? Read `~/.cache/switchboard/state.json` directly — see the
 [schema](docs/state-schema.md) and [bar integrations](docs/bars/README.md) for
@@ -242,7 +244,7 @@ switchboard-ctl focus pid:<n>                   # PID, if unique across hosts
 switchboard-ctl focus idx:<n>                   # Nth aggregate session
 switchboard-ctl focus host:<host>:pid:<n>        # exact host namespace
 switchboard-ctl cycle next|prev     # focus next/prev session, wrapping
-switchboard-ctl attention           # first permission, else first idle, else cycle green if all green (repeat to cycle the tier)
+switchboard-ctl attention           # step around the ring: reds, then oranges, then greens; always moves, wraps at the end
 switchboard-ctl pick                # exact-token<TAB>label<TAB>ws<TAB>cwd (for fzf)
 switchboard-ctl diagnose --observer # content-free binding/freshness/graph health
 ```
