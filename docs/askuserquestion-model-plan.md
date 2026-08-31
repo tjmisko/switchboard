@@ -433,6 +433,55 @@ removes it.
 vocabulary is Claude-only by design — every Codex transition still records
 `agent_graph_authority`, which is what its knob hint says it means.
 
+### 4b. Addendum — the Codex approval red, closed after Phase 1
+
+Phase 1 closed the *question* red on Codex and left one open concern behind, which
+is a missed RED of the same class and on the same provider: the pending record for
+a generic approval gate survived an unrelated writer's edge, but the **published
+colour did not**. `state.pending` is re-asserted on every observation by
+`applyCodexPendingAttention`, which is what makes a question red outlive a
+sibling's edge; `state.approvals` had no equivalent. After the grace timer
+published `AttentionApproval`, the next `Stop` or `PostToolUse` from any writer
+produced a root observation of active/none in `handleCodexHookNow`, and
+`overlayCodexHookObservation` wrote that straight over the red while the modal was
+still undecided.
+
+**The fix is the missing re-assertion path, not a new record.**
+`overlayCodexApprovalObservation` sits beside `overlayCodexPendingObservation` in
+`applyObservationWithRule`, so it covers the hook landing path and the app-server
+`Observe` tick alike. Three properties make it safe:
+
+- **It re-asserts only a red the grace timer actually published**
+  (`redPublishedAt` non-zero). Before the deadline a gate stays colourless — that
+  silence is what the grace is *for*, and painting red there would be the false red
+  §2.3 rejected.
+- **It never repaints a more specific human reason.** The pending overlay runs
+  first, so the approval overlay only ever fills a root whose attention is `none`.
+  A question red therefore still wins while one is open, and D3's deferral still
+  brings the gate's own red back the moment the question clears.
+- **It reads the record rather than replacing it**, so the red is gone the instant
+  the record is. Every release edge that existed before still releases: the gate's
+  own `PreToolUse`/`PostToolUse`, the root turn `Stop` (writer-blind, per D1),
+  `SessionStart`/`UserPromptSubmit`, conversation rotation and root removal, and
+  the app-server settle branch of a deferred grace timer. They are enumerated in the
+  comment on the overlay so a later change cannot quietly drop one.
+
+**The stale-red window this deliberately accepts.** Once the red is published the
+timer is spent, so an app-server snapshot reporting active/none no longer releases
+the gate — only the edges above do. A gate the user *denies* emits no
+`PreToolUse`/`PostToolUse`, so its red now stands until the turn `Stop` or the next
+prompt instead of being erased by the next unrelated hook edge. That is a loud
+stale red replacing a silent missed one, which is the trade §4 of
+[status-color-state-model.md](status-color-state-model.md) requires. Extending the
+`appServerSettled` trust past publication would shorten it, and was rejected here:
+that trust is unproven for approvals on the standard-CLI launch path — the same
+blind spot that makes `overlayCodexPendingObservation` refuse app-server evidence —
+and buying seconds of staleness with a possible missed RED is the wrong direction.
+
+**Phase 1's open concern is now closed; its DoD is otherwise unchanged.**
+`request_user_input` and the whole question path are byte-identical — no reducer,
+matcher, key or predicate was touched — and every Phase 1 test passes unmodified.
+
 ---
 
 ## 5. The probes that settle what nobody established

@@ -467,6 +467,9 @@ func (c *agentCoordinator) applyObservationWithRule(ref provider.RootRef, genera
 	if ref.Provider == agentgraph.ProviderCodex {
 		observation = c.overlayCodexHookRootObservation(ref.Key(), observation, now)
 		observation = c.overlayCodexPendingObservation(ref.Key(), observation, now)
+		// Order is load-bearing: the pending overlay claims the root first, so the
+		// approval overlay only ever fills a chip no more specific human reason owns.
+		observation = c.overlayCodexApprovalObservation(ref.Key(), observation, now)
 		observation = c.overlayCodexChildObservation(ref.Key(), observation, now)
 	}
 	c.mu.Lock()

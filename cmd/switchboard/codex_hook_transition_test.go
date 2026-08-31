@@ -686,6 +686,133 @@ func TestCodexApprovalShouldOutliveAQuestionRedRatherThanBeDiscarded(t *testing.
 	}
 }
 
+// The published approval red is the one human-owned colour nothing re-asserts.
+// state.approvals keeps the record, but handleCodexHookNow maps the next Stop or
+// PostToolUse from ANY writer to active/none and overlayCodexHookObservation
+// writes that straight over the red, while the gate itself is still undecided.
+// That is the missed RED of §2.3, one provider and one attention reason across:
+// silent, and it lasts until the user next looks at the modal.
+func TestCodexApprovalRedShouldSurviveUnrelatedProgressWhenTheGateIsUndecided(t *testing.T) {
+	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
+	coordinator.codexApprovalGrace = 20 * time.Millisecond
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PermissionRequest", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "gate-1",
+		ToolName: "exec_command", ObservedAt: time.Now(),
+	})
+	waitForCodexAttention(t, store, agentgraph.AttentionApproval)
+
+	// A sibling's completed call says nothing about this gate. The timestamps must
+	// be real wall clock and later than the timer's publication, or shouldApplyObservation
+	// fences the edge on staleness and the test passes without proving anything.
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PostToolUse", SessionID: "thread-1", TurnID: "turn-1", AgentID: "sibling-writer",
+		ToolUseID: "exec-1", ToolName: "exec_command", ObservedAt: time.Now(),
+	})
+	if graph := codexGraph(t, store); graph.Summary.Status != state.StatusPermission ||
+		graph.Summary.Attention != agentgraph.AttentionApproval {
+		t.Fatalf("an unrelated writer's progress erased the published approval red: %#v", graph.Summary)
+	}
+
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PreToolUse", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "gate-1",
+		ToolName: "exec_command", ObservedAt: time.Now(),
+	})
+	if graph := codexGraph(t, store); graph.Summary.Status != state.StatusWorking ||
+		graph.Summary.Attention != agentgraph.AttentionNone {
+		t.Fatalf("the decided gate did not resume working: %#v", graph.Summary)
+	}
+	if got := codexApprovalWriters(t, coordinator, store); len(got) != 0 {
+		t.Fatalf("the decided gate stayed armed: %v", got)
+	}
+}
+
+// Re-assertion buys a latch, and a latch that outlives its release edges is a red
+// nobody can clear. Every edge that resolved an approval record before this change
+// must still resolve one whose red is already up.
+func TestCodexPublishedApprovalRedShouldStillReleaseWhenItsResolvingEdgeArrives(t *testing.T) {
+	release := []struct {
+		name       string
+		req        rpc.Request
+		wantStatus string
+	}{
+		{
+			name: "should release when its own call completes",
+			req: rpc.Request{
+				Event: "PostToolUse", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "gate-1",
+				ToolName: "exec_command",
+			},
+			wantStatus: state.StatusWorking,
+		},
+		{
+			name:       "should release when the root turn ends",
+			req:        rpc.Request{Event: "Stop", SessionID: "thread-1", TurnID: "turn-1"},
+			wantStatus: state.StatusIdle,
+		},
+		{
+			name:       "should release when the turn boundary names no turn",
+			req:        rpc.Request{Event: "Stop", SessionID: "thread-1"},
+			wantStatus: state.StatusIdle,
+		},
+		{
+			name:       "should release when the user starts another turn",
+			req:        rpc.Request{Event: "UserPromptSubmit", SessionID: "thread-1", TurnID: "turn-2"},
+			wantStatus: state.StatusWorking,
+		},
+	}
+	for _, testCase := range release {
+		t.Run(testCase.name, func(t *testing.T) {
+			coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
+			coordinator.codexApprovalGrace = 20 * time.Millisecond
+			sendCodexHook(coordinator, store, rpc.Request{
+				Event: "PermissionRequest", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "gate-1",
+				ToolName: "exec_command", ObservedAt: time.Now(),
+			})
+			waitForCodexAttention(t, store, agentgraph.AttentionApproval)
+
+			testCase.req.ObservedAt = time.Now()
+			sendCodexHook(coordinator, store, testCase.req)
+			if graph := codexGraph(t, store); graph.Summary.Status != testCase.wantStatus ||
+				graph.Summary.Attention != agentgraph.AttentionNone {
+				t.Fatalf("%s left the approval red latched: %#v", testCase.req.Event, graph.Summary)
+			}
+			if got := codexApprovalWriters(t, coordinator, store); len(got) != 0 {
+				t.Fatalf("%s left the gate armed: %v", testCase.req.Event, got)
+			}
+		})
+	}
+}
+
+// A question is the more specific human reason and it already has its own owner.
+// Re-asserting approval must never repaint over it, or answering the question
+// would show the wrong reason while the gate still holds — and the gate's own red
+// must come back once the question clears, which is what D3's deferral bought.
+func TestCodexPublishedApprovalRedShouldYieldToAQuestionRedWhileOneIsOpen(t *testing.T) {
+	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
+	coordinator.codexApprovalGrace = 20 * time.Millisecond
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PermissionRequest", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "gate-1",
+		ToolName: "exec_command", ObservedAt: time.Now(),
+	})
+	waitForCodexAttention(t, store, agentgraph.AttentionApproval)
+
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PermissionRequest", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "question-1",
+		ToolName: "AskUserQuestion", ObservedAt: time.Now(),
+	})
+	if graph := codexGraph(t, store); graph.Summary.Attention != agentgraph.AttentionUserInput {
+		t.Fatalf("the published approval red masked a live question: %#v", graph.Summary)
+	}
+
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PostToolUse", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "question-1",
+		ToolName: "AskUserQuestion", ObservedAt: time.Now(),
+	})
+	if graph := codexGraph(t, store); graph.Summary.Status != state.StatusPermission ||
+		graph.Summary.Attention != agentgraph.AttentionApproval {
+		t.Fatalf("answering the question painted green over the undecided gate: %#v", graph.Summary)
+	}
+}
+
 func waitForCodexAttention(t *testing.T, store *state.Store, attention agentgraph.AttentionState) *state.AgentGraph {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)

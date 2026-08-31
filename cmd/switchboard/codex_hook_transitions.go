@@ -1233,6 +1233,70 @@ func (c *agentCoordinator) overlayCodexPendingObservation(key provider.RootKey, 
 	return applyCodexPendingAttention(observation, agentgraph.AttentionUserInput, now)
 }
 
+// overlayCodexApprovalObservation gives a published approval red the same
+// re-assertion path the input pending has. Without it the record survives an
+// unrelated edge but the colour does not: handleCodexHookNow maps the next Stop
+// or PostToolUse from ANY writer to active/none, and overlayCodexHookObservation
+// writes that over a modal nobody has decided — a missed RED, silent, lasting
+// until the user next looks at the terminal.
+//
+// Only a red the grace timer actually published is re-asserted. Before the
+// deadline the gate is deliberately colourless: the hook says Codex reached a
+// permission boundary, not that a person owns it, and painting red there is the
+// false-red the grace exists to avoid.
+//
+// This latches a colour, so it must not outlive its release edges. Every edge
+// that could resolve an approval record before this change still does, because
+// this reads the record rather than replacing it — the red is gone the moment the
+// record is:
+//
+//   - the gate's own PreToolUse or PostToolUse (codexPendingApprovalMatches);
+//   - the root turn Stop, writer-blind, scoped by turn id when both sides name one;
+//   - SessionStart or UserPromptSubmit, which sweep every gate in the conversation
+//     and are the only cancelling edge a denied or interrupted gate ever gets;
+//   - conversation rotation and root removal (clearCodexApprovalsLocked, via
+//     handleCodexHookNow's session change and forgetCodexHookState);
+//   - the app-server settle branch of a deferred grace timer.
+//
+// The graph's own freshness deadline remains the outer bound, exactly as it is for
+// overlayCodexPendingObservation.
+func (c *agentCoordinator) overlayCodexApprovalObservation(key provider.RootKey, observation agentgraph.Observation, now time.Time) agentgraph.Observation {
+	if codexObservationRootAttention(observation) != agentgraph.AttentionNone {
+		// Approval is the least specific human reason. A question red — from the
+		// pending overlay that ran just before this one, or observed by the
+		// app-server — is the more exact account of why the chip is red, and the
+		// gate keeps its own record until it is decided either way.
+		return observation
+	}
+	c.codexHookMu.Lock()
+	defer c.codexHookMu.Unlock()
+	state := c.codexHookRoots[key]
+	if state == nil || state.sessionID != observation.RootID || !codexApprovalRedPublishedLocked(state) {
+		return observation
+	}
+	return applyCodexPendingAttention(observation, agentgraph.AttentionApproval, now)
+}
+
+// codexApprovalRedPublishedLocked reports whether any gate this root holds has
+// already reached the chip. c.codexHookMu must be held.
+func codexApprovalRedPublishedLocked(state *codexHookRootState) bool {
+	for _, pending := range state.approvals {
+		if !pending.redPublishedAt.IsZero() {
+			return true
+		}
+	}
+	return false
+}
+
+func codexObservationRootAttention(observation agentgraph.Observation) agentgraph.AttentionState {
+	for _, node := range observation.Nodes {
+		if node.ID == observation.RootID {
+			return node.Attention
+		}
+	}
+	return agentgraph.AttentionNone
+}
+
 func (c *agentCoordinator) forgetCodexHookState(key provider.RootKey) {
 	c.codexHookMu.Lock()
 	if pending := c.codexStarts[key]; pending != nil {
