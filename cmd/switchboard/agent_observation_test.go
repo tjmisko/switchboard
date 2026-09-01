@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"log"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -11,6 +15,7 @@ import (
 	claudeprovider "github.com/tjmisko/switchboard/internal/provider/claude"
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
+	"github.com/tjmisko/switchboard/internal/statustune"
 )
 
 type fakeCodexCoordinatorObserver struct {
@@ -537,6 +542,108 @@ func TestClaudeHookAgentIDIsNormalizedExactlyOnceByAdapter(t *testing.T) {
 	coordinator.Close()
 }
 
+func TestClaudeGraphLandingLogsDiagnosableRulesAndPerCallHolds(t *testing.T) {
+	store := state.New("")
+	started := time.Now().Add(-time.Hour)
+	ref := seedCoordinatorSession(store, 4502, started, state.AgentKindClaude, "claude-root", "/project")
+	coordinator := newAgentCoordinator(store, nil, claudeprovider.NewObserver(t.TempDir()), nil)
+	coordinator.refreshTrackedRoots()
+	defer coordinator.Close()
+	coordinator.HandleHook(rpc.Request{
+		Agent: state.AgentKindClaude, Event: "SessionStart", SessionID: "claude-root", ObservedAt: time.Now(),
+	}, store.Snapshot().Sessions[0])
+
+	var logs bytes.Buffer
+	priorWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(priorWriter) })
+
+	for i, tool := range []string{"AskUserQuestion", "Bash"} {
+		sess, ok := sessionForKey(store.Snapshot(), ref.Key())
+		if !ok {
+			t.Fatal("Claude root disappeared before hook")
+		}
+		coordinator.HandleHook(rpc.Request{
+			Agent: state.AgentKindClaude, Event: "PermissionRequest", SessionID: "claude-root",
+			ToolName: tool, ToolInputHash: "hash-" + tool, ObservedAt: time.Now().Add(time.Duration(i) * time.Millisecond),
+		}, sess)
+	}
+
+	got := logs.String()
+	if !strings.Contains(got, "rule=permission_recorded_for_writer") {
+		t.Fatalf("Claude graph decision omitted its real rule:\n%s", got)
+	}
+	if !strings.Contains(got, "permission==permission") || !strings.Contains(got, `pending="Bash+1"`) {
+		t.Fatalf("second call was not logged as a two-call red hold:\n%s", got)
+	}
+	parsed := false
+	for _, line := range strings.Split(got, "\n") {
+		record, ok := statustune.ParseDecision(line)
+		if ok && record.Rule == statustune.RuleGraphPermissionRecorded && record.Hold && record.Pending == "Bash+1" {
+			parsed = true
+			break
+		}
+	}
+	if !parsed {
+		t.Fatalf("diagnose parser could not recover the rule and per-call hold:\n%s", got)
+	}
+}
+
+func TestClaudePreToolUseBindsThroughCoordinatorAndClearsExactCall(t *testing.T) {
+	store := state.New("")
+	started := time.Now().Add(-time.Hour)
+	ref := seedCoordinatorSession(store, 4503, started, state.AgentKindClaude, "claude-pretool", "/project")
+	coordinator := newAgentCoordinator(store, nil, claudeprovider.NewObserver(t.TempDir()), nil)
+	coordinator.refreshTrackedRoots()
+	defer coordinator.Close()
+
+	handle := func(req rpc.Request) {
+		t.Helper()
+		sess, ok := sessionForKey(store.Snapshot(), ref.Key())
+		if !ok {
+			t.Fatal("Claude root disappeared before hook")
+		}
+		coordinator.HandleHook(req, sess)
+	}
+	now := time.Now()
+	handle(rpc.Request{
+		Agent: state.AgentKindClaude, Event: "SessionStart", SessionID: "claude-pretool", ObservedAt: now,
+	})
+	handle(rpc.Request{
+		Agent: state.AgentKindClaude, Event: "PreToolUse", SessionID: "claude-pretool",
+		ToolName: "AskUserQuestion", ToolInputHash: "ask-before", ToolUseID: "toolu_fast",
+		ObservedAt: now.Add(time.Second),
+	})
+	afterPre, _ := sessionForKey(store.Snapshot(), ref.Key())
+	if got := afterPre.Enrichment().Status; got != state.StatusIdle {
+		t.Fatalf("PreToolUse status = %q, want idle with no attention", got)
+	}
+	if got := len(afterPre.Enrichment().PendingPrompts); got != 0 {
+		t.Fatalf("PreToolUse opened %d prompts, want none", got)
+	}
+
+	handle(rpc.Request{
+		Agent: state.AgentKindClaude, Event: "PermissionRequest", SessionID: "claude-pretool",
+		ToolName: "AskUserQuestion", ToolInputHash: "ask-before", ObservedAt: now.Add(2 * time.Second),
+	})
+	blocked, _ := sessionForKey(store.Snapshot(), ref.Key())
+	info := blocked.Enrichment()
+	if info.Status != state.StatusPermission || len(info.PendingPrompts) != 1 || info.PendingPrompts[0].CallID != "toolu_fast" {
+		t.Fatalf("PermissionRequest did not publish the pre-bound call: %+v", info)
+	}
+
+	handle(rpc.Request{
+		Agent: state.AgentKindClaude, Event: "PostToolUse", SessionID: "claude-pretool",
+		ToolName: "AskUserQuestion", ToolInputHash: "ask-after-rewrite", ToolUseID: "toolu_fast",
+		ObservedAt: now.Add(3 * time.Second),
+	})
+	cleared, _ := sessionForKey(store.Snapshot(), ref.Key())
+	info = cleared.Enrichment()
+	if info.Status != state.StatusWorking || len(info.PendingPrompts) != 0 {
+		t.Fatalf("exact PostToolUse did not clear at hook speed: %+v", info)
+	}
+}
+
 func TestClaudeShadowFixturesAuthorizeGraphSummary(t *testing.T) {
 	for _, fixture := range claudeprovider.CanonicalShadowCases() {
 		t.Run(fixture.Name, func(t *testing.T) {
@@ -582,4 +689,82 @@ func TestUpdateStormDoesNotStarvePeriodicReconciliation(t *testing.T) {
 	if observes < 2 {
 		t.Fatalf("Observe calls = %d, want initial/event work plus a periodic backstop", observes)
 	}
+}
+
+// claudeDiagnosticCount reads one of the Claude provider's bounded diagnostic
+// counters by category (diagnosticCount is the Codex-scoped twin).
+func claudeDiagnosticCount(coordinator *agentCoordinator, category string) uint64 {
+	for _, diagnostic := range coordinator.Diagnostics() {
+		if diagnostic.Provider == string(agentgraph.ProviderClaude) && diagnostic.Category == category {
+			return diagnostic.Count
+		}
+	}
+	return 0
+}
+
+// P1 (docs/askuserquestion-model-plan.md §5) must count parallel EPISODES, not
+// PermissionRequest edges. The plan branches on this number — it decides whether
+// the container fix ships as an urgent fix or as hygiene — so an N-way dispatch
+// counting N-1 times, or a redelivered hook counting at all, reports an inflated
+// exposure that nobody can tell from a real one.
+func TestParallelPromptProbeCountsOneEpisodePerWriterNotOneEdgePerCall(t *testing.T) {
+	store := state.New("")
+	started := time.Now().Add(-time.Hour)
+	ref := seedCoordinatorSession(store, 4801, started, state.AgentKindClaude, "claude-root", "/project")
+	coordinator := newAgentCoordinator(store, nil, claudeprovider.NewObserver(t.TempDir()), nil)
+	coordinator.refreshTrackedRoots()
+	defer coordinator.Close()
+
+	now := time.Now()
+	permission := func(hash string, at time.Time) {
+		sess, ok := sessionForKey(store.Snapshot(), ref.Key())
+		if !ok {
+			t.Fatalf("Claude root discovery was lost before the %q hook", hash)
+		}
+		coordinator.HandleHook(rpc.Request{
+			Agent: state.AgentKindClaude, Event: "PermissionRequest", SessionID: "claude-root",
+			ToolName: "Bash", ToolInputHash: hash, ObservedAt: at,
+		}, sess)
+	}
+	count := func() uint64 {
+		return claudeDiagnosticCount(coordinator, "prompt_parallel_episode")
+	}
+
+	t.Run("should not fire when a writer holds only one prompt", func(t *testing.T) {
+		permission("call-1", now)
+		if got := count(); got != 0 {
+			t.Fatalf("episodes after a single prompt = %d, want 0", got)
+		}
+	})
+
+	t.Run("should fire once when one turn dispatches four gated calls", func(t *testing.T) {
+		for i := 2; i <= 4; i++ {
+			permission("call-"+strconv.Itoa(i), now.Add(time.Duration(i)*time.Millisecond))
+		}
+		if got := count(); got != 1 {
+			t.Fatalf("episodes after a 4-way dispatch = %d, want 1", got)
+		}
+	})
+
+	t.Run("should not fire again when a hook edge is redelivered verbatim", func(t *testing.T) {
+		// Answer down to one open prompt, reopen the second, then redeliver that
+		// exact edge: the redelivery opens nothing, so it must not re-count.
+		sess, _ := sessionForKey(store.Snapshot(), ref.Key())
+		for i := 2; i <= 4; i++ {
+			coordinator.HandleHook(rpc.Request{
+				Agent: state.AgentKindClaude, Event: "PostToolUse", SessionID: "claude-root",
+				ToolName: "Bash", ToolInputHash: "call-" + strconv.Itoa(i),
+				ObservedAt: now.Add(time.Duration(10+i) * time.Millisecond),
+			}, sess)
+		}
+		reopened := now.Add(time.Second)
+		permission("call-5", reopened)
+		if got := count(); got != 2 {
+			t.Fatalf("episodes after a second parallel wait opened = %d, want 2", got)
+		}
+		permission("call-5", reopened)
+		if got := count(); got != 2 {
+			t.Fatalf("a verbatim redelivery re-counted the episode: %d, want 2", got)
+		}
+	})
 }

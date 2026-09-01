@@ -655,6 +655,31 @@ func TestBlockedWriters_namesTheTeammateWhenASubagentRaisedThePrompt(t *testing.
 	}
 }
 
+func TestBlockedWriters_namesHowManyCallsOneWriterIsBlockedOn(t *testing.T) {
+	s, _ := blockedFixture(t, []string{"af5bd126402ac16c7"}, 4, map[string]string{
+		"af5bd126402ac16c7": teammateMeta("escalate-cleanup", "Clean up escalation duplication"),
+	})
+	s.Claude.PendingPrompts = []state.PendingPromptRecord{
+		{Writer: "af5bd126402ac16c7", Tool: "Bash"},
+		{Writer: "af5bd126402ac16c7", Tool: "Edit"},
+		{Writer: "af5bd126402ac16c7", Tool: "AskUserQuestion"},
+	}
+	if got := BlockedWriters(s); got != "escalate-cleanup (3 calls)" {
+		t.Errorf("BlockedWriters = %q, want %q", got, "escalate-cleanup (3 calls)")
+	}
+}
+
+func TestBlockedWriters_showsParallelCallsForAnOtherwiseObviousMainThread(t *testing.T) {
+	s, _ := blockedFixture(t, []string{state.PendingWriterMain}, 0, nil)
+	s.Claude.PendingPrompts = []state.PendingPromptRecord{
+		{Writer: state.PendingWriterMain, Tool: "Bash"},
+		{Writer: state.PendingWriterMain, Tool: "Edit"},
+	}
+	if got := BlockedWriters(s); got != "main (2 calls)" {
+		t.Errorf("BlockedWriters = %q, want %q", got, "main (2 calls)")
+	}
+}
+
 // Case 18: the main thread and a teammate are both blocked, and the red now holds
 // for both. Naming only one of them would send the user to the wrong decision.
 func TestBlockedWriters_namesEveryWriterWhenTwoAreBlockedAtOnce(t *testing.T) {

@@ -6,12 +6,14 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/agentgraph"
 	"github.com/tjmisko/switchboard/internal/provider"
+	"github.com/tjmisko/switchboard/internal/statustune"
 )
 
 var _ provider.Observer = (*Observer)(nil)
@@ -128,6 +130,248 @@ func TestChildAttentionOwnershipAndWriterCollision(t *testing.T) {
 		t.Fatalf("writer-local clear pending writers = %v, want child-b", got)
 	}
 	assertSummary(t, result.Observation, now.Add(4*time.Second), agentgraph.LegacyPermission, agentgraph.AttentionUserInput)
+}
+
+// Two gated calls dispatched in one assistant turn are two prompts, not one.
+// Answering either must hold the chip red while the other still blocks the
+// agent: a chip that goes green here is a missed RED — silent, and it costs the
+// user the entire remaining wait (askuserquestion-model-plan.md §2.2, M2).
+func TestParallelPromptsFromOneWriterHoldRedUntilEveryCallIsAnswered(t *testing.T) {
+	o, root, now := newTestObserver(t)
+	defer o.Close()
+	o.ApplyHook(HookSignal{Root: root, Event: "SessionStart", At: now})
+
+	first := o.ApplyHook(HookSignal{
+		Root: root, Event: "PermissionRequest", ToolName: "Bash",
+		ToolInputHash: "call-a", At: now.Add(time.Second),
+	})
+	if first.PromptDepth != 1 {
+		t.Fatalf("first prompt depth = %d, want 1", first.PromptDepth)
+	}
+	second := o.ApplyHook(HookSignal{
+		Root: root, Event: "PermissionRequest", ToolName: "Bash",
+		ToolInputHash: "call-b", At: now.Add(2 * time.Second),
+	})
+	if second.PromptDepth != 2 {
+		t.Fatalf("parallel prompt depth = %d, want 2", second.PromptDepth)
+	}
+	if !second.Projection.StatusSince.Equal(now.Add(time.Second)) {
+		t.Fatalf("second parallel prompt restarted the episode clock at %v", second.Projection.StatusSince)
+	}
+
+	// The user answers the second call. The first is still blocking.
+	result := o.ApplyHook(HookSignal{
+		Root: root, Event: "PostToolUse", ToolName: "Bash",
+		ToolInputHash: "call-b", At: now.Add(3 * time.Second),
+	})
+	if result.Rule != "writer_tool_match_cleared" || result.PromptDepth != 1 {
+		t.Fatalf("answering one parallel call = rule %q depth %d, want one prompt still open", result.Rule, result.PromptDepth)
+	}
+	if got := sortedPendingWriters(result.Projection.Pending); !reflect.DeepEqual(got, []string{""}) {
+		t.Fatalf("first parallel prompt lost its owner: %v", got)
+	}
+	assertSummary(t, result.Observation, now.Add(3*time.Second), agentgraph.LegacyPermission, agentgraph.AttentionApproval)
+
+	// Only the last answer may take the chip out of red.
+	result = o.ApplyHook(HookSignal{
+		Root: root, Event: "PostToolUse", ToolName: "Bash",
+		ToolInputHash: "call-a", At: now.Add(4 * time.Second),
+	})
+	if result.PromptDepth != 0 || len(result.Projection.Pending) != 0 || result.Projection.PendingTool != "" {
+		t.Fatalf("last answer did not clear the writer: depth %d projection %+v", result.PromptDepth, result.Projection)
+	}
+	assertSummary(t, result.Observation, now.Add(4*time.Second), agentgraph.LegacyWorking, agentgraph.AttentionNone)
+}
+
+// A writer's node attention is the fold over its open prompts and must use the
+// reducer's own precedence: approval outranks user_input, so the folded value
+// only relaxes as prompts are actually answered.
+func TestWriterAttentionFoldsApprovalAheadOfUserInputWhilePromptsAreOpen(t *testing.T) {
+	o, root, now := newTestObserver(t)
+	defer o.Close()
+	o.ApplyHook(HookSignal{Root: root, Event: "SessionStart", At: now})
+	o.ApplyHook(HookSignal{
+		Root: root, Event: "PermissionRequest", ToolName: "AskUserQuestion",
+		ToolInputHash: "ask-1", At: now.Add(time.Second),
+	})
+	result := o.ApplyHook(HookSignal{
+		Root: root, Event: "PermissionRequest", ToolName: "Bash",
+		ToolInputHash: "call-a", At: now.Add(2 * time.Second),
+	})
+	if got := result.Observation.Nodes[0].Attention; got != agentgraph.AttentionApproval {
+		t.Fatalf("folded attention with an open approval = %q, want approval", got)
+	}
+
+	result = o.ApplyHook(HookSignal{
+		Root: root, Event: "PostToolUse", ToolName: "Bash",
+		ToolInputHash: "call-a", At: now.Add(3 * time.Second),
+	})
+	if got := result.Observation.Nodes[0].Attention; got != agentgraph.AttentionUserInput {
+		t.Fatalf("folded attention after the approval closed = %q, want user_input", got)
+	}
+	if got := result.Projection.PendingTool; got != "AskUserQuestion" {
+		t.Fatalf("projected pending tool = %q, want the surviving question", got)
+	}
+
+	result = o.ApplyHook(HookSignal{
+		Root: root, Event: "PostToolUse", ToolName: "AskUserQuestion",
+		ToolInputHash: "ask-1", At: now.Add(4 * time.Second),
+	})
+	if got := result.Observation.Nodes[0].Attention; got != agentgraph.AttentionNone {
+		t.Fatalf("attention after every prompt closed = %q, want none", got)
+	}
+}
+
+func TestParallelPromptSetIsBoundedAndDedupesRedeliveredHooks(t *testing.T) {
+	o, root, now := newTestObserver(t)
+	defer o.Close()
+	o.ApplyHook(HookSignal{Root: root, Event: "SessionStart", At: now})
+
+	// A verbatim redelivery of one hook edge is the same prompt, not a second.
+	signal := HookSignal{
+		Root: root, Event: "PermissionRequest", ToolName: "Bash",
+		ToolInputHash: "call-0", At: now.Add(time.Second),
+	}
+	o.ApplyHook(signal)
+	repeat := o.ApplyHook(signal)
+	if repeat.Changed || repeat.PromptDepth != 1 {
+		t.Fatalf("redelivered hook = changed %v depth %d, want the same single prompt", repeat.Changed, repeat.PromptDepth)
+	}
+
+	var result HookResult
+	for i := 1; i <= maxPendingPromptsPerWriter; i++ {
+		result = o.ApplyHook(HookSignal{
+			Root: root, Event: "PermissionRequest", ToolName: "Bash",
+			ToolInputHash: "call-" + strconv.Itoa(i), At: now.Add(time.Duration(i+1) * time.Second),
+		})
+	}
+	if result.PromptDepth != maxPendingPromptsPerWriter {
+		t.Fatalf("prompt depth = %d, want the cap %d", result.PromptDepth, maxPendingPromptsPerWriter)
+	}
+	// The oldest record is the one dropped, so its answer no longer matches.
+	result = o.ApplyHook(HookSignal{
+		Root: root, Event: "PostToolUse", ToolName: "Bash",
+		ToolInputHash: "call-0", At: now.Add(time.Minute),
+	})
+	if result.Rule != "writer_prompt_held" || result.PromptDepth != maxPendingPromptsPerWriter {
+		t.Fatalf("overflow eviction = rule %q depth %d, want the oldest dropped", result.Rule, result.PromptDepth)
+	}
+}
+
+// The overflow bound must sit far outside real dispatch width. The corpus
+// maximum of 8 parallel calls is an observed maximum, not a limit Claude Code
+// enforces, so a cap set at 8 would evict a LIVE prompt from the first 9-way
+// turn and go green with that call still blocking — a missed RED. Nine parallel
+// calls must all stay open, and only the last answer may leave red.
+func TestEveryCallStaysOpenWhenOneTurnDispatchesPastTheMeasuredParallelMaximum(t *testing.T) {
+	const observedCorpusMaximum = 8
+	if maxPendingPromptsPerWriter <= observedCorpusMaximum {
+		t.Fatalf("cap %d leaves no headroom over the observed corpus maximum %d",
+			maxPendingPromptsPerWriter, observedCorpusMaximum)
+	}
+
+	o, root, now := newTestObserver(t)
+	defer o.Close()
+	o.ApplyHook(HookSignal{Root: root, Event: "SessionStart", At: now})
+
+	const parallel = observedCorpusMaximum + 1
+	for i := 1; i <= parallel; i++ {
+		result := o.ApplyHook(HookSignal{
+			Root: root, Event: "PermissionRequest", ToolName: "Bash",
+			ToolInputHash: "call-" + strconv.Itoa(i), At: now.Add(time.Duration(i) * time.Millisecond),
+		})
+		if result.PromptDepth != i {
+			t.Fatalf("prompt %d of a %d-way dispatch = depth %d, want %d (a live call was evicted)",
+				i, parallel, result.PromptDepth, i)
+		}
+	}
+
+	// Answered newest-first, which is the order that would expose an eviction of
+	// the oldest: every answer but the last must hold the chip red.
+	answeredAt := now.Add(time.Second)
+	for i := parallel; i > 1; i-- {
+		answeredAt = answeredAt.Add(time.Second)
+		result := o.ApplyHook(HookSignal{
+			Root: root, Event: "PostToolUse", ToolName: "Bash",
+			ToolInputHash: "call-" + strconv.Itoa(i), At: answeredAt,
+		})
+		if result.Rule != "writer_tool_match_cleared" || result.PromptDepth != i-1 {
+			t.Fatalf("answering call %d = rule %q depth %d, want %d still open",
+				i, result.Rule, result.PromptDepth, i-1)
+		}
+		assertSummary(t, result.Observation, answeredAt, agentgraph.LegacyPermission, agentgraph.AttentionApproval)
+	}
+
+	answeredAt = answeredAt.Add(time.Second)
+	result := o.ApplyHook(HookSignal{
+		Root: root, Event: "PostToolUse", ToolName: "Bash",
+		ToolInputHash: "call-1", At: answeredAt,
+	})
+	if result.PromptDepth != 0 || len(result.Projection.Pending) != 0 {
+		t.Fatalf("last answer left depth %d projection %+v", result.PromptDepth, result.Projection)
+	}
+	assertSummary(t, result.Observation, answeredAt, agentgraph.LegacyWorking, agentgraph.AttentionNone)
+}
+
+// The 2026-08-05 invariant (docs/subagent-permission-plan.md) restated for the
+// container: a writer routes evidence, so a teammate's PostToolUse may not close
+// ANY of another writer's prompts — not the one it happens to match by tool and
+// hash, and not the set. The single-prompt case is pinned by
+// TestChildAttentionOwnershipAndWriterCollision; this is the parallel case, where
+// a match-over-all-writers regression would take one call out of a set that must
+// stay whole.
+func TestTeammateHookCannotCloseAnyOfAnotherWritersParallelPrompts(t *testing.T) {
+	o, root, now := newTestObserver(t)
+	defer o.Close()
+	o.ApplyHook(HookSignal{Root: root, Event: "SessionStart", At: now})
+
+	for i, hash := range []string{"call-a", "call-b", "call-c"} {
+		o.ApplyHook(HookSignal{
+			Root: root, Event: "PermissionRequest", AgentID: "child-a", AgentType: "Explore",
+			ToolName: "Bash", ToolInputHash: hash, At: now.Add(time.Duration(i+1) * time.Second),
+		})
+	}
+	o.ApplyHook(HookSignal{
+		Root: root, Event: "PermissionRequest", AgentID: "child-b",
+		AgentType: "general-purpose", ToolName: "Bash", ToolInputHash: "call-b",
+		At: now.Add(4 * time.Second),
+	})
+
+	// child-b answers its own byte-identical call. Only its own prompt closes.
+	result := o.ApplyHook(HookSignal{
+		Root: root, Event: "PostToolUse", AgentID: "child-b", ToolName: "Bash",
+		ToolInputHash: "call-b", At: now.Add(5 * time.Second),
+	})
+	if result.Rule != "writer_tool_match_cleared" || result.PromptDepth != 0 {
+		t.Fatalf("teammate's own answer = rule %q depth %d", result.Rule, result.PromptDepth)
+	}
+	if got := sortedPendingWriters(result.Projection.Pending); !reflect.DeepEqual(got, []string{"child-a"}) {
+		t.Fatalf("pending writers after the teammate answered = %v, want child-a", got)
+	}
+
+	// The main thread answers the same call shape. It owns nothing, so nothing moves.
+	result = o.ApplyHook(HookSignal{
+		Root: root, Event: "PostToolUse", ToolName: "Bash",
+		ToolInputHash: "call-b", At: now.Add(6 * time.Second),
+	})
+	if result.Rule != "non_owner_prompt_held" {
+		t.Fatalf("non-owner answer = rule %q, want non_owner_prompt_held", result.Rule)
+	}
+
+	// child-a's set is untouched: all three calls still close, one at a time.
+	for i, hash := range []string{"call-a", "call-b", "call-c"} {
+		result = o.ApplyHook(HookSignal{
+			Root: root, Event: "PostToolUse", AgentID: "child-a", ToolName: "Bash",
+			ToolInputHash: hash, At: now.Add(time.Duration(7+i) * time.Second),
+		})
+		if result.Rule != "writer_tool_match_cleared" || result.PromptDepth != 2-i {
+			t.Fatalf("child-a answering %q = rule %q depth %d, want %d still open",
+				hash, result.Rule, result.PromptDepth, 2-i)
+		}
+	}
+	if len(result.Projection.Pending) != 0 {
+		t.Fatalf("owner's own answers did not empty its set: %+v", result.Projection.Pending)
+	}
 }
 
 func TestMainToolMatchHoldsWithLiveTeammateAndHashMismatch(t *testing.T) {
@@ -324,6 +568,67 @@ func TestFirstObservationUsesKnownParentTurnBoundaryForTerminalChildren(t *testi
 			t.Fatalf("current-turn terminal %q missing: %+v", id, observation.Nodes)
 		}
 	}
+}
+
+// resolvePending has always computed a reason and thrown it away, so a red
+// released by the transcript reached the record as "the graph said so" and the
+// stale-red latency in docs/attention-latency-report.md was invisible for a
+// week. The reason now survives the tick that computed it, and no longer.
+func TestObserveNamesTheRuleThatResolvedAPromptAndDrainsItOnce(t *testing.T) {
+	t.Run("should attribute nothing when a tick resolves no prompt", func(t *testing.T) {
+		o, root, now := newTestObserver(t)
+		defer o.Close()
+		o.ApplyHook(HookSignal{Root: root, Event: "PermissionRequest", ToolName: "Bash", At: now})
+		if _, err := o.Observe(context.Background(), root, now.Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if rule := o.DrainResolutionRule(root.Key()); rule != "" {
+			t.Fatalf("unresolved prompt claimed rule %q; an unexplained hold must not borrow one", rule)
+		}
+	})
+
+	t.Run("should name the resuming writer's rule when its own transcript releases the red", func(t *testing.T) {
+		o, root, now := newTestObserver(t)
+		defer o.Close()
+		o.ApplyHook(HookSignal{Root: root, Event: "PermissionRequest", ToolName: "Bash", At: now})
+		appendClaudeLine(t, root.Transcript,
+			`{"type":"assistant","timestamp":"`+now.Add(time.Second).Format(time.RFC3339Nano)+`","message":{"role":"assistant","content":[]}}`)
+
+		observation, err := o.Observe(context.Background(), root, now.Add(2*time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if observation.Nodes[0].Attention != agentgraph.AttentionNone {
+			t.Fatalf("the resume did not release the red: %+v", observation.Nodes[0])
+		}
+		if rule := o.DrainResolutionRule(root.Key()); rule != statustune.RuleGraphWriterResumed {
+			t.Fatalf("resolution rule = %q, want %q", rule, statustune.RuleGraphWriterResumed)
+		}
+		// Drained, not read: a rule that outlived its tick would be stamped on
+		// whatever edge landed next, and a wrong explanation is worse than none.
+		if rule := o.DrainResolutionRule(root.Key()); rule != "" {
+			t.Fatalf("rule survived its drain: %q", rule)
+		}
+	})
+
+	t.Run("should forget the previous tick's rule when a later tick resolves nothing", func(t *testing.T) {
+		o, root, now := newTestObserver(t)
+		defer o.Close()
+		o.ApplyHook(HookSignal{Root: root, Event: "PermissionRequest", ToolName: "Bash", At: now})
+		appendClaudeLine(t, root.Transcript,
+			`{"type":"assistant","timestamp":"`+now.Add(time.Second).Format(time.RFC3339Nano)+`","message":{"role":"assistant","content":[]}}`)
+		if _, err := o.Observe(context.Background(), root, now.Add(2*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		// The coordinator never drained that one — a tick that moves no chip does
+		// not record a transition — so the NEXT tick has to clear it itself.
+		if _, err := o.Observe(context.Background(), root, now.Add(3*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if rule := o.DrainResolutionRule(root.Key()); rule != "" {
+			t.Fatalf("stale rule %q survived a tick that resolved nothing", rule)
+		}
+	})
 }
 
 func TestObserveReturnsDeepCopiesAndLifecycleMethodsAreIdempotent(t *testing.T) {

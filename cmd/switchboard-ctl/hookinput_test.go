@@ -357,6 +357,30 @@ func TestCmdHookShouldForwardToolInputHashWhenPayloadCarriesToolInput(t *testing
 	}
 }
 
+func TestParseClaudePreToolUseForwardsOnlyJoinMetadata(t *testing.T) {
+	rawInput := json.RawMessage(`{"questions":[{"question":"secret question"}]}`)
+	payload := []byte(`{
+		"session_id": "sess-1",
+		"transcript_path": "/tmp/t.jsonl",
+		"tool_name": "AskUserQuestion",
+		"tool_input": {"questions":[{"question":"secret question"}]},
+		"tool_use_id": "toolu_ask",
+		"agent_id": "agent-child"
+	}`)
+	req := parseHookPayload(payload, "PreToolUse", "claude")
+	if req.Event != "PreToolUse" || req.Agent != "claude" || req.ToolName != "AskUserQuestion" ||
+		req.ToolUseID != "toolu_ask" || req.AgentID != "agent-child" || req.ToolInputHash != hashToolInput(rawInput) {
+		t.Fatalf("PreToolUse join metadata = %+v", req)
+	}
+	encoded, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contains(string(encoded), "secret question") {
+		t.Fatalf("raw PreToolUse input crossed the RPC boundary: %s", encoded)
+	}
+}
+
 func TestCmdHookShouldForwardEmptyToolInputHashWhenPayloadHasNoToolInput(t *testing.T) {
 	req := hookRequestForPayload(t, `{
 		"session_id": "sess-1",

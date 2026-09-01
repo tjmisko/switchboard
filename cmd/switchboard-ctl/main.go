@@ -490,122 +490,124 @@ func cycleTargetPID(sessions []state.Session, direction string) (int, bool) {
 	return target.PID, ok
 }
 
-// cmdAttention jumps to a session that needs the user. Priority mirrors the
-// waybar chip colors: sessions waiting on a permission prompt (red) outrank
-// idle sessions (orange). Among the top-priority tier, focus cycles — each
-// press advances from the currently focused session to the next member of that
-// tier, wrapping around, so repeated presses visit every red (or, if there are
-// no reds, every orange) in turn. When nothing needs attention but every
-// session is working (green), the green sessions become the tier so the
-// shortcut still does something useful — it cycles through the running
-// sessions. It is a no-op only when a session is unknown (grey), or when there
-// are no sessions at all. Bound to mod+Shift+a in Hyprland.
+// cmdAttention jumps toward the most urgent populated tier. When focus is
+// already in that tier, it cycles peers there and may toggle at most one tier
+// above it, so repeated presses can never climb all the way from red to green.
+// Bound to mod+Shift+a in Hyprland.
 func cmdAttention(c *rpc.Client) {
-	snap := mustList(c)
-
-	// The focused session anchors the cycle, so a repeat press steps to the
-	// next member of the tier instead of re-focusing the same one. 0 (no PID)
-	// when nothing is focused, which pickAttention treats as "outside the tier".
-	var focused *state.Session
-	for _, s := range snap.Sessions {
-		if s.Focused {
-			copy := s
-			focused = &copy
-			break
-		}
-	}
-
-	target := pickAttentionExact(snap.Sessions, focused)
+	target := nextAttentionTarget(mustList(c).Sessions)
 	if target == nil {
 		return
 	}
 	focusSession(c, *target)
 }
 
-func pickAttentionExact(sessions []state.Session, focused *state.Session) *state.Session {
-	tier := topAttentionTier(sessions)
-	if len(tier) == 0 {
-		return nil
-	}
-	for i, session := range tier {
-		if focused != nil && sameExactSession(*session, *focused) {
-			return tier[(i+1)%len(tier)]
-		}
-	}
-	return tier[0]
-}
-
-func sameExactSession(a, b state.Session) bool {
-	return a.Hostname == b.Hostname && a.PID == b.PID && a.StartedAt.Equal(b.StartedAt)
-}
-
-// pickAttention returns the next session needing attention, cycling within the
-// highest-priority tier. The tier is the permission sessions (red) if any
-// exist, otherwise the idle sessions (orange), otherwise — only when every
-// session is working — the green sessions; an unknown (grey) session is never
-// a target and suppresses the all-green fallback. Members keep snapshot order
-// (oldest-first per state.Snapshot).
-// When focusedPID names a tier member, the next member is returned, wrapping
-// around — so repeated calls cycle through the whole tier, and a single-member
-// tier stays put. When the focused session is outside the tier (or nothing is
-// focused), the first member is returned, so one press jumps in. Returns nil
-// when no session needs attention.
-func pickAttention(sessions []state.Session, focusedPID int) *state.Session {
-	tier := topAttentionTier(sessions)
-	if len(tier) == 0 {
-		return nil
-	}
-
-	current := -1
-	for i, s := range tier {
-		if s.PID == focusedPID {
-			current = i
-			break
-		}
-	}
-	if current == -1 {
-		return tier[0]
-	}
-	return tier[(current+1)%len(tier)]
-}
-
-// topAttentionTier returns the highest-priority group of sessions needing
-// attention — all permission sessions if any exist, otherwise all idle
-// sessions — in snapshot order. As a last resort, when *every* session is
-// working (green), all of them form the tier so the shortcut still has
-// somewhere to go and instead cycles through the running sessions. A single
-// unknown (grey) session suppresses the green tier, so a half-discovered
-// snapshot stays a no-op rather than jumping somewhere arbitrary. Returns nil
-// when nothing needs attention.
-func topAttentionTier(sessions []state.Session) []*state.Session {
+// attentionRing orders the navigable sessions that `attention` may visit. It
+// starts with the most urgent populated tier and includes no more than one
+// adjacent colour above it:
+//
+//   - any red: red + orange (green is unreachable)
+//   - otherwise any orange: orange + green
+//   - otherwise: green
+//
+// This ceiling is computed from the snapshot, not from the focused session.
+// Consequently repeated presses stay within the same bounded set instead of
+// using an orange as a staircase from red to green. Within each tier, snapshot
+// order is preserved. Unknown (grey) sessions are excluded —
+// they are not actionable, and `cycle next|prev` already reaches every session
+// regardless of colour. Headless and unbound-remote rows are excluded by
+// sessionNavigable.
+func attentionRing(sessions []state.Session) []*state.Session {
 	var permission, idle, working []*state.Session
-	// Headless claude -p runs are never attention targets (nothing to focus)
-	// and do not count against the all-green fallback's denominator.
-	considered := 0
 	for i := range sessions {
 		if !sessionNavigable(sessions[i]) {
 			continue
 		}
-		considered++
 		switch sessionStatus(sessions[i]) {
-		case "permission":
+		case state.StatusPermission:
 			permission = append(permission, &sessions[i])
-		case "idle":
+		case state.StatusIdle:
 			idle = append(idle, &sessions[i])
-		case "working":
+		case state.StatusWorking, state.StatusDelegating:
 			working = append(working, &sessions[i])
 		}
 	}
 	if len(permission) > 0 {
-		return permission
+		return append(permission, idle...)
 	}
 	if len(idle) > 0 {
-		return idle
+		return append(idle, working...)
 	}
-	if len(working) > 0 && len(working) == considered {
-		return working
+	return working
+}
+
+// nextAttentionTarget returns the session `attention` should focus. A press
+// from outside the most urgent populated tier always enters that tier at its
+// first member. A press from inside it advances to another un-focused peer in
+// the same tier; only when every urgent member is already focused may it toggle
+// to the adjacent tier. Thus orange always jumps to red while any red exists,
+// and an orange can never become a staircase to green.
+//
+// Skipping (rather than merely advancing past) the focused set is what makes
+// the wezterm split case safe. Focused is a WINDOW flag today, so two sessions
+// sharing one window both report it; skipping the whole set lands the press on
+// a genuinely different window instead of on a sibling pane, which would look
+// like another dead key.
+//
+// Returns nil when the bounded ring is empty, or when every member in the
+// allowed one-layer range is already focused. A less urgent session may exist
+// outside that range; `cycle next|prev` remains the unrestricted navigator.
+func nextAttentionTarget(sessions []state.Session) *state.Session {
+	ring := attentionRing(sessions)
+	if len(ring) == 0 {
+		return nil
+	}
+
+	urgentTier := attentionTier(*ring[0])
+	urgentEnd := 0
+	for urgentEnd < len(ring) && attentionTier(*ring[urgentEnd]) == urgentTier {
+		urgentEnd++
+	}
+
+	// Focus outside the urgent tier (including an orange while red exists)
+	// always jumps to the first urgent session.
+	focusedUrgent := -1
+	for i := 0; i < urgentEnd; i++ {
+		if ring[i].Focused {
+			focusedUrgent = i
+			break
+		}
+	}
+	if focusedUrgent < 0 {
+		return ring[0]
+	}
+
+	// Stay at maximum urgency while another window in that tier is available.
+	for step := 1; step < urgentEnd; step++ {
+		if candidate := ring[(focusedUrgent+step)%urgentEnd]; !candidate.Focused {
+			return candidate
+		}
+	}
+	// Every urgent member is already focused. Toggle no more than one tier up.
+	for _, candidate := range ring[urgentEnd:] {
+		if !candidate.Focused {
+			return candidate
+		}
 	}
 	return nil
+}
+
+func attentionTier(session state.Session) int {
+	switch sessionStatus(session) {
+	case state.StatusPermission:
+		return 0
+	case state.StatusIdle:
+		return 1
+	case state.StatusWorking, state.StatusDelegating:
+		return 2
+	default:
+		return 3
+	}
 }
 
 // sessionStatus normalizes a missing or empty agent status to "unknown",
@@ -910,11 +912,11 @@ commands:
   status                  one-line summary
   pick                    emit exact-token<TAB>label<TAB>ws<TAB>cwd for fzf
   cycle next|prev         focus the next/previous session, wrapping
-  attention               jump to a session needing attention, cycling within
-                            the top tier: permission (red), else idle (orange),
-                            else — only if all are green — working sessions;
-                            repeated presses visit each member in turn;
-                            no-op if any session is unknown (grey)
+  attention               jump to the most urgent populated colour. If already
+                            there, cycle its peers or toggle at most one layer
+                            above it. With any red present, orange always jumps
+                            to red and green is unreachable. Unknown (grey)
+                            sessions are excluded; cycle remains unrestricted.
   agent-diagnostics       show bounded provider diagnostic counters; --json
                             emits the raw content-free array
   name <sub>              project names: resolve --cwd --name, abbrev --cwd,

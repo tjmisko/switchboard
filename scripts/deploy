@@ -36,6 +36,18 @@ set -Eeuo pipefail
 # needs. find(1) cannot sort by time without a portability fight.
 # shellcheck disable=SC2012
 
+# CDPATH is an interactive convenience with two effects that are both fatal
+# here: `cd` ECHOES the directory when it resolves through a CDPATH entry, and
+# a relative operand like `scripts` is looked up in someone ELSE'S tree before
+# the current directory. Every path below is derived from $(cd … && pwd), so an
+# inherited CDPATH either poisons those captures with a second line — the
+# observed failure, `cd: $'…/scripts\n…/scripts/..': No such file or directory`
+# — or, when the decoy resolves, silently points the whole deploy at another
+# repo, which is exactly what the wrong-tree guard exists to prevent. Clearing
+# it here makes every `cd` in this script, including the build subshell, resolve
+# against the filesystem alone.
+unset CDPATH
+
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_dir=$(cd -- "$script_dir/.." && pwd)
 

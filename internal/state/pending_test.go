@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -198,7 +199,7 @@ func TestPendingToolIsDerivedDeterministically(t *testing.T) {
 		}
 	})
 
-	t.Run("should count the other blocked writers in the decision log's summary", func(t *testing.T) {
+	t.Run("should count every blocked call in the decision log's summary", func(t *testing.T) {
 		info := &AgentInfo{}
 		info.SetPending("", PendingPrompt{Tool: "AskUserQuestion"})
 		if got := info.PendingSummary(); got != "AskUserQuestion" {
@@ -207,6 +208,140 @@ func TestPendingToolIsDerivedDeterministically(t *testing.T) {
 		info.SetPending("af5bd126402ac16c7", PendingPrompt{Tool: "Bash"})
 		if got := info.PendingSummary(); got != "AskUserQuestion+1" {
 			t.Errorf("PendingSummary = %q, want AskUserQuestion+1 (a multi-writer red must not report as a single one)", got)
+		}
+		info.PendingPrompts = []PendingPromptRecord{
+			{Writer: "", Tool: "AskUserQuestion"},
+			{Writer: "", Tool: "Bash"},
+			{Writer: "af5bd126402ac16c7", Tool: "Bash"},
+		}
+		if got := info.PendingSummary(); got != "AskUserQuestion+2" {
+			t.Errorf("PendingSummary = %q, want AskUserQuestion+2 (three calls across two writers)", got)
+		}
+		if got := info.PendingCallCountForWriter(""); got != 2 {
+			t.Errorf("main call count = %d, want 2", got)
+		}
+	})
+}
+
+// pending_prompts is the per-CALL half of the same contract (plan step 11): the
+// key set says WHO is blocked, the records say on what. They are two fields
+// rather than one because ownership must keep restoring from an old mirror, and
+// because every existing consumer folds on the map — so the pair has to stay
+// consistent by construction rather than by convention.
+func TestPendingPromptRecordsProjectAndRoundTrip(t *testing.T) {
+	recordsFor := func(writer string, tools ...string) []PendingPromptRecord {
+		records := make([]PendingPromptRecord, 0, len(tools))
+		for i, tool := range tools {
+			records = append(records, PendingPromptRecord{
+				Writer: writer, Tool: tool, InputHash: "hash-" + tool,
+				Attention: "approval", Since: time.Unix(1700+int64(i), 0),
+			})
+		}
+		return records
+	}
+
+	t.Run("should group the records by writer in the same order pending_writers uses", func(t *testing.T) {
+		info := redInfoWithPending("", "af5bd126402ac16c7")
+		info.PendingPrompts = append(recordsFor("", "Bash", "Edit"), recordsFor("af5bd126402ac16c7", "AskUserQuestion")...)
+
+		wire := enrichForWire(info)
+		want := []string{"af5bd126402ac16c7", PendingWriterMain, PendingWriterMain}
+		got := make([]string, 0, len(wire.PendingPrompts))
+		for _, record := range wire.PendingPrompts {
+			got = append(got, record.Writer)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("record writers = %v, want %v — grouped and sorted exactly as the key set is", got, want)
+		}
+		if wire.PendingPrompts[1].Tool != "Bash" || wire.PendingPrompts[2].Tool != "Edit" {
+			t.Errorf("main-thread records = %v, want them left oldest-first", wire.PendingPrompts[1:])
+		}
+	})
+
+	t.Run("should drop a record whose writer no longer owns a prompt", func(t *testing.T) {
+		// The invariant that keeps the two fields readable together. The legacy
+		// reconciler releases a prompt through DropPending and knows nothing about
+		// records, so an orphan left here would restore as a red nobody owns.
+		info := redInfoWithPending("", "af5bd126402ac16c7")
+		info.PendingPrompts = append(recordsFor("", "Bash"), recordsFor("af5bd126402ac16c7", "AskUserQuestion")...)
+		info.DropPending("af5bd126402ac16c7")
+
+		if len(info.PendingPrompts) != 1 || info.PendingPrompts[0].Writer != "" {
+			t.Fatalf("records after the drop = %+v, want only the surviving writer's", info.PendingPrompts)
+		}
+		info.ClearPending()
+		if info.PendingPrompts != nil {
+			t.Errorf("records survived ClearPending: %+v", info.PendingPrompts)
+		}
+	})
+
+	t.Run("should round-trip a writer's whole set through the mirror", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "state.json")
+		src := New(path)
+		src.Apply(func(m map[int]*Session) {
+			info := redInfoWithPending("")
+			info.PendingPrompts = recordsFor("", "Bash", "Edit")
+			info.PendingPrompts[0].CallID = "toolu_bash"
+			m[42] = &Session{PID: 42, StartedAt: time.Unix(1000, 0), Agent: AgentKindClaude, Claude: info}
+		})
+
+		dst := New(path)
+		if err := dst.Load(); err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		var got *AgentInfo
+		dst.Apply(func(m map[int]*Session) { got = m[42].Claude })
+
+		if len(got.PendingPrompts) != 2 {
+			t.Fatalf("hydrated %d records, want both parallel prompts: %+v", len(got.PendingPrompts), got.PendingPrompts)
+		}
+		for i, record := range got.PendingPrompts {
+			if record.Writer != "" {
+				t.Errorf("record %d writer = %q, want the bare main-thread key in memory", i, record.Writer)
+			}
+		}
+		if got.PendingPrompts[0].Tool != "Bash" || got.PendingPrompts[0].InputHash != "hash-Bash" || got.PendingPrompts[0].CallID != "toolu_bash" ||
+			!got.PendingPrompts[0].Since.Equal(time.Unix(1700, 0)) || got.PendingPrompts[0].Attention != "approval" {
+			t.Errorf("hydrated record = %+v, want every field it was written with", got.PendingPrompts[0])
+		}
+	})
+
+	t.Run("should own a writer named only by a record", func(t *testing.T) {
+		// Ownership is a union, never a filter, on the way in. The two fields can
+		// only disagree in a hand-edited or half-written mirror, and reading a record
+		// whose owner the key set forgot as "no red here" would drop a prompt nothing
+		// can re-raise.
+		path := filepath.Join(t.TempDir(), "state.json")
+		mirror := `{"schema_version":` + strconv.Itoa(CurrentSchemaVersion) +
+			`,"sessions":[{"pid":42,"cwd":"/p","tty":"/dev/pts/1","started_at":"2026-05-28T09:00:00Z","agent":"claude","claude":` +
+			`{"status":"permission","pending_prompts":[{"writer":"main","tool":"Bash","attention":"approval","since":"2026-05-28T09:04:00Z"}]}}],` +
+			`"updated_at":"2026-05-28T09:05:00Z"}`
+		if err := os.WriteFile(path, []byte(mirror), 0o644); err != nil {
+			t.Fatalf("write mirror: %v", err)
+		}
+		store := New(path)
+		if err := store.Load(); err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		var got *AgentInfo
+		store.Apply(func(m map[int]*Session) { got = m[42].Claude })
+
+		if _, ok := got.Pending[""]; !ok || len(got.Pending) != 1 {
+			t.Errorf("hydrated writers = %v, want the main thread the record names", got.PendingWriterKeys())
+		}
+	})
+
+	t.Run("should omit pending_prompts entirely when no writer is blocked", func(t *testing.T) {
+		wire := enrichForWire(&AgentInfo{Status: StatusWorking, PendingPrompts: recordsFor("", "Bash")})
+		if wire.PendingPrompts != nil {
+			t.Fatalf("pending_prompts = %+v, want nil: no writer owns anything", wire.PendingPrompts)
+		}
+		body, err := json.Marshal(wire)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if bytes.Contains(body, []byte("pending_prompts")) {
+			t.Errorf("pending_prompts reached the wire on a block with no prompts: %s", body)
 		}
 	})
 }

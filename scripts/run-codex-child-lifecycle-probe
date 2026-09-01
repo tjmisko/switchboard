@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# See scripts/deploy: an inherited CDPATH makes `cd` echo its target and lets a
+# relative operand resolve against a foreign tree, poisoning both captures below.
+unset CDPATH
+
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_dir=$(cd -- "$script_dir/.." && pwd)
 go_bin=/home/tjmisko/go/bin

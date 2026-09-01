@@ -184,10 +184,26 @@ Hooks are partial observations, with independently owned attention latches.
 mechanical approval evidence and uses the same 30-second grace; exact matching
 tool progress cancels it before red. A question-shaped permission request maps
 to user input immediately.
-`request_user_input` is the narrow exception: its `PreToolUse` opens a
-user-input wait keyed by `tool_use_id`, and only the matching `PostToolUse`, the
-turn's `Stop`, or conversation rotation clears it. Generic app-server snapshots
-cannot clear this standard-CLI wait. `SessionStart(clear|startup|resume)` is
+Human-input prompts are the narrow exception, and they are owned rather than
+merely observed: either onset edge — `PreToolUse` or `PermissionRequest` — for
+`request_user_input` *or* `AskUserQuestion` opens a user-input wait, keyed by
+`tool_use_id` when the edge carries one and by
+writer+turn+tool+input-hash when it does not. Only the matching `PostToolUse`,
+the turn's `Stop`, or conversation rotation clears it, and generic app-server
+snapshots cannot. The two onset edges need not agree on whether they carry an id,
+so a record they both describe is folded into one on the composite; a wait that
+carries neither an id nor an input hash has nothing to correlate on and is
+released by the turn's `Stop`.
+
+That `Stop` sweep is deliberately writer-blind, as are the
+`SessionStart`/`UserPromptSubmit` approval sweeps. Only the root emits those
+events here — `SubagentStart`/`SubagentStop` are diverted to the child pipeline
+before the reducer runs — so they are turn and conversation boundaries, not
+per-writer edges. Scoping them to a pending's own writer would leave any record
+opened by an `agent_id`-bearing hook with no release edge at all, since that
+writer's `Stop` never arrives.
+
+`SessionStart(clear|startup|resume)` is
 briefly coalesced with a same-thread continuation so `/clear` followed by an
 accepted plan does not create a synthetic idle interval; a standalone `/clear`
 still settles idle. `SessionStart(compact)` stays active because the documented

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"path/filepath"
 	"sort"
@@ -17,6 +18,7 @@ import (
 	codexprovider "github.com/tjmisko/switchboard/internal/provider/codex"
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
+	"github.com/tjmisko/switchboard/internal/statustune"
 )
 
 const (
@@ -34,6 +36,8 @@ type claudeObserver interface {
 	ApplyHook(claudeprovider.HookSignal) claudeprovider.HookResult
 	Restore(provider.RootRef, claudeprovider.Compatibility, time.Time) (agentgraph.Observation, error)
 	Projection(provider.RootKey) claudeprovider.Compatibility
+	DrainResolutionRule(provider.RootKey) string
+	DrainPromptDiagnostics(provider.RootKey) []string
 	DrainLegacyEvents(provider.RootKey) []history.Event
 }
 
@@ -360,6 +364,15 @@ func (c *agentCoordinator) observer(kind agentgraph.ProviderKind) provider.Obser
 }
 
 func (c *agentCoordinator) observe(ctx context.Context, ref provider.RootRef) {
+	c.observeAt(ctx, ref, time.Now())
+}
+
+// observeAt is observe with the tick's instant supplied. The clock is a
+// parameter because some provider rules are about the DISTANCE between two
+// ticks, not about either one — the call-identity latch refuses a confirmation
+// taken too soon after its proposal — and a test driving two ticks in a row
+// cannot express that against a wall clock it does not control.
+func (c *agentCoordinator) observeAt(ctx context.Context, ref provider.RootRef, now time.Time) {
 	observer := c.observer(ref.Provider)
 	if observer == nil {
 		return
@@ -371,7 +384,6 @@ func (c *agentCoordinator) observe(ctx context.Context, ref provider.RootRef) {
 		c.restoreClaude(ref)
 	}
 	generation := c.begin(ref.Key())
-	now := time.Now()
 	if ref.Provider == agentgraph.ProviderCodex {
 		defer func() { c.reconcileCodexChildHooks(ref, time.Now()) }()
 	}
@@ -388,11 +400,21 @@ func (c *agentCoordinator) observe(ctx context.Context, ref provider.RootRef) {
 		c.expireCurrent(ref, generation, now)
 		return
 	}
-	compat := claudeprovider.Compatibility{}
+	compat, rule := claudeprovider.Compatibility{}, ""
 	if ref.Provider == agentgraph.ProviderClaude {
 		compat = c.claude.Projection(ref.Key())
+		// Drained unconditionally, whether or not this tick moves the chip: the
+		// rule belongs to the tick that computed it, and leaving it behind would
+		// let it explain some later edge instead.
+		rule = c.claude.DrainResolutionRule(ref.Key())
+		// P3 and the reachability of the id fast path, drained on the same
+		// principle: the tick that produced a category is the tick that owns it.
+		// Bounded categories only — never a writer, a tool, or a call id.
+		for _, category := range c.claude.DrainPromptDiagnostics(ref.Key()) {
+			c.recordDiagnostic(ref.Provider, category, now)
+		}
 	}
-	if c.applyObservation(ref, generation, observation, compat, now) && ref.Provider == agentgraph.ProviderClaude {
+	if c.applyObservationWithRule(ref, generation, observation, compat, now, rule, false) && ref.Provider == agentgraph.ProviderClaude {
 		for _, event := range c.claude.DrainLegacyEvents(ref.Key()) {
 			c.sink.Record(event)
 		}
@@ -440,13 +462,30 @@ func (c *agentCoordinator) current(key provider.RootKey, generation uint64) bool
 }
 
 func (c *agentCoordinator) applyObservation(ref provider.RootRef, generation uint64, observation agentgraph.Observation, compat claudeprovider.Compatibility, now time.Time) bool {
-	return c.applyObservationWithHookOwnership(ref, generation, observation, compat, now, false)
+	return c.applyObservationWithRule(ref, generation, observation, compat, now, "", false)
 }
 
 func (c *agentCoordinator) applyObservationWithHookOwnership(ref provider.RootRef, generation uint64, observation agentgraph.Observation, compat claudeprovider.Compatibility, now time.Time, hookOwnsTransition bool) bool {
+	return c.applyObservationWithRule(ref, generation, observation, compat, now, "", hookOwnsTransition)
+}
+
+// applyObservationWithRule is the landing path. rule is the content-free id of
+// the decision that produced this observation — a hook edge's HookResult.Rule or
+// an Observe tick's drained resolution reason — and is recorded on the
+// transition, if any, that the observation causes. An empty rule falls back to
+// RuleGraphAuthority: the provider attributed nothing, which is the honest
+// record for a Codex edge, a restore, or a Claude observation whose transition
+// came from fanout topology rather than from a prompt.
+//
+// The rule EXPLAINS the transition; it never decides one. Nothing below reads it
+// except the history event.
+func (c *agentCoordinator) applyObservationWithRule(ref provider.RootRef, generation uint64, observation agentgraph.Observation, compat claudeprovider.Compatibility, now time.Time, rule string, hookOwnsTransition bool) bool {
 	if ref.Provider == agentgraph.ProviderCodex {
 		observation = c.overlayCodexHookRootObservation(ref.Key(), observation, now)
 		observation = c.overlayCodexPendingObservation(ref.Key(), observation, now)
+		// Order is load-bearing: the pending overlay claims the root first, so the
+		// approval overlay only ever fills a chip no more specific human reason owns.
+		observation = c.overlayCodexApprovalObservation(ref.Key(), observation, now)
 		observation = c.overlayCodexChildObservation(ref.Key(), observation, now)
 	}
 	c.mu.Lock()
@@ -472,11 +511,17 @@ func (c *agentCoordinator) applyObservationWithHookOwnership(ref provider.RootRe
 		c.recordDiagnosticLocked(ref.Provider, "history_projection_error", now)
 		canonical = nil
 	}
-	beforeStatus, beforeSince := "", time.Time{}
+	beforeStatus, beforePending, beforeSession := "", "", observation.RootID
+	beforeSince := time.Time{}
 	if info := priorSession.Enrichment(); info != nil {
 		beforeStatus, beforeSince = info.Status, info.StatusSince
+		beforePending = info.PendingSummary()
+		if info.SessionID != "" {
+			beforeSession = info.SessionID
+		}
 	}
 	applied, nativeOverride := false, false
+	afterPending, afterSession := "", beforeSession
 	nativeName, hasNativeName := observationRootName(observation)
 	authoritativeNativeName := ref.Provider == agentgraph.ProviderCodex &&
 		observation.Source == agentgraph.SourceCodexAppServer && observation.Complete && hasNativeName
@@ -489,6 +534,12 @@ func (c *agentCoordinator) applyObservationWithHookOwnership(ref provider.RootRe
 			applyClaudeCompatibility(sess.AgentBlock(state.AgentKindClaude), compat)
 		}
 		sess.SetAgentGraph(graph)
+		if info := sess.Enrichment(); info != nil {
+			afterPending = info.PendingSummary()
+			if info.SessionID != "" {
+				afterSession = info.SessionID
+			}
+		}
 		if ref.Provider == agentgraph.ProviderCodex && sess.DisplayName != nil {
 			if !sess.DisplayName.ValidFor(observation.RootID) {
 				sess.DisplayName = nil
@@ -520,16 +571,58 @@ func (c *agentCoordinator) applyObservationWithHookOwnership(ref provider.RootRe
 	for _, event := range canonical {
 		c.sink.Record(event)
 	}
-	if graph.Summary.Status != beforeStatus {
+	statusChanged := graph.Summary.Status != beforeStatus
+	if statusChanged {
 		c.sink.Record(history.Event{
 			Ts: now, Type: history.EventTransition, SessionID: observation.RootID,
 			PID: ref.PID, Agent: string(ref.Provider), CWD: ref.CWD,
 			From: beforeStatus, To: graph.Summary.Status,
-			Rule: "agent_graph_authority", DurPrevMs: history.HeldMs(beforeSince, now),
+			Rule: transitionRule(rule), DurPrevMs: history.HeldMs(beforeSince, now),
 			Subagents: graph.Summary.LiveChildren,
 		})
 	}
+	// The provider graph used to write only history events. `diagnose` reads the
+	// canonical statustune decision lines from the journal, so every Claude
+	// transition — and every deliberate hold while red — was invisible there.
+	// Log the same finite rule id at this landing point. Ordinary same-color
+	// working/idle observations stay quiet; red holds remain visible because they
+	// are precisely where "I answered it and it is still red" needs an explanation.
+	if ref.Provider == agentgraph.ProviderClaude &&
+		(statusChanged || (rule != "" && (beforeStatus == state.StatusPermission || graph.Summary.Status == state.StatusPermission))) {
+		pending := afterPending
+		if beforeStatus == state.StatusPermission && graph.Summary.Status != state.StatusPermission {
+			pending = beforePending
+		}
+		age := time.Duration(0)
+		if !beforeSince.IsZero() && now.After(beforeSince) {
+			age = now.Sub(beforeSince)
+		}
+		from, to := beforeStatus, graph.Summary.Status
+		if from == "" {
+			from = "unknown"
+		}
+		if to == "" {
+			to = "unknown"
+		}
+		statustune.Decision{
+			PID: ref.PID, Session: shortSessionID(afterSession),
+			From: from, To: to, Rule: transitionRule(rule),
+			Reason:    fmt.Sprintf("provider graph source=%s", observation.Source),
+			Subagents: graph.Summary.LiveChildren, Pending: pending, Age: age,
+		}.Log()
+	}
 	return true
+}
+
+// transitionRule is what a transition records as its `rule`. An unattributed
+// edge keeps the blanket id rather than an empty field, so `switchboard-ctl
+// history` and diagnose can always tell "no rule reached the record" apart from
+// "this line predates the rule field".
+func transitionRule(rule string) string {
+	if rule == "" {
+		return statustune.RuleGraphAuthority
+	}
+	return rule
 }
 
 func observationRootName(observation agentgraph.Observation) (string, bool) {
@@ -685,6 +778,16 @@ func sessionForKey(snapshot state.Snapshot, key provider.RootKey) (state.Session
 	return state.Session{}, false
 }
 
+// compatibilityFromState rebuilds the adapter's compatibility view from the
+// persisted block — the input to a restore, and to the re-observation of a session
+// whose graph went stale.
+//
+// Attention is NOT stamped here. It used to be hardcoded to AttentionApproval
+// because the block had nowhere to carry it, which republished every question-red
+// as an approval-red; now the per-call records carry the real one, and the legacy
+// map — which still carries none — is left blank so restoredPending derives it
+// from the tool rather than being handed a guess (askuserquestion-model-plan.md
+// §2.4).
 func compatibilityFromState(info *state.AgentInfo) claudeprovider.Compatibility {
 	if info == nil {
 		return claudeprovider.Compatibility{}
@@ -693,12 +796,13 @@ func compatibilityFromState(info *state.AgentInfo) claudeprovider.Compatibility 
 		SessionID: info.SessionID, Transcript: info.Transcript, Status: info.Status,
 		StatusSince: info.StatusSince, InFlightSubagents: info.InFlightSubagents,
 		PendingWriters: append([]string(nil), info.PendingWriters...), PendingTool: info.PendingTool,
-		Pending:   make(map[string]claudeprovider.PendingPrompt, len(info.Pending)),
-		Workflows: make([]fanout.Workflow, len(info.Workflows)),
+		Pending:     make(map[string]claudeprovider.PendingPrompt, len(info.Pending)),
+		PendingSets: pendingSetsFromRecords(info.PendingPrompts),
+		Workflows:   make([]fanout.Workflow, len(info.Workflows)),
 	}
 	for writer, prompt := range info.Pending {
 		compat.Pending[writer] = claudeprovider.PendingPrompt{
-			Tool: prompt.Tool, InputHash: prompt.InputHash, Attention: agentgraph.AttentionApproval, Since: prompt.Since,
+			Tool: prompt.Tool, InputHash: prompt.InputHash, Since: prompt.Since,
 		}
 	}
 	for i, workflow := range info.Workflows {
@@ -728,8 +832,76 @@ func applyClaudeCompatibility(info *state.AgentInfo, compat claudeprovider.Compa
 	if len(info.Pending) == 0 {
 		info.Pending = nil
 	}
+	info.PendingPrompts = pendingRecordsFromSets(compat.PendingSets)
 	info.PendingWriters = append([]string(nil), compat.PendingWriters...)
 	info.PendingTool = compat.PendingTool
+}
+
+// pendingRecordsFromSets flattens the adapter's writer→open-set map into the
+// persisted record list, writers in ascending order and each writer's prompts left
+// in their own oldest-first order. The order is stamped here rather than left to
+// map iteration because these records are encoded into the publish gate's change
+// key; a set that reordered itself would republish to every bar on every tick.
+//
+// Only a confirmed call id is persisted. Proposed/ambiguous latch state remains
+// in-memory: it carries no identity safe enough to use after a restart.
+func pendingRecordsFromSets(sets map[string][]claudeprovider.PendingPrompt) []state.PendingPromptRecord {
+	if len(sets) == 0 {
+		return nil
+	}
+	writers := make([]string, 0, len(sets))
+	for writer := range sets {
+		writers = append(writers, writer)
+	}
+	sort.Strings(writers)
+	records := make([]state.PendingPromptRecord, 0, len(sets))
+	for _, writer := range writers {
+		for _, prompt := range sets[writer] {
+			callID := ""
+			if prompt.Latch == claudeprovider.CallLatchBound {
+				callID = prompt.CallID
+			}
+			records = append(records, state.PendingPromptRecord{
+				Writer: writer, Tool: prompt.Tool, InputHash: prompt.InputHash,
+				CallID: callID, Attention: string(prompt.Attention), Since: prompt.Since,
+			})
+		}
+	}
+	if len(records) == 0 {
+		return nil
+	}
+	return records
+}
+
+// pendingSetsFromRecords is the inverse, regrouping the flat record list by
+// writer in the adapter's own bare ("" = main) key spelling.
+//
+// The main thread is normalized on the way in because this reads a block from
+// either side of the wire projection: a live AgentInfo carries the bare key, while
+// every snapshot copy — which is what restoreClaude and expireCurrent actually
+// hand it — carries "main". Left untranslated the two spellings become two
+// writers, and the writer whose set was not found would be rebuilt from the legacy
+// scalar as a second, unclearable red beside its own prompts.
+func pendingSetsFromRecords(records []state.PendingPromptRecord) map[string][]claudeprovider.PendingPrompt {
+	if len(records) == 0 {
+		return nil
+	}
+	sets := make(map[string][]claudeprovider.PendingPrompt, len(records))
+	for _, record := range records {
+		writer := record.Writer
+		if writer == state.PendingWriterMain {
+			writer = ""
+		}
+		sets[writer] = append(sets[writer], claudeprovider.PendingPrompt{
+			Tool: record.Tool, InputHash: record.InputHash,
+			CallID: record.CallID, Attention: agentgraph.AttentionState(record.Attention), Since: record.Since,
+		})
+		if record.CallID != "" {
+			last := len(sets[writer]) - 1
+			sets[writer][last].Latch = claudeprovider.CallLatchBound
+		}
+	}
+	return sets
 }
 
 // HandleHook is the RPC graph-aware hook callback. The incoming Claude
@@ -772,16 +944,39 @@ func (c *agentCoordinator) HandleHook(req rpc.Request, sess state.Session) {
 		generation := c.begin(ref.Key())
 		result := c.claude.ApplyHook(claudeprovider.HookSignal{
 			Root: ref, Event: req.Event, AgentID: req.AgentID, AgentType: req.AgentType,
-			ToolName: req.ToolName, ToolInputHash: req.ToolInputHash, At: now,
+			ToolName: req.ToolName, ToolInputHash: req.ToolInputHash, ToolUseID: req.ToolUseID, At: now,
 		})
 		if !result.Applied {
 			return
+		}
+		if req.Event == "PermissionRequest" && result.Changed && result.PromptDepth == 2 {
+			// P1 (askuserquestion-model-plan.md §5): parallel dispatch is measured
+			// at 7.6% of tool-using turns, but nobody established how often that
+			// becomes two concurrent permission prompts for one writer. The counter
+			// must therefore read as EPISODES, not edges, so it is gated twice:
+			// depth == 2 fires only on the 1->2 transition, so an 8-way dispatch
+			// counts once rather than seven times; Changed excludes the dedupe path,
+			// where a verbatim redelivery returns the writer's unchanged depth and
+			// would otherwise re-count an episode that opened nothing.
+			//
+			// One upward bias survives and cannot be removed without call identity:
+			// a hook registered twice (a user settings.json and a project one) fires
+			// the same edge with two different wall-clock stamps, which is not a
+			// verbatim redelivery and so opens a second prompt. Phase 4's id-matched
+			// open is what makes those two edges one prompt.
+			//
+			// Content-free: a bounded category and a count, never a tool name or its
+			// input.
+			c.recordDiagnostic(ref.Provider, "prompt_parallel_episode", now)
 		}
 		comparison := claudeprovider.CompareShadow(result.Projection.Status, result.Observation, agentgraph.Summary{}, now)
 		if !comparison.Match {
 			c.recordDiagnostic(ref.Provider, comparison.Rule, now)
 		}
-		c.applyObservation(ref, generation, result.Observation, result.Projection, now)
+		// result.Rule names the edge the adapter just decided by — the red opening,
+		// one call's clear, a hold that left it red — and is the whole point of
+		// Phase 3: a transition recorded without it says only that the graph spoke.
+		c.applyObservationWithRule(ref, generation, result.Observation, result.Projection, now, result.Rule, false)
 	case agentgraph.ProviderCodex:
 		rootID := req.SessionID
 		if rootID == "" {

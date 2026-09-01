@@ -253,8 +253,11 @@ type AgentInfo struct {
 	// leave "permission" only when no writer still owns a prompt.
 	//
 	// In-memory only. Its KEY SET — and only its key set — is projected onto the wire
-	// as PendingWriters so prompt ownership survives a daemon restart (§9); the
-	// correlators below are re-earned from the next hook.
+	// as PendingWriters so prompt ownership survives a daemon restart (§9); these
+	// correlators are re-earned from the next hook. The per-call records that DO
+	// survive a restart live in PendingPrompts below, beside this map rather than
+	// inside it: this map is the ownership authority every existing reader folds on,
+	// and widening it to a set would change what `len(Pending)` means to all of them.
 	Pending map[string]PendingPrompt `json:"-"`
 
 	// PendingWriters is the wire projection of Pending's KEY SET: sorted ascending,
@@ -276,6 +279,35 @@ type AgentInfo struct {
 	// ranging a map would differ between snapshots of identical state and republish
 	// to every waybar slot on every reconcile tick.
 	PendingWriters []string `json:"pending_writers,omitempty"`
+
+	// PendingPrompts is the per-CALL companion to that key set: one record for
+	// every prompt each blocked writer holds open, oldest-first within a writer and
+	// grouped by writer in the same ascending order PendingWriters uses. It is
+	// ADDITIVE beside PendingWriters, never a replacement — an older reader that
+	// knows only the key set keeps reading exactly what it always read, and a
+	// state.json written before this field existed still restores a writer's red
+	// through the key set alone.
+	//
+	// Why the whole set and not one prompt per writer: one assistant turn dispatches
+	// two or more gated calls in 7.6 % of tool-using turns
+	// (askuserquestion-model-plan.md §2.2), and the daemon has tracked them as a set
+	// since the prompt container landed. Persisting only the key set collapsed that
+	// set to one record on every restart, so answering the survivor took the chip
+	// green while the other calls were still blocking the agent — the same missed RED
+	// the container fixed, reintroduced by the restart alone.
+	//
+	// It carries Attention for the same class of reason. The restore path used to
+	// stamp `approval` on every rebuilt prompt because the block could not say
+	// otherwise, so every question-red came back as an approval-red; that is a
+	// silent downgrade now that the two are distinguished.
+	//
+	// Unlike PendingWriters this is NOT derived from Pending — it is state in its
+	// own right, held in memory in the bare ("" = main) writer spelling and
+	// projected to the wire ("main") by enrichForWire. What enrichForWire does
+	// enforce is the invariant that makes the two fields safe to read together:
+	// records are pruned to Pending's key set, so a writer the reconciler released
+	// can never leave a record behind for a later restore to raise a red from.
+	PendingPrompts []PendingPromptRecord `json:"pending_prompts,omitempty"`
 
 	// PendingTool is the tool_name of the prompt the chip's red is reported under:
 	// the MAIN thread's if it has one, else the lowest-keyed writer's. It is DERIVED
@@ -329,6 +361,44 @@ type PendingPrompt struct {
 	Since     time.Time
 }
 
+// PendingPromptRecord is ONE open prompt as it survives a daemon restart: the
+// writer that owns it, what it is waiting for, which kind of wait it is, and when
+// it opened. It is the persisted element of AgentInfo.PendingPrompts.
+//
+// Writer is the same spelling PendingWriters uses — a bare subagent agent_id, or
+// "main" for the main thread on the wire ("" in memory).
+//
+// Tool and InputHash are the correlators the hook-speed match uses. They are
+// persisted here even though the Pending map's copies are not, and the difference
+// is deliberate: a record stands for one CALL, and a record with no tool cannot be
+// told apart from its writer's other calls — neither by the hook's (tool, hash)
+// rule nor by the transcript latch that binds a tool_use id — so a set of them
+// would restore as several indistinguishable reds that any one completion could
+// clear. The Pending map's values stay ownership-only, exactly as before.
+//
+// Since is the instant the PermissionRequest fired, NOT the restart instant. It
+// dates the record against the writer's own transcript so a restored prompt can
+// still bind the call it gates. The restart instant remains the clock the
+// whole-file resolution rules run from; those two clocks are separate on purpose
+// (see the claude adapter's restoredPending and Restore).
+//
+// Attention is the neutral graph's spelling — "approval" or "user_input". An
+// absent or unrecognized value degrades to the tool's own kind rather than to a
+// colourless prompt, so a hand-edited or future value can never restore as green.
+//
+// CallID is the optional opaque identity already earned by the transcript latch.
+// Persisting it lets hydrate subtract one answered call from a mixed parallel set
+// without dropping the writer's still-blocked siblings. Empty keeps the legacy
+// fail-closed behavior for prompts that had not bound before shutdown.
+type PendingPromptRecord struct {
+	Writer    string    `json:"writer"`
+	Tool      string    `json:"tool,omitempty"`
+	InputHash string    `json:"input_hash,omitempty"`
+	CallID    string    `json:"call_id,omitempty"`
+	Attention string    `json:"attention,omitempty"`
+	Since     time.Time `json:"since"`
+}
+
 // SetPending records that writer agentID (bare; "" is the main thread) is blocked
 // on prompt p, allocating the map on first use and re-deriving PendingTool.
 func (a *AgentInfo) SetPending(agentID string, p PendingPrompt) {
@@ -343,6 +413,7 @@ func (a *AgentInfo) SetPending(agentID string, p PendingPrompt) {
 // removed only by evidence from writer `a` (plan §3.3). Re-derives PendingTool.
 func (a *AgentInfo) DropPending(agentID string) {
 	delete(a.Pending, agentID)
+	a.PendingPrompts = ownedPendingPrompts(a.Pending, a.PendingPrompts)
 	a.derivePendingTool()
 }
 
@@ -352,6 +423,7 @@ func (a *AgentInfo) DropPending(agentID string) {
 // "permission".
 func (a *AgentInfo) ClearPending() {
 	a.Pending = nil
+	a.PendingPrompts = nil
 	a.PendingTool = ""
 }
 
@@ -374,18 +446,74 @@ func (a *AgentInfo) PendingWriterKeys() []string {
 
 // PendingSummary renders Pending for the decision log's `pending=` field: the
 // reported tool (PendingTool — the main thread's prompt if it has one, else the
-// lowest-keyed writer's) suffixed with "+N" when N further writers are also
+// lowest-keyed writer's) suffixed with "+N" when N further CALLS are also
 // blocked. One prompt therefore logs exactly what it always logged, so
-// statustune.ParseDecision and `switchboard-ctl diagnose` keep reading it, while a
-// multi-writer red no longer silently reports as a single one.
+// statustune.ParseDecision and `switchboard-ctl diagnose` keep reading it, while
+// parallel prompts from one writer no longer silently report as a single one.
 //
 // An empty map falls through to PendingTool, which is "" for a live block and may
 // be a hand-seeded or hydrated value otherwise.
 func (a *AgentInfo) PendingSummary() string {
-	if n := len(a.Pending); n > 1 {
+	if n := a.PendingCallCount(); n > 1 {
 		return fmt.Sprintf("%s+%d", a.PendingTool, n-1)
 	}
 	return a.PendingTool
+}
+
+// PendingCallCount reports how many individual calls currently hold the block
+// red. PendingPrompts is the per-call source; a writer represented only by the
+// legacy key set contributes one conservative residual call.
+func (a *AgentInfo) PendingCallCount() int {
+	counts := make(map[string]int, len(a.Pending)+len(a.PendingWriters))
+	for writer := range a.Pending {
+		counts[writer] = 0
+	}
+	for _, writer := range a.PendingWriters {
+		counts[pendingWriterMemoryName(writer)] = 0
+	}
+	for _, record := range a.PendingPrompts {
+		counts[pendingWriterMemoryName(record.Writer)]++
+	}
+	total := 0
+	for _, count := range counts {
+		if count == 0 {
+			count = 1
+		}
+		total += count
+	}
+	return total
+}
+
+// PendingCallCountForWriter is PendingCallCount narrowed to one wire or memory
+// writer spelling. It lets renderers say "main (3 calls)" instead of repeating
+// a writer name once per prompt.
+func (a *AgentInfo) PendingCallCountForWriter(writer string) int {
+	want := pendingWriterMemoryName(writer)
+	count := 0
+	for _, record := range a.PendingPrompts {
+		if pendingWriterMemoryName(record.Writer) == want {
+			count++
+		}
+	}
+	if count > 0 {
+		return count
+	}
+	if _, ok := a.Pending[want]; ok {
+		return 1
+	}
+	for _, candidate := range a.PendingWriters {
+		if pendingWriterMemoryName(candidate) == want {
+			return 1
+		}
+	}
+	return 0
+}
+
+func pendingWriterMemoryName(writer string) string {
+	if writer == PendingWriterMain {
+		return ""
+	}
+	return writer
 }
 
 // derivePendingTool re-stamps the scalar PendingTool from the map: the main
@@ -443,6 +571,101 @@ func pendingFromWire(names []string) map[string]PendingPrompt {
 		pending[n] = PendingPrompt{}
 	}
 	return pending
+}
+
+// ownedPendingPrompts returns the records whose writer still owns a prompt in
+// pending. It is the invariant that keeps the two pending fields readable
+// together: the Pending map is the ownership authority, so a record for a writer
+// that map no longer holds is a red nobody owns, and restoring one would
+// resurrect a prompt this daemon already released.
+//
+// It allocates only when something is actually dropped, because it runs on every
+// snapshot.
+func ownedPendingPrompts(pending map[string]PendingPrompt, records []PendingPromptRecord) []PendingPromptRecord {
+	if len(records) == 0 {
+		return nil
+	}
+	owned := true
+	for _, record := range records {
+		if _, ok := pending[bareWriter(record.Writer)]; !ok {
+			owned = false
+			break
+		}
+	}
+	if owned {
+		return records
+	}
+	kept := make([]PendingPromptRecord, 0, len(records))
+	for _, record := range records {
+		if _, ok := pending[bareWriter(record.Writer)]; ok {
+			kept = append(kept, record)
+		}
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	return kept
+}
+
+// pendingPromptsForWire translates a record set into its wire spelling: the
+// writer keys become PendingWriterMain for the main thread, and the records are
+// grouped by writer in the same ascending order pendingWritersForWire emits,
+// preserving each writer's own oldest-first order within its group.
+//
+// The ordering is load-bearing for the same reason that sort is: snapshotChangeKey
+// JSON-encodes every tagged field to decide whether to publish, so a set whose
+// order depended on map iteration would differ between snapshots of identical
+// state and republish to every bar on every tick.
+func pendingPromptsForWire(records []PendingPromptRecord) []PendingPromptRecord {
+	if len(records) == 0 {
+		return nil
+	}
+	byWriter := make(map[string][]PendingPromptRecord, len(records))
+	for _, record := range records {
+		writer := bareWriter(record.Writer)
+		record.Writer = wireWriter(writer)
+		byWriter[writer] = append(byWriter[writer], record)
+	}
+	writers := make([]string, 0, len(byWriter))
+	for writer := range byWriter {
+		writers = append(writers, wireWriter(writer))
+	}
+	sort.Strings(writers)
+	wire := make([]PendingPromptRecord, 0, len(records))
+	for _, writer := range writers {
+		wire = append(wire, byWriter[bareWriter(writer)]...)
+	}
+	return wire
+}
+
+// pendingPromptsFromWire is the inverse: the records in their in-memory ("" =
+// main) spelling, order preserved. Like pendingFromWire it manufactures nothing.
+func pendingPromptsFromWire(records []PendingPromptRecord) []PendingPromptRecord {
+	if len(records) == 0 {
+		return nil
+	}
+	decoded := make([]PendingPromptRecord, len(records))
+	for i, record := range records {
+		record.Writer = bareWriter(record.Writer)
+		decoded[i] = record
+	}
+	return decoded
+}
+
+// bareWriter and wireWriter translate the one writer key whose two spellings
+// differ. Everything in memory is bare; everything on the wire says "main".
+func bareWriter(writer string) string {
+	if writer == PendingWriterMain {
+		return ""
+	}
+	return writer
+}
+
+func wireWriter(writer string) string {
+	if writer == "" {
+		return PendingWriterMain
+	}
+	return writer
 }
 
 // ClaudeInfo is the original name for AgentInfo, kept as an alias so existing
@@ -707,6 +930,12 @@ func (s *Store) invalidatePublished(gen uint64) {
 // values consumers receive. In particular FreshUntil must remain encoded: if
 // its ceiling moves, suppressing the frame could make a consumer falsely stale.
 //
+// AgentInfo.PendingPrompts carries those same correlators and IS encoded, which is
+// not a contradiction: a record is stamped once when its PermissionRequest fires
+// and never re-derived from a clock, so an unchanged prompt set encodes
+// byte-identically tick after tick. It is ordered rather than map-ranged for
+// exactly that reason (pendingPromptsForWire).
+//
 // AgentInfo.StatusSince is json:"-" too, but it is NOT a hidden field for this
 // purpose: snapshotLocked projects it onto StatusSinceWire (status_since), which
 // IS encoded and IS compared. AgentInfo.Pending's KEY SET is the same case: it is
@@ -811,6 +1040,13 @@ func (s *Store) snapshotLocked() Snapshot {
 // Both are projections and nothing else: they are recomputed here on every
 // snapshot, so a stale value on the live block (Load leaves one behind until the
 // hydrate consumes it) can never reach the wire. nil in, nil out.
+//
+// PendingPrompts is NOT derived — it is real state, carried by value like
+// Workflows — but it is pruned and re-spelled on the same copy, so the two pending
+// fields on any published snapshot describe one consistent set of owners. Pruning
+// here rather than at every mutation site is what keeps a legacy reconciler path
+// (which releases prompts through DropPending/ClearPending and knows nothing about
+// records) from leaving an orphan behind.
 func enrichForWire(info *AgentInfo) *AgentInfo {
 	if info == nil {
 		return nil
@@ -822,6 +1058,7 @@ func enrichForWire(info *AgentInfo) *AgentInfo {
 		cp.StatusSinceWire = &since
 	}
 	cp.PendingWriters = pendingWritersForWire(cp.Pending)
+	cp.PendingPrompts = pendingPromptsForWire(ownedPendingPrompts(cp.Pending, cp.PendingPrompts))
 	return &cp
 }
 
@@ -1087,11 +1324,29 @@ func (s *Store) Load() error {
 // of truth the instant Load returns (enrichForWire re-derives the slice for every
 // later snapshot). A block with no persisted writers is left with a nil map, which
 // is what tells dropStaleSessions it is reading a pre-T12 mirror.
+//
+// pending_prompts is decoded back to its bare writer spelling on the same pass,
+// and its writers JOIN the key set rather than being filtered against it. The
+// union is the direction that cannot invent a false green: this daemon always
+// writes the two fields consistently, so they can only disagree in a
+// hand-edited or partially-written mirror, and reading a record whose owner the
+// key set forgot as "no red here" would drop a prompt nothing else can re-raise.
+// The reverse pruning still happens on the way out (enrichForWire).
 func hydratePendingWriters(info *AgentInfo) {
 	if info == nil {
 		return
 	}
 	info.Pending = pendingFromWire(info.PendingWriters)
 	info.PendingWriters = nil
+	info.PendingPrompts = pendingPromptsFromWire(info.PendingPrompts)
+	for _, record := range info.PendingPrompts {
+		if _, ok := info.Pending[record.Writer]; ok {
+			continue
+		}
+		if info.Pending == nil {
+			info.Pending = make(map[string]PendingPrompt, 1)
+		}
+		info.Pending[record.Writer] = PendingPrompt{}
+	}
 	info.derivePendingTool()
 }

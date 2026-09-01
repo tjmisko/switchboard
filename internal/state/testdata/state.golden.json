@@ -43,6 +43,29 @@
         "pending_writers": [
           "af5bd126402ac16c7",
           "main"
+        ],
+        "pending_prompts": [
+          {
+            "writer": "af5bd126402ac16c7",
+            "tool": "AskUserQuestion",
+            "input_hash": "9f2c4a1b7d05e386",
+            "attention": "user_input",
+            "since": "2026-05-28T09:02:00Z"
+          },
+          {
+            "writer": "main",
+            "tool": "Bash",
+            "input_hash": "3c81de52b9a0f74e",
+            "attention": "approval",
+            "since": "2026-05-28T09:02:30Z"
+          },
+          {
+            "writer": "main",
+            "tool": "Edit",
+            "input_hash": "5a6072ce18bd493f",
+            "attention": "approval",
+            "since": "2026-05-28T09:02:45Z"
+          }
         ]
       }
     },

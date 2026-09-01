@@ -79,7 +79,9 @@ switchboard · 3 sessions · navigate · wm=hyprland term=wezterm
 
 Only the root lines are navigation targets. Child agents do not own independent
 terminal targets or Switchboard sessions; they appear as indented, non-focusable
-rows in the TUI, and as a one-line roll-up in the Waybar hover.
+rows in the TUI, and as a one-line roll-up in the Waybar hover. Unknown (grey)
+root sessions are reachable with `cycle next|prev` but are not members of the
+`attention` ring — nothing is waiting on them.
 
 Prefer your own UI? Read `~/.cache/switchboard/state.json` directly — see the
 [schema](docs/state-schema.md) and [bar integrations](docs/bars/README.md) for
@@ -242,7 +244,7 @@ switchboard-ctl focus pid:<n>                   # PID, if unique across hosts
 switchboard-ctl focus idx:<n>                   # Nth aggregate session
 switchboard-ctl focus host:<host>:pid:<n>        # exact host namespace
 switchboard-ctl cycle next|prev     # focus next/prev session, wrapping
-switchboard-ctl attention           # first permission, else first idle, else cycle green if all green (repeat to cycle the tier)
+switchboard-ctl attention           # jump to the most urgent color; only toggle one layer up when already there
 switchboard-ctl pick                # exact-token<TAB>label<TAB>ws<TAB>cwd (for fzf)
 switchboard-ctl diagnose --observer # content-free binding/freshness/graph health
 ```
@@ -348,6 +350,7 @@ Status colors come from Claude Code hooks. Without them, sessions still appear
   "hooks": {
     "SessionStart":      [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook SessionStart",      "timeout": 2 }] }],
     "UserPromptSubmit":  [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook UserPromptSubmit",  "timeout": 2 }] }],
+    "PreToolUse":        [{ "matcher": "AskUserQuestion|ExitPlanMode", "hooks": [{ "type": "command", "command": "switchboard-ctl hook PreToolUse", "timeout": 2 }] }],
     "PostToolUse":       [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook PostToolUse",       "timeout": 2 }] }],
     "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook PermissionRequest", "timeout": 2 }] }],
     "Stop":              [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook Stop",              "timeout": 2 }] }],
@@ -359,6 +362,12 @@ Status colors come from Claude Code hooks. Without them, sessions still appear
 
 The forwarder is fire-and-forget; a broken hook can never corrupt state or
 block Claude Code.
+
+The matcher on Claude `PreToolUse` is load-bearing: this hook only stages opaque
+call identity and must not be broadened to arbitrary tools. `PermissionRequest`
+remains the event that opens red; a missing or ambiguous join falls back to the
+transcript latch. See the implementation and rollout record in
+[docs/pretooluse-hook-plan.md](docs/pretooluse-hook-plan.md).
 
 `SubagentStart`/`SubagentStop` are **optional** — they make subagent-fanout
 detection real-time by triggering an immediate re-scan instead of waiting for the
