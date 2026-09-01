@@ -194,7 +194,7 @@ Consequences for switchboard:
 | **`agent_id`** | **✅ on every event** | **✅ (all events)** | **✅ writer ownership and fanout** |
 | `agent_type` | ✅ | ✅ | fanout only |
 | `tool_input` | ✅ | ✅, as a bounded hash only | ✅ call-shape correlation |
-| `tool_use_id` | ✅ (not on `PermissionRequest`) | ✅ | ✅ exact completion and confirmed-call persistence |
+| `tool_use_id` | ✅ (not on `PermissionRequest`) | ✅ | ✅ PreTool staging, exact completion, and confirmed-call persistence |
 | `prompt_id` | ✅ | ❌ | ❌ |
 
 `agent_id` is **already arriving and already forwarded** as `rpc.Request.AgentID`

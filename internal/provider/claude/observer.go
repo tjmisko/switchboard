@@ -38,6 +38,11 @@ var (
 
 const defaultFreshness = 15 * time.Second
 
+const (
+	preToolCandidateTTL           = 60 * time.Second
+	maxPreToolCandidatesPerWriter = maxPendingPromptsPerWriter
+)
+
 // maxPendingPromptsPerWriter bounds one writer's open prompt set so a leak
 // cannot grow without limit. It is a backstop, NOT a model of dispatch width:
 // the widest parallel turn in the measured corpus is 8
@@ -69,9 +74,10 @@ type HookSignal struct {
 	ToolName      string
 	ToolInputHash string
 	// ToolUseID is Claude Code's exact identity for the call the edge is about.
-	// It is present on the tool events and absent on PermissionRequest
-	// (docs/claude-code-hook-schema.md §2), which is why a prompt cannot be opened
-	// with one and has to latch it from the transcript instead (PendingCall).
+	// It is present on PreToolUse/PostToolUse and absent on PermissionRequest
+	// (docs/claude-code-hook-schema.md §2). A matcher-limited PreToolUse can stage
+	// it for a later unique join at red onset; otherwise the prompt latches it
+	// lazily from the transcript (PendingCall).
 	// Unlike ToolInputHash it names a CALL and not a call SHAPE, so two writers
 	// running byte-identical commands are distinguishable by it and a rewritten
 	// input is not.
@@ -149,6 +155,15 @@ type rootState struct {
 	// collapse onto one record. A writer with no open prompt has no key at all;
 	// an empty slice is never stored.
 	pending map[string][]PendingPrompt
+	// preToolCandidates stages opaque call identity from matcher-limited
+	// PreToolUse hooks. Staging never opens attention; PermissionRequest consumes
+	// a candidate only when writer, tool and non-empty input hash identify one
+	// distinct call. The set is bounded, short-lived and never persisted.
+	preToolCandidates map[string][]preToolCandidate
+	// preToolContested quarantines a call id claimed by incompatible candidates
+	// or prompts. It prevents a later redelivery from reintroducing the id during
+	// the same short joining window.
+	preToolContested map[string]time.Time
 	// promptAnchors maps a writer to the newest instant at which any prompt it
 	// currently holds opened — INCLUDING prompts already retired. It is the clock
 	// every whole-file resolution rule dates from (writerResolutionAnchor), and it
@@ -190,6 +205,13 @@ type childOverlay struct {
 	AgentType string
 	Runtime   agentgraph.RuntimeState
 	UpdatedAt time.Time
+}
+
+type preToolCandidate struct {
+	Tool       string
+	InputHash  string
+	CallID     string
+	ObservedAt time.Time
 }
 
 // promptResolution is transcript evidence about a writer, not about one call:
@@ -247,11 +269,18 @@ const (
 	// happening, so it is counted rather than assumed, and the prompt goes
 	// CallLatchContested — refused, and refused once.
 	DiagnosticCallIDCollision = "prompt_call_id_collision"
+
+	DiagnosticPreToolStaged    = "pretooluse_staged"
+	DiagnosticPreToolJoinHit   = "pretooluse_join_hit"
+	DiagnosticPreToolJoinMiss  = "pretooluse_join_miss"
+	DiagnosticPreToolAmbiguous = "pretooluse_join_ambiguous"
+	DiagnosticPreToolCollision = "pretooluse_call_id_collision"
+	DiagnosticPreToolExpired   = "pretooluse_expired"
 )
 
-// maxPromptDiagnosticsPerRoot bounds the undrained buffer. A tick can only emit
-// a few of these — the latch state is one-shot per prompt and prompts are capped
-// per writer — but a root nobody drains must not grow without limit.
+// maxPromptDiagnosticsPerRoot bounds the undrained buffer. Latch outcomes are
+// one-shot per prompt and PreTool candidates are capped per writer, but a burst
+// of hooks before the coordinator drains the root must not grow without limit.
 const maxPromptDiagnosticsPerRoot = 64
 
 // NewObserver constructs one process-wide Claude observer. historyDir is used
@@ -345,12 +374,7 @@ func (o *Observer) Observe(ctx context.Context, root provider.RootRef, now time.
 	for _, latch := range latches {
 		applyPromptLatch(rs.pending, latch)
 	}
-	if len(latchDiagnostics) > 0 {
-		rs.promptDiagnostics = append(rs.promptDiagnostics, latchDiagnostics...)
-		if len(rs.promptDiagnostics) > maxPromptDiagnosticsPerRoot {
-			rs.promptDiagnostics = rs.promptDiagnostics[len(rs.promptDiagnostics)-maxPromptDiagnosticsPerRoot:]
-		}
-	}
+	appendPromptDiagnostics(rs, latchDiagnostics...)
 	for _, resolution := range resolutions {
 		current, ok := rs.pending[resolution.Writer]
 		if !ok || !slices.Equal(current, resolution.Prompts) {
@@ -442,11 +466,25 @@ func (o *Observer) applyHookLocked(rs *rootState, signal HookSignal) (bool, stri
 	writer := signal.AgentID
 	changed := false
 	rule := statustune.RuleGraphHookNoChange
+	if signal.Event == "SessionStart" {
+		clear(rs.preToolCandidates)
+		clear(rs.preToolContested)
+	} else {
+		expirePreToolCandidates(rs, signal.At)
+	}
+
+	if signal.Event == "PreToolUse" {
+		stagePreToolCandidate(rs, writer, signal)
+		return false, rule, 0
+	}
 
 	if signal.Event == "PermissionRequest" {
 		next := PendingPrompt{
 			Tool: signal.ToolName, InputHash: signal.ToolInputHash,
 			Attention: attentionForTool(signal.ToolName), Since: signal.At,
+		}
+		if callID := consumePreToolCandidate(rs, writer, signal); callID != "" {
+			next.CallID, next.Latch = callID, CallLatchBound
 		}
 		prompts, opened := openPendingPrompt(rs.pending[writer], next)
 		setPendingPrompts(rs, writer, prompts)
@@ -481,6 +519,7 @@ func (o *Observer) applyHookLocked(rs *rootState, signal HookSignal) (bool, stri
 			rule = statustune.RuleGraphChildActivity
 		}
 	case "PostToolUse":
+		consumeCompletedPreToolCandidate(rs, signal.ToolUseID)
 		// The call closes the prompt, so a match removes exactly the prompt it
 		// names and leaves the writer's other open calls blocking. Answering one
 		// of two parallel calls must not take the chip out of red.
@@ -543,6 +582,216 @@ func (o *Observer) applyHookLocked(rs *rootState, signal HookSignal) (bool, stri
 		rule = statustune.RuleGraphFanoutRescan
 	}
 	return changed, rule, depth
+}
+
+func preToolIdentityTool(tool string) bool {
+	return tool == "AskUserQuestion" || tool == "ExitPlanMode"
+}
+
+func appendPromptDiagnostics(rs *rootState, categories ...string) {
+	for _, category := range categories {
+		if category != "" {
+			rs.promptDiagnostics = append(rs.promptDiagnostics, category)
+		}
+	}
+	if len(rs.promptDiagnostics) > maxPromptDiagnosticsPerRoot {
+		rs.promptDiagnostics = rs.promptDiagnostics[len(rs.promptDiagnostics)-maxPromptDiagnosticsPerRoot:]
+	}
+}
+
+func expirePreToolCandidates(rs *rootState, at time.Time) {
+	for writer, candidates := range rs.preToolCandidates {
+		kept := candidates[:0]
+		for _, candidate := range candidates {
+			if at.Sub(candidate.ObservedAt) > preToolCandidateTTL {
+				appendPromptDiagnostics(rs, DiagnosticPreToolExpired)
+				continue
+			}
+			kept = append(kept, candidate)
+		}
+		if len(kept) == 0 {
+			delete(rs.preToolCandidates, writer)
+		} else {
+			rs.preToolCandidates[writer] = kept
+		}
+	}
+	for callID, contestedAt := range rs.preToolContested {
+		if at.Sub(contestedAt) > preToolCandidateTTL {
+			delete(rs.preToolContested, callID)
+		}
+	}
+}
+
+func stagePreToolCandidate(rs *rootState, writer string, signal HookSignal) {
+	if !preToolIdentityTool(signal.ToolName) || signal.ToolInputHash == "" || signal.ToolUseID == "" {
+		return
+	}
+	if _, contested := rs.preToolContested[signal.ToolUseID]; contested {
+		return
+	}
+
+	duplicate, conflict := false, false
+	for owner, prompts := range rs.pending {
+		for _, prompt := range prompts {
+			if prompt.CallID != signal.ToolUseID ||
+				(prompt.Latch != CallLatchBound && prompt.Latch != CallLatchProposed) {
+				continue
+			}
+			if prompt.Latch == CallLatchBound && owner == writer && prompt.Tool == signal.ToolName && prompt.InputHash == signal.ToolInputHash {
+				duplicate = true
+			} else {
+				conflict = true
+			}
+		}
+	}
+	for owner, candidates := range rs.preToolCandidates {
+		for _, candidate := range candidates {
+			if candidate.CallID != signal.ToolUseID {
+				continue
+			}
+			if owner == writer && candidate.Tool == signal.ToolName && candidate.InputHash == signal.ToolInputHash {
+				duplicate = true
+			} else {
+				conflict = true
+			}
+		}
+	}
+	if conflict {
+		quarantinePreToolCallID(rs, signal.ToolUseID, signal.At)
+		return
+	}
+	if duplicate {
+		return
+	}
+
+	candidates := append(rs.preToolCandidates[writer], preToolCandidate{
+		Tool: signal.ToolName, InputHash: signal.ToolInputHash,
+		CallID: signal.ToolUseID, ObservedAt: signal.At,
+	})
+	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].ObservedAt.Before(candidates[j].ObservedAt) })
+	if len(candidates) > maxPreToolCandidatesPerWriter {
+		candidates = candidates[len(candidates)-maxPreToolCandidatesPerWriter:]
+	}
+	rs.preToolCandidates[writer] = candidates
+	appendPromptDiagnostics(rs, DiagnosticPreToolStaged)
+}
+
+func quarantinePreToolCallID(rs *rootState, callID string, at time.Time) {
+	if callID == "" {
+		return
+	}
+	if _, already := rs.preToolContested[callID]; already {
+		return
+	}
+	for writer, candidates := range rs.preToolCandidates {
+		candidates = slices.DeleteFunc(candidates, func(candidate preToolCandidate) bool {
+			return candidate.CallID == callID
+		})
+		if len(candidates) == 0 {
+			delete(rs.preToolCandidates, writer)
+		} else {
+			rs.preToolCandidates[writer] = candidates
+		}
+	}
+	for writer, prompts := range rs.pending {
+		for i := range prompts {
+			if prompts[i].CallID == callID &&
+				(prompts[i].Latch == CallLatchBound || prompts[i].Latch == CallLatchProposed) {
+				prompts[i].CallID = ""
+				prompts[i].Latch = CallLatchContested
+				prompts[i].LatchAt = at
+			}
+		}
+		rs.pending[writer] = prompts
+	}
+	rs.preToolContested[callID] = at
+	appendPromptDiagnostics(rs, DiagnosticPreToolCollision, DiagnosticCallIDCollision)
+}
+
+func consumePreToolCandidate(rs *rootState, writer string, signal HookSignal) string {
+	if !preToolIdentityTool(signal.ToolName) {
+		return ""
+	}
+	candidates := rs.preToolCandidates[writer]
+	distinct := make(map[string]bool)
+	hadToolCandidate := false
+	for _, candidate := range candidates {
+		if candidate.Tool != signal.ToolName {
+			continue
+		}
+		hadToolCandidate = true
+		if signal.ToolInputHash != "" && candidate.InputHash == signal.ToolInputHash {
+			distinct[candidate.CallID] = true
+		}
+	}
+
+	switch len(distinct) {
+	case 0:
+		// A same-writer/tool candidate that failed the positive hash join can no
+		// longer be assigned safely. Purge it so a later call with the old shape
+		// cannot inherit this call's id.
+		removePreToolCandidates(rs, writer, func(candidate preToolCandidate) bool {
+			return candidate.Tool == signal.ToolName
+		})
+		if hadToolCandidate {
+			appendPromptDiagnostics(rs, DiagnosticPreToolJoinMiss)
+		}
+		return ""
+	case 1:
+		var callID string
+		for candidateID := range distinct {
+			callID = candidateID
+		}
+		removePreToolCandidates(rs, writer, func(candidate preToolCandidate) bool {
+			return candidate.Tool == signal.ToolName && candidate.InputHash == signal.ToolInputHash
+		})
+		if preToolCallIDClaimed(rs.pending, callID) {
+			quarantinePreToolCallID(rs, callID, signal.At)
+			appendPromptDiagnostics(rs, DiagnosticPreToolJoinMiss)
+			return ""
+		}
+		appendPromptDiagnostics(rs, DiagnosticPreToolJoinHit)
+		return callID
+	default:
+		removePreToolCandidates(rs, writer, func(candidate preToolCandidate) bool {
+			return candidate.Tool == signal.ToolName && candidate.InputHash == signal.ToolInputHash
+		})
+		appendPromptDiagnostics(rs, DiagnosticPreToolAmbiguous)
+		return ""
+	}
+}
+
+func preToolCallIDClaimed(pending map[string][]PendingPrompt, callID string) bool {
+	for _, prompts := range pending {
+		for _, prompt := range prompts {
+			if prompt.CallID == callID &&
+				(prompt.Latch == CallLatchBound || prompt.Latch == CallLatchProposed) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func consumeCompletedPreToolCandidate(rs *rootState, callID string) {
+	if callID == "" {
+		return
+	}
+	for writer := range rs.preToolCandidates {
+		removePreToolCandidates(rs, writer, func(candidate preToolCandidate) bool {
+			return candidate.CallID == callID
+		})
+	}
+	delete(rs.preToolContested, callID)
+}
+
+func removePreToolCandidates(rs *rootState, writer string, remove func(preToolCandidate) bool) {
+	candidates := slices.DeleteFunc(rs.preToolCandidates[writer], remove)
+	if len(candidates) == 0 {
+		delete(rs.preToolCandidates, writer)
+		return
+	}
+	rs.preToolCandidates[writer] = candidates
 }
 
 // openPendingPrompt inserts next into a writer's open set, keeping it ordered
@@ -860,6 +1109,7 @@ func (o *Observer) ensureRootLocked(root provider.RootRef) *rootState {
 	rs = &rootState{
 		ref: root, runtime: agentgraph.RuntimeUnknown,
 		pending: make(map[string][]PendingPrompt), promptAnchors: make(map[string]time.Time),
+		preToolCandidates: make(map[string][]preToolCandidate), preToolContested: make(map[string]time.Time),
 		overlays: make(map[string]childOverlay),
 		known:    make(map[string]fanout.Lifecycle), retained: make(map[string]fanout.Child),
 		legacyEvents: carriedEvents,
@@ -880,7 +1130,7 @@ func validateRoot(root provider.RootRef) error {
 
 func recognizedHook(event string) bool {
 	switch event {
-	case "UserPromptSubmit", "PostToolUse", "PermissionRequest", "Stop", "SessionStart", "SubagentStart", "SubagentStop":
+	case "UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest", "Stop", "SessionStart", "SubagentStart", "SubagentStop":
 		return true
 	default:
 		return false

@@ -182,8 +182,9 @@ edges after 7 days. The event mapping is:
 | Hook event | `claude` status | `codex` status |
 |------------|-----------------|----------------|
 | `UserPromptSubmit` | `working` | `working` |
-| ordinary `PreToolUse` | (unmapped) | `working` |
-| `request_user_input` `PreToolUse` | (unmapped) | `permission` (`user_input`) |
+| `AskUserQuestion` / `ExitPlanMode` `PreToolUse` | status unchanged; may stage call identity | `working` |
+| other `PreToolUse` | status unchanged | `working` |
+| `request_user_input` `PreToolUse` | status unchanged | `permission` (`user_input`) |
 | ordinary/unmatched `PostToolUse` | `working` | `working`, without clearing a pending question |
 | matching `request_user_input` `PostToolUse` | `working` | `working`, and clears that exact question |
 | `PermissionRequest` | `permission` | `permission` |
@@ -236,11 +237,14 @@ must stay red even while subagents work. If the transcript can't be read, a TTL
 backstop (`statustune.Tuning.PermissionDecayTTL`, default 30 s) exits it anyway so
 it never nags forever.
 
-There is also a **hook-speed early clear**: the `PermissionRequest` hook stashes
-the tool it was raised for, and a later `PostToolUse` whose `tool_name` matches
-(the *approved* tool completed) exits red immediately — collapsing the
-approve-path lag without waiting for the transcript. A non-matching / `Task`
-`PostToolUse` keeps the chip red.
+There is also a **hook-speed exact clear**. For allowlisted human-input tools, a
+preceding `PreToolUse` stages `(writer, tool, input_hash, tool_use_id)` without
+changing color. `PermissionRequest` opens red as before and binds that ID only
+when `(writer, tool, non-empty input_hash)` selects exactly one candidate. The
+matching `PostToolUse` then closes exactly that call even if approval rewrote its
+input. A missing, expired, or ambiguous join opens an unbound prompt and falls
+back to the transcript latch; it never guesses. Other tools retain the existing
+writer/tool/input-shape clear.
 
 This is purely a daemon-internal status correction. Every exit is recorded by a
 canonical decision log line (see below). The `StatusSince` it keys off is

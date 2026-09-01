@@ -350,6 +350,7 @@ Status colors come from Claude Code hooks. Without them, sessions still appear
   "hooks": {
     "SessionStart":      [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook SessionStart",      "timeout": 2 }] }],
     "UserPromptSubmit":  [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook UserPromptSubmit",  "timeout": 2 }] }],
+    "PreToolUse":        [{ "matcher": "AskUserQuestion|ExitPlanMode", "hooks": [{ "type": "command", "command": "switchboard-ctl hook PreToolUse", "timeout": 2 }] }],
     "PostToolUse":       [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook PostToolUse",       "timeout": 2 }] }],
     "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook PermissionRequest", "timeout": 2 }] }],
     "Stop":              [{ "hooks": [{ "type": "command", "command": "switchboard-ctl hook Stop",              "timeout": 2 }] }],
@@ -362,8 +363,10 @@ Status colors come from Claude Code hooks. Without them, sessions still appear
 The forwarder is fire-and-forget; a broken hook can never corrupt state or
 block Claude Code.
 
-The optional matcher-limited Claude `PreToolUse` identity upgrade is not part of
-this baseline hook set yet. Its staged, fail-closed rollout is specified in
+The matcher on Claude `PreToolUse` is load-bearing: this hook only stages opaque
+call identity and must not be broadened to arbitrary tools. `PermissionRequest`
+remains the event that opens red; a missing or ambiguous join falls back to the
+transcript latch. See the implementation and rollout record in
 [docs/pretooluse-hook-plan.md](docs/pretooluse-hook-plan.md).
 
 `SubagentStart`/`SubagentStop` are **optional** — they make subagent-fanout

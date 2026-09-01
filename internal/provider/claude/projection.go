@@ -22,19 +22,20 @@ const PendingWriterMain = "main"
 //
 // The first four fields are the prompt's IDENTITY: they are exactly what the
 // PermissionRequest edge carried, and promptIdentity compares them. The latch
-// fields below are learned later, from the writer's own transcript, and are
-// deliberately NOT part of that identity — a prompt that has since bound its
-// call id is still the same prompt, so a verbatim hook redelivery must dedupe
-// against it and the Observe merge must still recognize it.
+// fields below are learned either from a unique PreToolUse→PermissionRequest
+// join at open or later from the writer's own transcript. They are deliberately
+// NOT part of prompt identity — a prompt that has bound its call id is still the
+// same prompt, so a verbatim hook redelivery must dedupe against it and the
+// Observe merge must still recognize it.
 type PendingPrompt struct {
 	Tool      string
 	InputHash string
 	Attention agentgraph.AttentionState
 	Since     time.Time
 
-	// CallID is Claude Code's exact identity for the gated call, latched lazily
-	// on an Observe tick (PendingCall) because PermissionRequest carries none. It
-	// is meaningful only while Latch is CallLatchBound.
+	// CallID is Claude Code's exact identity for the gated call, joined from a
+	// matcher-limited PreToolUse at red onset when unique or latched lazily on an
+	// Observe tick otherwise. It is meaningful only while Latch is CallLatchBound.
 	CallID string
 	Latch  CallLatchState
 	// LatchAt is the instant the current latch state was reached. Only the
@@ -158,12 +159,13 @@ func (o *Observer) DrainResolutionRule(key provider.RootKey) string {
 }
 
 // DrainPromptDiagnostics returns and forgets the bounded, content-free
-// diagnostic categories the most recent Observe calls for key produced while
-// latching call identity. Drained rather than read for DrainResolutionRule's
-// reason: a counter that is read twice reports an event that happened once, and
-// these exist to be counted honestly — they are how anyone can tell whether the
-// id fast path is reachable in practice, and whether the uniqueness the lifted
-// fanout floor rests on ever fails (P3, askuserquestion-model-plan.md §5).
+// diagnostic categories the most recent hooks/Observe calls for key produced
+// while staging, joining, or latching call identity. Drained rather than read
+// for DrainResolutionRule's reason: a counter that is read twice reports an
+// event that happened once. These exist to be counted honestly — they are how
+// anyone can tell whether the id fast path is reachable in practice, and
+// whether the uniqueness the lifted fanout floor rests on ever fails (P3,
+// askuserquestion-model-plan.md §5).
 func (o *Observer) DrainPromptDiagnostics(key provider.RootKey) []string {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -245,6 +247,8 @@ func (o *Observer) Restore(root provider.RootRef, restored Compatibility, at tim
 	}
 	rs.pending = restoredPending(restored, at)
 	clear(rs.promptAnchors)
+	clear(rs.preToolCandidates)
+	clear(rs.preToolContested)
 	for writer, prompts := range rs.pending {
 		// The anchor is the RESTART instant, never a restored onset. Every whole-file
 		// resolution rule dates from it, and a pre-restart onset would make each of

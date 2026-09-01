@@ -588,6 +588,61 @@ func TestClaudeGraphLandingLogsDiagnosableRulesAndPerCallHolds(t *testing.T) {
 	}
 }
 
+func TestClaudePreToolUseBindsThroughCoordinatorAndClearsExactCall(t *testing.T) {
+	store := state.New("")
+	started := time.Now().Add(-time.Hour)
+	ref := seedCoordinatorSession(store, 4503, started, state.AgentKindClaude, "claude-pretool", "/project")
+	coordinator := newAgentCoordinator(store, nil, claudeprovider.NewObserver(t.TempDir()), nil)
+	coordinator.refreshTrackedRoots()
+	defer coordinator.Close()
+
+	handle := func(req rpc.Request) {
+		t.Helper()
+		sess, ok := sessionForKey(store.Snapshot(), ref.Key())
+		if !ok {
+			t.Fatal("Claude root disappeared before hook")
+		}
+		coordinator.HandleHook(req, sess)
+	}
+	now := time.Now()
+	handle(rpc.Request{
+		Agent: state.AgentKindClaude, Event: "SessionStart", SessionID: "claude-pretool", ObservedAt: now,
+	})
+	handle(rpc.Request{
+		Agent: state.AgentKindClaude, Event: "PreToolUse", SessionID: "claude-pretool",
+		ToolName: "AskUserQuestion", ToolInputHash: "ask-before", ToolUseID: "toolu_fast",
+		ObservedAt: now.Add(time.Second),
+	})
+	afterPre, _ := sessionForKey(store.Snapshot(), ref.Key())
+	if got := afterPre.Enrichment().Status; got != state.StatusIdle {
+		t.Fatalf("PreToolUse status = %q, want idle with no attention", got)
+	}
+	if got := len(afterPre.Enrichment().PendingPrompts); got != 0 {
+		t.Fatalf("PreToolUse opened %d prompts, want none", got)
+	}
+
+	handle(rpc.Request{
+		Agent: state.AgentKindClaude, Event: "PermissionRequest", SessionID: "claude-pretool",
+		ToolName: "AskUserQuestion", ToolInputHash: "ask-before", ObservedAt: now.Add(2 * time.Second),
+	})
+	blocked, _ := sessionForKey(store.Snapshot(), ref.Key())
+	info := blocked.Enrichment()
+	if info.Status != state.StatusPermission || len(info.PendingPrompts) != 1 || info.PendingPrompts[0].CallID != "toolu_fast" {
+		t.Fatalf("PermissionRequest did not publish the pre-bound call: %+v", info)
+	}
+
+	handle(rpc.Request{
+		Agent: state.AgentKindClaude, Event: "PostToolUse", SessionID: "claude-pretool",
+		ToolName: "AskUserQuestion", ToolInputHash: "ask-after-rewrite", ToolUseID: "toolu_fast",
+		ObservedAt: now.Add(3 * time.Second),
+	})
+	cleared, _ := sessionForKey(store.Snapshot(), ref.Key())
+	info = cleared.Enrichment()
+	if info.Status != state.StatusWorking || len(info.PendingPrompts) != 0 {
+		t.Fatalf("exact PostToolUse did not clear at hook speed: %+v", info)
+	}
+}
+
 func TestClaudeShadowFixturesAuthorizeGraphSummary(t *testing.T) {
 	for _, fixture := range claudeprovider.CanonicalShadowCases() {
 		t.Run(fixture.Name, func(t *testing.T) {

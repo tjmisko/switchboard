@@ -340,13 +340,14 @@ knows and no surface currently renders.
 `Observe` tick without it, with four teammates in flight. A teammate's
 byte-identical call still holds. A declined question exits to idle, not green.
 
-### Phase 5 — Optional, gated on §5's probes
+### Phase 5 — Protocol implemented; registration/live gate remains
 
-12. Register `PreToolUse` matcher-limited to `AskUserQuestion|ExitPlanMode`, giving
-    the id at open time and retiring the latch for those tools. The implementation
-    design and current gates now live in
-    [pretooluse-hook-plan.md](pretooluse-hook-plan.md); widen further only on
-    measurement.
+12. The adapter now accepts `PreToolUse` matcher-limited in policy to
+    `AskUserQuestion|ExitPlanMode`, giving the id at open time when the composite
+    join is unique and retaining the latch otherwise. Registering that matcher
+    and evaluating the live counters remain. The implementation design and
+    gates live in [pretooluse-hook-plan.md](pretooluse-hook-plan.md); widen
+    further only on measurement.
 
 ### 4a. Addendum — what actually landed in Phases 1–3
 
@@ -805,13 +806,13 @@ be read with that split in mind.
    interval, and worth knowing before anyone writes a test that drives exactly
    one tick after a restore.
 
-**Scope.** Nothing under `~/.config` or `~/.claude` was touched, `scripts/deploy`
-was not run, and the main tree is untouched (it carries a pre-existing untracked
-copy of this plan, written 14:53 on 2026-08-31, before this branch's first
-commit; left alone). No `scripts/`, `systemd/` or `hosts/` file changed, and
-`ExitPlanMode` appears nowhere outside these docs — Phase 5 was not attempted by
-any hand. No unrelated refactor rode along: every non-test change traces to a
-numbered step, an addendum, or R5.
+**Scope at audit time.** Nothing under `~/.config` or `~/.claude` was touched,
+`scripts/deploy` was not run, and the main tree is untouched (it carries a
+pre-existing untracked copy of this plan, written 14:53 on 2026-08-31, before
+this branch's first commit; left alone). No `scripts/`, `systemd/` or `hosts/`
+file changed, and `ExitPlanMode` appeared nowhere outside these docs — Phase 5
+had not yet been attempted. No unrelated refactor rode along: every non-test
+change traces to a numbered step, an addendum, or R5.
 
 ### 4g. Follow-up — U1, U2 and the mixed-downtime residual
 
@@ -831,10 +832,12 @@ follow-up supersedes its first four items:
   their writer's unanswered siblings. An unbound record still fails closed;
   [pretooluse-hook-plan.md](pretooluse-hook-plan.md) removes that remaining fast-
   answer window by supplying the id before the prompt opens.
-- **Phase 5 is planned.** Current official Claude Code documentation settles the
-  old ordering gate: matcher-limited `PreToolUse` runs before permission
-  evaluation and carries `tool_use_id`. The plan stages that id and joins it on
-  `PermissionRequest`; the pre-hook itself never opens red.
+- **Phase 5 protocol support is implemented; registration and live acceptance
+  remain.** Current official Claude Code documentation settles the old ordering
+  gate: matcher-limited `PreToolUse` runs before permission evaluation and
+  carries `tool_use_id`. The adapter stages that id and joins it on
+  `PermissionRequest`; the pre-hook itself never opens red. See
+  [pretooluse-hook-plan.md](pretooluse-hook-plan.md).
 
 ---
 

@@ -1,5 +1,9 @@
 # Claude `PreToolUse` call-identity plan
 
+> **Implementation status (2026-08-31).** Phases A and B are implemented on
+> `feat/auq-prompt-model`. The matcher has not been registered and no live
+> acceptance window has started; those remain Phases C and D after deployment.
+
 > **Goal.** Give `AskUserQuestion` and `ExitPlanMode` prompts their exact
 > `tool_use_id` when the red opens, so an answer can clear that exact prompt on
 > its `PostToolUse` edge without waiting 10–15 seconds for the transcript latch.
@@ -58,6 +62,16 @@ On `PermissionRequest`:
 3. If zero or several distinct IDs match, open the current unbound prompt and
    let `latchPendingCalls` do exactly what it does today.
 
+On a zero-match where same-writer/tool candidates exist, discard those stale
+candidates. Keeping a pre-modification hash would let a later call with that old
+shape inherit the wrong ID. A collision also invalidates any already-bound or
+proposed claim to the ID before quarantining it.
+
+A `PermissionRequest` with no staged evidence emits no join-miss counter. This
+keeps an inert binary deployed before registration from flooding the denominator;
+hash drift with an actual candidate emits `pretooluse_join_miss`, while TTL loss
+emits `pretooluse_expired` separately.
+
 The join never uses temporal nearest-neighbor or FIFO ordering. Parallel
 byte-identical calls are genuinely indistinguishable at `PermissionRequest`, so
 ordering them would turn latency work into a missed-RED risk.
@@ -86,7 +100,7 @@ ordering them would turn latency work into a missed-RED risk.
 
 ## 3. Implementation sequence
 
-### Phase A — inert protocol support
+### Phase A — inert protocol support (implemented)
 
 1. Add `PreToolUse` to the Claude adapter's recognized hook vocabulary. Keep the
    legacy `statusFromHookEvent` mapping unchanged: staging identity is not a
@@ -102,7 +116,7 @@ ordering them would turn latency work into a missed-RED risk.
 5. Keep all fields content-free. The raw `tool_input` still dies at
    `parseHookPayload`; only its bounded hash crosses RPC.
 
-### Phase B — regression gates
+### Phase B — regression gates (implemented)
 
 Add tests proving:
 
@@ -119,7 +133,7 @@ Add tests proving:
 - the existing lazy-latch, fanout, parallel-prompt, restart, and privacy tests
   pass unmodified.
 
-### Phase C — matcher-limited registration
+### Phase C — matcher-limited registration (not yet applied)
 
 After the binary containing Phase A/B is deployed, add this single handler to
 the existing Claude `hooks` object (user-scoped if the feature should cover all
@@ -148,11 +162,12 @@ Use Claude Code's `/hooks` view to confirm there is exactly one effective
 registration. User and project registrations both firing would be safe after
 deduplication but would distort the join counters.
 
-### Phase D — live acceptance
+### Phase D — live acceptance (pending registration)
 
 For one normal workday, read the content-free counters and history:
 
-- `pretooluse_join_hit / (hit + miss + ambiguous)` by tool;
+- `pretooluse_join_hit / (hit + miss + ambiguous)` across the scoped matcher,
+  with `pretooluse_expired` reported separately;
 - call-ID collisions (target: zero);
 - answer-to-clear p50/p95 and red episodes under 2 seconds;
 - an ID clear followed within 30 seconds by a new permission wait for the same
