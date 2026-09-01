@@ -31,6 +31,41 @@ jq -r '
 ' ~/.cache/switchboard/state.json
 ```
 
+## Waybar
+
+The Hyprland bottom strip keeps ten real GTK modules (and therefore per-chip
+CSS and click targets) without ten resident renderers. `switchboard-ctl
+bottombar watch` owns one aggregate subscription, renders all slots, and
+atomically replaces `$XDG_RUNTIME_DIR/switchboard/slot-N.json`. Waybar v0.15's
+signal mode runs one shell-builtin read at startup and again only after that
+slot's bytes change; it does not exec a separate reader binary.
+
+Copy [`../../waybar/claude.jsonc`](../../waybar/claude.jsonc) to
+`~/.config/waybar/claude.jsonc` and use
+`systemd/switchboard-waybar.service`. Keep `signal: 1..10`, omit `interval`, and
+leave `exec-on-event: false`; otherwise clicks cause redundant reads. Slot zero
+writes the exact Waybar parent PID to `bottom-waybar.ready`. The broker checks
+that acknowledgement before sending RT signals, retaining dirty slots until it
+can safely catch up after startup.
+
+Treat the binary and config as one cutover: install the signal-mode config
+before restarting `switchboard-waybar.service`. A new watcher paired with the
+old `switchboard-waybar --slot` config cannot receive readiness and leaves the
+old ten renderers in place. The watcher bounds its fast readiness retries, logs
+the mismatch, then probes only every three seconds, but that is a rollout guard,
+not a supported steady state.
+
+The example keeps the appliance's right-click picker and middle-click rename
+bindings under `$HOME/.config/scripts`, and resolves the control client through
+`$HOME/.local/bin`, so it does not depend on the systemd user manager's `PATH`.
+
+This Hyprland extra currently targets glibc Linux (`SIGRTMIN=34`) and uses
+pidfds (Linux 5.3+) so a recycled numeric PID can never receive a realtime
+update intended for Waybar.
+
+`switchboard-waybar` remains a standalone/debug wrapper, but the live config
+must not run it per slot.
+
 ## polybar
 
 The supported renderer subscribes to the daemon and emits a single formatted

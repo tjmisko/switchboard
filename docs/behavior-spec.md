@@ -452,8 +452,9 @@ last transition.
 
 ### 10.2 `topVisible` / `bottomPID` / `envOr` / `runtimeDir`  — §0.4
 - `topVisible` should be `true` when the marker file is **absent**, `false` when present.
-- `bottomPID` should return the recorded pid only when it is live **and** its
-  `comm` is `waybar`.
+- `bottomPID` should return the recorded pid only when it is live, its `comm` is
+  `waybar`, its command line selects the configured bottom-bar file, and its
+  `/proc` starttime matches the pidfile's PID-reuse fence.
 - `bottomPID` should remove the pidfile and return `0` on: missing pidfile,
   non-numeric/`<=0` content, dead pid, or `comm != waybar` (pid-reuse guard).
 - `envOr` should return the env value when set and non-empty, else the fallback.
@@ -473,13 +474,18 @@ last transition.
   **unreachable**.
 - `ensureStarted` idempotence: no-op when the bottom bar is already running.
 - `ensureStopped` idempotence: no-op when already stopped.
-- `ensureStopped` should target the **process group** (`-pid`) so the
-  `switchboard-waybar` slot subprocesses die with it (no orphans), falling back
-  to the bare pid if the group kill errors.
+- `ensureStopped` should signal the validated Waybar through a **pidfd**, so a
+  numeric PID recycled after validation cannot target an unrelated process.
 - `reapChildren` should reap killed bottom-bar children so they don't pile up as
   zombies across repeated start/kill cycles.
 - `watch` self-heal: should restore the correct bottom-bar state within the 3 s
   safety tick after an out-of-band change.
+- slot publication atomically replaces `slot-N.json` before signaling and
+  suppresses byte-identical replacements.
+- a realtime signal is sent through the validated Waybar pidfd only when its
+  numeric PID appears in `bottom-waybar.ready`; a failed or startup-suppressed
+  signal leaves the slot dirty for catch-up. Fast readiness polling is
+  exponential and bounded, then degrades to one probe per safety interval.
 
 ---
 

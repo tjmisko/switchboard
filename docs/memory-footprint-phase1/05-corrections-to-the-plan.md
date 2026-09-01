@@ -177,9 +177,9 @@ one on 2026-08-26**. Record the decision and the chosen mechanism (encode-time
    **wire** rate (View output, no gate); `publish-stats` counts **`Store.Apply`
    decisions**. The ablation and the target are stated against the wire rate.
    Say which, explicitly.
-2. **"'idle · Nm' counters unchanged by eye" will fail, and that means #6
-   worked.** `cmd/switchboard-waybar/main.go` has no timer, so counters advance
-   only when a frame arrives. Current `main` now renders Waybar ages through
+2. **"'idle · Nm' counters unchanged by eye" exposed a historical clock
+   dependency.** The renderer once had no timer, so counters advanced only when
+   a frame arrived. Current `main` renders Waybar ages through
    `durfmt.Coarse`, which changes at most once per minute. Task #8.5 therefore
    uses adaptive display-boundary timers: minute boundaries for Waybar and
    second boundaries only while the TUI visibly displays seconds. A fixed 1 Hz
@@ -220,7 +220,9 @@ renderer saves memory continuously and is required for the with-Codex target,
 whereas lazy startup saves memory only after Codex has been absent for its grace
 period and carries the higher history risk.
 
-The FIFO spike must not keep an unread `O_RDWR` descriptor. That design can fill
-the pipe while Waybar is absent and block the single renderer. Use reconnecting
-nonblocking writers with one cached latest line per slot, and prove prolonged
-reader absence cannot block another slot.
+Phase 2 no longer uses FIFOs. Waybar v0.15 signal mode plus atomically replaced
+regular slot files is smaller and makes the latest value sticky across both
+reader and writer restarts. It has no resident reader, no pipe-buffer backpressure,
+and no reconnecting writer state. The broker must signal only the validated
+bottom-Waybar PID after that exact PID acknowledges module readiness; dirty bits
+provide the startup catch-up.

@@ -186,8 +186,9 @@ units, verifies the running daemon, and rolls back on failure. Use
 `--allow-dirty` only for an explicitly recorded measurement build. Do not
 manually restart one binary from a mixed revision.
 
-`switchboard-waybar.service` runs `switchboard-ctl bottombar watch`, which spawns
-the 10 `switchboard-waybar --slot N` processes. `switchboard-dashboard` invokes
+`switchboard-waybar.service` runs one `switchboard-ctl bottombar watch`, which
+renders all ten signal-triggered slot files without resident per-slot helpers.
+`switchboard-dashboard` invokes
 `switchboard-ctl timeline` as a short-lived child per request, so a new ctl takes
 effect there without a restart. There is a backup convention in that directory
 (`.switchboard-backup-<date>-<tag>/`) — make one before the first deploy.
@@ -334,13 +335,11 @@ See "Definition of done" below.
 #10 requires "'idle · Nm' counters unchanged by eye". **That will not hold, and
 it is a consequence of #6 working correctly.**
 
-Verified: `cmd/switchboard-waybar/main.go` contains **no timer of any kind** —
-the loop is a blocking `Recv` → `emit`. `renderSlot` calls `time.Now()`
-internally (`:229`), so every `now.Sub(at)` counter — the chip's `idle · Nm` and
-the tooltip's age rows — advances **only when a frame arrives**. Today the
-`observed_at`/`fresh_until` churn this phase removes is what keeps them ticking.
-After #6 a quiet Claude session publishes nothing and its counter **freezes
-indefinitely**. `cmd/claude-tui` has the same shape.
+At `0e531b8`, `cmd/switchboard-waybar/main.go` contained no timer and ages moved
+only when a daemon frame arrived. That historical dependency is now removed:
+the consolidated broker owns one adaptive earliest-boundary timer for all ten
+slots. It never uses a fixed 1 Hz or 60 Hz loop. `cmd/claude-tui` has its own
+display-boundary timer as well.
 
 Task #8.5 implements the fix **client-side, not as a daemon heartbeat**. Waybar
 uses `durfmt.Coarse` and schedules its next visible boundary instead of polling

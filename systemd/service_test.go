@@ -118,3 +118,13 @@ func TestRendererUnitsAreSeparateOptInProfiles(t *testing.T) {
 		})
 	}
 }
+
+func TestWaybarBrokerUsesOneSmallGoHeap(t *testing.T) {
+	text := readUnit(t, "switchboard-waybar.service")
+	if !hasUnitDirective(text, "Environment=GOGC=50") {
+		t.Error("switchboard-waybar.service is missing the broker GC setting")
+	}
+	if !hasUnitDirective(text, "Environment=XDG_RUNTIME_DIR=%t") {
+		t.Error("switchboard-waybar.service does not align broker and module runtime paths")
+	}
+}

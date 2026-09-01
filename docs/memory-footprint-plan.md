@@ -934,20 +934,18 @@ journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
   - **Phase**: 2
   - **Notes**: The dotfiles repo owns that file; note the change there.
 
-- [ ] #16: FIFO renderer spike
+- [ ] #16: Waybar signal-mode renderer spike
   - **Prereqs**: none
-  - **DoD**: A throwaway prototype proves, on Waybar v0.15.0: a `custom`
-    module with `exec: cat $XDG_RUNTIME_DIR/switchboard/slot-0` and
-    `restart-interval: 1` renders JSON lines from a reconnecting nonblocking
-    writer. The writer opens `O_WRONLY|O_NONBLOCK` only while a reader exists,
-    caches one latest line per slot, and retries after `ENXIO`/`EPIPE`; it must
-    not hold an unread `O_RDWR` endpoint. Killing and restarting Waybar
-    re-attaches and receives exactly the latest line; killing the writer makes
-    `cat` exit and Waybar restart it within `restart-interval`. A sustained
-    reader absence long enough to exceed a pipe buffer leaves writer memory
-    bounded and never blocks another slot. The `cat` process is ≤ 1.5 MB RSS.
-    Findings go under a `### 3.x spike` note, including Waybar quirks such as
-    `exec-on-event` re-running `cat` after a click (set it `false`).
+  - **DoD**: Prove on Waybar v0.15.0 that a `custom` module with `signal: N`,
+    no `interval`, and a shell-builtin one-line read from
+    `$XDG_RUNTIME_DIR/switchboard/slot-N.json` runs once at startup and only on
+    `SIGRTMIN+N`. Set `exec-on-event: false`.
+    The broker atomically replaces the regular file before signaling a pidfd
+    bound to the validated bottom Waybar. No module reader remains resident. Slot zero
+    acknowledges the parent Waybar PID in `bottom-waybar.ready`; the broker
+    suppresses RT signals until that exact PID is ready and retains dirty slots
+    for a later catch-up. Record signal-to-render latency and transient process
+    count.
   - **Phase**: 2
 
 - [ ] #17: Fold rendering into `switchboard-ctl bottombar watch`
@@ -958,26 +956,24 @@ journalctl --user -u switchboard -g 'publish-stats|fanout-seed' --since -1h
     `switchboard-waybar` keeps aggregate mode and `--slot` for debugging but
     is no longer in `claude.jsonc`. `bottombar watch` — which already owns the
     waybar process and already subscribes — becomes the renderer: one
-    subscription, one decode per frame, `renderSlot` for `N` slots
-    (`--slots 10` flag, default 10), one FIFO per slot under
-    `$XDG_RUNTIME_DIR/switchboard/slot-N`, byte-identical dedupe per slot,
-    all slots re-emitted on reconnect. Tests: `should write a slot line only
-    when it changes`, `should re-emit every slot after reconnect`,
-    `should keep FIFOs open across a waybar restart`, `should render the
-    empty class for slots past the session count`, `should stop the bar and
-    keep serving FIFOs when the last session ends` (or document that FIFOs
-    are torn down with the bar — pick one and test it), and `should not let one
-    absent or stalled FIFO reader block another slot`.
+    subscription, one decode per frame, and `renderSlot` for 10 slots. It
+    atomically replaces one regular JSON file per byte-changed slot and sends
+    that module's distinct RT signal only after replacement. Tests: exact-byte
+    duplicates cause neither rename nor signal; failed/startup signals remain
+    dirty; a stale ready PID cannot authorize a signal; readiness polling is
+    bounded; a final snapshot immediately before EOF is still rendered; removed
+    sessions render the empty class; all files exist before watcher-owned Waybar
+    startup; an update arriving during startup is delivered by the catch-up.
   - **Phase**: 2
   - **Notes**: `bottombar` runs before the daemon dial in `ctl main()` on
     purpose (must tolerate the daemon being down) — keep that.
 
 - [ ] #18: Config, unit, docs cutover
   - **Prereqs**: #17 complete
-  - **DoD**: `~/.config/waybar/claude.jsonc` modules use `cat` on the FIFOs
-    with `restart-interval` and `exec-on-event: false`;
+  - **DoD**: `~/.config/waybar/claude.jsonc` modules use signal-triggered shell
+    reads of atomic slot files, with no interval and `exec-on-event: false`;
     `systemd/switchboard-waybar.service` runs the new watcher with
-    `Environment=GOGC=50`; `docs/bars/*` describe the FIFO contract;
+    `Environment=GOGC=50`; `docs/bars/*` describe the signal/file contract;
     `DONE.md` entry for #15 notes it is superseded. `sb-mem-baseline`:
     `switchboard-waybar.service` anon < 25 MB excluding the GTK `waybar`
     process; `sb-mem-baseline.socket_connections` shows exactly one persistent

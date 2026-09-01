@@ -16,12 +16,15 @@ package main
 //	              marker file (absent => visible). Owned by hypr-float-center.
 //	sessions    : the switchboard daemon's aggregate session count.
 //
-// `bottombar watch` reacts to session changes (subscribe stream + safety
-// ticker). `bottombar reconcile` is the one-shot the F8 script calls after it
-// flips the master toggle, so the bottom bar follows the top in lockstep. Both
-// funnel through reconcile under a flock, so they never race each other.
+// `bottombar watch` reacts to session changes (one subscribe stream + safety
+// ticker), renders every chip into signal-triggered Waybar files, and owns the
+// bar lifecycle. `bottombar reconcile` is the one-shot the F8 script calls
+// after it flips the master toggle. Both lifecycle paths funnel through
+// reconcile under a flock, so they never race each other.
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -32,7 +35,18 @@ import (
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/rpc"
+	"github.com/tjmisko/switchboard/internal/state"
+	"github.com/tjmisko/switchboard/internal/waybarchip"
 	"golang.org/x/sys/unix"
+)
+
+const (
+	bottomBarSlots       = 10
+	waybarReadyPoll      = 25 * time.Millisecond
+	waybarReadyPollMax   = 400 * time.Millisecond
+	waybarReadyPollTries = 6
+	waybarReadyRetry     = 3 * time.Second
+	linuxGlibcSIGRTMIN   = 34
 )
 
 type bottomBarConfig struct {
@@ -40,6 +54,8 @@ type bottomBarConfig struct {
 	marker       string // master-visibility marker; present => top bar hidden
 	pidFile      string
 	lockFile     string
+	readyFile    string
+	slotDir      string
 	waybarConfig string
 
 	ops bottomBarOps
@@ -52,6 +68,132 @@ type bottomBarOps struct {
 	isRunning func(bottomBarConfig) bool // is the bottom bar currently up?
 	start     func(bottomBarConfig) error
 	stop      func(bottomBarConfig)
+}
+
+// slotPublisher is a latest-value mailbox for each Waybar module. Regular
+// files make the last frame sticky across Waybar and watcher restarts; a
+// realtime signal only tells an already-running module to re-read its file.
+// One broker goroutine owns this value, so it needs no mutex.
+type slotPublisher struct {
+	dir     string
+	last    [][]byte
+	dirty   []bool
+	blocked bool
+	replace func(string, []byte) error
+	signal  func(int, int) error
+}
+
+func newSlotPublisher(dir string, slots int) *slotPublisher {
+	return &slotPublisher{
+		dir:     dir,
+		last:    make([][]byte, slots),
+		dirty:   make([]bool, slots),
+		replace: replaceFile,
+		signal: func(pidfd, slot int) error {
+			// bottombar is a Linux/Waybar extra already (/proc, Setsid,
+			// Hyprland). Waybar's signal=N contract maps to SIGRTMIN+N;
+			// glibc reserves 32 and 33, so its userspace SIGRTMIN is 34.
+			return unix.PidfdSendSignal(pidfd, unix.Signal(linuxGlibcSIGRTMIN+slot+1), nil, 0)
+		},
+	}
+}
+
+func (p *slotPublisher) path(slot int) string {
+	return filepath.Join(p.dir, fmt.Sprintf("slot-%d.json", slot))
+}
+
+// stage atomically replaces only byte-changed slot documents. A successful
+// rename happens before dirty is set, so flush can never signal a reader toward
+// a partial or previous file.
+func (p *slotPublisher) stage(outputs []waybarchip.Output) error {
+	bodies := make([][]byte, len(p.last))
+	changed := make([]bool, len(p.last))
+	force := p.blocked
+	for slot := range p.last {
+		if slot >= len(outputs) {
+			break
+		}
+		body, err := json.Marshal(outputs[slot])
+		if err != nil {
+			return fmt.Errorf("marshal slot %d: %w", slot, err)
+		}
+		body = append(body, '\n')
+		bodies[slot] = body
+		// After any partial replacement, last no longer describes every file on
+		// disk. Rewrite the complete row before clearing the publication block.
+		changed[slot] = force || !bytes.Equal(body, p.last[slot])
+	}
+	for slot := range p.last {
+		if !changed[slot] {
+			continue
+		}
+		if err := p.replace(p.path(slot), bodies[slot]); err != nil {
+			// A prefix may already be on disk, but no signal may expose this
+			// generation. Keep last unchanged so the next stage retries the full
+			// replacement set before flushing anything.
+			p.blocked = true
+			return fmt.Errorf("publish slot %d: %w", slot, err)
+		}
+	}
+	for slot := range p.last {
+		if !changed[slot] {
+			continue
+		}
+		p.last[slot] = bytes.Clone(bodies[slot])
+		p.dirty[slot] = true
+	}
+	p.blocked = false
+	return nil
+}
+
+func (p *slotPublisher) hasDirty() bool {
+	for _, dirty := range p.dirty {
+		if dirty {
+			return true
+		}
+	}
+	return false
+}
+
+// flush signals exactly the dirty modules. Failed signals stay dirty so the
+// readiness poll or next snapshot retries them; a startup edge cannot disappear
+// merely because Waybar had not installed its handlers yet.
+func (p *slotPublisher) flush(pidfd int) {
+	if pidfd < 0 || p.blocked {
+		return
+	}
+	for slot, dirty := range p.dirty {
+		if !dirty {
+			continue
+		}
+		if err := p.signal(pidfd, slot); err == nil {
+			p.dirty[slot] = false
+		}
+	}
+}
+
+// replaceFile writes beside the destination and renames over it. Readers see
+// one complete JSON line or the previous complete line, never a truncation.
+func replaceFile(path string, body []byte) (err error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".slot-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if err = tmp.Chmod(0o600); err == nil {
+		_, err = tmp.Write(body)
+	}
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 func defaultOps() bottomBarOps {
@@ -70,6 +212,8 @@ func bottomBarConfigDefault(socketPath string) bottomBarConfig {
 		marker:       envOr("SWITCHBOARD_WAYBAR_MARKER", "/tmp/hypr-float-center/waybar-hidden"),
 		pidFile:      filepath.Join(run, "switchboard", "bottom-waybar.pid"),
 		lockFile:     filepath.Join(run, "switchboard", "bottombar.lock"),
+		readyFile:    filepath.Join(run, "switchboard", "bottom-waybar.ready"),
+		slotDir:      filepath.Join(run, "switchboard"),
 		waybarConfig: envOr("SWITCHBOARD_BOTTOM_CONFIG", filepath.Join(home, ".config", "waybar", "claude.jsonc")),
 		ops:          defaultOps(),
 	}
@@ -115,22 +259,30 @@ func shouldRun(topVisible bool, count int) bool {
 // the flock for the duration.
 func reconcile(cfg bottomBarConfig) {
 	unlock := mustFlock(cfg.lockFile)
-	defer unlock()
-
-	visible := topVisible(cfg)
-	if !visible {
+	if !topVisible(cfg) {
 		// Master toggle is off: the bottom bar must not exist regardless of
 		// session count. We can decide this without the daemon.
 		ensureStopped(cfg)
+		unlock()
 		return
 	}
+	unlock()
+
+	// Never hold the lifecycle flock across a daemon round-trip. The renderer
+	// uses the same flock to fence PID validation and RT signaling against an F8
+	// stop/start, so socket latency must not enter that critical path.
 	count, ok := sessionCount(cfg.socketPath)
 	if !ok {
 		// Daemon unreachable — we cannot know the session count, so leave the
 		// bottom bar in whatever state it is. Better than flapping.
 		return
 	}
-	setBottom(cfg, shouldRun(visible, count))
+
+	unlock = mustFlock(cfg.lockFile)
+	defer unlock()
+	// Visibility may have changed while the daemon replied; re-read it under
+	// the lifecycle lock before deciding process state.
+	setBottom(cfg, shouldRun(topVisible(cfg), count))
 }
 
 // reconcileWith is reconcile when the caller already knows the session count
@@ -154,20 +306,29 @@ func setBottom(cfg bottomBarConfig, run bool) {
 // net for dropped snapshots (the daemon's subscriber channel drops on lag) and
 // for any master-toggle path that does not call reconcile directly.
 func watchBottomBar(cfg bottomBarConfig) {
+	renderer := waybarchip.NewRenderer(0)
+	publisher := newSlotPublisher(cfg.slotDir, bottomBarSlots)
+	// Materialize every module's startup document before any watcher-owned
+	// reconcile can launch Waybar. Empty slots are valid Waybar JSON, so startup
+	// never depends on a pipe writer arriving in time.
+	if err := publisher.stage(renderer.RenderSlotsAt(state.Snapshot{}, bottomBarSlots, time.Now())); err != nil {
+		fail("bottombar: preseed: %v", err)
+	}
+
 	// Reap bottom-bar processes we (or an F8 one-shot) start. We launch them
 	// detached with Release() and never Wait(), so when one is killed it would
 	// linger as a zombie under us — its parent — until we reap it. A one-shot
 	// reconcile cannot reap a child of ours, so the responsibility lands here.
 	go reapChildren()
 
-	go func() {
-		for range time.Tick(3 * time.Second) {
-			reconcile(cfg)
-		}
-	}()
-
 	for {
-		streamSnapshots(cfg)
+		streamSnapshots(cfg, renderer, publisher)
+		// Match the old slot processes' disconnect behavior: blank their widgets
+		// but leave the Waybar lifecycle unchanged while the daemon restarts.
+		if err := publisher.stage(renderer.RenderSlotsAt(state.Snapshot{}, bottomBarSlots, time.Now())); err != nil {
+			fmt.Fprintf(os.Stderr, "bottombar: disconnect publish: %v\n", err)
+		}
+		flushSlotsWhenReady(cfg, publisher)
 		// Connection dropped. Reconcile once (the daemon may be restarting),
 		// then retry. The ticker keeps things honest in the meantime.
 		reconcile(cfg)
@@ -177,7 +338,7 @@ func watchBottomBar(cfg bottomBarConfig) {
 
 // streamSnapshots subscribes and reconciles on each snapshot until the
 // connection drops, then returns.
-func streamSnapshots(cfg bottomBarConfig) {
+func streamSnapshots(cfg bottomBarConfig, renderer *waybarchip.Renderer, publisher *slotPublisher) {
 	c, err := rpc.Dial(cfg.socketPath)
 	if err != nil {
 		return
@@ -187,6 +348,148 @@ func streamSnapshots(cfg bottomBarConfig) {
 	if err := c.Send(rpc.Request{Cmd: command}); err != nil {
 		return
 	}
+	snapshots := make(chan state.Snapshot, 1)
+	go receiveBottomSnapshots(c, command, snapshots)
+
+	var latest state.Snapshot
+	var haveLatest bool
+	var readyPID, readyTries int
+	var readyWarned bool
+	var readyRetryAt time.Time
+	var refreshTimer, readyTimer *time.Timer
+	var refreshC, readyC <-chan time.Time
+	safety := time.NewTicker(3 * time.Second)
+	defer func() {
+		safety.Stop()
+		if refreshTimer != nil {
+			refreshTimer.Stop()
+		}
+		if readyTimer != nil {
+			readyTimer.Stop()
+		}
+	}()
+
+	reset := func(timer **time.Timer, ch *<-chan time.Time, delay time.Duration) {
+		if delay < 0 {
+			delay = 0
+		}
+		if *timer == nil {
+			*timer = time.NewTimer(delay)
+		} else {
+			if !(*timer).Stop() {
+				select {
+				case <-(*timer).C:
+				default:
+				}
+			}
+			(*timer).Reset(delay)
+		}
+		*ch = (*timer).C
+	}
+	stop := func(timer *time.Timer, ch *<-chan time.Time) {
+		if timer != nil {
+			timer.Stop()
+		}
+		*ch = nil
+	}
+	scheduleReady := func() {
+		if !publisher.hasDirty() {
+			stop(readyTimer, &readyC)
+			readyPID, readyTries, readyWarned = 0, 0, false
+			readyRetryAt = time.Time{}
+			return
+		}
+		if readyWarned && time.Now().Before(readyRetryAt) {
+			return
+		}
+		flushed, pid := flushSlotsWhenReady(cfg, publisher)
+		if pid != readyPID {
+			stop(readyTimer, &readyC)
+			readyPID, readyTries, readyWarned = pid, 0, false
+			readyRetryAt = time.Time{}
+		}
+		if flushed {
+			stop(readyTimer, &readyC)
+			readyPID, readyTries, readyWarned = 0, 0, false
+			readyRetryAt = time.Time{}
+			return
+		}
+		if pid <= 0 || readyC != nil {
+			return
+		}
+		delay, retry := nextWaybarReadyDelay(readyTries)
+		if !retry {
+			if !readyWarned {
+				fmt.Fprintln(os.Stderr, "bottombar: Waybar never acknowledged signal-mode readiness; check claude.jsonc")
+				readyWarned = true
+			}
+			readyRetryAt = time.Now().Add(waybarReadyRetry)
+			return
+		}
+		readyTries++
+		reset(&readyTimer, &readyC, delay)
+	}
+	render := func(now time.Time) bool {
+		if err := publisher.stage(renderer.RenderSlotsAt(latest, bottomBarSlots, now)); err != nil {
+			fmt.Fprintf(os.Stderr, "bottombar: render: %v\n", err)
+			return false
+		}
+		reconcileWith(cfg, len(latest.Sessions))
+		scheduleReady()
+		next := renderer.NextRefresh(latest, bottomBarSlots, now)
+		if next.IsZero() {
+			stop(refreshTimer, &refreshC)
+		} else {
+			reset(&refreshTimer, &refreshC, next.Sub(now))
+		}
+		return true
+	}
+
+	for {
+		select {
+		case snapshot, ok := <-snapshots:
+			if !ok {
+				return
+			}
+			latest, haveLatest = snapshot, true
+			render(time.Now())
+		case <-refreshC:
+			render(time.Now())
+		case <-readyC:
+			readyC = nil
+			scheduleReady()
+		case <-safety.C:
+			if haveLatest {
+				render(time.Now())
+			} else {
+				reconcile(cfg)
+				scheduleReady()
+			}
+		}
+	}
+}
+
+type bottomSnapshotStream interface {
+	Send(rpc.Request) error
+	Recv(*rpc.Response) error
+}
+
+func nextWaybarReadyDelay(attempt int) (time.Duration, bool) {
+	if attempt < 0 || attempt >= waybarReadyPollTries {
+		return 0, false
+	}
+	delay := waybarReadyPoll << attempt
+	if delay > waybarReadyPollMax {
+		delay = waybarReadyPollMax
+	}
+	return delay, true
+}
+
+func receiveBottomSnapshots(c bottomSnapshotStream, command string, snapshots chan state.Snapshot) {
+	// Closing a buffered channel preserves its final queued value: streamSnapshots
+	// must consume that replacement before it observes ok=false and disconnects.
+	// A separate error channel would race the final snapshot in select.
+	defer close(snapshots)
 	for {
 		var resp rpc.Response
 		if err := c.Recv(&resp); err != nil {
@@ -194,9 +497,6 @@ func streamSnapshots(cfg bottomBarConfig) {
 		}
 		if resp.Error != "" {
 			if command == "subscribe-all" && unsupportedRPCCommand(resp.Error, command) {
-				// Federation was added after the original local-only protocol. A
-				// daemon and renderer can briefly differ during a rolling upgrade;
-				// keep the local bar useful until the daemon catches up.
 				fmt.Fprintln(os.Stderr, "bottombar: daemon lacks aggregate subscriptions; using local sessions")
 				command = "subscribe"
 				if err := c.Send(rpc.Request{Cmd: command}); err != nil {
@@ -210,8 +510,52 @@ func streamSnapshots(cfg bottomBarConfig) {
 		if resp.Snapshot == nil {
 			continue
 		}
-		reconcileWith(cfg, len(resp.Snapshot.Sessions))
+		// Full replacements make latest-wins coalescing safe. Do not let a slow
+		// render loop backpressure the daemon's socket writer.
+		select {
+		case snapshots <- *resp.Snapshot:
+		default:
+			select {
+			case <-snapshots:
+			default:
+			}
+			snapshots <- *resp.Snapshot
+		}
 	}
+}
+
+// flushSlotsWhenReady suppresses realtime signals until module zero has run
+// once in the newly started Waybar process and written its parent's PID to the
+// ready file. Dirty bits survive the wait, so the poll always catches up to the
+// newest atomically published files rather than replaying an old frame.
+// The lifecycle flock makes the pidfile/starttime check and signal one atomic
+// decision with respect to an F8-triggered stop/start.
+func flushSlotsWhenReady(cfg bottomBarConfig, publisher *slotPublisher) (flushed bool, pid int) {
+	unlock := mustFlock(cfg.lockFile)
+	defer unlock()
+	process, ok := openBottomProcess(cfg)
+	if !ok {
+		return false, 0
+	}
+	defer unix.Close(process.pidfd)
+	return flushSlotsForProcess(cfg, publisher, process.pid, process.pidfd), process.pid
+}
+
+func flushSlotsForProcess(cfg bottomBarConfig, publisher *slotPublisher, pid, pidfd int) bool {
+	if pid == 0 || !bottomBarReady(cfg, pid) {
+		return false
+	}
+	publisher.flush(pidfd)
+	return !publisher.hasDirty()
+}
+
+func bottomBarReady(cfg bottomBarConfig, pid int) bool {
+	b, err := os.ReadFile(cfg.readyFile)
+	if err != nil {
+		return false
+	}
+	readyPID, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	return err == nil && readyPID == pid
 }
 
 // topVisible reports whether the top bar's master toggle is on. The toggle is
@@ -273,24 +617,27 @@ func ensureStopped(cfg bottomBarConfig) {
 	cfg.ops.stop(cfg)
 }
 
-// stopBottom is the production stop: kill the bottom waybar's process group and
-// clear the pidfile. It is the default bottomBarOps.stop.
+// stopBottom is the production stop: signal the exact bottom Waybar through its
+// pidfd and clear its identity files. It is the default bottomBarOps.stop.
 func stopBottom(cfg bottomBarConfig) {
-	if pid := bottomPID(cfg); pid > 0 {
-		// Negative pid targets the whole process group. The bottom waybar is a
-		// session/group leader (Setsid below), so this also reaps the
-		// switchboard-waybar slot subprocesses — no orphans writing to a dead pipe.
-		if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil {
-			_ = syscall.Kill(pid, syscall.SIGTERM)
-		}
+	if process, ok := openBottomProcess(cfg); ok {
+		// A pidfd remains bound to this process even if the numeric PID exits and
+		// is reused between validation and signaling.
+		_ = unix.PidfdSendSignal(process.pidfd, unix.SIGTERM, nil, 0)
+		_ = unix.Close(process.pidfd)
 	}
 	_ = os.Remove(cfg.pidFile)
+	_ = os.Remove(cfg.readyFile)
 }
 
 // startBottom spawns `waybar -c <claude config>` detached into its own session
 // so it survives this process, and records its pid. Waybar diagnostics remain
 // connected to the watcher's stdout/stderr so systemd captures launch failures.
 func startBottom(cfg bottomBarConfig) error {
+	// A ready file belongs to one exact PID. Clear the previous generation
+	// before launch so the broker cannot send an RT signal while the replacement
+	// process still has the signal's default (terminating) disposition.
+	_ = os.Remove(cfg.readyFile)
 	cmd := exec.Command("waybar", "-c", cfg.waybarConfig)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if dn, err := os.OpenFile(os.DevNull, os.O_RDWR, 0); err == nil {
@@ -301,8 +648,26 @@ func startBottom(cfg bottomBarConfig) error {
 		return err
 	}
 	pid := cmd.Process.Pid
+	reapFailedStart := func() {
+		// This is still our unreaped child, so its process-group identity cannot
+		// be recycled before Wait. Clean up any startup module shells too.
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}
+	started, err := processStartTime(pid)
+	if err != nil {
+		reapFailedStart()
+		return fmt.Errorf("read waybar start time: %w", err)
+	}
+	// Publish the identity atomically. It keeps diagnostic/legacy readers safe
+	// too, and prevents a partial record if the watcher is replaced mid-write.
+	if err := replaceFile(cfg.pidFile, []byte(fmt.Sprintf("%d %d\n", pid, started))); err != nil {
+		reapFailedStart()
+		return err
+	}
 	_ = cmd.Process.Release()
-	return os.WriteFile(cfg.pidFile, []byte(strconv.Itoa(pid)), 0o644)
+	return nil
 }
 
 func configureBottomCommandIO(cmd *exec.Cmd, devNull *os.File) {
@@ -311,25 +676,116 @@ func configureBottomCommandIO(cmd *exec.Cmd, devNull *os.File) {
 	cmd.Stderr = os.Stderr
 }
 
-// bottomPID returns the live pid of the bottom waybar, or 0 if it is not
-// running. It verifies the recorded pid is still a waybar (guarding against pid
-// reuse) and cleans up a stale pidfile.
-func bottomPID(cfg bottomBarConfig) int {
+type bottomProcess struct {
+	pid   int
+	pidfd int
+}
+
+// openBottomProcess binds a pidfd before validating the recorded identity.
+// Later signals target that kernel object, not a recyclable numeric PID.
+func openBottomProcess(cfg bottomBarConfig) (bottomProcess, bool) {
 	b, err := os.ReadFile(cfg.pidFile)
 	if err != nil {
-		return 0
+		return bottomProcess{}, false
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	fields := strings.Fields(string(b))
+	if len(fields) < 1 || len(fields) > 2 {
+		_ = os.Remove(cfg.pidFile)
+		return bottomProcess{}, false
+	}
+	pid, err := strconv.Atoi(fields[0])
 	if err != nil || pid <= 0 {
 		_ = os.Remove(cfg.pidFile)
-		return 0
+		return bottomProcess{}, false
+	}
+	pidfd, err := unix.PidfdOpen(pid, 0)
+	if err != nil {
+		_ = os.Remove(cfg.pidFile)
+		return bottomProcess{}, false
+	}
+	fail := func() (bottomProcess, bool) {
+		_ = unix.Close(pidfd)
+		_ = os.Remove(cfg.pidFile)
+		return bottomProcess{}, false
 	}
 	comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
 	if err != nil || strings.TrimSpace(string(comm)) != "waybar" {
-		_ = os.Remove(cfg.pidFile)
+		return fail()
+	}
+	if !bottomCommandMatches(cfg, pid) {
+		return fail()
+	}
+	started, err := processStartTime(pid)
+	if err != nil {
+		return fail()
+	}
+	if len(fields) == 2 {
+		recorded, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil || recorded != started {
+			return fail()
+		}
+	} else {
+		// Rolling upgrade: adopt a legacy PID-only record only after the exact
+		// command and live starttime checks above, then fence every later use.
+		if err := replaceFile(cfg.pidFile, []byte(fmt.Sprintf("%d %d\n", pid, started))); err != nil {
+			// The open pidfd still makes this use safe. Keep the validated process
+			// rather than launching a duplicate, and retry the upgrade next time.
+			fmt.Fprintf(os.Stderr, "bottombar: upgrade pidfile identity: %v\n", err)
+		}
+	}
+	return bottomProcess{pid: pid, pidfd: pidfd}, true
+}
+
+// bottomPID is the lifecycle existence check. Signal paths keep the pidfd from
+// openBottomProcess through the send; callers that only need the number close
+// it immediately.
+func bottomPID(cfg bottomBarConfig) int {
+	process, ok := openBottomProcess(cfg)
+	if !ok {
 		return 0
 	}
-	return pid
+	_ = unix.Close(process.pidfd)
+	return process.pid
+}
+
+func bottomCommandMatches(cfg bottomBarConfig, pid int) bool {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return false
+	}
+	args := strings.Split(strings.TrimRight(string(b), "\x00"), "\x00")
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "-c" && args[i+1] == cfg.waybarConfig {
+			return true
+		}
+	}
+	return false
+}
+
+func processStartTime(pid int) (uint64, error) {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, err
+	}
+	return processStartTimeFromStat(string(b))
+}
+
+func processStartTimeFromStat(stat string) (uint64, error) {
+	// comm is parenthesized and may contain spaces. Fields after its final ')'
+	// begin at proc field 3 (state), making starttime/field 22 index 19 here.
+	close := strings.LastIndexByte(stat, ')')
+	if close < 0 {
+		return 0, fmt.Errorf("malformed proc stat")
+	}
+	fields := strings.Fields(stat[close+1:])
+	if len(fields) <= 19 {
+		return 0, fmt.Errorf("short proc stat")
+	}
+	started, err := strconv.ParseUint(fields[19], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse starttime: %w", err)
+	}
+	return started, nil
 }
 
 // reapChildren blocks on any child state change and reaps it, so killed

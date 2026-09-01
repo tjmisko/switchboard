@@ -13,6 +13,12 @@ Type=simple
 # Override SWITCHBOARD_CTL in a machine-local drop-in when this host runs a
 # development build. Do not replace ExecStart just to change the binary path.
 Environment=SWITCHBOARD_CTL=%h/go/bin/switchboard-ctl
+# Keep the broker and Waybar's shell modules on the same runtime directory even
+# when the user manager was started with a minimal environment.
+Environment=XDG_RUNTIME_DIR=%t
+# The watcher now owns all ten chip renders in one Go heap. Keep its GC
+# headroom modest; Waybar itself is a separate process and is unaffected.
+Environment=GOGC=50
 ExecStart=/bin/sh -c 'exec "$$0" bottombar watch' ${SWITCHBOARD_CTL}
 Restart=on-failure
 RestartSec=2

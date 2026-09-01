@@ -207,9 +207,10 @@ cmd/
   switchboard-ctl/    CLI — list / focus / cycle / pick / hook / bottombar
   claude-tui/         reference TUI renderer (subscribe → live list)
   switchboard-polybar/ Polybar stream renderer — all sessions, inline actions
-  switchboard-waybar/ waybar exec module — one process per slot (Hyprland extra)
+  switchboard-waybar/ standalone/debug wrapper for the shared Waybar renderer
 
 internal/
+  waybarchip/  shared all-slot Waybar rendering (live broker + debug wrapper)
   osproc/      Seam 1 — OS process layer (enumerate + death watch; per-OS)
   terminal/    Seam 2 — terminal locator (wezterm, tmux, auto, none, chain)
   wm/          Seam 3 — window manager (hyprland, sway/i3, x11, none)
@@ -519,10 +520,14 @@ with two config files:
   directly. Its lifecycle is owned by `switchboard-ctl bottombar`.
 
 `claude.jsonc` declares 10 `custom/claude-N` modules so each chip is a real GTK
-widget with its own CSS. Each runs `switchboard-waybar --slot N` and emits a
-JSON line per snapshot; `class` carries status + `focused` + `suspended` +
-`remote` so `style.css` paints the chip. Click = focus that slot; right-click =
-rofi picker; scroll = cycle.
+widget with its own CSS. One `switchboard-ctl bottombar watch` subscription
+renders the whole slot set into atomic files under
+`$XDG_RUNTIME_DIR/switchboard/`. Waybar's signal mode runs a one-shot shell read
+only when a slot changes; no per-slot renderer or reader stays resident. The
+JSON `class` carries status + `focused` + `suspended` + `remote` so
+`style.css` paints the chip. Click = focus that slot; right-click = picker;
+scroll = cycle. A complete example lives at
+[`waybar/claude.jsonc`](waybar/claude.jsonc).
 
 Waybar's row does not wrap, so each slot abbreviates its label to fit the
 monitor (`internal/barlayout`). The fit shares out *glyph cells*, not pixels —
@@ -595,8 +600,9 @@ literally starts and kills the `waybar -c claude.jsonc` process, so the two bars
 never desync. The session-count input comes from the daemon stream (`bottombar
 watch`, plus a 3 s self-heal ticker); the top-bar-visibility input comes from
 the F8 master toggle, which touches a marker file and calls `bottombar
-reconcile` so the bottom bar follows in lockstep. The watcher kills by process
-group (no orphan slot subprocesses) and reaps them (no zombies).
+reconcile` so the bottom bar follows in lockstep. The watcher kills Waybar by
+process group and reaps it; slot commands are short signal-triggered reads, not
+resident children.
 
 Overridable via `SWITCHBOARD_WAYBAR_MARKER` and `SWITCHBOARD_BOTTOM_CONFIG`.
 This auto-hide logic is deeply Hyprland-specific and stays an opt-in extra, not

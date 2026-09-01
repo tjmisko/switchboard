@@ -1,0 +1,34 @@
+// Example bottom-strip configuration for `switchboard-ctl bottombar watch`.
+// The watcher atomically replaces slot-N.json and signals only the module whose
+// bytes changed. With `signal` and no `interval`, Waybar's existing shell reads
+// one line at startup and on SIGRTMIN+N; there are no per-slot executables.
+[
+  {
+    "name": "claude",
+    "layer": "top",
+    "position": "bottom",
+    "height": 34,
+    "spacing": 2,
+    "exclusive": true,
+    "modules-left": [],
+    "modules-center": [
+      "custom/claude-0", "custom/claude-1", "custom/claude-2", "custom/claude-3", "custom/claude-4",
+      "custom/claude-5", "custom/claude-6", "custom/claude-7", "custom/claude-8", "custom/claude-9"
+    ],
+    "modules-right": [],
+
+    // Slot zero also acknowledges that this exact Waybar PID has completed a
+    // module update. The broker withholds RT signals until that PID is ready,
+    // then flushes every update accumulated during startup.
+    "custom/claude-0": { "exec": "printf '%s\\n' \"$PPID\" > \"$XDG_RUNTIME_DIR/switchboard/bottom-waybar.ready\"; IFS= read -r line < \"$XDG_RUNTIME_DIR/switchboard/slot-0.json\"; printf '%s\\n' \"$line\"", "signal": 1, "return-type": "json", "exec-on-event": false, "on-click": "$HOME/.local/bin/switchboard-ctl focus idx:0", "on-click-right": "$HOME/.config/scripts/claude-picker", "on-click-middle": "$HOME/.config/scripts/claude-abbrev-edit 0", "on-scroll-up": "$HOME/.local/bin/switchboard-ctl cycle prev", "on-scroll-down": "$HOME/.local/bin/switchboard-ctl cycle next", "tooltip": true },
+    "custom/claude-1": { "exec": "IFS= read -r line < \"$XDG_RUNTIME_DIR/switchboard/slot-1.json\"; printf '%s\\n' \"$line\"", "signal": 2, "return-type": "json", "exec-on-event": false, "on-click": "$HOME/.local/bin/switchboard-ctl focus idx:1", "on-click-right": "$HOME/.config/scripts/claude-picker", "on-click-middle": "$HOME/.config/scripts/claude-abbrev-edit 1", "on-scroll-up": "$HOME/.local/bin/switchboard-ctl cycle prev", "on-scroll-down": "$HOME/.local/bin/switchboard-ctl cycle next", "tooltip": true },
+    "custom/claude-2": { "exec": "IFS= read -r line < \"$XDG_RUNTIME_DIR/switchboard/slot-2.json\"; printf '%s\\n' \"$line\"", "signal": 3, "return-type": "json", "exec-on-event": false, "on-click": "$HOME/.local/bin/switchboard-ctl focus idx:2", "on-click-right": "$HOME/.config/scripts/claude-picker", "on-click-middle": "$HOME/.config/scripts/claude-abbrev-edit 2", "on-scroll-up": "$HOME/.local/bin/switchboard-ctl cycle prev", "on-scroll-down": "$HOME/.local/bin/switchboard-ctl cycle next", "tooltip": true },
+    "custom/claude-3": { "exec": "IFS= read -r line < \"$XDG_RUNTIME_DIR/switchboard/slot-3.json\"; printf '%s\\n' \"$line\"", "signal": 4, "return-type": "json", "exec-on-event": false, "on-click": "$HOME/.local/bin/switchboard-ctl focus idx:3", "on-click-right": "$HOME/.config/scripts/claude-picker", "on-click-middle": "$HOME/.config/scripts/claude-abbrev-edit 3", "on-scroll-up": "$HOME/.local/bin/switchboard-ctl cycle prev", "on-scroll-down": "$HOME/.local/bin/switchboard-ctl cycle next", "tooltip": true },
+    "custom/claude-4": { "exec": "IFS= read -r line < \"$XDG_RUNTIME_DIR/switchboard/slot-4.json\"; printf '%s\\n' \"$line\"", "signal": 5, "return-type": "json", "exec-on-event": false, "on-click": "$HOME/.local/bin/switchboard-ctl focus idx:4", "on-click-right": "$HOME/.config/scripts/claude-picker", "on-click-middle": "$HOME/.config/scripts/claude-abbrev-edit 4", "on-scroll-up": "$HOME/.local/bin/switchboard-ctl cycle prev", "on-scroll-down": "$HOME/.local/bin/switchboard-ctl cycle next", "tooltip": true },
+    "custom/claude-5": { "exec": "IFS= read -r line < \"$XDG_RUNTIME_DIR/switchboard/slot-5.json\"; printf '%s\\n' \"$line\"", "signal": 6, "return-type": "json", "exec-on-event": false, "on-click": "$HOME/.local/bin/switchboard-ctl focus idx:5", "on-click-right": "$HOME/.config/scripts/claude-picker", "on-click-middle": "$HOME/.config/scripts/claude-abbrev-edit 5", "on-scroll-up": "$HOME/.local/bin/switchboard-ctl cycle prev", "on-scroll-down": "$HOME/.local/bin/switchboard-ctl cycle next", "tooltip": true },
+    "custom/claude-6": { "exec": "IFS= read -r line < \"$XDG_RUNTIME_DIR/switchboard/slot-6.json\"; printf '%s\\n' \"$line\"", "signal": 7, "return-type": "json", "exec-on-event": false, "on-click": "$HOME/.local/bin/switchboard-ctl focus idx:6", "on-click-right": "$HOME/.config/scripts/claude-picker", "on-click-middle": "$HOME/.config/scripts/claude-abbrev-edit 6", "on-scroll-up": "$HOME/.local/bin/switchboard-ctl cycle prev", "on-scroll-down": "$HOME/.local/bin/switchboard-ctl cycle next", "tooltip": true },
+    "custom/claude-7": { "exec": "IFS= read -r line < \"$XDG_RUNTIME_DIR/switchboard/slot-7.json\"; printf '%s\\n' \"$line\"", "signal": 8, "return-type": "json", "exec-on-event": false, "on-click": "$HOME/.local/bin/switchboard-ctl focus idx:7", "on-click-right": "$HOME/.config/scripts/claude-picker", "on-click-middle": "$HOME/.config/scripts/claude-abbrev-edit 7", "on-scroll-up": "$HOME/.local/bin/switchboard-ctl cycle prev", "on-scroll-down": "$HOME/.local/bin/switchboard-ctl cycle next", "tooltip": true },
+    "custom/claude-8": { "exec": "IFS= read -r line < \"$XDG_RUNTIME_DIR/switchboard/slot-8.json\"; printf '%s\\n' \"$line\"", "signal": 9, "return-type": "json", "exec-on-event": false, "on-click": "$HOME/.local/bin/switchboard-ctl focus idx:8", "on-click-right": "$HOME/.config/scripts/claude-picker", "on-click-middle": "$HOME/.config/scripts/claude-abbrev-edit 8", "on-scroll-up": "$HOME/.local/bin/switchboard-ctl cycle prev", "on-scroll-down": "$HOME/.local/bin/switchboard-ctl cycle next", "tooltip": true },
+    "custom/claude-9": { "exec": "IFS= read -r line < \"$XDG_RUNTIME_DIR/switchboard/slot-9.json\"; printf '%s\\n' \"$line\"", "signal": 10, "return-type": "json", "exec-on-event": false, "on-click": "$HOME/.local/bin/switchboard-ctl focus idx:9", "on-click-right": "$HOME/.config/scripts/claude-picker", "on-click-middle": "$HOME/.config/scripts/claude-abbrev-edit 9", "on-scroll-up": "$HOME/.local/bin/switchboard-ctl cycle prev", "on-scroll-down": "$HOME/.local/bin/switchboard-ctl cycle next", "tooltip": true }
+  }
+]

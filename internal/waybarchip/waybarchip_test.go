@@ -1,4 +1,4 @@
-package main
+package waybarchip
 
 import (
 	"bytes"
@@ -1019,6 +1019,50 @@ func BenchmarkRenderSlotCachedNames(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		_ = renderSlot(snap, 0, testAvail, testMetrics, names, labels)
+	}
+}
+
+func TestRendererMatchesSlotOutputAndUsesEarliestBoundary(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	now := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
+	since := now.Add(-59 * time.Second)
+	snap := state.Snapshot{Sessions: []state.Session{
+		{PID: 1, CWD: "/work/one", StartedAt: since, Claude: &state.AgentInfo{Status: state.StatusIdle, StatusSinceWire: &since}},
+		{PID: 2, CWD: "/work/two", StartedAt: now.Add(-30 * time.Second), Claude: &state.AgentInfo{Status: state.StatusWorking}},
+	}}
+
+	renderer := NewRenderer(testAvail)
+	got := renderer.RenderSlotsAt(snap, 10, now)
+	if len(got) != 10 {
+		t.Fatalf("slot count = %d, want 10", len(got))
+	}
+	names := &nameConfig{}
+	labels := &sblabel.NameCache{}
+	for slot := range got {
+		want := renderSlotAt(snap, slot, testAvail, testMetrics, names, labels, now)
+		if got[slot].Text != want.Text || got[slot].Tooltip != want.Tooltip ||
+			got[slot].Alt != want.Alt || !slices.Equal(got[slot].Class, want.Class) {
+			t.Errorf("slot %d = %+v, want legacy-equivalent %+v", slot, got[slot], want)
+		}
+	}
+	if next := renderer.NextRefresh(snap, 10, now); !next.Equal(now.Add(time.Second)) {
+		t.Errorf("next refresh = %v, want earliest visible boundary %v", next, now.Add(time.Second))
+	}
+}
+
+// BenchmarkRendererRenderAllSlots is the live broker path: one naming pass and
+// one Fit feed all ten GTK modules. Compare it with ten times
+// BenchmarkRenderSlotCachedNames, which is the old process-per-slot shape.
+func BenchmarkRendererRenderAllSlots(b *testing.B) {
+	snap := benchSnapshot(b)
+	renderer := NewRenderer(testAvail)
+	now := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
+	renderer.RenderSlotsAt(snap, 10, now) // prime filesystem-backed caches
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		_ = renderer.RenderSlotsAt(snap, 10, now)
 	}
 }
 
