@@ -657,6 +657,158 @@ was a missed one, which is the trade §4 of
 needs per-CALL falsification at hydrate, which needs the call id — the one thing
 this step deliberately does not persist.
 
+### 4f. Addendum — the whole-branch audit
+
+Written after every phase was on one branch, against the code rather than
+against the earlier addenda. It records the verified state of the Definition of
+Done line by line, one repair this audit landed, and what is still open.
+
+**Verification actually run** (from the worktree, 2026-08-31): `go build ./...`,
+`gofmt -l cmd internal` silent, `go vet ./...` clean, `go test ./... -count=1`
+green across all 37 packages including `internal/conformance`, and
+`go test -race -count=1` green over `cmd/switchboard`, `internal/provider/...`,
+`internal/state`, `internal/transcript`, `internal/statustune`, `internal/rpc`.
+
+**R5 — the two-read latch rule counted reads, not time, and that is a missed
+RED.** Found and fixed here. §4d's R2 fix requires a candidate to survive "two
+consecutive reads", and the guard it was built for is a read landing inside the
+0.5–1.5 s gap between one assistant message's parallel `tool_use` entries, which
+sees a gated call's auto-approved sibling ALONE. Counting reads does not defeat
+that: `ApplyHook` signals the coordinator, so every hook edge from ANY writer
+schedules an `Observe` for that root, and a fanned-out session delivers them in
+bursts milliseconds apart. Two reads inside the gap see the same partial file and
+agree for the same wrong reason; the sibling then returns clean and its
+id-matched result closes a prompt nobody answered. A proposal is now stamped
+(`PendingPrompt.LatchAt`) and confirmable only by a read taken
+`callLatchConfirmGrace` (2 s, the same evidence `callLatchSkewGrace` rests on)
+later, so the confirming read is a genuinely LATER VIEW of the file. Pinned by
+`TestLatchShouldRefuseAConfirmingReadTakenInsideTheFlushGap`, which fails with
+the grace at zero. It costs nothing: the reconcile interval is 5 s, so a
+proposal refused as early is confirmed on the next tick.
+
+`agentCoordinator.observeAt` was extracted in the same change so a test can drive
+two ticks a real interval apart without sleeping; `observe` is unchanged and
+still stamps `time.Now()`.
+
+**The DoD, line by line.**
+
+| Phase | DoD line | Verdict |
+|---|---|---|
+| 1 | Codex question red survives an unrelated writer's `PreToolUse` | met |
+| 1 | …its `PostToolUse` | met — the id path needs id equality, the composite needs writer, turn, tool and hash |
+| 1 | …its `Stop` | **NOT met, and must not be** — D1: every `Stop` reaching the reducer is the root turn boundary, and the guard would strand |
+| 1 | clears on its own id-matched `PostToolUse` | met |
+| 1 | clears on `Stop` when that never arrives | met in the writer-blind form (root turn `Stop`) |
+| 1 | `request_user_input` byte-identical | **NOT met, deliberately** — see below |
+| 1 | write the false green as a failing test first | met (6 of 7 new Codex tests fail on `main`) |
+| 2 | two prompts, one answered holds red, both clears it | met |
+| 2 | compatibility key set and `PendingTool` derivation byte-identical | met |
+| 2 | "no wire change" | superseded by step 11, additively — `pending_prompts` is a new optional field |
+| 3 | `diagnose` names the real rule again | **NOT met** (U1), re-verified: the only `Decision{}.Log()` sites are still the legacy reconciler and the legacy hook path |
+| 3 | a held red says how many calls hold it | **NOT met** (U2), re-verified: `PendingSummary` still renders `len(a.Pending)`, a writer count |
+| 4 | answered question clears <500 ms with the hook | met **once the prompt has bound** — see the arming window below |
+| 4 | within one `Observe` tick without the hook | met |
+| 4 | with four teammates in flight | met — the floor is lifted for id matches only |
+| 4 | a teammate's byte-identical call still holds | met |
+| 4 | a declined question exits to idle, not green | met, with D4's corrected discriminator |
+| 5 | — | not attempted, correctly |
+
+**Phase 1's byte-identity clause, stated honestly.** `request_user_input` did
+change: its onset predicate widened to `isCodexHumanInputPermission` on both
+edges, so it now also opens on `PermissionRequest` (folded by
+`codexPendingInputFold`), and D2's matcher rewrite means an id-less pending now
+reaches the composite against an id-bearing `PostToolUse` where it used to fail
+closed. Both widenings are the point of the phase and both are in the
+stale-red direction. What is actually pinned is that no `request_user_input`
+lifecycle test needed changing and that
+`TestCodexRequestUserInputLifecycleShouldBeUnchangedWhenOpenedByPreToolUse` holds
+the `PreToolUse` path exactly. Read the DoD line as "no regression", not as
+"untouched".
+
+**The arming window, which the Phase 4 DoD does not say out loud.** A prompt
+cannot clear at hook speed until it has BOUND, and binding needs the `tool_use`
+to flush (~5 s) plus a proposal and a confirmation a grace apart — roughly two to
+three ticks, ~10–15 s after the prompt opens. A question answered faster than
+that still falls back to the `(tool, hash)` rule, which for `AskUserQuestion`
+never matches, and so still exits by the whole-file transcript rule at the old
+latency. Against the measured 45–300 s of think-time this is the uncommon case,
+which is why L1 is fixed in practice — but "an answered `AskUserQuestion` clears
+in <500 ms" is conditional on the wait outliving the arming window, and P5 should
+be read with that split in mind.
+
+**Cross-phase, checked at the line.**
+
+- *P4 × P2.* The id path closes exactly one element of the writer's slice
+  (`closePendingPromptAt`, and `promptResolution.Closed` for the transcript
+  half); the writer's entry survives while anything is open and red leaves at
+  `len == 0` and nowhere else. `matchingPromptIndex` prefers an exact id match
+  anywhere in the set over an older shape match, which is what stops a
+  call-scoped clear from retiring the wrong prompt and then being refused by the
+  floor.
+- *P4 × step 11.* `CallID` is still not persisted; a prompt rebuilt from a
+  per-call record is not `Residual` and re-latches in one arming window, while a
+  prompt rebuilt from the legacy scalar still refuses to bind. The two clocks
+  hold: the record's own onset dates it against its writer's transcript
+  (`ownableCall`), and the writer's resolution anchor is seeded from the RESTART
+  instant so no pre-restart entry can close a restored red.
+- *P3's vocabulary.* Every rule the later phases emit is a `statustune.Rule*`
+  constant; `TestRuleKnobCoverage` parses `knobs.go` and fails on a constant with
+  no knob row or an empty `What`; `assertRulesAreDiagnosable` checks the ids the
+  two landing paths actually write. **What is NOT enforced is the reverse
+  direction**: nothing fails if a future edge records a bare string literal
+  instead of a constant. Today none does — the only literal `Rule` left in
+  `internal/provider/claude` is `shadow.go`'s `claude_shadow_match`, which is a
+  diagnostic category and never reaches a transition — but the coverage test does
+  not pin that, and a lint or a source scan over the landing path would.
+- *Two models, one vocabulary (§2.3).* Held. No type, function or file is shared
+  between the Codex and Claude prompt models; the only common dependency is
+  `internal/statustune`'s rule ids, and every Codex transition still records
+  `agent_graph_authority`, which is what its knob hint says it means.
+
+**The guards, re-verified.**
+
+- *`ApplyHook` performs no filesystem I/O.* Every `os.` and `transcript.` call
+  site in `observer.go` lives in `resolvePending`, `latchPendingCalls`,
+  `writerQuiescentPastCap` or `reconcileRootRuntime`, all reached only from
+  `Observe`. `ApplyHook` calls `applyHookLocked` and `rebuildLocked`, neither of
+  which touches either package.
+- *The privacy boundary.* `cmd/switchboard-ctl` and `internal/rpc` have ZERO diff
+  on this branch: `parseHookPayload` is untouched and `tool_use_id` was already
+  parsed and already on the wire, exactly as §1 said. Nothing new crosses.
+- *The 2026-08-05 sibling oscillation.* `internal/rpc/writer_match_test.go`
+  passes unmodified, including "should not let one writer's resolution drop
+  another writer's entry".
+- *Missed-RED paths opened.* One, R5 above, now closed. No other was found.
+
+**Still open, and inherited rather than introduced.**
+
+1. U1 — `switchboard-ctl diagnose` is still blind to every Claude edge. Needs a
+   `Decision{}.Log()` on `applyObservationWithRule`.
+2. U2 — no user-visible surface can say a writer is blocked on three calls, so
+   Phase 2's deliberately-accepted stale red still has no explanation.
+   `PendingSummary` and `internal/label` both count writers; `PendingPrompts` now
+   carries the material to fix it.
+3. §4e's residual gap — a call answered while the daemon was down cannot be
+   falsified per call at hydrate, so the mixed case restores a stale red.
+4. Phase 5 and probes P2/P4/P5, all gated on live data.
+5. A restart resets a `CallLatchAmbiguous`/`CallLatchContested` prompt to
+   unbound, because latch state is not persisted. Terminal ambiguity is
+   therefore terminal only until the next restart. Every guard still applies to
+   the re-attempt, so this costs a re-derivation rather than a wrong bind.
+6. Noticed while fixing R5's test, not a defect: the `Observe` that TRIGGERS a
+   restore is always superseded by the restore's own observation instant, so the
+   first useful tick after a restore is the second one. Harmless at a 5 s
+   interval, and worth knowing before anyone writes a test that drives exactly
+   one tick after a restore.
+
+**Scope.** Nothing under `~/.config` or `~/.claude` was touched, `scripts/deploy`
+was not run, and the main tree is untouched (it carries a pre-existing untracked
+copy of this plan, written 14:53 on 2026-08-31, before this branch's first
+commit; left alone). No `scripts/`, `systemd/` or `hosts/` file changed, and
+`ExitPlanMode` appears nowhere outside these docs — Phase 5 was not attempted by
+any hand. No unrelated refactor rode along: every non-test change traces to a
+numbered step, an addendum, or R5.
+
 ---
 
 ## 5. The probes that settle what nobody established
