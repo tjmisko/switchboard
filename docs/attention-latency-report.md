@@ -313,14 +313,13 @@ truthful as they are today. It decouples the navigation predicate from the
 color, which is the actual conflation behind the complaint.
 
 The sketch below was "first tier containing a non-focused member." It is
-superseded by the **ring**: one tier-major order — permission, then idle, then
-green — walked one step per press, skipping every focused session and wrapping
-at the end. The ring subsumes the sketch (popping out of a level and moving
-right within one are the same step) and additionally fixes the `delegating`
-denominator bug, which is a second, independent dead key. See
-[attention-ring-plan.md](attention-ring-plan.md) for the implementation, the
-C1–C5 behavior changes, and the one trade it accepts (§1.2: a red is now up to
-one lap away from a green, instead of one press).
+superseded by the **bounded ring**: walk the most urgent populated tier and at
+most the adjacent color above it, skipping every focused session and wrapping
+inside that bound. Thus red permits orange but excludes green; repeated presses
+cannot use orange as a staircase to green. The ring also fixes the `delegating`
+denominator bug, which was a second, independent dead key. See
+[attention-ring-plan.md](attention-ring-plan.md) for the current rule and its
+regression matrix.
 
 Superseded sketch, kept for the record:
 

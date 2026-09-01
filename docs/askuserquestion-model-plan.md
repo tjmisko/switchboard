@@ -343,8 +343,10 @@ byte-identical call still holds. A declined question exits to idle, not green.
 ### Phase 5 — Optional, gated on §5's probes
 
 12. Register `PreToolUse` matcher-limited to `AskUserQuestion|ExitPlanMode`, giving
-    the id at open time and retiring the latch for those tools — **only if** both
-    probes pass. Widen further only on measurement.
+    the id at open time and retiring the latch for those tools. The implementation
+    design and current gates now live in
+    [pretooluse-hook-plan.md](pretooluse-hook-plan.md); widen further only on
+    measurement.
 
 ### 4a. Addendum — what actually landed in Phases 1–3
 
@@ -644,7 +646,7 @@ i.e. a red that comes back green. The repair now requires approval or user_input
 and otherwise falls through to the tool's own kind, which can only ever restore a
 colour.
 
-**The residual gap, stated plainly.** A call already ANSWERED when the daemon comes
+**The residual gap at this implementation point.** A call already ANSWERED when the daemon comes
 back cannot be identified: its `tool_use` is matched in the transcript, so
 `PendingCall` never offers it and the prompt cannot bind it. For a writer whose
 calls are ALL answered this costs nothing — `hydratePendingVerdicts` drops the
@@ -654,8 +656,9 @@ still blocks: the answered prompt is restored with the writer and holds until a
 whole-file rule closes the set. That is a stale red where the pre-step-11 behaviour
 was a missed one, which is the trade §4 of
 [status-color-state-model.md](status-color-state-model.md) requires. Closing it
-needs per-CALL falsification at hydrate, which needs the call id — the one thing
-this step deliberately does not persist.
+needs per-CALL falsification at hydrate, which needs the call id. The later §4g
+follow-up persists confirmed ids and closes this gap; step 11 itself deliberately
+did not.
 
 ### 4f. Addendum — the whole-branch audit
 
@@ -745,12 +748,13 @@ be read with that split in mind.
   anywhere in the set over an older shape match, which is what stops a
   call-scoped clear from retiring the wrong prompt and then being refused by the
   floor.
-- *P4 × step 11.* `CallID` is still not persisted; a prompt rebuilt from a
+- *P4 × step 11, at audit time.* `CallID` was not yet persisted; a prompt rebuilt from a
   per-call record is not `Residual` and re-latches in one arming window, while a
   prompt rebuilt from the legacy scalar still refuses to bind. The two clocks
   hold: the record's own onset dates it against its writer's transcript
   (`ownableCall`), and the writer's resolution anchor is seeded from the RESTART
-  instant so no pre-restart entry can close a restored red.
+  instant so no pre-restart entry can close a restored red. §4g supersedes the
+  persistence limitation while preserving that fallback for unbound records.
 - *P3's vocabulary.* Every rule the later phases emit is a `statustune.Rule*`
   constant; `TestRuleKnobCoverage` parses `knobs.go` and fails on a constant with
   no knob row or an empty `What`; `assertRulesAreDiagnosable` checks the ids the
@@ -808,6 +812,29 @@ commit; left alone). No `scripts/`, `systemd/` or `hosts/` file changed, and
 `ExitPlanMode` appears nowhere outside these docs — Phase 5 was not attempted by
 any hand. No unrelated refactor rode along: every non-test change traces to a
 numbered step, an addendum, or R5.
+
+### 4g. Follow-up — U1, U2 and the mixed-downtime residual
+
+The "still open" list above records the state of the 13-commit audit. This
+follow-up supersedes its first four items:
+
+- **U1 closed.** `applyObservationWithRule` now emits the canonical
+  `statustune.Decision` line for every Claude graph transition and for attributed
+  holds while red. `diagnose` therefore sees the same finite rule id history
+  already carried; unattributed periodic same-color observations stay quiet.
+- **U2 closed.** `PendingSummary` counts `pending_prompts` calls, falling back to
+  one residual call for a legacy writer, and `internal/label` annotates one
+  writer's multiplicity (`main (3 calls)`, `agent-name (3 calls)`).
+- **The mixed-downtime residual is closed for identified calls.** A confirmed
+  opaque call id is additive on each persisted prompt record. Hydrate subtracts
+  only records whose exact result arrived while the daemon was down and keeps
+  their writer's unanswered siblings. An unbound record still fails closed;
+  [pretooluse-hook-plan.md](pretooluse-hook-plan.md) removes that remaining fast-
+  answer window by supplying the id before the prompt opens.
+- **Phase 5 is planned.** Current official Claude Code documentation settles the
+  old ordering gate: matcher-limited `PreToolUse` runs before permission
+  evaluation and carries `tool_use_id`. The plan stages that id and joins it on
+  `PermissionRequest`; the pre-hook itself never opens red.
 
 ---
 

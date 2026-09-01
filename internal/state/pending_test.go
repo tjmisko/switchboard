@@ -199,7 +199,7 @@ func TestPendingToolIsDerivedDeterministically(t *testing.T) {
 		}
 	})
 
-	t.Run("should count the other blocked writers in the decision log's summary", func(t *testing.T) {
+	t.Run("should count every blocked call in the decision log's summary", func(t *testing.T) {
 		info := &AgentInfo{}
 		info.SetPending("", PendingPrompt{Tool: "AskUserQuestion"})
 		if got := info.PendingSummary(); got != "AskUserQuestion" {
@@ -208,6 +208,17 @@ func TestPendingToolIsDerivedDeterministically(t *testing.T) {
 		info.SetPending("af5bd126402ac16c7", PendingPrompt{Tool: "Bash"})
 		if got := info.PendingSummary(); got != "AskUserQuestion+1" {
 			t.Errorf("PendingSummary = %q, want AskUserQuestion+1 (a multi-writer red must not report as a single one)", got)
+		}
+		info.PendingPrompts = []PendingPromptRecord{
+			{Writer: "", Tool: "AskUserQuestion"},
+			{Writer: "", Tool: "Bash"},
+			{Writer: "af5bd126402ac16c7", Tool: "Bash"},
+		}
+		if got := info.PendingSummary(); got != "AskUserQuestion+2" {
+			t.Errorf("PendingSummary = %q, want AskUserQuestion+2 (three calls across two writers)", got)
+		}
+		if got := info.PendingCallCountForWriter(""); got != 2 {
+			t.Errorf("main call count = %d, want 2", got)
 		}
 	})
 }
@@ -270,6 +281,7 @@ func TestPendingPromptRecordsProjectAndRoundTrip(t *testing.T) {
 		src.Apply(func(m map[int]*Session) {
 			info := redInfoWithPending("")
 			info.PendingPrompts = recordsFor("", "Bash", "Edit")
+			info.PendingPrompts[0].CallID = "toolu_bash"
 			m[42] = &Session{PID: 42, StartedAt: time.Unix(1000, 0), Agent: AgentKindClaude, Claude: info}
 		})
 
@@ -288,7 +300,7 @@ func TestPendingPromptRecordsProjectAndRoundTrip(t *testing.T) {
 				t.Errorf("record %d writer = %q, want the bare main-thread key in memory", i, record.Writer)
 			}
 		}
-		if got.PendingPrompts[0].Tool != "Bash" || got.PendingPrompts[0].InputHash != "hash-Bash" ||
+		if got.PendingPrompts[0].Tool != "Bash" || got.PendingPrompts[0].InputHash != "hash-Bash" || got.PendingPrompts[0].CallID != "toolu_bash" ||
 			!got.PendingPrompts[0].Since.Equal(time.Unix(1700, 0)) || got.PendingPrompts[0].Attention != "approval" {
 			t.Errorf("hydrated record = %+v, want every field it was written with", got.PendingPrompts[0])
 		}

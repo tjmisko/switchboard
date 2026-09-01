@@ -223,8 +223,8 @@ func TestLatchShouldRefuseAConfirmingReadTakenInsideTheFlushGap(t *testing.T) {
 	assertSummary(t, observation, gatedAt.Add(10*time.Second), agentgraph.LegacyPermission, agentgraph.AttentionApproval)
 }
 
-// A restored record stands for a writer's residual RED, not for one call: the
-// persisted block carries one prompt per writer, so a writer that went down
+// A prompt restored from the legacy scalar stands for a writer's residual RED,
+// not for one call: that old block carries one prompt per writer, so a writer that went down
 // blocked on three calls comes back holding one. Binding an id to it would let
 // that one call's completion clear a red two real calls are still holding — a
 // missed RED manufactured by the restart itself.

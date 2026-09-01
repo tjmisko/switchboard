@@ -58,6 +58,43 @@ func TestRestoreRebuildsAWritersWholeOpenSet(t *testing.T) {
 		}
 	})
 
+	t.Run("should restore a confirmed call id as bound", func(t *testing.T) {
+		o, root, now := newTestObserver(t)
+		defer o.Close()
+		restored := restoredWith(root.ProviderSessionID, root.Transcript, map[string][]PendingPrompt{
+			"": {{
+				Tool: "AskUserQuestion", InputHash: "ask-1", CallID: "toolu_question",
+				Latch: CallLatchBound, Attention: agentgraph.AttentionUserInput, Since: now.Add(-time.Minute),
+			}},
+		})
+		if _, err := o.Restore(root, restored, now); err != nil {
+			t.Fatal(err)
+		}
+		prompt := o.Projection(root.Key()).PendingSets[""][0]
+		if prompt.CallID != "toolu_question" || prompt.Latch != CallLatchBound {
+			t.Fatalf("restored prompt = %+v, want its confirmed call id still bound", prompt)
+		}
+	})
+
+	t.Run("should quarantine a persisted call id claimed by two prompts", func(t *testing.T) {
+		o, root, now := newTestObserver(t)
+		defer o.Close()
+		restored := restoredWith(root.ProviderSessionID, root.Transcript, map[string][]PendingPrompt{
+			"": {
+				{Tool: "Bash", CallID: "toolu_duplicate", Latch: CallLatchBound, Attention: agentgraph.AttentionApproval, Since: now.Add(-time.Minute)},
+				{Tool: "Edit", CallID: "toolu_duplicate", Latch: CallLatchBound, Attention: agentgraph.AttentionApproval, Since: now.Add(-time.Minute)},
+			},
+		})
+		if _, err := o.Restore(root, restored, now); err != nil {
+			t.Fatal(err)
+		}
+		for _, prompt := range o.Projection(root.Key()).PendingSets[""] {
+			if prompt.CallID != "" || prompt.Latch != CallLatchContested {
+				t.Fatalf("duplicate persisted identity was trusted: %+v", prompt)
+			}
+		}
+	})
+
 	t.Run("should hold a restored red against transcript evidence older than the restart", func(t *testing.T) {
 		// The second clock, and the reason there are two. A record's Since is its own
 		// pre-restart onset, which is what dates it against its writer's transcript

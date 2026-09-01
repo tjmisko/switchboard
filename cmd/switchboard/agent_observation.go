@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"path/filepath"
 	"sort"
@@ -510,11 +511,17 @@ func (c *agentCoordinator) applyObservationWithRule(ref provider.RootRef, genera
 		c.recordDiagnosticLocked(ref.Provider, "history_projection_error", now)
 		canonical = nil
 	}
-	beforeStatus, beforeSince := "", time.Time{}
+	beforeStatus, beforePending, beforeSession := "", "", observation.RootID
+	beforeSince := time.Time{}
 	if info := priorSession.Enrichment(); info != nil {
 		beforeStatus, beforeSince = info.Status, info.StatusSince
+		beforePending = info.PendingSummary()
+		if info.SessionID != "" {
+			beforeSession = info.SessionID
+		}
 	}
 	applied, nativeOverride := false, false
+	afterPending, afterSession := "", beforeSession
 	nativeName, hasNativeName := observationRootName(observation)
 	authoritativeNativeName := ref.Provider == agentgraph.ProviderCodex &&
 		observation.Source == agentgraph.SourceCodexAppServer && observation.Complete && hasNativeName
@@ -527,6 +534,12 @@ func (c *agentCoordinator) applyObservationWithRule(ref provider.RootRef, genera
 			applyClaudeCompatibility(sess.AgentBlock(state.AgentKindClaude), compat)
 		}
 		sess.SetAgentGraph(graph)
+		if info := sess.Enrichment(); info != nil {
+			afterPending = info.PendingSummary()
+			if info.SessionID != "" {
+				afterSession = info.SessionID
+			}
+		}
 		if ref.Provider == agentgraph.ProviderCodex && sess.DisplayName != nil {
 			if !sess.DisplayName.ValidFor(observation.RootID) {
 				sess.DisplayName = nil
@@ -558,7 +571,8 @@ func (c *agentCoordinator) applyObservationWithRule(ref provider.RootRef, genera
 	for _, event := range canonical {
 		c.sink.Record(event)
 	}
-	if graph.Summary.Status != beforeStatus {
+	statusChanged := graph.Summary.Status != beforeStatus
+	if statusChanged {
 		c.sink.Record(history.Event{
 			Ts: now, Type: history.EventTransition, SessionID: observation.RootID,
 			PID: ref.PID, Agent: string(ref.Provider), CWD: ref.CWD,
@@ -566,6 +580,36 @@ func (c *agentCoordinator) applyObservationWithRule(ref provider.RootRef, genera
 			Rule: transitionRule(rule), DurPrevMs: history.HeldMs(beforeSince, now),
 			Subagents: graph.Summary.LiveChildren,
 		})
+	}
+	// The provider graph used to write only history events. `diagnose` reads the
+	// canonical statustune decision lines from the journal, so every Claude
+	// transition — and every deliberate hold while red — was invisible there.
+	// Log the same finite rule id at this landing point. Ordinary same-color
+	// working/idle observations stay quiet; red holds remain visible because they
+	// are precisely where "I answered it and it is still red" needs an explanation.
+	if ref.Provider == agentgraph.ProviderClaude &&
+		(statusChanged || (rule != "" && (beforeStatus == state.StatusPermission || graph.Summary.Status == state.StatusPermission))) {
+		pending := afterPending
+		if beforeStatus == state.StatusPermission && graph.Summary.Status != state.StatusPermission {
+			pending = beforePending
+		}
+		age := time.Duration(0)
+		if !beforeSince.IsZero() && now.After(beforeSince) {
+			age = now.Sub(beforeSince)
+		}
+		from, to := beforeStatus, graph.Summary.Status
+		if from == "" {
+			from = "unknown"
+		}
+		if to == "" {
+			to = "unknown"
+		}
+		statustune.Decision{
+			PID: ref.PID, Session: shortSessionID(afterSession),
+			From: from, To: to, Rule: transitionRule(rule),
+			Reason:    fmt.Sprintf("provider graph source=%s", observation.Source),
+			Subagents: graph.Summary.LiveChildren, Pending: pending, Age: age,
+		}.Log()
 	}
 	return true
 }
@@ -781,10 +825,8 @@ func applyClaudeCompatibility(info *state.AgentInfo, compat claudeprovider.Compa
 // map iteration because these records are encoded into the publish gate's change
 // key; a set that reordered itself would republish to every bar on every tick.
 //
-// The latch state is dropped on the way out. A call id is re-earned from the
-// transcript in one Observe tick, and re-earning it reflects what actually
-// happened across the restart, so persisting it would buy nothing for a schema
-// field and the federation churn that comes with one.
+// Only a confirmed call id is persisted. Proposed/ambiguous latch state remains
+// in-memory: it carries no identity safe enough to use after a restart.
 func pendingRecordsFromSets(sets map[string][]claudeprovider.PendingPrompt) []state.PendingPromptRecord {
 	if len(sets) == 0 {
 		return nil
@@ -797,9 +839,13 @@ func pendingRecordsFromSets(sets map[string][]claudeprovider.PendingPrompt) []st
 	records := make([]state.PendingPromptRecord, 0, len(sets))
 	for _, writer := range writers {
 		for _, prompt := range sets[writer] {
+			callID := ""
+			if prompt.Latch == claudeprovider.CallLatchBound {
+				callID = prompt.CallID
+			}
 			records = append(records, state.PendingPromptRecord{
 				Writer: writer, Tool: prompt.Tool, InputHash: prompt.InputHash,
-				Attention: string(prompt.Attention), Since: prompt.Since,
+				CallID: callID, Attention: string(prompt.Attention), Since: prompt.Since,
 			})
 		}
 	}
@@ -830,8 +876,12 @@ func pendingSetsFromRecords(records []state.PendingPromptRecord) map[string][]cl
 		}
 		sets[writer] = append(sets[writer], claudeprovider.PendingPrompt{
 			Tool: record.Tool, InputHash: record.InputHash,
-			Attention: agentgraph.AttentionState(record.Attention), Since: record.Since,
+			CallID: record.CallID, Attention: agentgraph.AttentionState(record.Attention), Since: record.Since,
 		})
+		if record.CallID != "" {
+			last := len(sets[writer]) - 1
+			sets[writer][last].Latch = claudeprovider.CallLatchBound
+		}
 	}
 	return sets
 }

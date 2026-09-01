@@ -216,7 +216,8 @@ func graphRootName(graph *state.AgentGraph) string {
 // BlockedWriters names the writers of s currently blocked on a permission prompt,
 // as one display string a renderer drops straight into a tooltip or a status row:
 //
-//	"escalate-cleanup"                   one teammate is blocked
+//	"escalate-cleanup"                   one teammate is blocked on one call
+//	"escalate-cleanup (3 calls)"         one teammate has three prompts
 //	"main, escalate-cleanup"             case 18 — two writers blocked at once
 //	"escalate-cleanup, probe, scan +2"   capped, with the overflow counted
 //
@@ -263,7 +264,8 @@ func blockedWriters(s state.Session, displayName func(metaPath string) string) s
 		return ""
 	}
 	// Solo main thread: the red chip already says this. See the doc comment.
-	if len(info.PendingWriters) == 1 && info.PendingWriters[0] == state.PendingWriterMain && info.InFlightSubagents == 0 {
+	if len(info.PendingWriters) == 1 && info.PendingWriters[0] == state.PendingWriterMain &&
+		info.InFlightSubagents == 0 && info.PendingCallCountForWriter(state.PendingWriterMain) <= 1 {
 		return ""
 	}
 
@@ -272,14 +274,19 @@ func blockedWriters(s state.Session, displayName func(metaPath string) string) s
 		if i == maxNamedBlockedWriters {
 			return strings.Join(named, ", ") + fmt.Sprintf(" +%d", len(info.PendingWriters)-i)
 		}
+		var name string
 		if s.Remote {
 			// Transcript paths are meaningful only on the source host. Preserve
 			// the exact blocked set with stable short IDs instead of following a
 			// coincidentally matching path on this machine.
-			named = append(named, writerName("", w, func(string) string { return "" }))
+			name = writerName("", w, func(string) string { return "" })
 		} else {
-			named = append(named, writerName(info.Transcript, w, displayName))
+			name = writerName(info.Transcript, w, displayName)
 		}
+		if calls := info.PendingCallCountForWriter(w); calls > 1 {
+			name += fmt.Sprintf(" (%d calls)", calls)
+		}
+		named = append(named, name)
 	}
 	return strings.Join(named, ", ")
 }

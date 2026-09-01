@@ -247,6 +247,39 @@ func TestPromptStatePersistsAcrossADaemonRestart(t *testing.T) {
 		}
 	})
 
+	t.Run("should subtract an exactly answered call from a mixed set during downtime", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "state.json")
+		first := bootDaemon(t, path, "")
+		live := first.coordinator(t)
+		now := time.Now().Add(-5 * time.Minute)
+
+		first.permissionRequest(t, live, "", "Bash", "hash-bash", now)
+		appendTranscriptLine(t, first.transcript, toolUseLine(now.Add(-200*time.Millisecond), "Bash", "toolu_bash"))
+		first.permissionRequest(t, live, "", "Edit", "hash-edit", now.Add(time.Second))
+		appendTranscriptLine(t, first.transcript, toolUseLine(now.Add(800*time.Millisecond), "Edit", "toolu_edit"))
+
+		ctx := context.Background()
+		live.observeAt(ctx, first.ref, now.Add(4*time.Second))
+		live.observeAt(ctx, first.ref, now.Add(7*time.Second))
+		before := recordsFor(first.claude(t), state.PendingWriterMain)
+		if len(before) != 2 || before[0].CallID == "" || before[1].CallID == "" {
+			t.Fatalf("persisted records did not retain their confirmed call ids: %+v", before)
+		}
+
+		// No hook reaches the daemon for this result: it lands while switchboard
+		// is down. The next boot must remove only toolu_bash and keep toolu_edit.
+		appendTranscriptLine(t, first.transcript, toolResultLine(now.Add(10*time.Second), "toolu_bash"))
+		second := bootDaemon(t, path, first.transcript)
+		after := recordsFor(second.claude(t), state.PendingWriterMain)
+		if len(after) != 1 || after[0].CallID != "toolu_edit" {
+			t.Fatalf("records after downtime hydrate = %+v, want only toolu_edit", after)
+		}
+		if second.claude(t).Status != state.StatusPermission {
+			t.Fatalf("status = %q, want permission while toolu_edit still blocks", second.claude(t).Status)
+		}
+	})
+
 	t.Run("should load an old state.json without inventing or dropping a prompt", func(t *testing.T) {
 		// The version boundary in both directions. A mirror written before
 		// pending_prompts existed carries only the writer key set, and must restore

@@ -194,11 +194,21 @@ func TestNextAttentionTarget(t *testing.T) {
 			wantPID:  3,
 		},
 		{
-			// C5: the accepted trade — a green with a red elsewhere advances
-			// within green and reaches the red at the end of the lap.
-			name:     "should advance within green rather than jumping to a red",
+			// A focused green is outside the bounded ring while red exists, so it
+			// jumps back to the urgent tier instead of beginning a full-color lap.
+			name:     "should jump from green to red when red bounds the ring",
 			sessions: []state.Session{sess(1, "permission"), focusedSess(2, "working"), sess(3, "working")},
-			wantPID:  3,
+			wantPID:  1,
+		},
+		{
+			name:     "should advance from orange to green when no red bounds the ring",
+			sessions: []state.Session{focusedSess(1, "idle"), sess(2, "working")},
+			wantPID:  2,
+		},
+		{
+			name:     "should not skip an empty orange layer to reach green from red",
+			sessions: []state.Session{focusedSess(1, "permission"), sess(2, "working")},
+			wantPID:  0,
 		},
 		{
 			// Focused is a window flag, so two panes of one wezterm window both
@@ -246,7 +256,7 @@ func TestAttentionRingOrdersPermissionThenIdleThenGreenInSnapshotOrder(t *testin
 	for _, session := range attentionRing(sessions) {
 		got = append(got, session.PID)
 	}
-	want := []int{2, 6, 4, 7, 1, 5}
+	want := []int{2, 6, 4, 7}
 	if len(got) != len(want) {
 		t.Fatalf("ring = %v, want %v", got, want)
 	}
@@ -281,14 +291,36 @@ func TestNextAttentionTargetVisitsEveryRingMemberOncePerLap(t *testing.T) {
 		target.Focused = true
 		visited = append(visited, target.PID)
 	}
-	// One lap of N presses from ring[0] visits every member and returns home.
-	want := []int{1, 2, 3, 4, 1}
+	// Red bounds this snapshot to the red and orange tiers. One lap visits both
+	// allowed members and returns home; green/delegating remain outside it.
+	want := []int{1, 2, 1}
 	if len(visited) != len(want) {
 		t.Fatalf("visited = %v, want %v", visited, want)
 	}
 	for i := range want {
 		if visited[i] != want[i] {
 			t.Fatalf("visited = %v, want %v", visited, want)
+		}
+	}
+}
+
+func TestNextAttentionTargetNeverClimbsMoreThanOneLayer(t *testing.T) {
+	sessions := []state.Session{
+		focusedSess(1, "permission"),
+		sess(2, "idle"),
+		sess(3, "working"),
+	}
+
+	for press, wantPID := range []int{2, 1, 2, 1, 2, 1} {
+		target := nextAttentionTarget(sessions)
+		if target == nil {
+			t.Fatalf("press %d returned nil, want pid %d", press+1, wantPID)
+		}
+		if target.PID != wantPID {
+			t.Fatalf("press %d targeted pid %d, want pid %d; the green tier must stay unreachable while red exists", press+1, target.PID, wantPID)
+		}
+		for i := range sessions {
+			sessions[i].Focused = sessions[i].PID == target.PID
 		}
 	}
 }

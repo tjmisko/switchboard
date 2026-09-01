@@ -389,7 +389,7 @@ func dropStaleSessions(store *state.Store, procSrc osproc.Source, sink *history.
 	// (§9.4). Nothing is serving yet so there is no contention to create, but the
 	// rule that transcript I/O stays outside store.Apply is worth keeping absolute.
 	snapshot := store.Snapshot()
-	verdicts := hydratePendingVerdicts(snapshot, tailBytes)
+	verdicts := hydratePendingVerdicts(snapshot, tailBytes, now)
 	type processVerdict struct {
 		alive      bool
 		definitive bool
@@ -435,8 +435,9 @@ func dropStaleSessions(store *state.Store, procSrc osproc.Source, sink *history.
 
 // hydratePendingVerdicts asks each hydrated session's transcripts whether the
 // writers it persisted as blocked still have a tool in flight, returning
-// pid → writer key → KEEP. It is pure I/O and pure reading: it runs before
-// store.Apply, mutates nothing, and its verdicts can only ever remove ownership.
+// pid → writer key → {KEEP, exactly-resolved call ids}. It is pure I/O and pure
+// reading: it runs before store.Apply, mutates nothing, and its verdicts can only
+// ever remove ownership or individual records.
 //
 // Each writer is falsified against its OWN file — main against <session>.jsonl,
 // a subagent against <session>/subagents/agent-<id>.jsonl (SubagentPath, from the
@@ -445,22 +446,60 @@ func dropStaleSessions(store *state.Store, procSrc osproc.Source, sink *history.
 // matched throughout while the raising agent-*.jsonl carries the unmatched
 // tool_use (§9.7, carry-over 2).
 //
+// A persisted call id adds a narrower falsifier: its exact tool_result removes
+// only that record, even when a sibling call from the same writer is still open.
 // Anything short of proof keeps the entry, so an unreadable file, a truncated
-// tail, or a window that missed the tool_use all fail closed — the same reading
-// permissionExit gives an unreadable transcript.
-func hydratePendingVerdicts(snap state.Snapshot, tailBytes int64) map[int]map[string]bool {
-	verdicts := map[int]map[string]bool{}
+// tail, or an unbound record all fail closed — the same reading permissionExit
+// gives an unreadable transcript.
+type hydratePendingVerdict struct {
+	keep            bool
+	resolvedCallIDs map[string]bool
+}
+
+func hydratePendingVerdicts(snap state.Snapshot, tailBytes int64, sampledAt time.Time) map[int]map[string]hydratePendingVerdict {
+	verdicts := map[int]map[string]hydratePendingVerdict{}
 	for _, sess := range snap.Sessions {
 		c := sess.Claude
 		if c == nil || len(c.Pending) == 0 {
 			continue
 		}
-		keep := make(map[string]bool, len(c.Pending))
+		keep := make(map[string]hydratePendingVerdict, len(c.Pending))
 		for _, writer := range c.PendingWriterKeys() {
 			path := transcript.SubagentPath(c.Transcript, writer)
 			evidence, err := transcript.BlockedByPendingTool(path, tailBytes)
-			keep[writer] = evidence != transcript.BlockedNo
-			if !keep[writer] {
+			verdict := hydratePendingVerdict{keep: evidence != transcript.BlockedNo}
+			var callIDs []string
+			recordCount := 0
+			for _, record := range c.PendingPrompts {
+				recordWriter := record.Writer
+				if recordWriter == state.PendingWriterMain {
+					recordWriter = ""
+				}
+				if recordWriter != writer {
+					continue
+				}
+				recordCount++
+				if record.CallID != "" {
+					callIDs = append(callIDs, record.CallID)
+				}
+			}
+			if kinds, callErr := transcript.ResolveKindForCalls(path, sampledAt, callIDs, tailBytes); callErr == nil {
+				for callID, kind := range kinds {
+					if kind != transcript.ResolutionNone {
+						if verdict.resolvedCallIDs == nil {
+							verdict.resolvedCallIDs = make(map[string]bool)
+						}
+						verdict.resolvedCallIDs[callID] = true
+					}
+				}
+			}
+			// When every persisted per-call record has an exact result, unrelated
+			// in-flight tools in the same writer file cannot keep these prompts red.
+			if recordCount > 0 && len(verdict.resolvedCallIDs) == recordCount {
+				verdict.keep = false
+			}
+			keep[writer] = verdict
+			if !verdict.keep {
 				log.Printf("hydrate: pid=%d session=%s writer=%s resolved while the daemon was down (%s), dropping its prompt",
 					sess.PID, shortSessionID(c.SessionID), pendingWriterLabel(writer), path)
 			} else if err != nil {
@@ -510,14 +549,29 @@ func hydratePendingVerdicts(snap state.Snapshot, tailBytes int64) map[int]map[st
 // no pre-restart entry can close a restored red (see the claude adapter's
 // Restore). What this function does own for the records is ownership: a writer the
 // falsifier dropped loses its records with it, through DropPending.
-func hydratePending(sess *state.Session, keep map[string]bool, now time.Time) {
+func hydratePending(sess *state.Session, keep map[string]hydratePendingVerdict, now time.Time) {
 	c := sess.Claude
 	if c == nil {
 		return
 	}
 	persisted := len(c.Pending) > 0
 	for _, writer := range c.PendingWriterKeys() {
-		if !keep[writer] {
+		verdict := keep[writer]
+		if len(verdict.resolvedCallIDs) > 0 {
+			filtered := c.PendingPrompts[:0]
+			for _, record := range c.PendingPrompts {
+				recordWriter := record.Writer
+				if recordWriter == state.PendingWriterMain {
+					recordWriter = ""
+				}
+				if recordWriter == writer && verdict.resolvedCallIDs[record.CallID] {
+					continue
+				}
+				filtered = append(filtered, record)
+			}
+			c.PendingPrompts = filtered
+		}
+		if !verdict.keep {
 			c.DropPending(writer)
 		}
 	}

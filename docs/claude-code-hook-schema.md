@@ -191,15 +191,15 @@ Consequences for switchboard:
 | `session_id` | ✅ | ✅ | ✅ |
 | `transcript_path` | ✅ | ✅ | ✅ |
 | `tool_name` | ✅ | ✅ | ✅ (`clearsPermission`) |
-| **`agent_id`** | **✅ on every event** | **✅ (`main.go:405`, all events)** | **⚠ only in the fanout trigger — ignored by `clearsPermission`** |
+| **`agent_id`** | **✅ on every event** | **✅ (all events)** | **✅ writer ownership and fanout** |
 | `agent_type` | ✅ | ✅ | fanout only |
-| `tool_input` | ✅ | ❌ | ❌ |
-| `tool_use_id` | ✅ (not on `PermissionRequest`) | ❌ | ❌ |
+| `tool_input` | ✅ | ✅, as a bounded hash only | ✅ call-shape correlation |
+| `tool_use_id` | ✅ (not on `PermissionRequest`) | ✅ | ✅ exact completion and confirmed-call persistence |
 | `prompt_id` | ✅ | ❌ | ❌ |
 
 `agent_id` is **already arriving and already forwarded** as `rpc.Request.AgentID`
-on `PermissionRequest` and `PostToolUse`. The daemon simply does not read it
-outside the `SubagentStart`/`Stop` branch.
+on `PermissionRequest` and `PostToolUse`. The daemon uses it as the writer key;
+raw `tool_input` never crosses the ctl privacy boundary.
 
 ---
 

@@ -412,7 +412,30 @@ func restoredPending(restored Compatibility, at time.Time) map[string][]PendingP
 		}
 		pending[writer] = []PendingPrompt{restoredPrompt(prompt, at, true)}
 	}
+	invalidateRestoredCallIDCollisions(pending)
 	return pending
+}
+
+// A duplicated persisted id means the mirror cannot prove which prompt owns
+// the call. Refuse every claim instead of letting one result clear two prompts.
+func invalidateRestoredCallIDCollisions(pending map[string][]PendingPrompt) {
+	claims := make(map[string]int)
+	for _, prompts := range pending {
+		for _, prompt := range prompts {
+			if prompt.CallID != "" {
+				claims[prompt.CallID]++
+			}
+		}
+	}
+	for writer, prompts := range pending {
+		for i := range prompts {
+			if prompts[i].CallID != "" && claims[prompts[i].CallID] > 1 {
+				prompts[i].CallID = ""
+				prompts[i].Latch = CallLatchContested
+			}
+		}
+		pending[writer] = prompts
+	}
 }
 
 // restoredPromptSet rebuilds one writer's whole open set from its records,
@@ -431,9 +454,8 @@ func restoredPromptSet(set []PendingPrompt, at time.Time) []PendingPrompt {
 	return prompts
 }
 
-// restoredPrompt normalizes one rebuilt prompt. The latch state is always reset —
-// a call id is re-earned from the transcript rather than persisted
-// (askuserquestion-model-plan.md §2.4) — and the attention is repaired rather than
+// restoredPrompt normalizes one rebuilt prompt. A confirmed persisted call id
+// stays bound; every other latch state resets. Attention is repaired rather than
 // trusted.
 //
 // The attention repair rejects AttentionNone as well as an unset or unknown value,
@@ -447,7 +469,12 @@ func restoredPrompt(prompt PendingPrompt, at time.Time, residual bool) PendingPr
 	if prompt.Since.IsZero() {
 		prompt.Since = at
 	}
-	prompt.CallID, prompt.Latch, prompt.LatchAt, prompt.Residual = "", CallLatchUnbound, time.Time{}, residual
+	if prompt.CallID != "" && !residual {
+		prompt.Latch = CallLatchBound
+	} else {
+		prompt.CallID, prompt.Latch = "", CallLatchUnbound
+	}
+	prompt.LatchAt, prompt.Residual = time.Time{}, residual
 	return prompt
 }
 

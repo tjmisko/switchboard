@@ -490,9 +490,10 @@ func cycleTargetPID(sessions []state.Session, direction string) (int, bool) {
 	return target.PID, ok
 }
 
-// cmdAttention advances one step around the attention ring, so the shortcut
-// always moves the focus rightward and never lands back on the window the key
-// was pressed in. Bound to mod+Shift+a in Hyprland.
+// cmdAttention advances one step around the bounded attention ring. The ring
+// contains the most urgent populated tier and at most the adjacent tier above
+// it, so repeated presses can never climb all the way from red to green.
+// Bound to mod+Shift+a in Hyprland.
 func cmdAttention(c *rpc.Client) {
 	target := nextAttentionTarget(mustList(c).Sessions)
 	if target == nil {
@@ -501,12 +502,21 @@ func cmdAttention(c *rpc.Client) {
 	focusSession(c, *target)
 }
 
-// attentionRing orders every navigable session into the ring `attention`
-// walks: permission (red) first, then idle (orange), then working and
-// delegating (green), each in snapshot order. Unknown (grey) sessions are
-// excluded — they are not actionable, and `cycle next|prev` already reaches
-// every session regardless of colour. Headless and unbound-remote rows are
-// excluded by sessionNavigable.
+// attentionRing orders the navigable sessions that `attention` may visit. It
+// starts with the most urgent populated tier and includes no more than one
+// adjacent colour above it:
+//
+//   - any red: red + orange (green is unreachable)
+//   - otherwise any orange: orange + green
+//   - otherwise: green
+//
+// This ceiling is computed from the snapshot, not from the focused session.
+// Consequently repeated presses toggle/cycle within the same bounded set
+// instead of using an orange as a staircase from red to green. Within each
+// tier, snapshot order is preserved. Unknown (grey) sessions are excluded —
+// they are not actionable, and `cycle next|prev` already reaches every session
+// regardless of colour. Headless and unbound-remote rows are excluded by
+// sessionNavigable.
 func attentionRing(sessions []state.Session) []*state.Session {
 	var permission, idle, working []*state.Session
 	for i := range sessions {
@@ -522,19 +532,21 @@ func attentionRing(sessions []state.Session) []*state.Session {
 			working = append(working, &sessions[i])
 		}
 	}
-	ring := make([]*state.Session, 0, len(permission)+len(idle)+len(working))
-	ring = append(ring, permission...)
-	ring = append(ring, idle...)
-	ring = append(ring, working...)
-	return ring
+	if len(permission) > 0 {
+		return append(permission, idle...)
+	}
+	if len(idle) > 0 {
+		return append(idle, working...)
+	}
+	return working
 }
 
 // nextAttentionTarget returns the session `attention` should focus: one step
-// clockwise around the ring from the focused session, skipping every session
-// that is ALREADY focused so the key always moves. Because the ring is
-// tier-major, "there is nothing below me in this level" and "pop out to the
-// next level" are the same step — the last red advances to the first orange,
-// and the last green wraps back to the first red.
+// clockwise around the bounded ring from the focused session, skipping every
+// session that is ALREADY focused. Because the ring is tier-major, "there is
+// nothing below me in this level" and "pop out to the next level" are the same
+// step — the last red advances to the first orange, but the last orange wraps
+// to red while any red remains; it never advances to green.
 //
 // Skipping (rather than merely advancing past) the focused set is what makes
 // the wezterm split case safe. Focused is a WINDOW flag today, so two sessions
@@ -542,8 +554,10 @@ func attentionRing(sessions []state.Session) []*state.Session {
 // a genuinely different window instead of on a sibling pane, which would look
 // like another dead key.
 //
-// Returns nil only when the ring is empty, or when every ring member is
-// already focused — the "nothing below, nothing beyond" terminal case.
+// Returns nil when the bounded ring is empty, or when every member in the
+// allowed one-layer range is already focused. A less urgent session may exist
+// outside that range; `cycle next|prev` remains the unrestricted navigation
+// command.
 func nextAttentionTarget(sessions []state.Session) *state.Session {
 	ring := attentionRing(sessions)
 	if len(ring) == 0 {
@@ -869,12 +883,11 @@ commands:
   status                  one-line summary
   pick                    emit exact-token<TAB>label<TAB>ws<TAB>cwd for fzf
   cycle next|prev         focus the next/previous session, wrapping
-  attention               advance one step around the attention ring:
-                            permission (red), then idle (orange), then green
-                            (working/delegating), each in snapshot order.
-                            Always moves and wraps at the end; unknown (grey)
-                            sessions are not members. No-op only when there is
-                            nowhere else to go.
+  attention               advance through the most urgent populated colour
+                            and at most one layer above it, in snapshot order.
+                            With any red present, cycles red/orange and never
+                            reaches green. Unknown (grey) sessions are excluded;
+                            cycle next|prev remains unrestricted.
   agent-diagnostics       show bounded provider diagnostic counters; --json
                             emits the raw content-free array
   name <sub>              project names: resolve --cwd --name, abbrev --cwd,

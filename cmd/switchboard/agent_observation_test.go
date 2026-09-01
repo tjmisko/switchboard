@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"log"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -12,6 +15,7 @@ import (
 	claudeprovider "github.com/tjmisko/switchboard/internal/provider/claude"
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
+	"github.com/tjmisko/switchboard/internal/statustune"
 )
 
 type fakeCodexCoordinatorObserver struct {
@@ -535,6 +539,53 @@ func TestClaudeHookAgentIDIsNormalizedExactlyOnceByAdapter(t *testing.T) {
 		t.Fatalf("child id = %q, want one prefix strip to agent-child", got)
 	}
 	coordinator.Close()
+}
+
+func TestClaudeGraphLandingLogsDiagnosableRulesAndPerCallHolds(t *testing.T) {
+	store := state.New("")
+	started := time.Now().Add(-time.Hour)
+	ref := seedCoordinatorSession(store, 4502, started, state.AgentKindClaude, "claude-root", "/project")
+	coordinator := newAgentCoordinator(store, nil, claudeprovider.NewObserver(t.TempDir()), nil)
+	coordinator.refreshTrackedRoots()
+	defer coordinator.Close()
+	coordinator.HandleHook(rpc.Request{
+		Agent: state.AgentKindClaude, Event: "SessionStart", SessionID: "claude-root", ObservedAt: time.Now(),
+	}, store.Snapshot().Sessions[0])
+
+	var logs bytes.Buffer
+	priorWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(priorWriter) })
+
+	for i, tool := range []string{"AskUserQuestion", "Bash"} {
+		sess, ok := sessionForKey(store.Snapshot(), ref.Key())
+		if !ok {
+			t.Fatal("Claude root disappeared before hook")
+		}
+		coordinator.HandleHook(rpc.Request{
+			Agent: state.AgentKindClaude, Event: "PermissionRequest", SessionID: "claude-root",
+			ToolName: tool, ToolInputHash: "hash-" + tool, ObservedAt: time.Now().Add(time.Duration(i) * time.Millisecond),
+		}, sess)
+	}
+
+	got := logs.String()
+	if !strings.Contains(got, "rule=permission_recorded_for_writer") {
+		t.Fatalf("Claude graph decision omitted its real rule:\n%s", got)
+	}
+	if !strings.Contains(got, "permission==permission") || !strings.Contains(got, `pending="Bash+1"`) {
+		t.Fatalf("second call was not logged as a two-call red hold:\n%s", got)
+	}
+	parsed := false
+	for _, line := range strings.Split(got, "\n") {
+		record, ok := statustune.ParseDecision(line)
+		if ok && record.Rule == statustune.RuleGraphPermissionRecorded && record.Hold && record.Pending == "Bash+1" {
+			parsed = true
+			break
+		}
+	}
+	if !parsed {
+		t.Fatalf("diagnose parser could not recover the rule and per-call hold:\n%s", got)
+	}
 }
 
 func TestClaudeShadowFixturesAuthorizeGraphSummary(t *testing.T) {

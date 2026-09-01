@@ -244,7 +244,7 @@ switchboard-ctl focus pid:<n>                   # PID, if unique across hosts
 switchboard-ctl focus idx:<n>                   # Nth aggregate session
 switchboard-ctl focus host:<host>:pid:<n>        # exact host namespace
 switchboard-ctl cycle next|prev     # focus next/prev session, wrapping
-switchboard-ctl attention           # step around the ring: reds, then oranges, then greens; always moves, wraps at the end
+switchboard-ctl attention           # cycle the most urgent color and at most one layer above it; red excludes green
 switchboard-ctl pick                # exact-token<TAB>label<TAB>ws<TAB>cwd (for fzf)
 switchboard-ctl diagnose --observer # content-free binding/freshness/graph health
 ```
@@ -361,6 +361,10 @@ Status colors come from Claude Code hooks. Without them, sessions still appear
 
 The forwarder is fire-and-forget; a broken hook can never corrupt state or
 block Claude Code.
+
+The optional matcher-limited Claude `PreToolUse` identity upgrade is not part of
+this baseline hook set yet. Its staged, fail-closed rollout is specified in
+[docs/pretooluse-hook-plan.md](docs/pretooluse-hook-plan.md).
 
 `SubagentStart`/`SubagentStop` are **optional** — they make subagent-fanout
 detection real-time by triggering an immediate re-scan instead of waiting for the

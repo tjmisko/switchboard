@@ -386,13 +386,15 @@ type PendingPrompt struct {
 // absent or unrecognized value degrades to the tool's own kind rather than to a
 // colourless prompt, so a hand-edited or future value can never restore as green.
 //
-// CallID is deliberately absent. It is re-earned from the transcript in one
-// Observe tick, and re-earning it reflects what actually happened across the
-// restart (askuserquestion-model-plan.md §2.4).
+// CallID is the optional opaque identity already earned by the transcript latch.
+// Persisting it lets hydrate subtract one answered call from a mixed parallel set
+// without dropping the writer's still-blocked siblings. Empty keeps the legacy
+// fail-closed behavior for prompts that had not bound before shutdown.
 type PendingPromptRecord struct {
 	Writer    string    `json:"writer"`
 	Tool      string    `json:"tool,omitempty"`
 	InputHash string    `json:"input_hash,omitempty"`
+	CallID    string    `json:"call_id,omitempty"`
 	Attention string    `json:"attention,omitempty"`
 	Since     time.Time `json:"since"`
 }
@@ -444,18 +446,74 @@ func (a *AgentInfo) PendingWriterKeys() []string {
 
 // PendingSummary renders Pending for the decision log's `pending=` field: the
 // reported tool (PendingTool — the main thread's prompt if it has one, else the
-// lowest-keyed writer's) suffixed with "+N" when N further writers are also
+// lowest-keyed writer's) suffixed with "+N" when N further CALLS are also
 // blocked. One prompt therefore logs exactly what it always logged, so
-// statustune.ParseDecision and `switchboard-ctl diagnose` keep reading it, while a
-// multi-writer red no longer silently reports as a single one.
+// statustune.ParseDecision and `switchboard-ctl diagnose` keep reading it, while
+// parallel prompts from one writer no longer silently report as a single one.
 //
 // An empty map falls through to PendingTool, which is "" for a live block and may
 // be a hand-seeded or hydrated value otherwise.
 func (a *AgentInfo) PendingSummary() string {
-	if n := len(a.Pending); n > 1 {
+	if n := a.PendingCallCount(); n > 1 {
 		return fmt.Sprintf("%s+%d", a.PendingTool, n-1)
 	}
 	return a.PendingTool
+}
+
+// PendingCallCount reports how many individual calls currently hold the block
+// red. PendingPrompts is the per-call source; a writer represented only by the
+// legacy key set contributes one conservative residual call.
+func (a *AgentInfo) PendingCallCount() int {
+	counts := make(map[string]int, len(a.Pending)+len(a.PendingWriters))
+	for writer := range a.Pending {
+		counts[writer] = 0
+	}
+	for _, writer := range a.PendingWriters {
+		counts[pendingWriterMemoryName(writer)] = 0
+	}
+	for _, record := range a.PendingPrompts {
+		counts[pendingWriterMemoryName(record.Writer)]++
+	}
+	total := 0
+	for _, count := range counts {
+		if count == 0 {
+			count = 1
+		}
+		total += count
+	}
+	return total
+}
+
+// PendingCallCountForWriter is PendingCallCount narrowed to one wire or memory
+// writer spelling. It lets renderers say "main (3 calls)" instead of repeating
+// a writer name once per prompt.
+func (a *AgentInfo) PendingCallCountForWriter(writer string) int {
+	want := pendingWriterMemoryName(writer)
+	count := 0
+	for _, record := range a.PendingPrompts {
+		if pendingWriterMemoryName(record.Writer) == want {
+			count++
+		}
+	}
+	if count > 0 {
+		return count
+	}
+	if _, ok := a.Pending[want]; ok {
+		return 1
+	}
+	for _, candidate := range a.PendingWriters {
+		if pendingWriterMemoryName(candidate) == want {
+			return 1
+		}
+	}
+	return 0
+}
+
+func pendingWriterMemoryName(writer string) string {
+	if writer == PendingWriterMain {
+		return ""
+	}
+	return writer
 }
 
 // derivePendingTool re-stamps the scalar PendingTool from the map: the main

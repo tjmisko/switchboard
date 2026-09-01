@@ -168,7 +168,7 @@ is present.
 | `status` | string | always (when block present) | Legacy root-chip activity. One of: `working`, `idle`, `permission`, `delegating`; `""` means no fresh authoritative reduction. `delegating` is an idle root with live descendant work and renders the **same green as `working`**. `permission` folds both approval and user-input waits; use `agent_graph.summary`/nodes when that distinction matters. Consumers must tolerate unknown future strings. |
 | `in_flight_subagents` | number | omitted when 0 | How many subagent `Task`s the main thread has launched but not yet collected, recomputed each reconcile tick from the transcript tail. It is the signal behind a `delegating` chip; renderers show it as "N agents" in the tooltip, and `switchboard-ctl list --json` exposes it so a green chip's true state (genuinely working vs delegating) is visible. Claude-only. |
 | `pending_writers` | array of string | omitted when empty | Which **writers** are currently blocked on a permission prompt. A session is not one thread but 1 + N concurrent writers — the main thread plus each in-flight subagent — that share a pid and a chip, write to different files, and can each block independently. Each element is a bare subagent `agent_id` (the `<id>` stem of `<session>/subagents/agent-<id>.jsonl`), or the literal **`"main"`** for the main thread. **Sorted ascending**, so a renderer can diff two snapshots directly. A non-empty array means the chip is `permission`; a renderer may name the blocked teammate from it. Claude-only. Additive; consumers tolerate its absence. |
-| `pending_prompts` | array of object | omitted when empty | One entry per **open prompt**, where `pending_writers` carries one per blocked *writer* — a single writer can be blocked on several parallel calls at once. Each object is `{"writer","tool","input_hash","attention","since"}`: `writer` in the same spelling `pending_writers` uses (`"main"` for the main thread), `tool` the gated tool name, `input_hash` a hash of that call's `tool_input` (never the input itself), `attention` the wait's kind (`"approval"` or `"user_input"`, matching `agent_graph`'s vocabulary), and `since` the RFC 3339 instant that prompt opened. **Grouped by writer in `pending_writers`' ascending order, oldest-first within a writer.** Every `writer` here also appears in `pending_writers`; a writer may appear there with no record (see below). Claude-only. Additive; consumers tolerate its absence, and `pending_writers` remains the ownership contract. |
+| `pending_prompts` | array of object | omitted when empty | One entry per **open prompt**, where `pending_writers` carries one per blocked *writer* — a single writer can be blocked on several parallel calls at once. Each object is `{"writer","tool","input_hash","call_id","attention","since"}`: `writer` in the same spelling `pending_writers` uses (`"main"` for the main thread), `tool` the gated tool name, `input_hash` a hash of that call's `tool_input` (never the input itself), optional `call_id` the opaque exact identity after the latch confirms it, `attention` the wait's kind (`"approval"` or `"user_input"`, matching `agent_graph`'s vocabulary), and `since` the RFC 3339 instant that prompt opened. **Grouped by writer in `pending_writers`' ascending order, oldest-first within a writer.** Every `writer` here also appears in `pending_writers`; a writer may appear there with no record (see below). Claude-only. Additive; consumers tolerate its absence, and `pending_writers` remains the ownership contract. |
 
 #### Legacy hook fallback mapping
 
@@ -313,9 +313,11 @@ or a prompt seeded by a path that has no call to name — and that restores exac
 as it did before the field existed: one residual red for that writer, which no
 single call may clear.
 
-The call's own `tool_use_id` is deliberately **not** persisted. It is re-earned
-from the transcript within one observation tick, and re-earning it reflects what
-actually happened across the restart.
+Once the transcript latch confirms the call's own `tool_use_id`, the opaque value
+is persisted as `call_id`. Hydrate uses it only as a falsifier: if that exact call
+has a result, remove that one record while keeping its writer's other prompts.
+This closes the mixed-downtime stale red. An absent id retains the older
+fail-closed behavior and is re-earned from the transcript after restart.
 
 ###### naming a blocked writer
 
@@ -341,7 +343,10 @@ resolving it at render time (memoized) keeps the reconcile tick free of the
 per-writer I/O that a wire field would add to every snapshot, and keeps this
 contract from carrying data it does not already imply. Switchboard's own renderers
 go through `internal/label.NameCache.BlockedWriters`, which is the reference
-implementation of the derivation above.
+implementation of the derivation above. When one writer owns several records it
+adds the call count, for example `escalate-cleanup (3 calls)`; a parallel main
+thread wait similarly renders `main (3 calls)` instead of being hidden as the
+otherwise-obvious solo-main case.
 
 ##### `delegating` self-heal & decision log
 
