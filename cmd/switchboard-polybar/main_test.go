@@ -147,6 +147,20 @@ func TestRenderSnapshotHeadlessAndSuspendedAreMuted(t *testing.T) {
 	}
 }
 
+func TestRenderSnapshotUsesHostScopedRemoteSelector(t *testing.T) {
+	snap := state.Snapshot{Sessions: []state.Session{
+		{PID: 7, Hostname: "nlessfun", Remote: true, Navigable: true},
+		{PID: 8, Hostname: "offline", Remote: true},
+	}}
+	got := renderSnapshot(snap, []string{"remote", "offline"}, testOptions)
+	if !strings.Contains(got, `focus host\:nlessfun\:pid\:7`) {
+		t.Fatalf("remote chip lacks host-scoped selector: %q", got)
+	}
+	if strings.Contains(got, `pid\:8`) {
+		t.Fatalf("unnavigable remote chip is clickable: %q", got)
+	}
+}
+
 func TestEscapeActionCommandEscapesEveryColon(t *testing.T) {
 	got := escapeActionCommand("'/opt/with:colon/ctl' focus pid:42")
 	want := `'/opt/with\:colon/ctl' focus pid\:42`

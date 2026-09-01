@@ -1,3 +1,5 @@
+//go:build linux
+
 package main
 
 import (
@@ -317,7 +319,8 @@ func TestSlotPublisherWaitsForExactWaybarReadyPIDThenCatchesUp(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if flushSlotsForProcess(cfg, publisher, 4242, 4242) {
+	process := bottomProcess{pid: 4242, pidfd: 4242, started: 99}
+	if flushSlotsForProcess(cfg, publisher, process, 4242) {
 		t.Fatal("flush reported complete before Waybar declared readiness")
 	}
 	if signals != 0 || !publisher.hasDirty() {
@@ -326,7 +329,7 @@ func TestSlotPublisherWaitsForExactWaybarReadyPIDThenCatchesUp(t *testing.T) {
 	if err := os.WriteFile(cfg.readyFile, []byte("1111\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if flushSlotsForProcess(cfg, publisher, 4242, 4242) {
+	if flushSlotsForProcess(cfg, publisher, process, 4242) {
 		t.Fatal("stale ready PID must not authorize signals")
 	}
 	if signals != 0 || !publisher.hasDirty() {
@@ -335,11 +338,86 @@ func TestSlotPublisherWaitsForExactWaybarReadyPIDThenCatchesUp(t *testing.T) {
 	if err := os.WriteFile(cfg.readyFile, []byte("4242\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if !flushSlotsForProcess(cfg, publisher, 4242, 4242) {
+	if !flushSlotsForProcess(cfg, publisher, process, 4242) {
 		t.Fatal("matching ready PID did not flush the startup catch-up")
 	}
 	if signals != 1 || publisher.hasDirty() {
 		t.Fatalf("after ready: signals=%d dirty=%v, want 1/false", signals, publisher.hasDirty())
+	}
+}
+
+func TestAttachedReadinessRequiresExactProcessGeneration(t *testing.T) {
+	dir := t.TempDir()
+	cfg := bottomBarConfig{readyFile: filepath.Join(dir, "bottom-waybar.ready"), attached: true}
+	process := bottomProcess{pid: 4242, started: 99}
+
+	for _, record := range []string{"4242\n", "4242 98\n", "1111 99\n"} {
+		if err := os.WriteFile(cfg.readyFile, []byte(record), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if bottomBarReady(cfg, process) {
+			t.Fatalf("stale attached readiness %q was accepted", strings.TrimSpace(record))
+		}
+	}
+	if err := os.WriteFile(cfg.readyFile, []byte("4242 99\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !bottomBarReady(cfg, process) {
+		t.Fatal("exact attached process generation was rejected")
+	}
+}
+
+func TestAttachedVisibilityRecordIsGenerationScoped(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bottom-waybar.visible")
+	if err := os.WriteFile(path, []byte("4242 99 true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := readAttachedVisibility(path)
+	if !ok || got.pid != 4242 || got.started != 99 || !got.visible {
+		t.Fatalf("visibility = %+v/%v", got, ok)
+	}
+	if err := os.WriteFile(path, []byte("4242 true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := readAttachedVisibility(path); ok {
+		t.Fatal("generation-less visibility record was accepted")
+	}
+}
+
+func TestAttachedVisibilityReconcileIsIdempotentAndResetsOnWaybarRestart(t *testing.T) {
+	dir := t.TempDir()
+	cfg := bottomBarConfig{visibleFile: filepath.Join(dir, "bottom-waybar.visible")}
+	process := bottomProcess{pid: 4242, started: 99}
+	toggles := 0
+	toggle := func() error { toggles++; return nil }
+
+	reconcileAttachedVisibility(cfg, process, true, toggle)
+	reconcileAttachedVisibility(cfg, process, true, toggle)
+	if toggles != 1 {
+		t.Fatalf("repeated show toggles = %d, want 1", toggles)
+	}
+	reconcileAttachedVisibility(cfg, process, false, toggle)
+	reconcileAttachedVisibility(cfg, process, false, toggle)
+	if toggles != 2 {
+		t.Fatalf("repeated hide toggles = %d, want 2 total", toggles)
+	}
+
+	// A different start time is a new Waybar generation. The combined config
+	// starts its bottom window hidden, so showing it requires one new toggle.
+	process.started++
+	reconcileAttachedVisibility(cfg, process, true, toggle)
+	if toggles != 3 {
+		t.Fatalf("restart show toggles = %d, want 3 total", toggles)
+	}
+}
+
+func TestAttachedVisibilityDoesNotCommitFailedToggle(t *testing.T) {
+	dir := t.TempDir()
+	cfg := bottomBarConfig{visibleFile: filepath.Join(dir, "bottom-waybar.visible")}
+	process := bottomProcess{pid: 4242, started: 99}
+	reconcileAttachedVisibility(cfg, process, true, func() error { return errors.New("gone") })
+	if _, ok := readAttachedVisibility(cfg.visibleFile); ok {
+		t.Fatal("failed signal was committed as visible")
 	}
 }
 

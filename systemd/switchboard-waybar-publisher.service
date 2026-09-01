@@ -1,0 +1,22 @@
+[Unit]
+Description=Switchboard — publisher for a combined Waybar process
+PartOf=graphical-session.target
+Wants=switchboard.service
+# This marker is created only after config.jsonc has been replaced by a
+# two-window config generated with scripts/merge-waybar-config. It prevents an
+# ordinary package install from activating attach mode against the legacy split
+# configuration.
+ConditionPathExists=%h/.config/waybar/.switchboard-combined-v1
+
+[Service]
+Type=simple
+Environment=SWITCHBOARD_CTL=%h/go/bin/switchboard-ctl
+Environment=XDG_RUNTIME_DIR=%t
+Environment=GOGC=50
+ExecStart=/bin/sh -c 'exec "$$0" bottombar publish' ${SWITCHBOARD_CTL}
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+
+[Install]
+WantedBy=graphical-session.target

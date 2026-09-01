@@ -509,11 +509,11 @@ The original Switchboard was a Hyprland + wezterm + waybar appliance. That
 integration still ships as a Hyprland-specific extra; the portable core above
 does not depend on it.
 
-### Waybar — two bars, two processes
+### Waybar — split and combined profiles
 
-The top bar and the bottom agent strip run as **separate waybar processes** so
-the bottom one can be shown/hidden without touching the top. The split is done
-with two config files:
+The legacy profile runs the top bar and bottom agent strip as separate Waybar
+processes. This keeps visibility control simple and remains the rollback path.
+The split uses two config files:
 
 - `~/.config/waybar/config.jsonc` — the top bar only (launched by `exec-once = waybar`).
 - `~/.config/waybar/claude.jsonc` — the bottom strip only; **not** launched
@@ -607,3 +607,10 @@ resident children.
 Overridable via `SWITCHBOARD_WAYBAR_MARKER` and `SWITCHBOARD_BOTTOM_CONFIG`.
 This auto-hide logic is deeply Hyprland-specific and stays an opt-in extra, not
 part of the portable core.
+
+For hosts where eliminating the second GTK process matters, Waybar can load
+both objects in one generated config. `scripts/merge-waybar-config` injects the
+per-window signal contract, and `switchboard-ctl bottombar publish` attaches to
+that desktop-owned process without ever starting or killing it. See
+[`docs/bars/README.md`](docs/bars/README.md#one-waybar-process) for the guarded
+cutover and rollback contract.

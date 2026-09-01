@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/barview"
 	sblabel "github.com/tjmisko/switchboard/internal/label"
 	"github.com/tjmisko/switchboard/internal/projectname"
 	"github.com/tjmisko/switchboard/internal/rpc"
@@ -81,7 +82,8 @@ func runOnce(socketPath string, renderer *liveRenderer, out *emitter) {
 		return
 	}
 	defer c.Close()
-	if err := c.Send(rpc.Request{Cmd: "subscribe"}); err != nil {
+	command := "subscribe-all"
+	if err := c.Send(rpc.Request{Cmd: command}); err != nil {
 		return
 	}
 
@@ -91,6 +93,17 @@ func runOnce(socketPath string, renderer *liveRenderer, out *emitter) {
 	for {
 		var resp rpc.Response
 		if err := c.Recv(&resp); err != nil {
+			return
+		}
+		if resp.Error != "" {
+			if command == "subscribe-all" && strings.TrimSpace(resp.Error) == "unknown cmd: subscribe-all" {
+				command = "subscribe"
+				if err := c.Send(rpc.Request{Cmd: command}); err != nil {
+					return
+				}
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "switchboard-polybar: %s: %s\n", command, resp.Error)
 			return
 		}
 		if resp.Snapshot != nil {
@@ -132,13 +145,14 @@ func renderSnapshot(snap state.Snapshot, labels []string, options renderOptions)
 	if options.maxSessions > 0 && limit > options.maxSessions {
 		limit = options.maxSessions
 	}
-	parts := make([]string, 0, limit+1)
-	for i := range limit {
-		label := fmt.Sprintf("pid %d", snap.Sessions[i].PID)
+	chips := barview.Prepare(snap, limit)
+	parts := make([]string, 0, len(chips)+1)
+	for i, chip := range chips {
+		label := fmt.Sprintf("pid %d", chip.Session.PID)
 		if i < len(labels) && strings.TrimSpace(labels[i]) != "" {
 			label = labels[i]
 		}
-		parts = append(parts, renderSession(snap.Sessions[i], label, options))
+		parts = append(parts, renderChip(chip, label, options))
 	}
 	if hidden := len(snap.Sessions) - limit; hidden > 0 {
 		parts = append(parts, colorize(options.colors.unknown, fmt.Sprintf("+%d", hidden)))
@@ -147,16 +161,19 @@ func renderSnapshot(snap state.Snapshot, labels []string, options renderOptions)
 }
 
 func renderSession(session state.Session, label string, options renderOptions) string {
-	status := sessionStatus(session)
-	color := statusColor(status, options.colors)
-	if session.Suspended || session.Headless {
+	return renderChip(barview.Prepare(state.Snapshot{Sessions: []state.Session{session}}, 1)[0], label, options)
+}
+
+func renderChip(chipView barview.Chip, label string, options renderOptions) string {
+	color := statusColor(chipView.Status, options.colors)
+	if chipView.Session.Suspended || chipView.Session.Headless {
 		color = options.colors.unknown
 	}
 	chip := colorize(color, "● "+escapeText(label))
-	if session.Headless || session.PID <= 0 {
+	if chipView.Selector == "" {
 		return chip
 	}
-	command := shellQuote(options.ctlPath) + " focus pid:" + fmt.Sprint(session.PID)
+	command := shellQuote(options.ctlPath) + " focus " + chipView.Selector
 	return "%{A1:" + escapeActionCommand(command) + ":}" + chip + "%{A}"
 }
 
@@ -176,13 +193,7 @@ func colorize(color, text string) string {
 }
 
 func sessionStatus(session state.Session) string {
-	if info := session.Enrichment(); info != nil && info.Status != "" {
-		return info.Status
-	}
-	if session.AgentGraph != nil && session.AgentGraph.Summary.Status != "" {
-		return session.AgentGraph.Summary.Status
-	}
-	return "unknown"
+	return barview.Status(session)
 }
 
 func statusColor(status string, colors palette) string {

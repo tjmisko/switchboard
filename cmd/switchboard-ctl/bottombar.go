@@ -1,14 +1,17 @@
+//go:build linux
+
 package main
 
-// The bottombar subcommand owns the lifecycle of the bottom ("claude") waybar
-// process. It enforces a single invariant:
+// The bottombar subcommand publishes the bottom ("claude") Waybar modules and
+// enforces a single visibility invariant:
 //
 //	bottom bar runs  <=>  (top bar visible)  AND  (>=1 aggregate agent session)
 //
-// The bottom bar's visibility primitive is process existence — we literally
-// start and stop the `waybar -c claude.jsonc` process — so there is no toggle
-// state to desync. The running process IS the truth, which is what keeps the
-// two bars in lockstep with no alternation under repeated F8 presses.
+// Legacy `watch` mode owns a dedicated `waybar -c claude.jsonc` process.
+// `publish` mode attaches to a combined top+bottom Waybar process owned by the
+// desktop session and toggles only its bottom window. Keeping both modes makes
+// the configuration migration reversible instead of changing ownership and
+// process topology in one unguarded step.
 //
 // Two inputs drive the invariant, each owned by a different actor:
 //
@@ -55,8 +58,10 @@ type bottomBarConfig struct {
 	pidFile      string
 	lockFile     string
 	readyFile    string
+	visibleFile  string
 	slotDir      string
 	waybarConfig string
+	attached     bool
 
 	ops bottomBarOps
 }
@@ -213,6 +218,7 @@ func bottomBarConfigDefault(socketPath string) bottomBarConfig {
 		pidFile:      filepath.Join(run, "switchboard", "bottom-waybar.pid"),
 		lockFile:     filepath.Join(run, "switchboard", "bottombar.lock"),
 		readyFile:    filepath.Join(run, "switchboard", "bottom-waybar.ready"),
+		visibleFile:  filepath.Join(run, "switchboard", "bottom-waybar.visible"),
 		slotDir:      filepath.Join(run, "switchboard"),
 		waybarConfig: envOr("SWITCHBOARD_BOTTOM_CONFIG", filepath.Join(home, ".config", "waybar", "claude.jsonc")),
 		ops:          defaultOps(),
@@ -237,12 +243,18 @@ func cmdBottombar(args []string, socketPath string) {
 		reconcile(cfg)
 	case "watch":
 		watchBottomBar(cfg)
+	case "publish":
+		cfg.attached = true
+		watchBottomBar(cfg)
+	case "reconcile-attached":
+		cfg.attached = true
+		reconcile(cfg)
 	case "stop":
 		unlock := mustFlock(cfg.lockFile)
 		ensureStopped(cfg)
 		unlock()
 	default:
-		fail("bottombar: unknown subcommand %q (want reconcile|watch|stop)", sub)
+		fail("bottombar: unknown subcommand %q (want publish|reconcile-attached|watch|reconcile|stop)", sub)
 	}
 }
 
@@ -294,6 +306,10 @@ func reconcileWith(cfg bottomBarConfig, count int) {
 }
 
 func setBottom(cfg bottomBarConfig, run bool) {
+	if cfg.attached {
+		setAttachedBottom(cfg, run)
+		return
+	}
 	if run {
 		ensureStarted(cfg)
 	} else {
@@ -319,7 +335,9 @@ func watchBottomBar(cfg bottomBarConfig) {
 	// detached with Release() and never Wait(), so when one is killed it would
 	// linger as a zombie under us — its parent — until we reap it. A one-shot
 	// reconcile cannot reap a child of ours, so the responsibility lands here.
-	go reapChildren()
+	if !cfg.attached {
+		go reapChildren()
+	}
 
 	for {
 		streamSnapshots(cfg, renderer, publisher)
@@ -420,7 +438,7 @@ func streamSnapshots(cfg bottomBarConfig, renderer *waybarchip.Renderer, publish
 		delay, retry := nextWaybarReadyDelay(readyTries)
 		if !retry {
 			if !readyWarned {
-				fmt.Fprintln(os.Stderr, "bottombar: Waybar never acknowledged signal-mode readiness; check claude.jsonc")
+				fmt.Fprintln(os.Stderr, "bottombar: Waybar never acknowledged signal-mode readiness; check the active Waybar config")
 				readyWarned = true
 			}
 			readyRetryAt = time.Now().Add(waybarReadyRetry)
@@ -533,29 +551,40 @@ func receiveBottomSnapshots(c bottomSnapshotStream, command string, snapshots ch
 func flushSlotsWhenReady(cfg bottomBarConfig, publisher *slotPublisher) (flushed bool, pid int) {
 	unlock := mustFlock(cfg.lockFile)
 	defer unlock()
-	process, ok := openBottomProcess(cfg)
+	process, ok := openConfiguredProcess(cfg)
 	if !ok {
 		return false, 0
 	}
 	defer unix.Close(process.pidfd)
-	return flushSlotsForProcess(cfg, publisher, process.pid, process.pidfd), process.pid
+	return flushSlotsForProcess(cfg, publisher, process, process.pidfd), process.pid
 }
 
-func flushSlotsForProcess(cfg bottomBarConfig, publisher *slotPublisher, pid, pidfd int) bool {
-	if pid == 0 || !bottomBarReady(cfg, pid) {
+func flushSlotsForProcess(cfg bottomBarConfig, publisher *slotPublisher, process bottomProcess, pidfd int) bool {
+	if process.pid == 0 || !bottomBarReady(cfg, process) {
 		return false
 	}
 	publisher.flush(pidfd)
 	return !publisher.hasDirty()
 }
 
-func bottomBarReady(cfg bottomBarConfig, pid int) bool {
+func bottomBarReady(cfg bottomBarConfig, process bottomProcess) bool {
 	b, err := os.ReadFile(cfg.readyFile)
 	if err != nil {
 		return false
 	}
-	readyPID, err := strconv.Atoi(strings.TrimSpace(string(b)))
-	return err == nil && readyPID == pid
+	fields := strings.Fields(string(b))
+	if len(fields) < 1 || len(fields) > 2 {
+		return false
+	}
+	readyPID, err := strconv.Atoi(fields[0])
+	if err != nil || readyPID != process.pid {
+		return false
+	}
+	if len(fields) == 1 {
+		return !cfg.attached
+	}
+	readyStarted, err := strconv.ParseUint(fields[1], 10, 64)
+	return err == nil && readyStarted == process.started
 }
 
 // topVisible reports whether the top bar's master toggle is on. The toggle is
@@ -677,8 +706,123 @@ func configureBottomCommandIO(cmd *exec.Cmd, devNull *os.File) {
 }
 
 type bottomProcess struct {
-	pid   int
-	pidfd int
+	pid     int
+	pidfd   int
+	started uint64
+}
+
+func openConfiguredProcess(cfg bottomBarConfig) (bottomProcess, bool) {
+	if cfg.attached {
+		return openAttachedProcess(cfg)
+	}
+	return openBottomProcess(cfg)
+}
+
+// openAttachedProcess binds the process that loaded the combined Waybar
+// configuration. The module-created ready record is the attachment handshake;
+// unlike legacy mode, the publisher never infers ownership from a command line
+// and never starts or kills this process.
+func openAttachedProcess(cfg bottomBarConfig) (bottomProcess, bool) {
+	b, err := os.ReadFile(cfg.readyFile)
+	if err != nil {
+		return bottomProcess{}, false
+	}
+	fields := strings.Fields(string(b))
+	// Combined mode requires the process start time as a generation fence. A
+	// PID-only record belongs to the legacy split configuration and must not be
+	// adopted during a partial rollout.
+	if len(fields) != 2 {
+		return bottomProcess{}, false
+	}
+	pid, err := strconv.Atoi(fields[0])
+	if err != nil || pid <= 0 {
+		return bottomProcess{}, false
+	}
+	recordedStart, err := strconv.ParseUint(fields[1], 10, 64)
+	if err != nil {
+		return bottomProcess{}, false
+	}
+	pidfd, err := unix.PidfdOpen(pid, 0)
+	if err != nil {
+		return bottomProcess{}, false
+	}
+	fail := func() (bottomProcess, bool) {
+		_ = unix.Close(pidfd)
+		return bottomProcess{}, false
+	}
+	comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+	if err != nil || strings.TrimSpace(string(comm)) != "waybar" {
+		return fail()
+	}
+	started, err := processStartTime(pid)
+	if err != nil || started != recordedStart {
+		return fail()
+	}
+	return bottomProcess{pid: pid, pidfd: pidfd, started: started}, true
+}
+
+type attachedVisibility struct {
+	pid     int
+	started uint64
+	visible bool
+}
+
+func readAttachedVisibility(path string) (attachedVisibility, bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return attachedVisibility{}, false
+	}
+	fields := strings.Fields(string(b))
+	if len(fields) != 3 {
+		return attachedVisibility{}, false
+	}
+	pid, err := strconv.Atoi(fields[0])
+	if err != nil || pid <= 0 {
+		return attachedVisibility{}, false
+	}
+	started, err := strconv.ParseUint(fields[1], 10, 64)
+	if err != nil {
+		return attachedVisibility{}, false
+	}
+	visible, err := strconv.ParseBool(fields[2])
+	if err != nil {
+		return attachedVisibility{}, false
+	}
+	return attachedVisibility{pid: pid, started: started, visible: visible}, true
+}
+
+// setAttachedBottom reconciles the bottom window of a combined Waybar process.
+// The shipped combined config starts that window hidden and maps SIGUSR2 to a
+// bottom-only toggle. Persisting the acknowledged generation and state makes a
+// one-shot F8 reconcile and the long-running publisher share one idempotence
+// fence; a new Waybar generation always resets to its configured hidden state.
+func setAttachedBottom(cfg bottomBarConfig, visible bool) {
+	process, ok := openAttachedProcess(cfg)
+	if !ok {
+		return
+	}
+	defer unix.Close(process.pidfd)
+	reconcileAttachedVisibility(cfg, process, visible, func() error {
+		return unix.PidfdSendSignal(process.pidfd, unix.SIGUSR2, nil, 0)
+	})
+}
+
+func reconcileAttachedVisibility(cfg bottomBarConfig, process bottomProcess, visible bool, toggle func() error) {
+	actual := false
+	if saved, ok := readAttachedVisibility(cfg.visibleFile); ok &&
+		saved.pid == process.pid && saved.started == process.started {
+		actual = saved.visible
+	}
+	if actual != visible {
+		if err := toggle(); err != nil {
+			fmt.Fprintf(os.Stderr, "bottombar: toggle attached bottom: %v\n", err)
+			return
+		}
+	}
+	body := []byte(fmt.Sprintf("%d %d %t\n", process.pid, process.started, visible))
+	if err := replaceFile(cfg.visibleFile, body); err != nil {
+		fmt.Fprintf(os.Stderr, "bottombar: record attached visibility: %v\n", err)
+	}
 }
 
 // openBottomProcess binds a pidfd before validating the recorded identity.
@@ -733,7 +877,7 @@ func openBottomProcess(cfg bottomBarConfig) (bottomProcess, bool) {
 			fmt.Fprintf(os.Stderr, "bottombar: upgrade pidfile identity: %v\n", err)
 		}
 	}
-	return bottomProcess{pid: pid, pidfd: pidfd}, true
+	return bottomProcess{pid: pid, pidfd: pidfd, started: started}, true
 }
 
 // bottomPID is the lifecycle existence check. Signal paths keep the pidfd from

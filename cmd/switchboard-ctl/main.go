@@ -44,9 +44,9 @@ func main() {
 		os.Exit(2)
 	}
 
-	// bottombar manages the bottom waybar's lifecycle and runs before the
-	// mandatory dial: its `watch` mode must tolerate a down daemon and
-	// reconnect on its own.
+	// bottombar publishes the bottom Waybar modules. Its legacy `watch` mode
+	// owns a split process; `publish` attaches to a combined desktop-owned
+	// process. Both tolerate a down daemon and reconnect on their own.
 	if args[0] == "bottombar" {
 		cmdBottombar(args[1:], *socketPath)
 		return
@@ -926,10 +926,13 @@ commands:
   codex-hook <event>      forward Codex hook enrichment (stdin = JSON)
   activity idle|active    report a global user-activity edge for the delegation
                             metrics (idle daemon, e.g. hypridle); session-less
-  bottombar [sub]         manage the bottom waybar lifecycle:
-                            watch      long-running; show/hide bar with sessions
-                            reconcile  one-shot; re-derive bar visibility (F8)
-                            stop       kill the bottom bar
+  bottombar [sub]         publish the Linux/Waybar bottom strip:
+                            publish    attach to one combined Waybar process
+                            reconcile-attached
+                                       re-derive combined bottom visibility
+                            watch      legacy: own a separate bottom process
+                            reconcile  legacy: re-derive process visibility
+                            stop       legacy: kill the separate bottom process
   diagnose [flags] [desc] explain a wrong chip color, or use --observer for
                             content-free provider binding/graph health. Reads
                             state.json plus the journal; needs no daemon.

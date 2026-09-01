@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/barlayout"
+	"github.com/tjmisko/switchboard/internal/barview"
 	"github.com/tjmisko/switchboard/internal/buildinfo"
 	"github.com/tjmisko/switchboard/internal/durfmt"
 	sblabel "github.com/tjmisko/switchboard/internal/label"
@@ -86,8 +87,9 @@ func (r *Renderer) RenderSlotsAt(snap state.Snapshot, slots int, now time.Time) 
 		labels[i] = r.labels.Chip(cfg, snap.Sessions[i])
 	}
 	labels = barlayout.Fit(labels, r.availPx, r.metrics)
+	chips := barview.Prepare(snap, slots)
 	for slot := range out {
-		out[slot] = renderPreparedSlot(snap, slot, labels, cfg, &r.labels, now)
+		out[slot] = renderPreparedSlot(chips, slot, labels, cfg, &r.labels, now)
 	}
 	return out
 }
@@ -341,52 +343,20 @@ func renderSlotAt(snap state.Snapshot, slot int, availPx float64, metrics barlay
 		labels[i] = cache.Chip(cfg, snap.Sessions[i])
 	}
 	labels = barlayout.Fit(labels, availPx, metrics)
-	return renderPreparedSlot(snap, slot, labels, cfg, cache, now)
+	return renderPreparedSlot(barview.Prepare(snap, slot+1), slot, labels, cfg, cache, now)
 }
 
-func renderPreparedSlot(snap state.Snapshot, slot int, labels []string, cfg projectname.Config, cache *sblabel.NameCache, now time.Time) waybarOutput {
-	if slot >= len(snap.Sessions) {
+func renderPreparedSlot(chips []barview.Chip, slot int, labels []string, cfg projectname.Config, cache *sblabel.NameCache, now time.Time) waybarOutput {
+	if slot >= len(chips) {
 		return waybarOutput{Text: "", Class: []string{"empty"}}
 	}
-	s := snap.Sessions[slot]
-	status := sessionStatus(s)
-	// The primary class paints the chip's color; delegating reuses working's green
-	// (Q1 default: pure green, no CSS change needed). The raw "delegating" rides
-	// along as a secondary class so the bar CAN add a badge/different shade later
-	// without losing the green underneath.
-	classes := []string{chipClass(status)}
-	if status == state.StatusDelegating {
-		classes = append(classes, "delegating")
-	}
-	if s.Focused {
-		classes = append(classes, "focused")
-	}
-	if s.Suspended {
-		classes = append(classes, "suspended")
-	}
-	// Headless claude -p runs are visible but not navigable; the class lets the
-	// bar CSS render them inert (no fill, muted text) so they don't read as
-	// clickable chips.
-	if s.Headless {
-		classes = append(classes, "headless")
-	}
-	// A session on another machine is drawn as a nested pill (a double border
-	// inside the chip outline) rather than a color or a glyph: color is already
-	// spoken for by status, and a glyph would cost label width on a row that is
-	// fitted to the pixel. The CSS trades border width against padding so a
-	// remote chip occupies exactly the same box as a local one — see the
-	// footprint note in barlayout.DefaultMetrics.
-	if s.Remote {
-		classes = append(classes, "remote")
-	}
-	if s.Hostname != "" && !s.Navigable {
-		classes = append(classes, "unnavigable")
-	}
+	chip := chips[slot]
+	s := chip.Session
 	return waybarOutput{
 		Text:    labels[slot],
 		Tooltip: sessionTooltip(cfg, cache, s, now),
-		Class:   classes,
-		Alt:     chipClass(status),
+		Class:   chip.Classes,
+		Alt:     barview.ColorClass(chip.Status),
 	}
 }
 
@@ -414,10 +384,7 @@ func nextWaybarRefresh(snap state.Snapshot, slot int, now time.Time) time.Time {
 // chipClass maps a session status to the CSS class that paints its color.
 // delegating shares working's green; everything else maps to itself.
 func chipClass(status string) string {
-	if status == state.StatusDelegating {
-		return state.StatusWorking
-	}
-	return status
+	return barview.ColorClass(status)
 }
 
 // renderAggregate is the original single-module mode. Kept for ad-hoc
@@ -443,14 +410,7 @@ func renderAggregate(snap state.Snapshot, names *nameConfig, cache *sblabel.Name
 }
 
 func sessionStatus(s state.Session) string {
-	info := s.Enrichment()
-	if info != nil && info.Status != "" {
-		return info.Status
-	}
-	if s.AgentGraph != nil && s.AgentGraph.Summary.Status != "" {
-		return s.AgentGraph.Summary.Status
-	}
-	return "unknown"
+	return barview.Status(s)
 }
 
 // sessionTooltip renders the hover card with pango markup:

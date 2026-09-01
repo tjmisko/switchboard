@@ -90,6 +90,14 @@ func TestRendererUnitsAreSeparateOptInProfiles(t *testing.T) {
 			command:     `-c "$$1" switchboard`,
 			other:       "waybar",
 		},
+		{
+			unit:        "switchboard-waybar-publisher.service",
+			profile:     "Combined Waybar",
+			condition:   "ConditionPathExists=%h/.config/waybar/.switchboard-combined-v1",
+			environment: "Environment=SWITCHBOARD_CTL=%h/go/bin/switchboard-ctl",
+			command:     "bottombar publish",
+			other:       "polybar",
+		},
 	}
 
 	for _, tt := range tests {
@@ -120,11 +128,13 @@ func TestRendererUnitsAreSeparateOptInProfiles(t *testing.T) {
 }
 
 func TestWaybarBrokerUsesOneSmallGoHeap(t *testing.T) {
-	text := readUnit(t, "switchboard-waybar.service")
-	if !hasUnitDirective(text, "Environment=GOGC=50") {
-		t.Error("switchboard-waybar.service is missing the broker GC setting")
-	}
-	if !hasUnitDirective(text, "Environment=XDG_RUNTIME_DIR=%t") {
-		t.Error("switchboard-waybar.service does not align broker and module runtime paths")
+	for _, unit := range []string{"switchboard-waybar.service", "switchboard-waybar-publisher.service"} {
+		text := readUnit(t, unit)
+		if !hasUnitDirective(text, "Environment=GOGC=50") {
+			t.Errorf("%s is missing the broker GC setting", unit)
+		}
+		if !hasUnitDirective(text, "Environment=XDG_RUNTIME_DIR=%t") {
+			t.Errorf("%s does not align broker and module runtime paths", unit)
+		}
 	}
 }

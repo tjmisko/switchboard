@@ -66,6 +66,48 @@ update intended for Waybar.
 `switchboard-waybar` remains a standalone/debug wrapper, but the live config
 must not run it per slot.
 
+### One Waybar process
+
+Waybar can host the existing top window and Switchboard's bottom window from
+one config array. Generate that config from the two source arrays instead of
+maintaining a third hand-copied configuration:
+
+```bash
+scripts/merge-waybar-config \
+  ~/.config/waybar/config.jsonc \
+  waybar/claude.jsonc \
+  ~/.config/waybar/config.combined.jsonc
+```
+
+The generated signal contract is deliberately asymmetric:
+
+- `SIGUSR1` toggles only the top window.
+- `SIGUSR2` toggles only the bottom window.
+- The bottom window has `start_hidden: true`.
+
+The bottom module writes `PID starttime` to the readiness file. In combined
+mode, `switchboard-ctl bottombar publish` attaches only to that exact process
+generation. It never launches or terminates Waybar. The publisher records the
+last acknowledged bottom visibility per process generation, making repeated
+reconciliation idempotent and resetting safely to hidden after Waybar restarts.
+
+This is a separate, explicit host profile. Install
+`systemd/switchboard-waybar-publisher.service` and create
+`~/.config/waybar/.switchboard-combined-v1` only as part of the config cutover.
+Do not run it alongside the legacy `switchboard-waybar.service`; that unit owns
+a second Waybar process by design.
+
+The F8 owner must signal the desktop-owned Waybar once with `SIGUSR1`, flip its
+master marker, then call:
+
+```bash
+switchboard-ctl bottombar reconcile-attached
+```
+
+It must no longer search for a separate bottom PID. Rollback reverses those
+three host changes together: restore the split top config/F8 handler, remove
+the combined marker, and reactivate the legacy renderer unit.
+
 ## polybar
 
 The supported renderer subscribes to the daemon and emits a single formatted

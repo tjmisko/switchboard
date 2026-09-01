@@ -44,7 +44,7 @@ func TestBottomConfigUsesDistinctSignalTriggeredSlotFiles(t *testing.T) {
 			}
 		}
 	}
-	for _, want := range []string{"bottom-waybar.ready", "$PPID"} {
+	for _, want := range []string{"bottom-waybar.ready", "$PPID", `/proc/$PPID/stat`} {
 		if !strings.Contains(text, want) {
 			t.Errorf("startup readiness handshake is missing %q", want)
 		}

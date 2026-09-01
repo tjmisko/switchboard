@@ -55,7 +55,7 @@ root=${SWITCHBOARD_DEPLOY_ROOT:-$HOME/.local/share/switchboard}
 releases_dir=$root/releases
 current_link=$root/current
 commands=(switchboard switchboard-ctl switchboard-waybar)
-units=(switchboard.service switchboard-waybar.service)
+units=(switchboard.service switchboard-waybar.service switchboard-waybar-publisher.service)
 keep_releases=5
 version_ldflag_path=github.com/tjmisko/switchboard/internal/buildinfo.Version
 # Where the stable command names are published. Desktop config should reference
