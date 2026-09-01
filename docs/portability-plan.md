@@ -92,7 +92,7 @@ Check off as completed. Keep a running `DONE.md` log of merged milestones.
   - `bottombar.shouldRun(topVisible, count)` — extract the `topVisible && count>0` core out of `apply`/`reconcileWith` into a pure func; assert all four F8 truth-table cases.
   DoD: `go test ./...` green; `go test -cover` ≥ these packages' pure logic.
 - [x] **0.4 Fixture / in-memory tests.**
-  - `state`: Apply→broadcast+persist ordering; Snapshot sorts by StartedAt (and **pin tie-break ⚠**); subscriber buffer cap-4 **drops without blocking**; cancel closes channel; persist is atomic temp+rename, no `.state-*.json` litter on failure, no-op on empty path; Load no-op on missing, returns err on corrupt, hydrates by PID. Run under `-race`.
+  - `state`: Apply→broadcast+persist ordering; Snapshot sorts by StartedAt (and **pin tie-break ⚠**); subscriber mailbox cap-1 **coalesces latest without blocking**; cancel closes channel; persist is atomic temp+rename, no `.state-*.json` litter on failure, no-op on empty path; Load no-op on missing, returns err on corrupt, hydrates by PID. Run under `-race`.
   - `hyprland.Subscribe` parsing: split on first `>>`; drop delimiter-less lines; 1 MiB buffer; channel closes on ctx-cancel/EOF — all against a fake conn (extract the parse loop to take an `io.Reader`).
   - `wezterm.Muxes`: temp `XDG_RUNTIME_DIR/wezterm` with `gui-sock-<pid>` entries; only numeric-pid + live-`/proc` kept (use the test's own pid as "live"); non-`gui-sock-`/dead skipped.
   - `bottombar`: `topVisible` (marker present/absent), `bottomPID` (stale pidfile cleanup, comm≠waybar guard), `envOr`/`runtimeDir`.

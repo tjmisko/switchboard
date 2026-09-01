@@ -124,7 +124,9 @@ func TestLocalSubscribeTreatsQueuedBroadcastsAsNotifications(t *testing.T) {
 	}()
 
 	decoder := json.NewDecoder(client)
-	for frame := 0; frame < 3; frame++ {
+	// The capacity-one mailbox coalesces A and B to one wakeup, so this is the
+	// independent initial frame plus one authoritative current-frame reread.
+	for frame := 0; frame < 2; frame++ {
 		var response Response
 		if err := decoder.Decode(&response); err != nil {
 			t.Fatalf("decode frame %d: %v", frame, err)

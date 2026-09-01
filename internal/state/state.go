@@ -1156,7 +1156,7 @@ func workspaceID(s Session) (int, bool) {
 // channel values as notifications and re-read current state. Close the returned
 // cancel func to unsubscribe.
 func (s *Store) Subscribe() (<-chan Broadcast, func()) {
-	ch := make(chan Broadcast, 4)
+	ch := make(chan Broadcast, 1)
 	s.mu.Lock()
 	s.subscribers[ch] = struct{}{}
 	s.mu.Unlock()

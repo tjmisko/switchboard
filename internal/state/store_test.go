@@ -152,21 +152,26 @@ func TestSnapshotDetachesMutableSessionFields(t *testing.T) {
 	}
 }
 
-// §4.3 Subscribe — a lagging subscriber's cap-4 buffer drops snapshots rather
+// §4.3 Subscribe — a lagging subscriber's cap-1 mailbox drops snapshots rather
 // than blocking Apply. If broadcast blocked, this test would hang.
 func TestSubscribeDropsWithoutBlocking(t *testing.T) {
 	store := state.New("")
 	ch, cancel := store.Subscribe()
 	defer cancel()
 
-	// Never drain ch. Ten applies must all return; the buffer caps at 4.
+	// Never drain ch. Ten applies must all return; the mailbox retains only the
+	// newest complete replacement.
 	for i := 0; i < 10; i++ {
 		store.Apply(func(m map[int]*state.Session) {
 			m[1] = &state.Session{PID: 1, StartedAt: time.Unix(int64(i), 0)}
 		})
 	}
-	if n := len(ch); n > 4 {
-		t.Errorf("buffered snapshots = %d, want <= 4 (cap)", n)
+	if n := len(ch); n != 1 {
+		t.Errorf("buffered snapshots = %d, want 1 (latest-value mailbox)", n)
+	}
+	latest := <-ch
+	if got := latest.Snapshot.Sessions[0].StartedAt; !got.Equal(time.Unix(9, 0)) {
+		t.Errorf("retained snapshot started_at = %v, want newest %v", got, time.Unix(9, 0))
 	}
 }
 
