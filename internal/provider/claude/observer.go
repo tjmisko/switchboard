@@ -219,6 +219,10 @@ type promptLatch struct {
 	Identity promptIdentity
 	CallID   string
 	State    CallLatchState
+	// At is the instant the state was decided, stamped onto the prompt so a
+	// proposal can be told apart from a proposal made long enough ago to be worth
+	// confirming (callLatchConfirmGrace).
+	At time.Time
 }
 
 // The bounded diagnostic categories the call-identity latch reports.
@@ -301,7 +305,7 @@ func (o *Observer) Observe(ctx context.Context, root provider.RootRef, now time.
 		SessionID: root.ProviderSessionID, Transcript: root.Transcript,
 		PID: root.PID, Agent: string(agentgraph.ProviderClaude), CWD: root.CWD,
 	}, now)
-	latches, latchDiagnostics := latchPendingCalls(root.Transcript, pending, tuning.TailBytes)
+	latches, latchDiagnostics := latchPendingCalls(root.Transcript, pending, tuning.TailBytes, now)
 	resolutions := resolvePending(root.Transcript, pending, anchors, structured.Snapshot, now, tuning)
 	runtime = reconcileRootRuntime(root.Transcript, runtime, runtimeAt, tuning.TailBytes)
 
@@ -1054,16 +1058,18 @@ func resolvePending(mainTranscript string, pending map[string][]PendingPrompt, a
 //     would bind whatever sibling happened to be executing, ~5 s before the
 //     prompt's own tool_use can possibly be on disk;
 //   - no other writer offers or already holds that id (P3's runtime half);
-//   - and the SAME id was the sole candidate on the previous tick as well
-//     (CallLatchProposed) — one tick's uniqueness is not uniqueness when one
-//     message's parallel tool_use blocks reach disk 0.5–1.5 s apart.
+//   - and the SAME id was the sole candidate on an earlier read taken at least
+//     callLatchConfirmGrace ago (CallLatchProposed) — one read's uniqueness is
+//     not uniqueness when one message's parallel tool_use blocks reach disk
+//     0.5–1.5 s apart, and two reads inside that gap agree about the same
+//     partial file.
 //
 // Anything else stays unlatched: zero candidates retries next tick (the flush
 // lag), and ambiguity or contention is terminal. The asymmetry is the point — an
 // unlatched prompt keeps today's (tool, hash) rule and at worst stays red a few
 // seconds too long, whereas a WRONG bind lets some other call's result clear a
 // prompt nobody answered, a missed RED, silent, costing the whole remaining wait.
-func latchPendingCalls(mainTranscript string, pending map[string][]PendingPrompt, tailBytes int64) ([]promptLatch, []string) {
+func latchPendingCalls(mainTranscript string, pending map[string][]PendingPrompt, tailBytes int64, now time.Time) ([]promptLatch, []string) {
 	writers := make([]string, 0, len(pending))
 	for writer := range pending {
 		writers = append(writers, writer)
@@ -1163,23 +1169,30 @@ func latchPendingCalls(mainTranscript string, pending map[string][]PendingPrompt
 		}
 		switch {
 		case contested:
-			latches = append(latches, promptLatch{writer, prompt.identity(), "", CallLatchContested})
+			latches = append(latches, promptLatch{writer, prompt.identity(), "", CallLatchContested, now})
 			diagnostics = append(diagnostics, DiagnosticCallIDCollision)
 		case len(candidates.eligible) == 0:
 			// Nothing this prompt could own is on disk yet; retried next tick. A
 			// proposal already made is deliberately kept: a tail that briefly stops
 			// naming the candidate is not evidence against it.
 		case len(candidates.eligible) > 1 || unlatched[toolKey{writer, prompt.Tool}] > 1:
-			latches = append(latches, promptLatch{writer, prompt.identity(), "", CallLatchAmbiguous})
+			latches = append(latches, promptLatch{writer, prompt.identity(), "", CallLatchAmbiguous, now})
 			diagnostics = append(diagnostics, DiagnosticCallAmbiguous)
 		case prompt.Latch == CallLatchProposed && prompt.CallID == candidates.eligible[0]:
-			latches = append(latches, promptLatch{writer, prompt.identity(), candidates.eligible[0], CallLatchBound})
+			if now.Before(prompt.LatchAt.Add(callLatchConfirmGrace)) {
+				// Too soon to be a second view of the file. The proposal is left
+				// exactly as it stands — including its original LatchAt, which is what
+				// the grace is measured from — and the next read that clears the grace
+				// confirms or withdraws it.
+				continue
+			}
+			latches = append(latches, promptLatch{writer, prompt.identity(), candidates.eligible[0], CallLatchBound, now})
 			diagnostics = append(diagnostics, DiagnosticCallLatched)
 		default:
-			// The first tick to name this candidate. It is recorded, not counted: a
+			// The first read to name this candidate. It is recorded, not counted: a
 			// proposal is not an outcome, and counting one per tick would make this
 			// table a mix of level and edge counters that no ratio can be read off.
-			latches = append(latches, promptLatch{writer, prompt.identity(), candidates.eligible[0], CallLatchProposed})
+			latches = append(latches, promptLatch{writer, prompt.identity(), candidates.eligible[0], CallLatchProposed, now})
 		}
 	}
 	for _, latch := range latches {
@@ -1204,6 +1217,24 @@ func latchPendingCalls(mainTranscript string, pending map[string][]PendingPrompt
 // removal costs at most a stale red while the bind it prevents would cost a
 // missed one.
 const callLatchSkewGrace = 3 * time.Second
+
+// callLatchConfirmGrace is how long a proposal must stand before a second read
+// may confirm it.
+//
+// The confirmation rule exists to defeat one shape: a read landing inside the
+// 0.5–1.5 s gap between one assistant message's parallel tool_use entries sees a
+// gated call's auto-approved sibling ALONE and reads it as unique. Counting
+// reads alone does not defeat it. ApplyHook signals the coordinator, so every
+// hook edge from ANY writer schedules an Observe for this root, and a fanned-out
+// session routinely delivers two of them milliseconds apart — two reads of the
+// same partial file, agreeing for the same wrong reason. The grace is what makes
+// the confirming read a genuinely later view of the file.
+//
+// It is set just past the widest measured inter-entry spread, like
+// callLatchSkewGrace and for the same evidence. It costs nothing in practice:
+// the periodic reconcile is 5 s, so the read that would have confirmed a
+// proposal too early is followed by one that confirms it on schedule.
+const callLatchConfirmGrace = 2 * time.Second
 
 // ownableCall reports whether a candidate could be the call this prompt gates,
 // on the only ordering evidence the file carries. There is no upper bound: a
@@ -1242,7 +1273,7 @@ func applyPromptLatch(pending map[string][]PendingPrompt, latch promptLatch) {
 	if index < 0 {
 		return
 	}
-	prompts[index].CallID, prompts[index].Latch = latch.CallID, latch.State
+	prompts[index].CallID, prompts[index].Latch, prompts[index].LatchAt = latch.CallID, latch.State, latch.At
 }
 
 // resolveLatchedCalls closes the prompts whose OWN call has come back, and says

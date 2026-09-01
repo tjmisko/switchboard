@@ -355,10 +355,16 @@ func TestPromptStatePersistsAcrossADaemonRestart(t *testing.T) {
 		second := bootDaemon(t, path, first.transcript)
 		restarted := second.coordinator(t)
 		ctx := context.Background()
-		// Two ticks to bind: one tick's uniqueness is not uniqueness, so the first
-		// only proposes the candidate.
-		restarted.observe(ctx, second.ref)
-		restarted.observe(ctx, second.ref)
+		// Three driven ticks. The first performs the restore, which stamps its own
+		// observation instant and supersedes the tick that triggered it. The other
+		// two bind, and they must be a real interval apart: one read's uniqueness is
+		// not uniqueness, so the earlier only PROPOSES the candidate and a
+		// confirmation taken moments later is refused as the same view of the same
+		// partial file. The clock is supplied rather than slept through.
+		restoredAt := time.Now()
+		restarted.observeAt(ctx, second.ref, restoredAt)
+		restarted.observeAt(ctx, second.ref, restoredAt.Add(time.Second))
+		restarted.observeAt(ctx, second.ref, restoredAt.Add(6*time.Second))
 		if got := second.claude(t).Status; got != state.StatusPermission {
 			t.Fatalf("status = %q while the call was still open, want permission held through the latch", got)
 		}
@@ -371,7 +377,7 @@ func TestPromptStatePersistsAcrossADaemonRestart(t *testing.T) {
 		}
 
 		appendTranscriptLine(t, first.transcript, toolResultLine(now.Add(time.Second), "toolu_restored"))
-		restarted.observe(ctx, second.ref)
+		restarted.observeAt(ctx, second.ref, restoredAt.Add(11*time.Second))
 
 		if got := second.claude(t).Status; got == state.StatusPermission {
 			t.Error("the restored prompt outlived its own call's result; a restored record that names a call must be releasable by it")

@@ -363,6 +363,15 @@ func (c *agentCoordinator) observer(kind agentgraph.ProviderKind) provider.Obser
 }
 
 func (c *agentCoordinator) observe(ctx context.Context, ref provider.RootRef) {
+	c.observeAt(ctx, ref, time.Now())
+}
+
+// observeAt is observe with the tick's instant supplied. The clock is a
+// parameter because some provider rules are about the DISTANCE between two
+// ticks, not about either one — the call-identity latch refuses a confirmation
+// taken too soon after its proposal — and a test driving two ticks in a row
+// cannot express that against a wall clock it does not control.
+func (c *agentCoordinator) observeAt(ctx context.Context, ref provider.RootRef, now time.Time) {
 	observer := c.observer(ref.Provider)
 	if observer == nil {
 		return
@@ -374,7 +383,6 @@ func (c *agentCoordinator) observe(ctx context.Context, ref provider.RootRef) {
 		c.restoreClaude(ref)
 	}
 	generation := c.begin(ref.Key())
-	now := time.Now()
 	if ref.Provider == agentgraph.ProviderCodex {
 		defer func() { c.reconcileCodexChildHooks(ref, time.Now()) }()
 	}

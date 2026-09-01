@@ -149,7 +149,7 @@ func TestPromptShouldLatchOnALaterTickWhenTheToolUseHasNotFlushedYet(t *testing.
 		t.Fatalf("a proposal was counted as an outcome: %v", got)
 	}
 
-	if _, err := o.Observe(context.Background(), root, now.Add(8*time.Second)); err != nil {
+	if _, err := o.Observe(context.Background(), root, now.Add(7*time.Second).Add(callLatchConfirmGrace)); err != nil {
 		t.Fatal(err)
 	}
 	prompt = o.Projection(root.Key()).Pending[""]
@@ -159,6 +159,68 @@ func TestPromptShouldLatchOnALaterTickWhenTheToolUseHasNotFlushedYet(t *testing.
 	if got := o.DrainPromptDiagnostics(root.Key()); !slices.Contains(got, DiagnosticCallLatched) {
 		t.Fatalf("latch diagnostics = %v, want the bind counted once", got)
 	}
+}
+
+// The confirmation the proposal exists for is a LATER VIEW of the file, not a
+// second function call. ApplyHook signals the coordinator, so every hook edge
+// from any writer schedules an Observe for this root, and a fanned-out session
+// delivers them in bursts: two reads can land milliseconds apart, inside the
+// 0.5–1.5 s gap between one assistant message's parallel tool_use entries. Both
+// then see the gated call's auto-approved sibling ALONE and agree — for the same
+// wrong reason — and a bind off that agreement is the missed RED the whole
+// two-read rule exists to prevent, because the sibling's own result would clear
+// a prompt nobody answered.
+func TestLatchShouldRefuseAConfirmingReadTakenInsideTheFlushGap(t *testing.T) {
+	o, root, now := newTestObserver(t)
+	defer o.Close()
+	o.ApplyHook(HookSignal{Root: root, Event: "SessionStart", At: now})
+	gatedAt := now.Add(time.Second)
+	o.ApplyHook(HookSignal{
+		Root: root, Event: "PermissionRequest", ToolName: "Bash",
+		ToolInputHash: "run-tests", At: gatedAt,
+	})
+
+	// Only the auto-approved sibling has reached disk; the gated call's own entry
+	// is still inside the message's inter-entry gap.
+	writeToolUseLine(t, root.Transcript, dispatchedFor(gatedAt), "Bash", "toolu_sibling")
+	proposedAt := gatedAt.Add(5 * time.Second)
+	if _, err := o.Observe(context.Background(), root, proposedAt); err != nil {
+		t.Fatal(err)
+	}
+	if prompt := o.Projection(root.Key()).Pending[""]; prompt.Latch != CallLatchProposed {
+		t.Fatalf("first read = %+v, want the sibling only proposed", prompt)
+	}
+
+	// A teammate's hook wakes the coordinator a few milliseconds later. Same file,
+	// same answer, no new evidence.
+	if _, err := o.Observe(context.Background(), root, proposedAt.Add(20*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	prompt := o.Projection(root.Key()).Pending[""]
+	if prompt.Latch != CallLatchProposed || prompt.CallID != "toolu_sibling" {
+		t.Fatalf("burst read = %+v, want the proposal neither confirmed nor withdrawn", prompt)
+	}
+	if got := o.DrainPromptDiagnostics(root.Key()); len(got) != 0 {
+		t.Fatalf("a read inside the grace was counted as an outcome: %v", got)
+	}
+
+	// The gated entry lands before any read the grace allows, so the later read
+	// sees both calls and withdraws the proposal as ambiguous.
+	writeToolUseLine(t, root.Transcript, dispatchedFor(gatedAt), "Bash", "toolu_gated")
+	if _, err := o.Observe(context.Background(), root, proposedAt.Add(callLatchConfirmGrace)); err != nil {
+		t.Fatal(err)
+	}
+	if prompt := o.Projection(root.Key()).Pending[""]; prompt.Latch != CallLatchAmbiguous || prompt.CallID != "" {
+		t.Fatalf("post-grace read = %+v, want the proposal withdrawn as ambiguous", prompt)
+	}
+
+	// The proof that matters: the sibling's own result cannot clear the red.
+	writeToolResultLine(t, root.Transcript, gatedAt.Add(9*time.Second), "toolu_sibling", "ok", false)
+	observation, err := o.Observe(context.Background(), root, gatedAt.Add(10*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSummary(t, observation, gatedAt.Add(10*time.Second), agentgraph.LegacyPermission, agentgraph.AttentionApproval)
 }
 
 // A restored record stands for a writer's residual RED, not for one call: the
@@ -756,10 +818,15 @@ func dispatchedFor(hookAt time.Time) time.Time {
 // the candidate, the second confirms it against a fresh read of the tail
 // (CallLatchProposed). Production pays one extra tick against 45–300 s of
 // measured think-time; a test that wants an identified prompt pays it here.
+// observeUntilLatched runs the two reads a bind needs: one to propose the
+// candidate and one, a full callLatchConfirmGrace later, to confirm it. The
+// spacing is not cosmetic — a confirming read inside that grace is refused,
+// because two reads of the same partial file agree for the same wrong reason
+// (see callLatchConfirmGrace).
 func observeUntilLatched(t *testing.T, o *Observer, root provider.RootRef, at time.Time) {
 	t.Helper()
-	for tick := range 2 {
-		if _, err := o.Observe(context.Background(), root, at.Add(time.Duration(tick)*time.Second)); err != nil {
+	for _, offset := range []time.Duration{0, callLatchConfirmGrace + time.Second} {
+		if _, err := o.Observe(context.Background(), root, at.Add(offset)); err != nil {
 			t.Fatal(err)
 		}
 	}

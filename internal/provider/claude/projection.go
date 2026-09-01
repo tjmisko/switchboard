@@ -37,6 +37,12 @@ type PendingPrompt struct {
 	// is meaningful only while Latch is CallLatchBound.
 	CallID string
 	Latch  CallLatchState
+	// LatchAt is the instant the current latch state was reached. Only the
+	// CallLatchProposed value is read: a proposal may not be confirmed by a read
+	// that lands within callLatchConfirmGrace of it, because two reads inside one
+	// message's flush gap see the same partial file and agreeing about it proves
+	// nothing (see CallLatchProposed).
+	LatchAt time.Time
 	// Residual marks a prompt rebuilt from a persisted block that could carry only
 	// ONE prompt per writer. Such a record stands for a writer's leftover RED rather
 	// than for one call — a writer that went down blocked on three calls comes back
@@ -74,16 +80,23 @@ const (
 	// forever, which is a stale red rather than the missed red a wrong bind buys.
 	CallLatchAmbiguous
 	// CallLatchProposed — one candidate survived this tick, and CallID holds it
-	// pending a SECOND tick that names the same one. It is not an identity yet and
+	// pending a LATER read that names the same one. It is not an identity yet and
 	// nothing may match on it.
 	//
-	// The confirmation exists because a single tick's uniqueness is not evidence
+	// The confirmation exists because a single read's uniqueness is not evidence
 	// of uniqueness. One assistant message's parallel tool_use blocks are separate
-	// JSONL entries written 0.5–1.5 s apart, so a tick landing inside that gap
+	// JSONL entries written 0.5–1.5 s apart, so a read landing inside that gap
 	// sees a gated call's auto-approved sibling ALONE and reads it as unique. A
-	// second tick a whole interval later sees both and refuses. The cost is one
-	// extra tick against 45–300 s of measured think-time; the alternative is a
-	// wrong bind, which is a missed RED.
+	// read taken after the gap sees both and refuses.
+	//
+	// "Later" is wall-clock and not merely "the next call", which is the part that
+	// is easy to get wrong: ApplyHook signals the coordinator, so every hook from
+	// ANY writer schedules an Observe for this root, and a fanned-out session can
+	// deliver two reads milliseconds apart. Two such reads see the same partial
+	// file, so agreement between them is not evidence of anything —
+	// callLatchConfirmGrace is what makes the second read a genuinely later view.
+	// The cost is one extra tick against 45–300 s of measured think-time; the
+	// alternative is a wrong bind, which is a missed RED.
 	CallLatchProposed
 	// CallLatchContested — two writers of one session offered the same call id, so
 	// the id cannot name a writer and no tiebreak has evidence behind it. Terminal
@@ -434,7 +447,7 @@ func restoredPrompt(prompt PendingPrompt, at time.Time, residual bool) PendingPr
 	if prompt.Since.IsZero() {
 		prompt.Since = at
 	}
-	prompt.CallID, prompt.Latch, prompt.Residual = "", CallLatchUnbound, residual
+	prompt.CallID, prompt.Latch, prompt.LatchAt, prompt.Residual = "", CallLatchUnbound, time.Time{}, residual
 	return prompt
 }
 
