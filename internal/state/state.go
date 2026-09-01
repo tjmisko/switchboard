@@ -768,6 +768,10 @@ type Store struct {
 	persistMu      sync.Mutex
 	persistRunning bool
 	persistPending *persistBatch
+	// afterBroadcastUnlock is a deterministic test seam. Production leaves it
+	// nil; ordering tests use it to observe that a generation has been queued and
+	// the live publication lock has actually been released.
+	afterBroadcastUnlock func(uint64)
 }
 
 type persistBatch struct {
@@ -1204,6 +1208,7 @@ func (s *Store) broadcast(snap Snapshot, gen uint64) error {
 		s.frameMu.Unlock()
 		persisted := s.queuePersistence(snap)
 		s.broadcastMu.Unlock()
+		s.didUnlockBroadcast(gen)
 		return <-persisted
 	}
 
@@ -1245,7 +1250,14 @@ func (s *Store) broadcast(snap Snapshot, gen uint64) error {
 	s.mu.RUnlock()
 	persisted := s.queuePersistence(snap)
 	s.broadcastMu.Unlock()
+	s.didUnlockBroadcast(gen)
 	return <-persisted
+}
+
+func (s *Store) didUnlockBroadcast(gen uint64) {
+	if s.afterBroadcastUnlock != nil {
+		s.afterBroadcastUnlock(gen)
+	}
 }
 
 // queuePersistence adopts one full replacement into the ordered disk queue.

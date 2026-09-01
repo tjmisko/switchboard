@@ -25,6 +25,8 @@ func TestBroadcastSerializesPersistenceInGenerationOrder(t *testing.T) {
 	store := New("unused")
 	updates, cancel := store.Subscribe()
 	defer cancel()
+	unlocked := make(chan uint64, 2)
+	store.afterBroadcastUnlock = func(gen uint64) { unlocked <- gen }
 	firstEntered := make(chan struct{})
 	releaseFirst := make(chan struct{})
 	persisted := make(chan int, 2)
@@ -54,15 +56,9 @@ func TestBroadcastSerializesPersistenceInGenerationOrder(t *testing.T) {
 
 	// Disk generation 1 is still blocked, but generation 2 must already be the
 	// live frame: persistence ordering must not enter the semantic-delivery path.
-	deadline := time.After(time.Second)
-	seenNewer := false
-	for !seenNewer {
-		select {
-		case update := <-updates:
-			seenNewer = update.Snapshot.Sessions[0].PID == 2
-		case <-deadline:
-			t.Fatal("newer live frame blocked behind older persistence")
-		}
+	waitForUnlockedGeneration(t, unlocked, 2)
+	if got := (<-updates).Snapshot.Sessions[0].PID; got != 2 {
+		t.Fatalf("live frame PID = %d, want newest 2", got)
 	}
 	if !store.broadcastMu.TryLock() {
 		close(releaseFirst)
@@ -82,8 +78,8 @@ func TestBroadcastSerializesPersistenceInGenerationOrder(t *testing.T) {
 
 func TestPersistenceCoalescesQueuedFullReplacementsToNewest(t *testing.T) {
 	store := New("unused")
-	updates, cancel := store.Subscribe()
-	defer cancel()
+	unlocked := make(chan uint64, 3)
+	store.afterBroadcastUnlock = func(gen uint64) { unlocked <- gen }
 	firstEntered := make(chan struct{})
 	releaseFirst := make(chan struct{})
 	persisted := make(chan int, 3)
@@ -104,9 +100,9 @@ func TestPersistenceCoalescesQueuedFullReplacementsToNewest(t *testing.T) {
 	go func() { _ = store.broadcast(snapshotWithPID(1), 1); close(done[0]) }()
 	<-firstEntered
 	go func() { _ = store.broadcast(snapshotWithPID(2), 2); close(done[1]) }()
-	waitForBroadcastPID(t, updates, 2)
+	waitForUnlockedGeneration(t, unlocked, 2)
 	go func() { _ = store.broadcast(snapshotWithPID(3), 3); close(done[2]) }()
-	waitForBroadcastPID(t, updates, 3)
+	waitForUnlockedGeneration(t, unlocked, 3)
 	close(releaseFirst)
 	for _, ch := range done {
 		<-ch
@@ -124,17 +120,17 @@ func snapshotWithPID(pid int) Snapshot {
 	return Snapshot{Sessions: []Session{{PID: pid, StartedAt: time.Unix(int64(pid), 0)}}}
 }
 
-func waitForBroadcastPID(t *testing.T, updates <-chan Broadcast, want int) {
+func waitForUnlockedGeneration(t *testing.T, unlocked <-chan uint64, want uint64) {
 	t.Helper()
 	deadline := time.After(time.Second)
 	for {
 		select {
-		case update := <-updates:
-			if update.Snapshot.Sessions[0].PID == want {
+		case gen := <-unlocked:
+			if gen == want {
 				return
 			}
 		case <-deadline:
-			t.Fatalf("timed out waiting for live PID %d", want)
+			t.Fatalf("timed out waiting for unlocked generation %d", want)
 		}
 	}
 }
