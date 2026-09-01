@@ -741,10 +741,10 @@ type Store struct {
 	// without clobbering one a later Apply made in the meantime. See
 	// invalidatePublished.
 	publishedGen uint64
-	// broadcastGen serializes every post-unlock publication side effect by the
-	// Apply generation. Two concurrent Apply calls may arrive out of order; an
-	// older one must never overwrite either the latest subscriber frame or the
-	// newer state.json mirror.
+	// broadcastGen serializes live frame adoption/fanout and ordered persistence
+	// enqueueing by Apply generation. Two concurrent Apply calls may arrive out
+	// of order; an older one must never replace the latest subscriber frame or be
+	// queued behind a newer state.json replacement.
 	broadcastMu  sync.Mutex
 	broadcastGen uint64
 	// frameMu guards lastBroadcast independently of the store and publish-stats
@@ -759,6 +759,20 @@ type Store struct {
 	// persistSnapshot is the ordered state.json writer. It is a seam only so the
 	// generation-order test can pause one write deterministically.
 	persistSnapshot func(Snapshot) error
+	// persistMu protects a latest-wins persistence batch. Publication queues its
+	// full replacement while holding broadcastMu, then releases the publication
+	// sequencer before waiting for disk. One short-lived worker writes batches in
+	// order; concurrent generations which accumulate behind an active write are
+	// collapsed to the newest full snapshot, whose completion satisfies every
+	// older waiter in that batch.
+	persistMu      sync.Mutex
+	persistRunning bool
+	persistPending *persistBatch
+}
+
+type persistBatch struct {
+	snapshot Snapshot
+	waiters  []chan error
 }
 
 func New(statePath string) *Store {
@@ -855,10 +869,10 @@ func (s *Store) Apply(fn func(map[int]*Session)) {
 // It deliberately runs under the SAME write lock as the mutation that produced
 // snap. That is what makes suppression safe: the reference advances in mutation
 // order, so a change can never be compared against a reference stamped by a
-// LATER mutation and dropped as a no-op. Broadcast generation ordering is
-// serialized separately after the unlock together with persistence. The cost is
-// one encode inside the write lock, which is microseconds against the
-// milliseconds of terminal/WM I/O the reconciler used to hold it for.
+// LATER mutation and dropped as a no-op. Live broadcast generation ordering and
+// persistence enqueueing are serialized separately after the unlock; disk I/O
+// is not. The cost is one encode inside the write lock, which is microseconds
+// against the milliseconds of terminal/WM I/O the reconciler used to hold it for.
 func (s *Store) adoptPublishedLocked(snap Snapshot) (gen uint64, changed bool) {
 	key := SnapshotChangeKey(snap)
 	if key != nil && bytes.Equal(key, s.publishedKey) {
@@ -1172,8 +1186,8 @@ func (s *Store) Subscribe() (<-chan Broadcast, func()) {
 
 func (s *Store) broadcast(snap Snapshot, gen uint64) error {
 	s.broadcastMu.Lock()
-	defer s.broadcastMu.Unlock()
 	if gen <= s.broadcastGen {
+		s.broadcastMu.Unlock()
 		return nil
 	}
 	s.broadcastGen = gen
@@ -1188,7 +1202,9 @@ func (s *Store) broadcast(snap Snapshot, gen uint64) error {
 		s.frameMu.Lock()
 		s.lastBroadcast = nil
 		s.frameMu.Unlock()
-		return s.persistSnapshot(snap)
+		persisted := s.queuePersistence(snap)
+		s.broadcastMu.Unlock()
+		return <-persisted
 	}
 
 	// Encode OUTSIDE the lock, once, for everyone. Holding RLock across the encode
@@ -1227,7 +1243,50 @@ func (s *Store) broadcast(snap Snapshot, gen uint64) error {
 		}
 	}
 	s.mu.RUnlock()
-	return s.persistSnapshot(snap)
+	persisted := s.queuePersistence(snap)
+	s.broadcastMu.Unlock()
+	return <-persisted
+}
+
+// queuePersistence adopts one full replacement into the ordered disk queue.
+// Callers invoke it while holding broadcastMu, so pending snapshots can only
+// move forward. It returns immediately; waiting happens after broadcastMu is
+// released, keeping a slow filesystem out of the live publication path.
+func (s *Store) queuePersistence(snap Snapshot) <-chan error {
+	done := make(chan error, 1)
+	s.persistMu.Lock()
+	if s.persistPending == nil {
+		s.persistPending = &persistBatch{snapshot: snap}
+	} else {
+		s.persistPending.snapshot = snap
+	}
+	s.persistPending.waiters = append(s.persistPending.waiters, done)
+	if !s.persistRunning {
+		s.persistRunning = true
+		go s.runPersistence()
+	}
+	s.persistMu.Unlock()
+	return done
+}
+
+func (s *Store) runPersistence() {
+	for {
+		s.persistMu.Lock()
+		batch := s.persistPending
+		if batch == nil {
+			s.persistRunning = false
+			s.persistMu.Unlock()
+			return
+		}
+		s.persistPending = nil
+		s.persistMu.Unlock()
+
+		err := s.persistSnapshot(batch.snapshot)
+		for _, waiter := range batch.waiters {
+			waiter <- err
+			close(waiter)
+		}
+	}
 }
 
 // CurrentBroadcast returns the latest published frame. When no cached frame is
