@@ -44,17 +44,17 @@ func TestBroadcastSerializesPersistenceInGenerationOrder(t *testing.T) {
 		close(firstDone)
 	}()
 	<-firstEntered
+	if store.broadcastMu.TryLock() {
+		store.broadcastMu.Unlock()
+		close(releaseFirst)
+		<-firstDone
+		t.Fatal("publication sequencer was released while the older persistence was still in flight")
+	}
 	secondDone := make(chan struct{})
 	go func() {
 		_ = store.broadcast(newer, 2)
 		close(secondDone)
 	}()
-
-	select {
-	case <-secondDone:
-		t.Fatal("newer generation persisted while the older publication was still in flight")
-	case <-time.After(20 * time.Millisecond):
-	}
 	close(releaseFirst)
 	<-firstDone
 	<-secondDone
