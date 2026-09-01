@@ -86,6 +86,15 @@ func TestDeploy_shouldPublishStableCommandLinksWithAnOverride(t *testing.T) {
 	}
 }
 
+// Deployment cleanup is recursive by necessity, but it must never use the
+// force-recursive spelling forbidden by the repository's standing safety
+// policy. The script validates its exact stage/release child before `rm -r`.
+func TestDeploy_shouldNeverForceRecursivelyRemoveAPath(t *testing.T) {
+	if strings.Contains(readDeploy(t), "rm -rf") {
+		t.Fatal("scripts/deploy must not invoke rm -rf")
+	}
+}
+
 // An interactive CDPATH makes bash's `cd` echo the directory it resolved, and
 // makes a relative operand resolve against a foreign tree first. The script
 // derives script_dir and repo_dir with $(cd … && pwd), so an inherited CDPATH

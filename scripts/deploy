@@ -78,7 +78,17 @@ die() {
 
 cleanup_stage() {
 	if [ -n "$stage_dir" ] && [ -d "$stage_dir" ]; then
-		rm -rf "$stage_dir"
+		case "$stage_dir" in
+		"$releases_dir"/.stage.*)
+			# This directory was created by build_release with mktemp under the
+			# release root. Keep cleanup narrowly scoped and avoid force-removing
+			# an unresolved or unexpectedly broad path.
+			rm -r -- "$stage_dir"
+			;;
+		*)
+			warn "deploy: refusing to clean unexpected stage path: $stage_dir"
+			;;
+		esac
 	fi
 }
 trap cleanup_stage EXIT
@@ -427,7 +437,14 @@ prune_releases() {
 			continue
 		fi
 		log "  pruning old release $dir"
-		run rm -rf "${releases_dir:?}/$dir"
+		# `dir` comes from a direct child listing, but validate it again at the
+		# destructive boundary. Never recurse through a slash-bearing or hidden
+		# name, and never remove the release selected by `current`.
+		case "$dir" in
+		'' | .* | */*) die "refusing to prune unexpected release name: $dir" ;;
+		esac
+		[ "$releases_dir/$dir" != "$current" ] || die "refusing to prune current release: $dir"
+		run rm -r -- "$releases_dir/$dir"
 	done < <(ls -1t "$releases_dir" 2>/dev/null || true)
 }
 
