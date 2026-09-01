@@ -244,7 +244,7 @@ switchboard-ctl focus pid:<n>                   # PID, if unique across hosts
 switchboard-ctl focus idx:<n>                   # Nth aggregate session
 switchboard-ctl focus host:<host>:pid:<n>        # exact host namespace
 switchboard-ctl cycle next|prev     # focus next/prev session, wrapping
-switchboard-ctl attention           # cycle the most urgent color and at most one layer above it; red excludes green
+switchboard-ctl attention           # jump to the most urgent color; only toggle one layer up when already there
 switchboard-ctl pick                # exact-token<TAB>label<TAB>ws<TAB>cwd (for fzf)
 switchboard-ctl diagnose --observer # content-free binding/freshness/graph health
 ```

@@ -129,6 +129,16 @@ func TestNextAttentionTarget(t *testing.T) {
 			wantPID:  2,
 		},
 		{
+			name:     "should jump from the first of several idle sessions to permission",
+			sessions: []state.Session{sess(1, "permission"), focusedSess(2, "idle"), sess(3, "idle")},
+			wantPID:  1,
+		},
+		{
+			name:     "should jump from the last of several idle sessions to permission",
+			sessions: []state.Session{sess(1, "permission"), sess(2, "idle"), focusedSess(3, "idle")},
+			wantPID:  1,
+		},
+		{
 			name:     "should jump to the only idle session when no permission exists",
 			sessions: []state.Session{sess(1, "working"), sess(2, "idle"), sess(3, "working")},
 			wantPID:  2,
@@ -160,10 +170,10 @@ func TestNextAttentionTarget(t *testing.T) {
 			wantPID:  2,
 		},
 		{
-			// C2: the last member of a tier pops out instead of wrapping inside it.
-			name:     "should pop out to the idle tier from the last red of several",
+			// Equal-urgency peers take precedence over relaxing to orange.
+			name:     "should wrap within permission before toggling to idle",
 			sessions: []state.Session{sess(1, "permission"), focusedSess(2, "permission"), sess(3, "idle")},
-			wantPID:  3,
+			wantPID:  1,
 		},
 		{
 			name:     "should wrap from the last green back to the first red",
@@ -267,7 +277,7 @@ func TestAttentionRingOrdersPermissionThenIdleThenGreenInSnapshotOrder(t *testin
 	}
 }
 
-func TestNextAttentionTargetVisitsEveryRingMemberOncePerLap(t *testing.T) {
+func TestNextAttentionTargetSingletonUrgentTogglesOneLayerAndBack(t *testing.T) {
 	sessions := []state.Session{
 		focusedSess(1, "permission"),
 		sess(2, "idle"),
@@ -291,8 +301,8 @@ func TestNextAttentionTargetVisitsEveryRingMemberOncePerLap(t *testing.T) {
 		target.Focused = true
 		visited = append(visited, target.PID)
 	}
-	// Red bounds this snapshot to the red and orange tiers. One lap visits both
-	// allowed members and returns home; green/delegating remain outside it.
+	// A singleton red may toggle one layer to orange; the next press returns to
+	// red. Green/delegating remain outside the bounded candidates.
 	want := []int{1, 2, 1}
 	if len(visited) != len(want) {
 		t.Fatalf("visited = %v, want %v", visited, want)
@@ -318,6 +328,28 @@ func TestNextAttentionTargetNeverClimbsMoreThanOneLayer(t *testing.T) {
 		}
 		if target.PID != wantPID {
 			t.Fatalf("press %d targeted pid %d, want pid %d; the green tier must stay unreachable while red exists", press+1, target.PID, wantPID)
+		}
+		for i := range sessions {
+			sessions[i].Focused = sessions[i].PID == target.PID
+		}
+	}
+}
+
+func TestNextAttentionTargetAlwaysReturnsFromMultipleOrangeSessionsToRed(t *testing.T) {
+	sessions := []state.Session{
+		sess(1, "permission"),
+		sess(2, "idle"),
+		focusedSess(3, "idle"),
+		sess(4, "working"),
+	}
+
+	for press, wantPID := range []int{1, 2, 1, 2, 1, 2} {
+		target := nextAttentionTarget(sessions)
+		if target == nil {
+			t.Fatalf("press %d returned nil, want pid %d", press+1, wantPID)
+		}
+		if target.PID != wantPID {
+			t.Fatalf("press %d targeted pid %d, want pid %d; less-urgent focus must return directly to red", press+1, target.PID, wantPID)
 		}
 		for i := range sessions {
 			sessions[i].Focused = sessions[i].PID == target.PID

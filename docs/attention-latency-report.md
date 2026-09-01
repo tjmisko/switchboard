@@ -313,11 +313,12 @@ truthful as they are today. It decouples the navigation predicate from the
 color, which is the actual conflation behind the complaint.
 
 The sketch below was "first tier containing a non-focused member." It is
-superseded by the **bounded ring**: walk the most urgent populated tier and at
-most the adjacent color above it, skipping every focused session and wrapping
-inside that bound. Thus red permits orange but excludes green; repeated presses
-cannot use orange as a staircase to green. The ring also fixes the `delegating`
-denominator bug, which was a second, independent dead key. See
+superseded by the **urgency-first bounded ring**: a press from any less-urgent
+tier jumps to the most urgent populated tier. Once there, it cycles available
+peers at that urgency and may toggle at most one adjacent color above it. Thus
+orange always returns to red while any red exists, and can never become a
+staircase to green. The ring also fixes the `delegating` denominator bug, which
+was a second, independent dead key. See
 [attention-ring-plan.md](attention-ring-plan.md) for the current rule and its
 regression matrix.
 
