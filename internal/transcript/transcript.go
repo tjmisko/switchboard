@@ -159,6 +159,12 @@ type entry struct {
 		// user/system entries.
 		StopReason string `json:"stop_reason"`
 	} `json:"message"`
+	// ToolUseResult and ToolDenialKind sit BESIDE message on the user entry that
+	// carries a tool_result. They are what separates a user rejection from an
+	// ordinary approved-then-failed tool, which the tool_result block itself does
+	// not (both set is_error). See declinedResult.
+	ToolUseResult  json.RawMessage `json:"toolUseResult"`
+	ToolDenialKind string          `json:"toolDenialKind"`
 }
 
 type block struct {
@@ -171,6 +177,11 @@ type block struct {
 	Name      string `json:"name"`
 	ID        string `json:"id"`
 	ToolUseID string `json:"tool_use_id"`
+	// IsError marks a tool_result that reports a failure. It is deliberately NOT
+	// read as "the user declined" on its own — see declinedResult, where the
+	// measured corpus shows an ordinary approved-then-failed tool ("Error: Exit
+	// code 1") carries it just as a rejection does.
+	IsError bool `json:"is_error"`
 	// Content is a tool_result's payload, kept raw because Claude Code writes it
 	// either as a bare string or as an array of typed blocks. resultText()
 	// reconciles both; it is what isLaunchAck reads to tell a subagent's spawn
@@ -429,6 +440,12 @@ const (
 	// the prompt declined with no continuation, returning control to the user. The
 	// chip should exit to idle (orange).
 	ResolutionInterrupted
+	// ResolutionDeclined — the tool_result answering THIS EXACT call says the user
+	// rejected it (see declinedResult). Reachable only through ResolveKindFor with
+	// a call id, so no caller of the timestamp-scoped rules can ever see it. Like
+	// an interrupt it returns control to the user, so the chip exits to idle
+	// (orange) rather than to working.
+	ResolutionDeclined
 )
 
 func (k ResolutionKind) String() string {
@@ -437,6 +454,8 @@ func (k ResolutionKind) String() string {
 		return "resumed"
 	case ResolutionInterrupted:
 		return "interrupted"
+	case ResolutionDeclined:
+		return "declined"
 	default:
 		return "none"
 	}
@@ -459,9 +478,40 @@ func (k ResolutionKind) String() string {
 //   - (ResolutionNone, err) — the file is missing/unreadable; the caller should
 //     apply its TTL backstop.
 func ResolveKind(path string, since time.Time, maxBytes int64) (ResolutionKind, error) {
+	return ResolveKindFor(path, since, "", maxBytes)
+}
+
+// ResolveKindFor is ResolveKind with an optional exact call identity. An empty
+// callID makes it ResolveKind verbatim — that is how every timestamp-scoped
+// caller keeps its behaviour unchanged — and a non-empty one adds ONE rule
+// ahead of the timestamp scan: the user `tool_result` whose `tool_use_id` is
+// callID is DECISIVE about that call.
+//
+// It is decisive because it is the only evidence in the file that names the
+// call rather than the file. The bare-`tool_result` rule this package rejects
+// (see ResolveKind) fails on concurrency — a sibling auto-approved tool or a
+// background teammate flushes results while the prompt still waits — and the id
+// is exactly what removes that confound: a sibling's result carries a different
+// id, and a teammate's is in a different file. It is therefore strictly narrower
+// than the rejected rule, not a re-litigation of it
+// (askuserquestion-model-plan.md §1).
+//
+// The id rule is deliberately NOT gated on `since`. A call id is only ever bound
+// to a tool_use that was UNMATCHED when it was bound (see PendingCall), so a
+// result carrying that id cannot predate the prompt however the two clocks skew
+// — and the H8 flush lag that makes timestamp comparisons delicate here has no
+// purchase on an identity.
+//
+// The kind is ResolutionDeclined when the user rejected the call and
+// ResolutionResumed otherwise, including when the tool ran and failed:
+// declinedResult explains why `is_error` alone cannot make that call.
+func ResolveKindFor(path string, since time.Time, callID string, maxBytes int64) (ResolutionKind, error) {
 	entries, err := readTailEntries(path, maxBytes)
 	if err != nil {
 		return ResolutionNone, err
+	}
+	if kind, ok := callResolution(entries, callID); ok {
+		return kind, nil
 	}
 
 	var newest time.Time
@@ -485,6 +535,68 @@ func ResolveKind(path string, since time.Time, maxBytes int64) (ResolutionKind, 
 		return kind, nil
 	}
 	return ResolutionNone, nil
+}
+
+// callResolution finds the user tool_result that answers callID and says how it
+// went, or reports !ok when the call has no result in the window yet (which is
+// the normal state of a prompt still waiting). An empty callID is never a match:
+// an unlatched prompt must fall through to the timestamp rules.
+func callResolution(entries []entry, callID string) (ResolutionKind, bool) {
+	if callID == "" {
+		return ResolutionNone, false
+	}
+	for _, e := range entries {
+		if e.Message.Role != "user" {
+			continue
+		}
+		for _, b := range e.blocks() {
+			if b.Type != "tool_result" || b.ToolUseID != callID {
+				continue
+			}
+			if declinedResult(e, b) {
+				return ResolutionDeclined, true
+			}
+			return ResolutionResumed, true
+		}
+	}
+	return ResolutionNone, false
+}
+
+// userRejectedResult is the exact string Claude Code writes to the entry-level
+// `toolUseResult` when the human declines a permission prompt, and
+// userRejectedDenialKind the matching `toolDenialKind`. Both are checked because
+// either could drift; they are read together with the block's is_error so a
+// future rename of one field cannot silently turn every decline into a resume.
+const (
+	userRejectedResult     = "User rejected tool use"
+	userRejectedDenialKind = "user-rejected"
+)
+
+// declinedResult reports whether an id-matched tool_result means the USER
+// rejected the call, as opposed to the call running and failing.
+//
+// `is_error` alone cannot answer this, and reading it as "declined" would be
+// wrong far more often than right. Measured over the transcripts on this machine
+// (2026-08-31): 218 error results carry a denial kind, of which only 14 are
+// `user-rejected` — the other 204 are auto-denials by a permission rule or the
+// auto-mode classifier, which raise no prompt at all — while several hundred
+// more are ordinary approved-then-failed tools ("Error: Exit code 1"). Those all
+// resumed the turn; only the user's own rejection returned control to the user.
+//
+// So is_error is kept as a NECESSARY condition (every rejection sets it) and the
+// entry-level fields decide, either of which is sufficient on its own.
+func declinedResult(e entry, b block) bool {
+	if !b.IsError {
+		return false
+	}
+	if e.ToolDenialKind == userRejectedDenialKind {
+		return true
+	}
+	var summary string
+	if json.Unmarshal(e.ToolUseResult, &summary) != nil {
+		return false
+	}
+	return strings.HasPrefix(summary, userRejectedResult)
 }
 
 // resolutionKindOf maps an entry to the resolution it represents: an assistant
@@ -605,6 +717,68 @@ func BlockedByPendingTool(path string, maxBytes int64) (BlockedEvidence, error) 
 		}
 	}
 	return BlockedNo, nil
+}
+
+// PendingCall returns the ids of every `toolName` tool_use in the writer's OWN
+// transcript tail that has no `tool_result` yet, in file order. Pass the
+// writer's own file — SubagentPath(mainTranscript, agentID) — exactly as
+// BlockedByPendingTool requires, and for the same reason: a subagent-raised call
+// leaves the parent tail fully matched.
+//
+// It exists so a permission prompt can lazily LATCH the identity of the call it
+// gates. The hook cannot supply it — PermissionRequest carries no tool_use_id
+// (docs/claude-code-hook-schema.md §2) — but the pending tool_use lands on disk
+// within ~5 s of the hook and stays unmatched for the whole wait
+// (docs/subagent-permission-plan.md §9.7, V4), which is early enough against a
+// measured 45–300 s of user think-time.
+//
+// It returns EVERY unmatched candidate rather than picking one, because the
+// caller's safe rule needs the count: a single candidate is the call, two or
+// more are indistinguishable and must stay unbound. Binding the wrong id would
+// be a missed RED — the sibling call's own result would then clear a prompt
+// nobody answered — which is the error class this whole model is built to avoid,
+// so the ambiguity has to reach the caller instead of being resolved here by a
+// tiebreak that has no evidence behind it.
+//
+// A missing/unreadable file returns (nil, err); the caller keeps waiting.
+func PendingCall(path, toolName string, maxBytes int64) ([]string, error) {
+	if toolName == "" {
+		return nil, nil
+	}
+	entries, err := readTailEntries(path, maxBytes)
+	if err != nil {
+		return nil, err
+	}
+	// Both sides are collected over the WHOLE window before pairing, for
+	// BlockedByPendingTool's reason: parallel dispatch means a result can sit
+	// between two tool_use blocks, so anything deciding as it scans answers a
+	// different question. `answered` is NOT filtered by tool name — a result
+	// names only the id it answers.
+	var dispatched []string
+	seen := map[string]bool{}
+	answered := map[string]bool{}
+	for _, e := range entries {
+		for _, b := range e.blocks() {
+			switch b.Type {
+			case "tool_use":
+				if b.Name == toolName && b.ID != "" && !seen[b.ID] {
+					seen[b.ID] = true
+					dispatched = append(dispatched, b.ID)
+				}
+			case "tool_result":
+				if b.ToolUseID != "" {
+					answered[b.ToolUseID] = true
+				}
+			}
+		}
+	}
+	var pending []string
+	for _, id := range dispatched {
+		if !answered[id] {
+			pending = append(pending, id)
+		}
+	}
+	return pending, nil
 }
 
 // taskToolNames are the tool_use names whose invocation spawns a subagent. Work

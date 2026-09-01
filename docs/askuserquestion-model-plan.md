@@ -482,6 +482,73 @@ and buying seconds of staleness with a possible missed RED is the wrong directio
 `request_user_input` and the whole question path are byte-identical — no reducer,
 matcher, key or predicate was touched — and every Phase 1 test passes unmodified.
 
+### 4c. Addendum — what Phase 4 landed (steps 6–10)
+
+Step 11 was **not** attempted; it is the state-schema change and stays open, with
+step 7's latch refusing to bind a restored prompt exactly as §4 requires
+(`PendingPrompt.Restored`, pinned by `TestRestoredPromptShouldNeverBindACallID`).
+
+**D4 — step 10 is wrong about `is_error`, and the corpus says so.** The plan (and
+[attention-latency-report.md](attention-latency-report.md), and
+[status-color-state-model.md](status-color-state-model.md) §A3) says to decline on
+"`is_error` / `"User rejected tool use"`". Measured over `~/.claude/projects` on
+2026-08-31, `is_error` alone is not that signal and is not close: 218 error results
+carry a `toolDenialKind`, of which only **14 are `user-rejected`** — the other 204
+are auto-denials by a permission rule or the auto-mode classifier, which raise no
+prompt at all — and several hundred more error results are ordinary
+approved-then-failed tools (`"Error: Exit code 1"`, 132 occurrences of that exact
+string alone). All of those resumed the turn. Reading `is_error` as a decline would
+send a working session to orange on every failing command.
+
+So `is_error` landed as a **necessary** condition and the entry-level fields decide:
+`toolDenialKind == "user-rejected"` or a `toolUseResult` string beginning
+`"User rejected tool use"`, either sufficient. All three co-occur 14/14 in the
+corpus, so checking two of them is redundancy against field drift rather than a
+guess. Note this is an exit-colour error class, not a red-correctness one — both
+kinds clear the red — which is why it was safe to correct rather than escalate.
+
+**P3 passes, so step 9's floor is lifted — for id-matched clears only.** Measured
+over the same corpus: 2361 sessions, 3963 transcript files, 99,893 distinct
+`tool_use` ids, 61 sessions with more than one writer. **Exactly one** intra-session
+id is claimed by two writers, and it is not a reuse: a subagent's own file opens
+with a copy of the parent's launching `Agent` `tool_use`, so that id appears in
+both files. It is **matched in both** (each carries its own spawn ack), so
+`PendingCall` never offers it as a candidate. (839 ids are shared *across*
+sessions — two main threads of a resumed/forked conversation — which the floor,
+scoped to one `rootState`, never sees.) Both halves are pinned:
+`TestNoCallIDShouldBeClaimedByTwoWritersAcrossOneSession` builds that exact spawn
+echo, and `TestLatchShouldRefuseAndCountACallIDTwoWritersClaim` shows the latch
+refusing and counting the id if the uniqueness ever does fail. Shape matches keep
+the floor — `TestIDMatchedClearShouldLiftTheFanoutFloorWhileAShapeMatchStillHolds`
+pins both directions in one test.
+
+**Two things the plan did not name and the code needed.**
+
+- *The latch binds only when the writer has ONE unbound prompt of that tool AND
+  its file ONE unmatched call of it.* The plan's rule was the second conjunct
+  alone. Without the first, a writer holding two same-tool prompts against a tail
+  that shows one unmatched call binds that id to **both** — one completion then
+  closes two prompts, which is the missed RED the ambiguity rule exists to
+  prevent.
+- *Dedupe had to move from the whole struct to a `promptIdentity`.* A prompt
+  accumulates latch state the hook cannot carry, so `slices.Contains` stopped
+  recognizing a prompt the moment it bound an id, and a redelivered
+  `PermissionRequest` would have opened a second red nothing could clear. The
+  same identity addresses the prompt across the Observe merge, where an index
+  would be stale.
+
+**Ambiguity is terminal, and is measured rather than assumed.** `prompt_call_latched`
+/ `prompt_call_ambiguous` / `prompt_call_id_collision` are drained onto the
+diagnostic table each `Observe` (`switchboard-ctl n`), so the reachability of the
+fast path is a number rather than a hope. A prompt that reads ambiguous stays on
+the `(tool, hash)` rule forever: the candidate set shrinks as siblings complete,
+but nothing records *which* one shrank, so a later unique read is exactly as
+likely to name the sibling.
+
+**Phase 3's U2 is still open and is now slightly more visible.** A held red can be
+`writer_call_mismatch_held` — "I know which call you finished, and it is not the
+one you are waiting on" — but no user-facing surface renders it, for U2's reason.
+
 ---
 
 ## 5. The probes that settle what nobody established

@@ -19,11 +19,71 @@ const PendingWriterMain = "main"
 // parallel gated calls — so the writer routes evidence while the individual
 // call closes the prompt. Correlators remain in-memory compatibility state and
 // never enter the neutral graph.
+//
+// The first four fields are the prompt's IDENTITY: they are exactly what the
+// PermissionRequest edge carried, and promptIdentity compares them. The latch
+// fields below are learned later, from the writer's own transcript, and are
+// deliberately NOT part of that identity — a prompt that has since bound its
+// call id is still the same prompt, so a verbatim hook redelivery must dedupe
+// against it and the Observe merge must still recognize it.
 type PendingPrompt struct {
 	Tool      string
 	InputHash string
 	Attention agentgraph.AttentionState
 	Since     time.Time
+
+	// CallID is Claude Code's exact identity for the gated call, latched lazily
+	// on an Observe tick (PendingCall) because PermissionRequest carries none. It
+	// is meaningful only while Latch is CallLatchBound.
+	CallID string
+	Latch  CallLatchState
+	// Restored marks a prompt rebuilt from the persisted legacy block rather than
+	// opened by a hook. Such a record stands for a writer's residual RED, not for
+	// one call — the block carries one prompt per writer, so a writer that went
+	// down blocked on three calls comes back holding one (see restoredPending).
+	// Binding a call id to it would let that one id clear a red three real calls
+	// are still holding, so the latch refuses. It clears when the schema persists
+	// the set instead of the scalar (plan Phase 4 step 11).
+	Restored bool
+}
+
+// CallLatchState is how far the lazy call-identity latch has got with one
+// prompt. It is tracked explicitly rather than inferred from an empty CallID
+// because "no id yet, look again next tick" and "this prompt can never be
+// identified" are different states with opposite retry behaviour, and folding
+// both onto "" would either re-read an ambiguous tail forever or stop retrying a
+// prompt whose tool_use simply had not flushed yet.
+type CallLatchState uint8
+
+const (
+	// CallLatchUnbound — no id yet. The writer's tail has not shown exactly one
+	// unmatched tool_use of this prompt's tool, usually because the ~5 s flush has
+	// not landed. Retried on every Observe tick.
+	CallLatchUnbound CallLatchState = iota
+	// CallLatchBound — CallID names the exact call this prompt gates.
+	CallLatchBound
+	// CallLatchAmbiguous — the writer's tail held two or more unmatched calls of
+	// this tool, so nothing in the file distinguishes this prompt's from a
+	// sibling's. Terminal: the candidate set shrinks as siblings complete, but
+	// nothing records WHICH one shrank, so a later unique read is exactly as
+	// likely to name the sibling. The prompt falls back to the (tool, hash) rule
+	// forever, which is a stale red rather than the missed red a wrong bind buys.
+	CallLatchAmbiguous
+)
+
+// promptIdentity is the hook-derived identity of a prompt — what the
+// PermissionRequest edge itself carried, and nothing learned since. Two prompts
+// of one writer can never share it: openPendingPrompt dedupes on exactly these
+// fields, so it addresses a single record within a writer's open set.
+type promptIdentity struct {
+	Tool      string
+	InputHash string
+	Attention agentgraph.AttentionState
+	Since     time.Time
+}
+
+func (p PendingPrompt) identity() promptIdentity {
+	return promptIdentity{Tool: p.Tool, InputHash: p.InputHash, Attention: p.Attention, Since: p.Since}
 }
 
 // DrainLegacyEvents returns and forgets the exact-once Claude fanout/workflow
@@ -59,6 +119,25 @@ func (o *Observer) DrainResolutionRule(key provider.RootKey) string {
 	rule := rs.resolvedRule
 	rs.resolvedRule = ""
 	return rule
+}
+
+// DrainPromptDiagnostics returns and forgets the bounded, content-free
+// diagnostic categories the most recent Observe calls for key produced while
+// latching call identity. Drained rather than read for DrainResolutionRule's
+// reason: a counter that is read twice reports an event that happened once, and
+// these exist to be counted honestly — they are how anyone can tell whether the
+// id fast path is reachable in practice, and whether the uniqueness the lifted
+// fanout floor rests on ever fails (P3, askuserquestion-model-plan.md §5).
+func (o *Observer) DrainPromptDiagnostics(key provider.RootKey) []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	rs := o.roots[key]
+	if o.closed || rs == nil || len(rs.promptDiagnostics) == 0 {
+		return nil
+	}
+	categories := rs.promptDiagnostics
+	rs.promptDiagnostics = nil
+	return categories
 }
 
 // Compatibility contains the legacy fields C5/C6 must continue projecting
@@ -259,6 +338,7 @@ func restoredPending(restored Compatibility, at time.Time) map[string][]PendingP
 		if prompt.Since.IsZero() {
 			prompt.Since = at
 		}
+		prompt.CallID, prompt.Latch, prompt.Restored = "", CallLatchUnbound, true
 		pending[writer] = []PendingPrompt{prompt}
 	}
 	return pending

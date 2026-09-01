@@ -111,6 +111,26 @@ const (
 	// the pending tool with a compatible correlator, so exactly that one prompt
 	// closed. The writer's other open calls survive it.
 	RuleGraphToolMatchCleared = "writer_tool_match_cleared"
+	// RuleGraphCallMatchCleared — a PostToolUse named the EXACT call a prompt was
+	// gating, so that one prompt closed at hook speed. The narrower sibling of
+	// writer_tool_match_cleared: identity rather than shape, which is what lets it
+	// clear a call whose input was rewritten between the prompt and the completion
+	// (AskUserQuestion, every time) and what lets it skip the fanout floor.
+	RuleGraphCallMatchCleared = "writer_call_match_cleared"
+	// RuleGraphCallMismatchHeld — the event named a call, the writer holds a prompt
+	// that names a DIFFERENT one, and no other prompt matched. Unlike a hash
+	// mismatch this is a real negative rather than an ambiguity: the two ids say
+	// outright that this completion is not the awaited call.
+	RuleGraphCallMismatchHeld = "writer_call_mismatch_held"
+	// RuleGraphCallResolved — Observe-tick exit: the tool_result answering a
+	// prompt's own latched call landed clean, so that prompt closed even though no
+	// PostToolUse hook arrived.
+	RuleGraphCallResolved = "writer_call_resolved"
+	// RuleGraphCallDeclined — Observe-tick exit: the tool_result answering a
+	// prompt's own latched call says the user rejected it. Control returned to the
+	// user, so the chip exits to idle rather than working.
+	RuleGraphCallDeclined = "writer_call_declined"
+
 	// RuleGraphPromptHeld — the writer that fired the event holds an open prompt
 	// the event did not resolve: a different call, a rewritten input hash, or the
 	// main thread with teammates in flight (the fanout floor). The graph's
@@ -203,6 +223,10 @@ var ruleKnobs = map[string]KnobHint{
 	RuleGraphAuthority:          {"", "no rule was attributed to this edge, so there is nothing specific to tune. A Codex transition always reads this (that provider has no rule vocabulary yet), and so does a restore or a Claude edge that came from fanout topology rather than a prompt. On a Claude PROMPT edge it now means a rule was lost on the way to the record — that is a bug in the threading, not a knob"},
 	RuleGraphPermissionRecorded: {"", "not tunable, and deliberately unconditional: a PermissionRequest is the agent telling you it is blocked, so the red opens on the hook with no policy in between. What it opens is one prompt per CALL, so a writer with parallel gated calls holds several and the chip leaves red only when the last is answered"},
 	RuleGraphToolMatchCleared:   {"EarlyClearApproveByToolName", "the graph's fast clear. It is strictly narrower than the legacy case9-approve-toolmatch it replaced — it matches (writer, tool, input hash) AND closes only the single prompt that matched, leaving the writer's other open calls red. The knob is the legacy path's; the graph does not read it today, so turning it off does NOT slow this path down. Change the correlator, not a threshold"},
+	RuleGraphCallMatchCleared:   {"", "not tunable, and the point of Phase 4: the completion named the exact tool_use the prompt was raised for, so nothing is being guessed and there is no threshold to move. It is the only clear allowed past the fanout floor — an unidentifiable writer cannot fake a call id, whereas it can trivially collide on tool name and input hash — and if it ever fires wrongly the bug is in the latch (writer_call_match_cleared binding the wrong id), not in a knob. Watch prompt_call_id_collision in `switchboard-ctl n`"},
+	RuleGraphCallMismatchHeld:   {"", "intentional missed-RED guard, and a REAL negative rather than an ambiguity: both sides named a call and they are different calls, so this completion cannot be the awaited one. No knob. Unlike writer_prompt_held, seeing this repeatedly is the guard working — it is what a sibling call of the same tool looks like from inside the writer that owns the red"},
+	RuleGraphCallResolved:       {"", "the id-matched transcript clear: the tool_result answering the prompt's own call landed, so the red closed without ever seeing a PostToolUse. Not tunable — TailBytes is what changes how far back the tail can see the result"},
+	RuleGraphCallDeclined:       {"", "the id-matched decline: the tool_result answering the prompt's own call says the user rejected it, so the chip exits to idle rather than working. The exit color is the reducer's; there is no knob. Note that an approved tool which merely FAILED is not this — it resumed the turn and reads as writer_call_resolved"},
 	RuleGraphPromptHeld:         {"", "intentional missed-RED guard: the event came from the writer that owns the red but does not resolve it — a different call, an input hash rewritten on approval, or the main thread while teammates are in flight and nothing identifies the writer. No knob; the writer's own next matching event, or its own transcript on the reconcile tick, is what clears it. Seeing this repeatedly on one red is the signature of a correlator that cannot name the call (plan Phase 4)"},
 	RuleGraphNonOwnerHeld:       {"", "intentional missed-RED guard: the event's writer holds no prompt, so it says nothing about the red another writer is blocked on. No knob — a sibling must never clear a sibling's prompt, whatever tool it just ran"},
 	RuleGraphSessionStarted:     {"", "a SessionStart is an exact lifecycle fact, not a policy decision; nothing to tune"},

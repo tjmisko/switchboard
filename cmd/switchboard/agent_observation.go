@@ -36,6 +36,7 @@ type claudeObserver interface {
 	Restore(provider.RootRef, claudeprovider.Compatibility, time.Time) (agentgraph.Observation, error)
 	Projection(provider.RootKey) claudeprovider.Compatibility
 	DrainResolutionRule(provider.RootKey) string
+	DrainPromptDiagnostics(provider.RootKey) []string
 	DrainLegacyEvents(provider.RootKey) []history.Event
 }
 
@@ -397,6 +398,12 @@ func (c *agentCoordinator) observe(ctx context.Context, ref provider.RootRef) {
 		// rule belongs to the tick that computed it, and leaving it behind would
 		// let it explain some later edge instead.
 		rule = c.claude.DrainResolutionRule(ref.Key())
+		// P3 and the reachability of the id fast path, drained on the same
+		// principle: the tick that produced a category is the tick that owns it.
+		// Bounded categories only — never a writer, a tool, or a call id.
+		for _, category := range c.claude.DrainPromptDiagnostics(ref.Key()) {
+			c.recordDiagnostic(ref.Provider, category, now)
+		}
 	}
 	if c.applyObservationWithRule(ref, generation, observation, compat, now, rule, false) && ref.Provider == agentgraph.ProviderClaude {
 		for _, event := range c.claude.DrainLegacyEvents(ref.Key()) {
@@ -788,7 +795,7 @@ func (c *agentCoordinator) HandleHook(req rpc.Request, sess state.Session) {
 		generation := c.begin(ref.Key())
 		result := c.claude.ApplyHook(claudeprovider.HookSignal{
 			Root: ref, Event: req.Event, AgentID: req.AgentID, AgentType: req.AgentType,
-			ToolName: req.ToolName, ToolInputHash: req.ToolInputHash, At: now,
+			ToolName: req.ToolName, ToolInputHash: req.ToolInputHash, ToolUseID: req.ToolUseID, At: now,
 		})
 		if !result.Applied {
 			return
