@@ -1,6 +1,8 @@
 package federation
 
 import (
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +36,16 @@ type WorkspaceIndex struct {
 
 	mu      sync.RWMutex
 	clients []wm.Window
+	key     []workspaceWindowKey
+}
+
+// workspaceWindowKey is exactly the part of a WM enumeration Workspace reads.
+// Agent spinner prefixes and window ordering are intentionally absent, so they
+// do not manufacture aggregate-view refreshes.
+type workspaceWindowKey struct {
+	pid         int
+	marker      string
+	workspaceID int
 }
 
 func NewWorkspaceIndex(registry *panebind.Registry) *WorkspaceIndex {
@@ -47,16 +59,46 @@ func NewWorkspaceIndex(registry *panebind.Registry) *WorkspaceIndex {
 // bounce it back on the next tick. This mirrors mapping.ReconcileFrom, where a
 // missing observation never blanks a resolved mapping. An empty non-nil slice
 // is a real answer (no windows) and does replace the cache.
-func (w *WorkspaceIndex) ObserveWindows(clients []wm.Window) {
+func (w *WorkspaceIndex) ObserveWindows(clients []wm.Window) bool {
 	if w == nil || clients == nil {
-		return
+		return false
 	}
 	// Copied because the caller fans its enumeration across every session in the
 	// tick and this reference outlives that tick.
 	adopted := append([]wm.Window(nil), clients...)
+	key := workspaceKey(clients)
 	w.mu.Lock()
-	w.clients = adopted
+	changed := !slices.Equal(w.key, key)
+	if changed {
+		w.clients = adopted
+		w.key = key
+	}
 	w.mu.Unlock()
+	return changed
+}
+
+func workspaceKey(clients []wm.Window) []workspaceWindowKey {
+	key := make([]workspaceWindowKey, 0, len(clients))
+	for _, client := range clients {
+		title := strings.TrimSpace(client.Title)
+		start := strings.LastIndex(title, "[sbw:")
+		if start < 0 || !strings.HasSuffix(title, "]") {
+			continue
+		}
+		key = append(key, workspaceWindowKey{
+			pid: client.PID, marker: title[start:], workspaceID: client.WorkspaceID,
+		})
+	}
+	sort.Slice(key, func(i, j int) bool {
+		if key[i].pid != key[j].pid {
+			return key[i].pid < key[j].pid
+		}
+		if key[i].marker != key[j].marker {
+			return key[i].marker < key[j].marker
+		}
+		return key[i].workspaceID < key[j].workspaceID
+	})
+	return key
 }
 
 // Workspace returns the local workspace ID displaying an exact remote session,

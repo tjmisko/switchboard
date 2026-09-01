@@ -108,3 +108,25 @@ func TestWorkspaceIndexKeepsLastEnumerationWhenTheWMQueryFails(t *testing.T) {
 		t.Fatalf("empty enumeration resolved workspace %d", got)
 	}
 }
+
+func TestWorkspaceIndexReportsOnlyRealEnumerationChanges(t *testing.T) {
+	index := NewWorkspaceIndex(panebind.NewRegistry())
+	clients := []wm.Window{{Address: "0x1", PID: 7, Title: "one [sbw:7:1]", WorkspaceID: 1}}
+	if !index.ObserveWindows(clients) {
+		t.Fatal("first enumeration was not reported as a change")
+	}
+	if index.ObserveWindows(append([]wm.Window(nil), clients...)) {
+		t.Fatal("identical enumeration was reported as a change")
+	}
+	clients[0].Title = "⠹ repaint [sbw:7:1]"
+	if index.ObserveWindows(clients) {
+		t.Fatal("irrelevant title prefix was reported as a workspace change")
+	}
+	clients[0].WorkspaceID = 2
+	if !index.ObserveWindows(clients) {
+		t.Fatal("workspace move was not reported as a change")
+	}
+	if index.ObserveWindows(nil) {
+		t.Fatal("failed WM query was reported as a change")
+	}
+}

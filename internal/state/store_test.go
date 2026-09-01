@@ -121,6 +121,37 @@ func TestSnapshotEqualStartedAtSortsByPID(t *testing.T) {
 	}
 }
 
+func TestSnapshotDetachesMutableSessionFields(t *testing.T) {
+	store := state.New("")
+	store.Apply(func(m map[int]*state.Session) {
+		m[1] = &state.Session{
+			PID:       1,
+			StartedAt: time.Unix(1, 0),
+			Wezterm:   &state.WeztermInfo{WindowTitle: "old"},
+			Hyprland:  &state.HyprlandInfo{WorkspaceID: 1},
+			Claude: &state.AgentInfo{
+				Workflows: []state.WorkflowStatus{{RunID: "old"}},
+				Pending:   map[string]state.PendingPrompt{"writer": {Tool: "Read"}},
+			},
+		}
+	})
+	snapshot := store.Snapshot()
+
+	store.Apply(func(m map[int]*state.Session) {
+		session := m[1]
+		session.Wezterm.WindowTitle = "new"
+		session.Hyprland.WorkspaceID = 2
+		session.Claude.Workflows[0].RunID = "new"
+		session.Claude.Pending["writer"] = state.PendingPrompt{Tool: "Write"}
+	})
+
+	got := snapshot.Sessions[0]
+	if got.Wezterm.WindowTitle != "old" || got.Hyprland.WorkspaceID != 1 ||
+		got.Claude.Workflows[0].RunID != "old" || got.Claude.Pending["writer"].Tool != "Read" {
+		t.Fatalf("snapshot changed after a later Apply: %+v", got)
+	}
+}
+
 // §4.3 Subscribe — a lagging subscriber's cap-4 buffer drops snapshots rather
 // than blocking Apply. If broadcast blocked, this test would hang.
 func TestSubscribeDropsWithoutBlocking(t *testing.T) {

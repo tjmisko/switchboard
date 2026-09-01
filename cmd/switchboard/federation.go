@@ -100,7 +100,13 @@ func newFederationRuntime(store *state.Store, manager wm.Manager, destinations [
 // showing it. Install it on the mapping resolver, whose Enumerate already
 // fetches that list once per tick.
 func (f *federationRuntime) ObserveWindows(clients []wm.Window) {
-	f.workspaces.ObserveWindows(clients)
+	if f.workspaces.ObserveWindows(clients) {
+		// Workspace is aggregate-view state, not Store state. A terminal window
+		// can move while the session snapshot stays byte-identical, so waiting for
+		// a Store publish can otherwise strand a remote chip on its old workspace
+		// indefinitely.
+		f.view.Refresh()
+	}
 }
 
 func (f *federationRuntime) ConfigureServer(server *rpc.Server) {

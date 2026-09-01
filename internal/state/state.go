@@ -741,9 +741,10 @@ type Store struct {
 	// without clobbering one a later Apply made in the meantime. See
 	// invalidatePublished.
 	publishedGen uint64
-	// broadcastGen serializes post-unlock fanout by the Apply generation. Two
-	// concurrent Apply calls may reach broadcast out of order; an older one must
-	// never overwrite the newer full replacement in subscriber queues.
+	// broadcastGen serializes every post-unlock publication side effect by the
+	// Apply generation. Two concurrent Apply calls may arrive out of order; an
+	// older one must never overwrite either the latest subscriber frame or the
+	// newer state.json mirror.
 	broadcastMu  sync.Mutex
 	broadcastGen uint64
 	// frameMu guards lastBroadcast independently of the store and publish-stats
@@ -755,10 +756,13 @@ type Store struct {
 	// s.mu.
 	statsMu sync.Mutex
 	stats   publishCounters
+	// persistSnapshot is the ordered state.json writer. It is a seam only so the
+	// generation-order test can pause one write deterministically.
+	persistSnapshot func(Snapshot) error
 }
 
 func New(statePath string) *Store {
-	return &Store{
+	s := &Store{
 		path:        statePath,
 		sessions:    make(map[int]*Session),
 		subscribers: make(map[chan Broadcast]struct{}),
@@ -768,6 +772,8 @@ func New(statePath string) *Store {
 		// which is why that field is printed.
 		stats: publishCounters{since: time.Now()},
 	}
+	s.persistSnapshot = s.persist
+	return s
 }
 
 // SetCapabilities records the detected backend stack. It is included in every
@@ -828,8 +834,7 @@ func (s *Store) Apply(fn func(map[int]*Session)) {
 	if !changed {
 		return
 	}
-	s.broadcast(snap, gen)
-	if err := s.persist(snap); err != nil {
+	if err := s.broadcast(snap, gen); err != nil {
 		fmt.Fprintf(os.Stderr, "state: persist failed: %v\n", err)
 		// The reference was adopted before the write was attempted, so leaving it
 		// adopted would suppress every later Apply that produces this same state —
@@ -851,10 +856,9 @@ func (s *Store) Apply(fn func(map[int]*Session)) {
 // snap. That is what makes suppression safe: the reference advances in mutation
 // order, so a change can never be compared against a reference stamped by a
 // LATER mutation and dropped as a no-op. Broadcast generation ordering is
-// serialized separately after the unlock; persistence may still overlap, but it
-// is not a live subscription source. The cost is one encode inside the write
-// lock, which is microseconds against the milliseconds of terminal/WM I/O the
-// reconciler used to hold it for.
+// serialized separately after the unlock together with persistence. The cost is
+// one encode inside the write lock, which is microseconds against the
+// milliseconds of terminal/WM I/O the reconciler used to hold it for.
 func (s *Store) adoptPublishedLocked(snap Snapshot) (gen uint64, changed bool) {
 	key := SnapshotChangeKey(snap)
 	if key != nil && bytes.Equal(key, s.publishedKey) {
@@ -997,9 +1001,10 @@ func ObservablyEqual(a, b Snapshot) bool {
 	return keyA != nil && keyB != nil && bytes.Equal(keyA, keyB)
 }
 
-// Snapshot returns a deep-ish copy of current state. Values are copied; the
-// pointer fields (Wezterm/Hyprland/Claude) are shared — fine for read-only
-// consumers.
+// Snapshot returns a detached copy of current state. Once the store lock is
+// released, publication encodes this value concurrently with later Apply calls;
+// sharing even a small pointer or slice would make one frame internally
+// inconsistent (and data-racy under -race).
 func (s *Store) Snapshot() Snapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1010,6 +1015,14 @@ func (s *Store) snapshotLocked() Snapshot {
 	sessions := make([]Session, 0, len(s.sessions))
 	for _, sess := range s.sessions {
 		cp := *sess
+		if sess.Wezterm != nil {
+			value := *sess.Wezterm
+			cp.Wezterm = &value
+		}
+		if sess.Hyprland != nil {
+			value := *sess.Hyprland
+			cp.Hyprland = &value
+		}
 		// Deep-copy the enrichment blocks so the snapshot never shares the live
 		// *AgentInfo with a later Apply (a read-after-unlock race), and project the
 		// in-memory StatusSince onto the wire-only StatusSinceWire on that copy.
@@ -1025,7 +1038,12 @@ func (s *Store) snapshotLocked() Snapshot {
 	// snapshots. A host-local snapshot has only its own workspaces to order by,
 	// so it passes no override.
 	SortChipOrder(sessions, nil)
-	return Snapshot{SchemaVersion: CurrentSchemaVersion, Sessions: sessions, UpdatedAt: time.Now(), Capabilities: s.caps}
+	var caps *Capabilities
+	if s.caps != nil {
+		value := *s.caps
+		caps = &value
+	}
+	return Snapshot{SchemaVersion: CurrentSchemaVersion, Sessions: sessions, UpdatedAt: time.Now(), Capabilities: caps}
 }
 
 // enrichForWire returns a wire-ready copy of an enrichment block: a value copy
@@ -1052,6 +1070,13 @@ func enrichForWire(info *AgentInfo) *AgentInfo {
 		return nil
 	}
 	cp := *info
+	cp.Workflows = append([]WorkflowStatus(nil), info.Workflows...)
+	if info.Pending != nil {
+		cp.Pending = make(map[string]PendingPrompt, len(info.Pending))
+		for writer, prompt := range info.Pending {
+			cp.Pending[writer] = prompt
+		}
+	}
 	cp.StatusSinceWire = nil
 	if !cp.StatusSince.IsZero() {
 		since := cp.StatusSince
@@ -1145,11 +1170,11 @@ func (s *Store) Subscribe() (<-chan Broadcast, func()) {
 	return ch, cancel
 }
 
-func (s *Store) broadcast(snap Snapshot, gen uint64) {
+func (s *Store) broadcast(snap Snapshot, gen uint64) error {
 	s.broadcastMu.Lock()
 	defer s.broadcastMu.Unlock()
 	if gen <= s.broadcastGen {
-		return
+		return nil
 	}
 	s.broadcastGen = gen
 	// Peek the subscriber count before paying for the encode. A daemon with no bar
@@ -1163,7 +1188,7 @@ func (s *Store) broadcast(snap Snapshot, gen uint64) {
 		s.frameMu.Lock()
 		s.lastBroadcast = nil
 		s.frameMu.Unlock()
-		return
+		return s.persistSnapshot(snap)
 	}
 
 	// Encode OUTSIDE the lock, once, for everyone. Holding RLock across the encode
@@ -1184,7 +1209,6 @@ func (s *Store) broadcast(snap Snapshot, gen uint64) {
 	s.frameMu.Unlock()
 
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	for ch := range s.subscribers {
 		select {
 		case ch <- b:
@@ -1202,6 +1226,8 @@ func (s *Store) broadcast(snap Snapshot, gen uint64) {
 			}
 		}
 	}
+	s.mu.RUnlock()
+	return s.persistSnapshot(snap)
 }
 
 // CurrentBroadcast returns the latest published frame. When no cached frame is
