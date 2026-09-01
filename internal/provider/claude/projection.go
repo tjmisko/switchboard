@@ -69,6 +69,25 @@ const (
 	// likely to name the sibling. The prompt falls back to the (tool, hash) rule
 	// forever, which is a stale red rather than the missed red a wrong bind buys.
 	CallLatchAmbiguous
+	// CallLatchProposed — one candidate survived this tick, and CallID holds it
+	// pending a SECOND tick that names the same one. It is not an identity yet and
+	// nothing may match on it.
+	//
+	// The confirmation exists because a single tick's uniqueness is not evidence
+	// of uniqueness. One assistant message's parallel tool_use blocks are separate
+	// JSONL entries written 0.5–1.5 s apart, so a tick landing inside that gap
+	// sees a gated call's auto-approved sibling ALONE and reads it as unique. A
+	// second tick a whole interval later sees both and refuses. The cost is one
+	// extra tick against 45–300 s of measured think-time; the alternative is a
+	// wrong bind, which is a missed RED.
+	CallLatchProposed
+	// CallLatchContested — two writers of one session offered the same call id, so
+	// the id cannot name a writer and no tiebreak has evidence behind it. Terminal
+	// for the same reason as CallLatchAmbiguous, and counted separately: it is the
+	// runtime half of the P3 uniqueness assertion the lifted fanout floor rests on
+	// (askuserquestion-model-plan.md §5), and a terminal state is what keeps that
+	// counter one-per-prompt instead of one-per-tick.
+	CallLatchContested
 )
 
 // promptIdentity is the hook-derived identity of a prompt — what the
@@ -201,6 +220,10 @@ func (o *Observer) Restore(root provider.RootRef, restored Compatibility, at tim
 		rs.runtimeAt = at
 	}
 	rs.pending = restoredPending(restored, at)
+	clear(rs.promptAnchors)
+	for writer, prompts := range rs.pending {
+		rs.promptAnchors[writer] = newestPromptSince(prompts)
+	}
 	rs.fanout.InFlight = restored.InFlightSubagents
 	rs.fanout.Workflows = append([]fanout.Workflow(nil), restored.Workflows...)
 	for writer := range rs.pending {

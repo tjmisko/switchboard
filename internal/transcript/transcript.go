@@ -163,8 +163,45 @@ type entry struct {
 	// carries a tool_result. They are what separates a user rejection from an
 	// ordinary approved-then-failed tool, which the tool_result block itself does
 	// not (both set is_error). See declinedResult.
-	ToolUseResult  json.RawMessage `json:"toolUseResult"`
-	ToolDenialKind string          `json:"toolDenialKind"`
+	ToolUseResult  declineSummary `json:"toolUseResult"`
+	ToolDenialKind string         `json:"toolDenialKind"`
+}
+
+// declineSummary is the entry-level `toolUseResult`, kept only as far as the
+// decline discriminator actually reads it.
+//
+// The field is a free-form JSON value that in practice carries the tool's WHOLE
+// output — a build log, a file's contents — so retaining it verbatim for every
+// parsed entry multiplies what one tail read holds live, on a path that runs per
+// blocked writer per tick. declinedResult only asks whether a STRING value
+// begins with userRejectedResult, which is 22 bytes, so anything else is dropped
+// at parse time and never allocated.
+type declineSummary struct {
+	Text string
+}
+
+// maxDeclineSummaryBytes bounds the raw literal kept. Generous against the 22
+// bytes the discriminator compares, and small against the outputs the field
+// really carries.
+const maxDeclineSummaryBytes = 128
+
+func (d *declineSummary) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 || data[0] != '"' {
+		return nil // an object, array or number is never the rejection string
+	}
+	if len(data) <= maxDeclineSummaryBytes {
+		return json.Unmarshal(data, &d.Text)
+	}
+	// Re-close the cut literal. A cut landing mid-escape simply fails to parse,
+	// which reads as "not a rejection" — the safe answer at this length, and an
+	// exit-colour error rather than a red-correctness one either way (the red
+	// closes on both readings).
+	trimmed := append(append(make([]byte, 0, maxDeclineSummaryBytes+1), data[:maxDeclineSummaryBytes]...), '"')
+	var prefix string
+	if err := json.Unmarshal(trimmed, &prefix); err == nil {
+		d.Text = prefix
+	}
+	return nil
 }
 
 type block struct {
@@ -496,11 +533,17 @@ func ResolveKind(path string, since time.Time, maxBytes int64) (ResolutionKind, 
 // than the rejected rule, not a re-litigation of it
 // (askuserquestion-model-plan.md §1).
 //
-// The id rule is deliberately NOT gated on `since`. A call id is only ever bound
-// to a tool_use that was UNMATCHED when it was bound (see PendingCall), so a
-// result carrying that id cannot predate the prompt however the two clocks skew
-// — and the H8 flush lag that makes timestamp comparisons delicate here has no
-// purchase on an identity.
+// The id rule is deliberately NOT gated on `since`, and NOT because binding an
+// id proved the call was the prompt's own — binding proves no such thing, and a
+// comment here once claimed it did. `since` is a WRITER-scoped clock (the newest
+// prompt that writer holds) and every entry it is compared against is dated at
+// GENERATION time, so the prompt's own tool_use is already stamped before the
+// hook that opened the prompt (docs/subagent-permission-plan.md §9.7). A
+// call-scoped rule inheriting that clock would reject the very evidence it
+// exists to read. Whether the id names the prompt's own call is settled
+// entirely upstream in the latch that bound it (see PendingCall and
+// latchPendingCalls); this function is decisive about the CALL and says nothing
+// about the prompt.
 //
 // The kind is ResolutionDeclined when the user rejected the call and
 // ResolutionResumed otherwise, including when the tool ran and failed:
@@ -513,7 +556,45 @@ func ResolveKindFor(path string, since time.Time, callID string, maxBytes int64)
 	if kind, ok := callResolution(entries, callID); ok {
 		return kind, nil
 	}
+	return timestampResolution(entries, since), nil
+}
 
+// ResolveKindForCalls is ResolveKindFor over a whole set of call ids, off ONE
+// read of the tail, returning the kind for each id.
+//
+// The batch exists for cost, not semantics: a writer blocked on n identified
+// calls asked for n separate 128 KiB tail reads and n full JSON decodes of the
+// same file on every reconcile tick, on top of the reads resolvePending and the
+// latch already make. Each id sees exactly what ResolveKindFor would have given
+// it — its own result when one has landed, and otherwise the same shared
+// timestamp fallback, computed once here instead of once per id.
+func ResolveKindForCalls(path string, since time.Time, callIDs []string, maxBytes int64) (map[string]ResolutionKind, error) {
+	if len(callIDs) == 0 {
+		return nil, nil
+	}
+	entries, err := readTailEntries(path, maxBytes)
+	if err != nil {
+		return nil, err
+	}
+	fallback := timestampResolution(entries, since)
+	kinds := make(map[string]ResolutionKind, len(callIDs))
+	for _, callID := range callIDs {
+		if _, done := kinds[callID]; done {
+			continue
+		}
+		if kind, ok := callResolution(entries, callID); ok {
+			kinds[callID] = kind
+			continue
+		}
+		kinds[callID] = fallback
+	}
+	return kinds, nil
+}
+
+// timestampResolution is the file-scoped rule both entry points fall back to:
+// the newest resolution-bearing entry wins, and only if it is dated strictly
+// after `since`.
+func timestampResolution(entries []entry, since time.Time) ResolutionKind {
 	var newest time.Time
 	kind := ResolutionNone
 	for _, e := range entries {
@@ -530,11 +611,10 @@ func ResolveKindFor(path string, since time.Time, callID string, maxBytes int64)
 			kind = k
 		}
 	}
-
 	if kind != ResolutionNone && newest.After(since) {
-		return kind, nil
+		return kind
 	}
-	return ResolutionNone, nil
+	return ResolutionNone
 }
 
 // callResolution finds the user tool_result that answers callID and says how it
@@ -592,11 +672,7 @@ func declinedResult(e entry, b block) bool {
 	if e.ToolDenialKind == userRejectedDenialKind {
 		return true
 	}
-	var summary string
-	if json.Unmarshal(e.ToolUseResult, &summary) != nil {
-		return false
-	}
-	return strings.HasPrefix(summary, userRejectedResult)
+	return strings.HasPrefix(e.ToolUseResult.Text, userRejectedResult)
 }
 
 // resolutionKindOf maps an entry to the resolution it represents: an assistant
@@ -719,11 +795,26 @@ func BlockedByPendingTool(path string, maxBytes int64) (BlockedEvidence, error) 
 	return BlockedNo, nil
 }
 
-// PendingCall returns the ids of every `toolName` tool_use in the writer's OWN
-// transcript tail that has no `tool_result` yet, in file order. Pass the
-// writer's own file — SubagentPath(mainTranscript, agentID) — exactly as
-// BlockedByPendingTool requires, and for the same reason: a subagent-raised call
-// leaves the parent tail fully matched.
+// PendingToolCall is one unmatched tool_use from a writer's tail: the call's
+// exact id and the instant its own entry carries.
+//
+// At is GENERATION time, not flush time and not hook time. Claude Code dates the
+// assistant entry when the model produced the block — 6–374 ms before the
+// matching PermissionRequest fires, and ~5 s before the line itself reaches disk
+// (docs/subagent-permission-plan.md §9.7) — so it orders calls against a prompt
+// only within that skew. That is still the one thing in the file that can say a
+// candidate is NOT a given prompt's own call: a tool_use dated well before the
+// prompt opened belongs to an earlier dispatch (see latchPendingCalls).
+type PendingToolCall struct {
+	ID string
+	At time.Time
+}
+
+// PendingCall returns every `toolName` tool_use in the writer's OWN transcript
+// tail that has no `tool_result` yet, in file order, each with the instant its
+// entry carries. Pass the writer's own file — SubagentPath(mainTranscript,
+// agentID) — exactly as BlockedByPendingTool requires, and for the same reason:
+// a subagent-raised call leaves the parent tail fully matched.
 //
 // It exists so a permission prompt can lazily LATCH the identity of the call it
 // gates. The hook cannot supply it — PermissionRequest carries no tool_use_id
@@ -733,15 +824,17 @@ func BlockedByPendingTool(path string, maxBytes int64) (BlockedEvidence, error) 
 // measured 45–300 s of user think-time.
 //
 // It returns EVERY unmatched candidate rather than picking one, because the
-// caller's safe rule needs the count: a single candidate is the call, two or
-// more are indistinguishable and must stay unbound. Binding the wrong id would
-// be a missed RED — the sibling call's own result would then clear a prompt
-// nobody answered — which is the error class this whole model is built to avoid,
-// so the ambiguity has to reach the caller instead of being resolved here by a
-// tiebreak that has no evidence behind it.
+// caller's safe rule needs the count: two or more are indistinguishable and must
+// stay unbound. Nor is a single candidate the call by itself — the tail has no
+// recency bound, so a call from an interrupted earlier turn sits there forever,
+// which is why each candidate is dated and the caller weighs that date against
+// the prompt. Binding the wrong id would be a missed RED — the other call's own
+// result would then clear a prompt nobody answered — which is the error class
+// this whole model is built to avoid, so the ambiguity has to reach the caller
+// instead of being resolved here by a tiebreak that has no evidence behind it.
 //
 // A missing/unreadable file returns (nil, err); the caller keeps waiting.
-func PendingCall(path, toolName string, maxBytes int64) ([]string, error) {
+func PendingCall(path, toolName string, maxBytes int64) ([]PendingToolCall, error) {
 	if toolName == "" {
 		return nil, nil
 	}
@@ -754,16 +847,20 @@ func PendingCall(path, toolName string, maxBytes int64) ([]string, error) {
 	// between two tool_use blocks, so anything deciding as it scans answers a
 	// different question. `answered` is NOT filtered by tool name — a result
 	// names only the id it answers.
-	var dispatched []string
+	var dispatched []PendingToolCall
 	seen := map[string]bool{}
 	answered := map[string]bool{}
 	for _, e := range entries {
+		// An entry nothing can date carries the zero time, which reads as older
+		// than any prompt. The caller refuses such a candidate, and refusing costs
+		// a stale red where guessing would cost a missed one.
+		at, _ := e.parsedTime()
 		for _, b := range e.blocks() {
 			switch b.Type {
 			case "tool_use":
 				if b.Name == toolName && b.ID != "" && !seen[b.ID] {
 					seen[b.ID] = true
-					dispatched = append(dispatched, b.ID)
+					dispatched = append(dispatched, PendingToolCall{ID: b.ID, At: at})
 				}
 			case "tool_result":
 				if b.ToolUseID != "" {
@@ -772,10 +869,10 @@ func PendingCall(path, toolName string, maxBytes int64) ([]string, error) {
 			}
 		}
 	}
-	var pending []string
-	for _, id := range dispatched {
-		if !answered[id] {
-			pending = append(pending, id)
+	var pending []PendingToolCall
+	for _, call := range dispatched {
+		if !answered[call.ID] {
+			pending = append(pending, call)
 		}
 	}
 	return pending, nil

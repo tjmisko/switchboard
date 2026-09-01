@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"slices"
 	"sort"
@@ -147,8 +148,16 @@ type rootState struct {
 	// individual call closes the prompt, so one writer's parallel calls must not
 	// collapse onto one record. A writer with no open prompt has no key at all;
 	// an empty slice is never stored.
-	pending  map[string][]PendingPrompt
-	overlays map[string]childOverlay
+	pending map[string][]PendingPrompt
+	// promptAnchors maps a writer to the newest instant at which any prompt it
+	// currently holds opened — INCLUDING prompts already retired. It is the clock
+	// every whole-file resolution rule dates from (writerResolutionAnchor), and it
+	// is kept beside `pending` rather than derived from it for one reason:
+	// retiring one of a writer's parallel prompts must never move that clock
+	// backwards. The entry is dropped with the writer's last prompt, so the next
+	// red starts its own anchor.
+	promptAnchors map[string]time.Time
+	overlays      map[string]childOverlay
 	// resolvedRule names the transcript rule the most recent Observe actually
 	// applied, held only until the coordinator drains it onto the transition that
 	// resolution produced (DrainResolutionRule). It is the Observe-tick half of
@@ -213,6 +222,12 @@ type promptLatch struct {
 }
 
 // The bounded diagnostic categories the call-identity latch reports.
+//
+// Every one of them is an EDGE, counted at most once per prompt because each
+// records a terminal latch state. That is what makes them comparable with one
+// another: a category that re-fired on every tick would count tick-seconds of a
+// human's think-time rather than events, and one such counter beside two edge
+// counters turns the whole table into a ratio nobody can read.
 const (
 	// DiagnosticCallLatched — a prompt bound the exact call it gates. The
 	// numerator of "is the id fast path reachable?".
@@ -223,9 +238,10 @@ const (
 	DiagnosticCallAmbiguous = "prompt_call_ambiguous"
 	// DiagnosticCallIDCollision — P3's runtime half
 	// (askuserquestion-model-plan.md §5): two writers of one session appeared to
-	// claim the same tool_use id. The lifted fanout floor rests on this never
-	// happening, so it is counted rather than assumed, and the colliding id is
-	// refused rather than bound.
+	// claim the same tool_use id, either by offering it in the same tick or by one
+	// of them already holding it. The lifted fanout floor rests on this never
+	// happening, so it is counted rather than assumed, and the prompt goes
+	// CallLatchContested — refused, and refused once.
 	DiagnosticCallIDCollision = "prompt_call_id_collision"
 )
 
@@ -274,6 +290,7 @@ func (o *Observer) Observe(ctx context.Context, root provider.RootRef, now time.
 	}
 	rs := o.ensureRootLocked(root)
 	pending := clonePendingSets(rs.pending)
+	anchors := maps.Clone(rs.promptAnchors)
 	runtime, runtimeAt := rs.runtime, rs.runtimeAt
 	tuning := o.tuning
 	o.mu.Unlock()
@@ -285,7 +302,7 @@ func (o *Observer) Observe(ctx context.Context, root provider.RootRef, now time.
 		PID: root.PID, Agent: string(agentgraph.ProviderClaude), CWD: root.CWD,
 	}, now)
 	latches, latchDiagnostics := latchPendingCalls(root.Transcript, pending, tuning.TailBytes)
-	resolutions := resolvePending(root.Transcript, pending, structured.Snapshot, now, tuning)
+	resolutions := resolvePending(root.Transcript, pending, anchors, structured.Snapshot, now, tuning)
 	runtime = reconcileRootRuntime(root.Transcript, runtime, runtimeAt, tuning.TailBytes)
 
 	if err := ctx.Err(); err != nil {
@@ -342,7 +359,7 @@ func (o *Observer) Observe(ctx context.Context, root provider.RootRef, now time.
 		remaining := slices.DeleteFunc(slices.Clone(current), func(prompt PendingPrompt) bool {
 			return slices.Contains(resolution.Closed, prompt)
 		})
-		setPendingPrompts(rs.pending, resolution.Writer, remaining)
+		setPendingPrompts(rs, resolution.Writer, remaining)
 		if rs.resolvedRule == "" {
 			// resolutions is sorted by writer and the main thread's key is "", so
 			// when several writers resolve on one tick the main thread's rule is the
@@ -428,7 +445,7 @@ func (o *Observer) applyHookLocked(rs *rootState, signal HookSignal) (bool, stri
 			Attention: attentionForTool(signal.ToolName), Since: signal.At,
 		}
 		prompts, opened := openPendingPrompt(rs.pending[writer], next)
-		setPendingPrompts(rs.pending, writer, prompts)
+		setPendingPrompts(rs, writer, prompts)
 		if writer != "" {
 			overlay := rs.overlays[writer]
 			overlay.AgentType = firstNonempty(signal.AgentType, overlay.AgentType)
@@ -481,11 +498,16 @@ func (o *Observer) applyHookLocked(rs *rootState, signal HookSignal) (bool, stri
 			if idMatched(prompts[index], signal) {
 				rule = statustune.RuleGraphCallMatchCleared
 			}
-			setPendingPrompts(rs.pending, writer, closePendingPromptAt(prompts, index))
+			setPendingPrompts(rs, writer, closePendingPromptAt(prompts, index))
 			changed = true
 		} else if len(prompts) > 0 {
 			rule = statustune.RuleGraphPromptHeld
-			if callMismatchHeld(prompts, signal) {
+			// Only when NOTHING in the set matched. A shape match refused by the
+			// fanout floor is a different hold — "a shape matched and nothing
+			// identified the writer" — and relabelling it would report the identity
+			// guard working on an edge identity never got to judge, which is the one
+			// distinction the knob table asks this rule to carry.
+			if index < 0 && callMismatchHeld(prompts, signal) {
 				rule = statustune.RuleGraphCallMismatchHeld
 			}
 		} else {
@@ -551,12 +573,20 @@ func closePendingPromptAt(prompts []PendingPrompt, index int) []PendingPrompt {
 // setPendingPrompts stores a writer's open set, dropping the key entirely once
 // the set is empty. Callers rely on `len(pending)` counting blocked writers, so
 // an empty slice must never be left behind.
-func setPendingPrompts(pending map[string][]PendingPrompt, writer string, prompts []PendingPrompt) {
+//
+// It is also the one choke point that moves the writer's resolution anchor, and
+// the anchor only ever moves FORWARD while the writer holds anything — see
+// writerResolutionAnchor for the missed RED that a regressing anchor buys.
+func setPendingPrompts(rs *rootState, writer string, prompts []PendingPrompt) {
 	if len(prompts) == 0 {
-		delete(pending, writer)
+		delete(rs.pending, writer)
+		delete(rs.promptAnchors, writer)
 		return
 	}
-	pending[writer] = prompts
+	rs.pending[writer] = prompts
+	if newest := newestPromptSince(prompts); newest.After(rs.promptAnchors[writer]) {
+		rs.promptAnchors[writer] = newest
+	}
 }
 
 // matchingPromptIndex returns the prompt the signal resolves, or -1.
@@ -613,6 +643,28 @@ func newestPromptSince(prompts []PendingPrompt) time.Time {
 		return time.Time{}
 	}
 	return prompts[len(prompts)-1].Since
+}
+
+// writerResolutionAnchor is the instant the whole-file rules date from: the
+// newest prompt this writer has held since its red opened, including the ones
+// already retired. rootState.promptAnchors carries that memory; the live set is
+// the floor under it, so a writer whose anchor was never recorded (a restore,
+// say) still reads today's newest-prompt rule.
+//
+// It must only ever move FORWARD, and that is the whole point. Taking the newest
+// still-open prompt alone lets the anchor REGRESS the moment a call-scoped rule
+// retires the newest of a writer's parallel prompts — and it now can, because an
+// id-matched result closes exactly one prompt. The next tick would then re-read
+// the assistant entry that DISPATCHED the call it just closed as evidence
+// younger than the anchor, and ResolveKind maps any assistant entry to "the
+// writer resumed", closing the older prompt whose call is still open and
+// unanswered. That is a missed RED, silent for the rest of the wait, and two
+// gated calls of different tools in one turn are enough to reach it.
+func writerResolutionAnchor(anchor time.Time, prompts []PendingPrompt) time.Time {
+	if newest := newestPromptSince(prompts); newest.After(anchor) {
+		return newest
+	}
+	return anchor
 }
 
 func (o *Observer) mergeFanoutLocked(rs *rootState, snapshot fanout.Snapshot) {
@@ -679,7 +731,7 @@ func clearTerminalPrompts(rs *rootState, observedAt time.Time) bool {
 		if len(kept) != len(prompts) {
 			retired = true
 		}
-		setPendingPrompts(rs.pending, child.ID, kept)
+		setPendingPrompts(rs, child.ID, kept)
 	}
 	return retired
 }
@@ -803,8 +855,9 @@ func (o *Observer) ensureRootLocked(root provider.RootRef) *rootState {
 	}
 	rs = &rootState{
 		ref: root, runtime: agentgraph.RuntimeUnknown,
-		pending: make(map[string][]PendingPrompt), overlays: make(map[string]childOverlay),
-		known: make(map[string]fanout.Lifecycle), retained: make(map[string]fanout.Child),
+		pending: make(map[string][]PendingPrompt), promptAnchors: make(map[string]time.Time),
+		overlays: make(map[string]childOverlay),
+		known:    make(map[string]fanout.Lifecycle), retained: make(map[string]fanout.Child),
 		legacyEvents: carriedEvents,
 	}
 	o.roots[key] = rs
@@ -919,11 +972,13 @@ func lifecycleTerminal(lifecycle fanout.Lifecycle) bool {
 
 // resolvePending turns transcript evidence into writer-scoped resolutions. Every
 // rule here reads a whole file — none of them can name which of a writer's
-// parallel calls was answered — so each is evaluated against the writer's NEWEST
-// prompt and closes the writer's whole open set when it fires. Dating the rules
-// from the newest prompt is what keeps that safe: evidence younger than the last
-// prompt to open cannot prove the older ones resolved.
-func resolvePending(mainTranscript string, pending map[string][]PendingPrompt, snapshot fanout.Snapshot, now time.Time, tuning statustune.Tuning) []promptResolution {
+// parallel calls was answered — so each is evaluated against the writer's
+// resolution ANCHOR and closes the writer's whole open set when it fires. Dating
+// the rules from that anchor is what keeps them safe: evidence younger than the
+// last prompt the writer opened cannot prove the older ones resolved, and the
+// anchor is what stops a call-scoped clear from walking that clock backwards
+// (writerResolutionAnchor).
+func resolvePending(mainTranscript string, pending map[string][]PendingPrompt, anchors map[string]time.Time, snapshot fanout.Snapshot, now time.Time, tuning statustune.Tuning) []promptResolution {
 	terminal := make(map[string]bool, len(snapshot.Children))
 	for _, child := range snapshot.Children {
 		terminal[child.ID] = child.LifecycleTerminal()
@@ -933,7 +988,7 @@ func resolvePending(mainTranscript string, pending map[string][]PendingPrompt, s
 		if len(prompts) == 0 {
 			continue
 		}
-		since := newestPromptSince(prompts)
+		since := writerResolutionAnchor(anchors[writer], prompts)
 		if terminal[writer] {
 			resolutions = append(resolutions, promptResolution{writer, prompts, prompts, agentgraph.RuntimeIdle, statustune.RuleGraphChildTerminal})
 			continue
@@ -987,14 +1042,27 @@ func resolvePending(mainTranscript string, pending map[string][]PendingPrompt, s
 // 45–300 s of user think-time, one tick later is early enough by two orders of
 // magnitude.
 //
-// The binding rule is deliberately the strictest one that can ever fire: a
-// prompt binds only when its writer has exactly ONE unbound prompt of that tool
-// and its file exactly ONE unmatched call of it. Anything else stays unbound —
-// zero candidates retries next tick (the flush lag), two or more is terminal.
-// The asymmetry is the point: an unbound prompt keeps today's (tool, hash) rule
-// and at worst stays red a few seconds too long, whereas a WRONG bind lets the
-// sibling call's own result clear a prompt nobody answered — a missed RED,
-// silent, costing the whole remaining wait.
+// The binding rule is deliberately the strictest one that can ever fire. A
+// prompt binds only when ALL of the following hold, and every one of them exists
+// because dropping it produced a missed RED:
+//
+//   - its writer has exactly ONE unlatched prompt of that tool, and its file
+//     exactly ONE eligible unmatched call of it (two are indistinguishable);
+//   - the call is not dated before the prompt opened by more than the two clocks
+//     can skew (callLatchSkewGrace) — otherwise the FIRST latch attempt, which
+//     runs milliseconds after the hook because ApplyHook signals the coordinator,
+//     would bind whatever sibling happened to be executing, ~5 s before the
+//     prompt's own tool_use can possibly be on disk;
+//   - no other writer offers or already holds that id (P3's runtime half);
+//   - and the SAME id was the sole candidate on the previous tick as well
+//     (CallLatchProposed) — one tick's uniqueness is not uniqueness when one
+//     message's parallel tool_use blocks reach disk 0.5–1.5 s apart.
+//
+// Anything else stays unlatched: zero candidates retries next tick (the flush
+// lag), and ambiguity or contention is terminal. The asymmetry is the point — an
+// unlatched prompt keeps today's (tool, hash) rule and at worst stays red a few
+// seconds too long, whereas a WRONG bind lets some other call's result clear a
+// prompt nobody answered, a missed RED, silent, costing the whole remaining wait.
 func latchPendingCalls(mainTranscript string, pending map[string][]PendingPrompt, tailBytes int64) ([]promptLatch, []string) {
 	writers := make([]string, 0, len(pending))
 	for writer := range pending {
@@ -1006,77 +1074,112 @@ func latchPendingCalls(mainTranscript string, pending map[string][]PendingPrompt
 	// uniqueness check that P3 gates the lifted fanout floor on cannot be made
 	// until every writer's claim is on the table.
 	type toolKey struct{ writer, tool string }
-	candidates := make(map[toolKey][]string)
-	unbound := make(map[toolKey]int)
-	// A set rather than an id->writer map: the main thread's writer key is "", so
-	// a map lookup could not tell "bound to the main thread" from "not bound".
-	bound := make(map[string]bool)
+	calls := make(map[toolKey][]transcript.PendingToolCall)
+	unlatched := make(map[toolKey]int)
+	// An id -> writer map plus a separate presence set: the main thread's writer
+	// key is "", so a bare lookup could not tell "bound to the main thread" from
+	// "not bound", and WHICH writer holds it is exactly what separates a prompt
+	// skipping its own writer's other call from two writers claiming one id.
+	boundBy := make(map[string]string)
+	boundHeld := make(map[string]bool)
 	for _, writer := range writers {
 		for _, prompt := range pending[writer] {
 			if prompt.Latch == CallLatchBound && prompt.CallID != "" {
-				bound[prompt.CallID] = true
+				boundBy[prompt.CallID], boundHeld[prompt.CallID] = writer, true
 			}
 		}
 	}
 	for _, writer := range writers {
 		path := transcript.SubagentPath(mainTranscript, writer)
 		for _, prompt := range pending[writer] {
-			if !latchablePrompt(prompt) || prompt.Latch != CallLatchUnbound {
+			if !latchablePrompt(prompt) {
 				continue
 			}
 			key := toolKey{writer, prompt.Tool}
-			unbound[key]++
-			if _, read := candidates[key]; read {
+			unlatched[key]++
+			if _, read := calls[key]; read {
 				continue // one read per (writer, tool), however many prompts share it
 			}
-			ids, err := transcript.PendingCall(path, prompt.Tool, tailBytes)
+			found, err := transcript.PendingCall(path, prompt.Tool, tailBytes)
 			if err != nil {
-				ids = nil // unreadable reads as "not flushed yet": keep waiting
+				found = nil // unreadable reads as "not flushed yet": keep waiting
 			}
-			// A call another prompt already owns is not a candidate for this one.
-			// That is what lets a writer holding one bound and one unbound prompt of
-			// the same tool still identify the second.
-			candidates[key] = slices.DeleteFunc(ids, func(id string) bool { return bound[id] })
+			calls[key] = found
 		}
 	}
 
-	claims := make(map[string]map[string]bool, len(candidates))
-	for key, ids := range candidates {
-		for _, id := range ids {
-			if claims[id] == nil {
-				claims[id] = make(map[string]bool, 1)
+	// Each prompt's own eligible set, then the cross-writer view of it. Claims are
+	// counted over ELIGIBLE candidates rather than raw ones so a call that is
+	// nobody's plausible owner cannot be reported as contested.
+	type promptCandidates struct {
+		writer    string
+		prompt    PendingPrompt
+		eligible  []string
+		contested bool
+	}
+	var considered []promptCandidates
+	claims := make(map[string]map[string]bool)
+	for _, writer := range writers {
+		for _, prompt := range pending[writer] {
+			if !latchablePrompt(prompt) {
+				continue
 			}
-			claims[id][key.writer] = true
+			candidates := promptCandidates{writer: writer, prompt: prompt}
+			for _, call := range calls[toolKey{writer, prompt.Tool}] {
+				if boundHeld[call.ID] {
+					// A call some prompt already owns is not a candidate for this one.
+					// That is what lets a writer holding one bound and one unlatched
+					// prompt of the same tool still identify the second — but only when
+					// the owner is that same writer. Another writer's bound id appearing
+					// here is P3 failing in the sequential ordering, and it must be
+					// counted rather than quietly dropped: dropping it is what let one
+					// writer stay bound to a call another writer also claims.
+					candidates.contested = candidates.contested || boundBy[call.ID] != writer
+					continue
+				}
+				if !ownableCall(call, prompt) {
+					continue
+				}
+				candidates.eligible = append(candidates.eligible, call.ID)
+				if claims[call.ID] == nil {
+					claims[call.ID] = make(map[string]bool, 1)
+				}
+				claims[call.ID][writer] = true
+			}
+			considered = append(considered, candidates)
 		}
 	}
 
 	var latches []promptLatch
 	var diagnostics []string
-	for _, writer := range writers {
-		for _, prompt := range pending[writer] {
-			if !latchablePrompt(prompt) || prompt.Latch != CallLatchUnbound {
-				continue
-			}
-			key := toolKey{writer, prompt.Tool}
-			ids := candidates[key]
-			if len(ids) == 0 {
-				continue // the tool_use has not flushed yet; retried next tick
-			}
-			if len(ids) > 1 || unbound[key] > 1 {
-				latches = append(latches, promptLatch{writer, prompt.identity(), "", CallLatchAmbiguous})
-				diagnostics = append(diagnostics, DiagnosticCallAmbiguous)
-				continue
-			}
-			if len(claims[ids[0]]) > 1 {
-				// Two writers appear to own one call. That should be impossible —
-				// tool_use ids are per-call and each writer's calls live in its own
-				// file — so it is counted and refused rather than resolved by a
-				// tiebreak, and the prompt is left to retry on today's rule.
-				diagnostics = append(diagnostics, DiagnosticCallIDCollision)
-				continue
-			}
-			latches = append(latches, promptLatch{writer, prompt.identity(), ids[0], CallLatchBound})
+	for _, candidates := range considered {
+		prompt, writer := candidates.prompt, candidates.writer
+		contested := candidates.contested
+		if !contested && len(candidates.eligible) == 1 {
+			// Two writers appear to own one call. That should be impossible —
+			// tool_use ids are per-call and each writer's calls live in its own file —
+			// so it is counted and refused rather than resolved by a tiebreak.
+			contested = len(claims[candidates.eligible[0]]) > 1
+		}
+		switch {
+		case contested:
+			latches = append(latches, promptLatch{writer, prompt.identity(), "", CallLatchContested})
+			diagnostics = append(diagnostics, DiagnosticCallIDCollision)
+		case len(candidates.eligible) == 0:
+			// Nothing this prompt could own is on disk yet; retried next tick. A
+			// proposal already made is deliberately kept: a tail that briefly stops
+			// naming the candidate is not evidence against it.
+		case len(candidates.eligible) > 1 || unlatched[toolKey{writer, prompt.Tool}] > 1:
+			latches = append(latches, promptLatch{writer, prompt.identity(), "", CallLatchAmbiguous})
+			diagnostics = append(diagnostics, DiagnosticCallAmbiguous)
+		case prompt.Latch == CallLatchProposed && prompt.CallID == candidates.eligible[0]:
+			latches = append(latches, promptLatch{writer, prompt.identity(), candidates.eligible[0], CallLatchBound})
 			diagnostics = append(diagnostics, DiagnosticCallLatched)
+		default:
+			// The first tick to name this candidate. It is recorded, not counted: a
+			// proposal is not an outcome, and counting one per tick would make this
+			// table a mix of level and edge counters that no ratio can be read off.
+			latches = append(latches, promptLatch{writer, prompt.identity(), candidates.eligible[0], CallLatchProposed})
 		}
 	}
 	for _, latch := range latches {
@@ -1085,12 +1188,43 @@ func latchPendingCalls(mainTranscript string, pending map[string][]PendingPrompt
 	return latches, diagnostics
 }
 
-// latchablePrompt reports whether a prompt may ever bind a call id. A restored
-// record may not: it stands for a writer's residual red rather than for one
-// call, so an id-matched clear against it would turn a single honest red into a
-// green with real calls still blocking (see PendingPrompt.Restored).
+// callLatchSkewGrace is how far BEFORE its prompt opened a candidate call may be
+// dated and still be that prompt's own.
+//
+// The comparison is between two clocks with a known offset: the transcript dates
+// an assistant entry at GENERATION time, 6–374 ms before the matching
+// PermissionRequest hook fires, and one message's parallel tool_use blocks are
+// separate entries 0.5–1.5 s apart, so a prompt's own call can honestly be dated
+// a second or two before the prompt. Anything older belongs to an earlier
+// dispatch — a sibling still executing, or a call from a turn the user
+// interrupted, which sits unmatched in the tail forever. The window is therefore
+// set just past the widest measured spread, and everything outside it is refused.
+//
+// It is not a heuristic tiebreak: it can only ever REMOVE a candidate, and every
+// removal costs at most a stale red while the bind it prevents would cost a
+// missed one.
+const callLatchSkewGrace = 3 * time.Second
+
+// ownableCall reports whether a candidate could be the call this prompt gates,
+// on the only ordering evidence the file carries. There is no upper bound: a
+// blocked writer dispatches nothing, so a call dated after the prompt is either
+// its own or its own message's sibling, and the ambiguity rule handles that.
+func ownableCall(call transcript.PendingToolCall, prompt PendingPrompt) bool {
+	return !call.At.Before(prompt.Since.Add(-callLatchSkewGrace))
+}
+
+// latchablePrompt reports whether a prompt may still bind a call id — it has a
+// tool, it is not restored, and its latch has not gone terminal.
+//
+// A restored record may not bind: it stands for a writer's residual red rather
+// than for one call, so an id-matched clear against it would turn a single
+// honest red into a green with real calls still blocking (see
+// PendingPrompt.Restored).
 func latchablePrompt(prompt PendingPrompt) bool {
-	return prompt.Tool != "" && !prompt.Restored
+	if prompt.Tool == "" || prompt.Restored {
+		return false
+	}
+	return prompt.Latch == CallLatchUnbound || prompt.Latch == CallLatchProposed
 }
 
 // applyPromptLatch writes one latch onto the writer's open set, addressing the
@@ -1100,7 +1234,7 @@ func latchablePrompt(prompt PendingPrompt) bool {
 func applyPromptLatch(pending map[string][]PendingPrompt, latch promptLatch) {
 	prompts := pending[latch.Writer]
 	index := slices.IndexFunc(prompts, func(prompt PendingPrompt) bool {
-		return prompt.Latch == CallLatchUnbound && prompt.identity() == latch.Identity
+		return latchablePrompt(prompt) && prompt.identity() == latch.Identity
 	})
 	if index < 0 {
 		return
@@ -1117,30 +1251,47 @@ func applyPromptLatch(pending map[string][]PendingPrompt, latch promptLatch) {
 // control came back to them; painting the chip green would say the agent is
 // busy when it is waiting.
 func resolveLatchedCalls(path string, prompts []PendingPrompt, since time.Time, tailBytes int64) ([]PendingPrompt, agentgraph.RuntimeState, string) {
+	callIDs := make([]string, 0, len(prompts))
+	for _, prompt := range prompts {
+		if prompt.Latch == CallLatchBound && prompt.CallID != "" {
+			callIDs = append(callIDs, prompt.CallID)
+		}
+	}
+	if len(callIDs) == 0 {
+		return nil, agentgraph.RuntimeActive, statustune.RuleGraphCallResolved
+	}
+	// ONE read of the tail for the writer's whole bound set. `since` is the
+	// caller's own resolution anchor, deliberately the same value it just gave
+	// ResolveKind: the per-id rules fall back to that timestamp rule when a call
+	// has no result yet, so passing anything else would let the fallback decide
+	// something the caller has already declined to decide on identical evidence.
+	kinds, err := transcript.ResolveKindForCalls(path, since, callIDs, tailBytes)
+	if err != nil {
+		return nil, agentgraph.RuntimeActive, statustune.RuleGraphCallResolved
+	}
 	var closed []PendingPrompt
-	runtime, rule := agentgraph.RuntimeActive, statustune.RuleGraphCallResolved
+	declined := 0
 	for _, prompt := range prompts {
 		if prompt.Latch != CallLatchBound || prompt.CallID == "" {
 			continue
 		}
-		// `since` is the caller's own newest-prompt anchor, deliberately the same
-		// value it just gave ResolveKind. ResolveKindFor falls back to that
-		// timestamp rule when the id has no result yet, so passing anything else
-		// would let the fallback decide something the caller has already declined
-		// to decide on identical evidence.
-		kind, err := transcript.ResolveKindFor(path, since, prompt.CallID, tailBytes)
-		if err != nil {
-			continue
-		}
-		switch kind {
+		switch kinds[prompt.CallID] {
 		case transcript.ResolutionDeclined:
 			closed = append(closed, prompt)
-			runtime, rule = agentgraph.RuntimeIdle, statustune.RuleGraphCallDeclined
+			declined++
 		case transcript.ResolutionResumed:
 			closed = append(closed, prompt)
 		}
 	}
-	return closed, runtime, rule
+	// The exit describes the WRITER, not whichever prompt sat last in the slice.
+	// A decline only returns control to the user if nothing else the writer just
+	// closed resumed it: a tick that carries one rejection and one approval leaves
+	// the agent executing the approved call, so painting the chip idle there would
+	// misreport both the color and the rule on the strength of slice order alone.
+	if declined > 0 && declined == len(closed) {
+		return closed, agentgraph.RuntimeIdle, statustune.RuleGraphCallDeclined
+	}
+	return closed, agentgraph.RuntimeActive, statustune.RuleGraphCallResolved
 }
 
 func writerQuiescentPastCap(path string, since, now time.Time, cap time.Duration) bool {

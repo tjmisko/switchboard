@@ -549,6 +549,60 @@ likely to name the sibling.
 `writer_call_mismatch_held` — "I know which call you finished, and it is not the
 one you are waiting on" — but no user-facing surface renders it, for U2's reason.
 
+### 4d. Addendum — what the Phase 4 review repaired
+
+An adversarial review of the call-identity work found four missed REDs the latch
+as landed could produce, and three counters/comments that misdescribed it. All
+seven were confirmed at the line and fixed; each has a regression test that fails
+against the pre-repair code.
+
+**R1 — the latch bound whatever was already running.** `ApplyHook` signals the
+coordinator and `agent_observation.go` reconciles that root at once, so the FIRST
+latch attempt for every prompt ran milliseconds after `PermissionRequest` — ~5 s
+before the prompt's own `tool_use` can be on disk. Every candidate visible then
+is by construction some *other* call, and the corpus makes that the common case
+rather than a corner one (1554 of the measured Bash dispatch moments had exactly
+one strictly-earlier unmatched same-tool call on disk, against 244 with two or
+more). The sibling then returned clean and its id-matched result closed a prompt
+nobody had answered. **Fix:** `PendingCall` now dates every candidate
+(`transcript.PendingToolCall`), and a call dated before the prompt by more than
+`callLatchSkewGrace` (3 s, just past the 0.5–1.5 s spread of one message's
+entries plus the 6–374 ms hook offset) is not a candidate. The same guard closes
+the "stale call from an interrupted earlier turn" false latch and the
+misattributed-writer case the review filed separately.
+
+**R2 — one tick's uniqueness is not uniqueness.** One assistant message's
+parallel `tool_use` blocks are separate entries 0.5–1.5 s apart, so a tick inside
+that gap sees the auto-approved sibling ALONE. **Fix:** `CallLatchProposed` — a
+candidate must survive two consecutive reads before it binds. Costs one 5 s tick
+against 45–300 s of think time.
+
+**R3 — the resolution anchor could regress.** `newestPromptSince` is the clock
+every whole-file rule dates from, and a call-scoped clear can now retire exactly
+the newest prompt. The next tick then read the assistant entry that *dispatched*
+the call it had just closed as fresh evidence — `resolutionKindOf` maps any
+assistant entry to "resumed" — and closed the older prompt whose call was still
+open. **Fix:** `rootState.promptAnchors`, a per-writer clock that only moves
+forward, dropped with the writer's last prompt.
+
+**R4 — a decline was sticky and order-dependent.** A tick closing one rejected
+and one approved call painted the chip idle if the rejection happened to sit
+first in the slice. **Fix:** the exit describes the writer — idle only when every
+call closed on that tick declined.
+
+**Three diagnosis repairs.** A refused collision now goes `CallLatchContested`
+(terminal) instead of re-counting `prompt_call_id_collision` on every tick of a
+4-minute wait — one event, one count, comparable with `prompt_call_latched`. A
+candidate dropped because ANOTHER writer already bound it is now counted as that
+collision instead of silently vanishing, which is the ordering P3's runtime half
+could not see. And `writer_call_mismatch_held` no longer relabels a hold whose
+real cause was the fanout floor.
+
+**One cost repair.** `ResolveKindForCalls` resolves a writer's whole bound set
+from one tail read; it was one 128 KiB read and full decode per bound prompt per
+tick. `toolUseResult` is likewise kept only as the bounded prefix `declinedResult`
+reads, rather than retaining whole tool outputs for every parsed entry.
+
 ---
 
 ## 5. The probes that settle what nobody established

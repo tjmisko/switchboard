@@ -2,6 +2,7 @@ package transcript
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -22,6 +23,12 @@ const (
 	// ~/.claude/projects: is_error on the block, plus the two entry-level fields.
 	declinedQuestion = questionTail + `{"type":"user","timestamp":"2026-08-31T10:04:00Z","toolUseResult":"User rejected tool use","toolDenialKind":"user-rejected","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_question","is_error":true,"content":"The user doesn't want to proceed with this tool use."}]}}
 `
+	// mixedAnswers is one writer's tail carrying two identified calls answered
+	// differently inside one window: the question approved, a later call rejected.
+	// It is what a batch resolve has to keep apart.
+	mixedAnswers = answeredQuestion + `{"type":"assistant","timestamp":"2026-08-31T10:00:04Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_second","name":"Bash","input":{}}]}}
+{"type":"user","timestamp":"2026-08-31T10:04:01Z","toolUseResult":"User rejected tool use","toolDenialKind":"user-rejected","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_second","is_error":true,"content":"The user doesn't want to proceed with this tool use."}]}}
+`
 	// failedAfterApproval is the case is_error alone cannot tell from a decline:
 	// the user APPROVED, the tool ran, and it exited non-zero. The turn resumed.
 	failedAfterApproval = questionTail + `{"type":"user","timestamp":"2026-08-31T10:04:00Z","toolUseResult":"Error: Exit code 1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_question","is_error":true,"content":"Error: Exit code 1"}]}}
@@ -38,8 +45,11 @@ func TestPendingCall(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if len(got) != 1 || got[0] != "toolu_question" {
+		if len(got) != 1 || got[0].ID != "toolu_question" {
 			t.Fatalf("pending calls = %v, want just the gated question", got)
+		}
+		if want := time.Date(2026, 8, 31, 10, 0, 0, 0, time.UTC); !got[0].At.Equal(want) {
+			t.Fatalf("candidate dated %s, want the entry's own generation time %s", got[0].At, want)
 		}
 	})
 
@@ -52,7 +62,7 @@ func TestPendingCall(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if len(got) != 1 || got[0] != "toolu_question" {
+		if len(got) != 1 || got[0].ID != "toolu_question" {
 			t.Fatalf("pending calls = %v, want the question alone", got)
 		}
 	})
@@ -89,9 +99,68 @@ func TestPendingCall(t *testing.T) {
 		}
 	})
 
+	t.Run("should date a candidate at the zero time when its entry carries no timestamp", func(t *testing.T) {
+		// The caller reads the zero time as "older than any prompt" and refuses to
+		// bind, which costs a stale red rather than a guess.
+		body := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_undated","name":"AskUserQuestion","input":{}}]}}` + "\n"
+		got, err := PendingCall(writeWriterTail(t, body), "AskUserQuestion", DefaultTailBytes)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != 1 || !got[0].At.IsZero() {
+			t.Fatalf("pending calls = %v, want the undatable candidate at the zero time", got)
+		}
+	})
+
 	t.Run("should return an error when the writer's transcript cannot be read", func(t *testing.T) {
 		if _, err := PendingCall(filepath.Join(t.TempDir(), "nope.jsonl"), "AskUserQuestion", DefaultTailBytes); err == nil {
 			t.Fatal("want a non-nil error so the caller keeps the prompt unbound")
+		}
+	})
+}
+
+// The batch is a cost fix, not a semantic one: a writer blocked on several
+// identified calls used to pay one full tail read and decode per call, every
+// tick. Each id must still see exactly what its own ResolveKindFor call saw.
+func TestResolveKindForCalls(t *testing.T) {
+	since := time.Date(2026, 8, 31, 23, 0, 0, 0, time.UTC)
+
+	t.Run("should answer every bound call from one read when the answers differ", func(t *testing.T) {
+		path := writeWriterTail(t, mixedAnswers)
+		got, err := ResolveKindForCalls(path, since, []string{"toolu_question", "toolu_second", "toolu_absent"}, DefaultTailBytes)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := map[string]ResolutionKind{
+			"toolu_question": ResolutionResumed,
+			"toolu_second":   ResolutionDeclined,
+			"toolu_absent":   ResolutionNone,
+		}
+		for callID, kind := range want {
+			if got[callID] != kind {
+				t.Fatalf("call %s = %s, want %s", callID, got[callID], kind)
+			}
+			single, err := ResolveKindFor(path, since, callID, DefaultTailBytes)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if single != got[callID] {
+				t.Fatalf("call %s: batch = %s, single = %s; the batch must decide identically", callID, got[callID], single)
+			}
+		}
+	})
+
+	t.Run("should return nothing when no call is bound", func(t *testing.T) {
+		got, err := ResolveKindForCalls(writeWriterTail(t, mixedAnswers), since, nil, DefaultTailBytes)
+		if err != nil || len(got) != 0 {
+			t.Fatalf("kinds = %v, err = %v; want an empty result and no read", got, err)
+		}
+	})
+
+	t.Run("should return an error when the transcript cannot be read", func(t *testing.T) {
+		_, err := ResolveKindForCalls(filepath.Join(t.TempDir(), "nope.jsonl"), since, []string{"toolu_question"}, DefaultTailBytes)
+		if err == nil {
+			t.Fatal("want a non-nil error so the caller applies its backstop")
 		}
 	})
 }
@@ -132,6 +201,22 @@ func TestResolveKindFor(t *testing.T) {
 		}
 		if got != ResolutionResumed {
 			t.Fatalf("kind = %s, want resumed — an approved tool that failed still resumed the turn", got)
+		}
+	})
+
+	t.Run("should resolve declined when the rejection summary runs past the prefix kept", func(t *testing.T) {
+		// toolUseResult carries whole tool outputs, so only its leading bytes are
+		// retained. The discriminator's own string is 22 of them, and it must still
+		// decide with no toolDenialKind beside it to fall back on.
+		body := questionTail + `{"type":"user","timestamp":"2026-08-31T10:04:00Z","toolUseResult":"` +
+			userRejectedResult + strings.Repeat(" and here is a long tail", 40) +
+			`","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_question","is_error":true,"content":"x"}]}}` + "\n"
+		got, err := ResolveKindFor(writeWriterTail(t, body), since, "toolu_question", DefaultTailBytes)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != ResolutionDeclined {
+			t.Fatalf("kind = %s, want declined — the bounded prefix still carries the discriminator", got)
 		}
 	})
 
