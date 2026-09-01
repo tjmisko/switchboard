@@ -168,6 +168,7 @@ is present.
 | `status` | string | always (when block present) | Legacy root-chip activity. One of: `working`, `idle`, `permission`, `delegating`; `""` means no fresh authoritative reduction. `delegating` is an idle root with live descendant work and renders the **same green as `working`**. `permission` folds both approval and user-input waits; use `agent_graph.summary`/nodes when that distinction matters. Consumers must tolerate unknown future strings. |
 | `in_flight_subagents` | number | omitted when 0 | How many subagent `Task`s the main thread has launched but not yet collected, recomputed each reconcile tick from the transcript tail. It is the signal behind a `delegating` chip; renderers show it as "N agents" in the tooltip, and `switchboard-ctl list --json` exposes it so a green chip's true state (genuinely working vs delegating) is visible. Claude-only. |
 | `pending_writers` | array of string | omitted when empty | Which **writers** are currently blocked on a permission prompt. A session is not one thread but 1 + N concurrent writers — the main thread plus each in-flight subagent — that share a pid and a chip, write to different files, and can each block independently. Each element is a bare subagent `agent_id` (the `<id>` stem of `<session>/subagents/agent-<id>.jsonl`), or the literal **`"main"`** for the main thread. **Sorted ascending**, so a renderer can diff two snapshots directly. A non-empty array means the chip is `permission`; a renderer may name the blocked teammate from it. Claude-only. Additive; consumers tolerate its absence. |
+| `pending_prompts` | array of object | omitted when empty | One entry per **open prompt**, where `pending_writers` carries one per blocked *writer* — a single writer can be blocked on several parallel calls at once. Each object is `{"writer","tool","input_hash","attention","since"}`: `writer` in the same spelling `pending_writers` uses (`"main"` for the main thread), `tool` the gated tool name, `input_hash` a hash of that call's `tool_input` (never the input itself), `attention` the wait's kind (`"approval"` or `"user_input"`, matching `agent_graph`'s vocabulary), and `since` the RFC 3339 instant that prompt opened. **Grouped by writer in `pending_writers`' ascending order, oldest-first within a writer.** Every `writer` here also appears in `pending_writers`; a writer may appear there with no record (see below). Claude-only. Additive; consumers tolerate its absence, and `pending_writers` remains the ownership contract. |
 
 #### Legacy hook fallback mapping
 
@@ -253,17 +254,15 @@ that prompt's correlators (its tool, a hash of its `tool_input`, its onset). The
 chip may leave `permission` only when no writer still owns a prompt, which is why
 a teammate finishing an unrelated tool cannot repaint a red chip.
 
-`pending_writers` is the **key set of that map, and only the key set**. The
-correlators are in-memory (`json:"-"`) and are deliberately not persisted:
+`pending_writers` is the **key set of that map, and only the key set**, and it is
+the field that carries OWNERSHIP:
 
 - Losing **ownership** across a restart is unrecoverable. `PermissionRequest` is
   edge-triggered, none of the registered hooks re-raises a live prompt, and a
   blocked writer runs no tools — so a dropped entry is a permanent missed red for
   the rest of that prompt's life. Persisting the keys is what prevents it.
-- Losing the **correlators** costs only latency: a hydrated prompt cannot take the
-  hook-speed early clear above and resolves via the transcript on the next
-  reconcile tick instead. It also *must* fail closed that way — a persisted entry
-  has no tool to match, so nothing at hook speed can match it.
+- Losing what a prompt *is* costs latency, not correctness, which is why the key
+  set shipped first and alone.
 
 At startup the daemon may use each writer's own transcript to **falsify** an entry
 — if every tool that writer dispatched has its `tool_result`, the tool returned, so
@@ -271,8 +270,52 @@ whatever gate it sat behind opened and the entry is dropped (this is what catche
 prompt answered while the daemon was down). It may never *manufacture* one: an
 unmatched `tool_use` means "a tool is dispatched and has not returned", which
 covers *awaiting approval* and *executing right now* with no field separating them.
-A `state.json` written before this field existed hydrates its red as a main-thread
+A `state.json` written before these fields existed hydrates its red as a main-thread
 prompt, reproducing the pre-field behavior exactly.
+
+##### what a prompt IS: `pending_prompts`
+
+The key set alone said who was blocked and nothing else, and two costs of that
+turned out to be correctness rather than latency:
+
+- **A writer's parallel prompts collapsed.** 7.6 % of tool-using turns dispatch
+  two or more calls at once, so a writer can hold several prompts at a time; one
+  key could stand for only one of them. Answering the survivor took the chip green
+  while the other calls were still blocking the agent — a *missed red*, silent for
+  the rest of the wait.
+- **Every restored prompt came back an approval.** The block could not carry the
+  wait's kind, so a question restored as an approval: the same chip colour, and a
+  silent downgrade for anything that distinguishes them (the agent graph, the
+  attention ring, and every rule that reads them).
+
+`pending_prompts` carries one record per open call, so both survive. A record also
+carries the correlators the prompt was opened with — its `tool`, its `input_hash`
+and its own `since` — because a record stands for one CALL, and a record with no
+tool cannot be told apart from its writer's other calls by anything: not the
+hook's `(tool, hash)` match, and not the transcript latch that binds a
+`tool_use_id`. A set of tool-less records would restore as several
+indistinguishable reds that any one completion could clear, which is the very
+defect the field exists to close. Raw tool input is still never persisted or
+forwarded; `input_hash` is the same bounded hash the hook boundary computes.
+
+`since` is the instant the prompt opened, **not** the restart instant. It dates a
+record against its writer's own transcript, which is what lets a restored prompt
+identify the call it gates and be released by that call's result. The clock the
+whole-file resolution rules run from is re-stamped to startup as it always was, so
+a pre-restart transcript entry still cannot clear a red that was live across the
+restart. Those are two different clocks on purpose.
+
+The two fields are consistent by construction: records are pruned to the key set
+whenever a snapshot is projected, so a writer released by any path cannot leave a
+record behind, and the pair can never describe two different sets of owners.
+A writer may still appear in `pending_writers` with **no** record — an old mirror,
+or a prompt seeded by a path that has no call to name — and that restores exactly
+as it did before the field existed: one residual red for that writer, which no
+single call may clear.
+
+The call's own `tool_use_id` is deliberately **not** persisted. It is re-earned
+from the transcript within one observation tick, and re-earning it reflects what
+actually happened across the restart.
 
 ###### naming a blocked writer
 
@@ -645,8 +688,8 @@ re-locates the pane by `tty` at request time.
   backend-neutral `terminal`/`window` blocks with the WM-specific blocks
   retained or aliased. Treat `hyprland.address` as an opaque ref.
 - **Additive changes** (new optional fields like `status_since`,
-  `pending_writers`, the `capabilities` block, the `agent` discriminator and the
-  `codex` enrichment block, and `agent_graph`) are **not** breaking;
+  `pending_writers`, `pending_prompts`, the `capabilities` block, the `agent`
+  discriminator and the `codex` enrichment block, and `agent_graph`) are **not** breaking;
   consumers must ignore unknown fields and tolerate missing optional fields. The
   `claude` block is unchanged — a consumer reading `.claude.status` keeps working;
   to be agent-aware, read `.codex.status` too (e.g. `.claude.status // .codex.status`).

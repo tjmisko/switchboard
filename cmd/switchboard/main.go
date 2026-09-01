@@ -495,11 +495,21 @@ func hydratePendingVerdicts(snap state.Snapshot, tailBytes int64) map[int]map[st
 // re-seeding it would manufacture the very red the falsifier just subtracted.
 //
 // Since is re-stamped rather than restored, deliberately. A true pre-restart onset
-// makes every pre-restart transcript entry read as "resolved after," and running
-// two clocks (true onset for T10's cap, restart for the resolution window) buys a
-// marginal gain. The consequence, stated plainly: a prompt raised ten minutes
-// before a restart gets a fresh full cap after it — the same #1-over-#2 trade the
-// StatusSince re-stamp above already makes.
+// makes every pre-restart transcript entry read as "resolved after," so a red that
+// was live across the restart would clear on evidence predating it. The
+// consequence, stated plainly: a prompt raised ten minutes before a restart gets a
+// fresh full cap after it — the same #1-over-#2 trade the StatusSince re-stamp
+// above already makes.
+//
+// The per-call records are NOT re-stamped, and that is not an inconsistency: the
+// two clocks this once judged not worth running are now both needed and both
+// present. A record's Since is its own onset, which is the only thing that can
+// date it against its writer's transcript and let the restored prompt bind the
+// call it gates; the resolution window stays the restart instant, on the writer's
+// resolution anchor, which the adapter seeds from the restore instant precisely so
+// no pre-restart entry can close a restored red (see the claude adapter's
+// Restore). What this function does own for the records is ownership: a writer the
+// falsifier dropped loses its records with it, through DropPending.
 func hydratePending(sess *state.Session, keep map[string]bool, now time.Time) {
 	c := sess.Claude
 	if c == nil {
@@ -978,6 +988,7 @@ func cloneSessionForReconcile(sess state.Session) state.Session {
 		value := *sess.Claude
 		value.Workflows = append([]state.WorkflowStatus(nil), sess.Claude.Workflows...)
 		value.PendingWriters = append([]string(nil), sess.Claude.PendingWriters...)
+		value.PendingPrompts = append([]state.PendingPromptRecord(nil), sess.Claude.PendingPrompts...)
 		if sess.Claude.Pending != nil {
 			value.Pending = make(map[string]state.PendingPrompt, len(sess.Claude.Pending))
 			for writer, prompt := range sess.Claude.Pending {

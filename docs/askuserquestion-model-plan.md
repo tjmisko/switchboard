@@ -603,6 +603,60 @@ from one tail read; it was one 128 KiB read and full decode per bound prompt per
 tick. `toolUseResult` is likewise kept only as the bounded prefix `declinedResult`
 reads, rather than retaining whole tool outputs for every parsed entry.
 
+### 4e. Addendum — what step 11 landed
+
+Step 11 is done, and with it the two holes Phase 2 recorded and left open.
+
+**The schema is additive, in both directions.** `state.PendingPrompt`'s persisted
+form was NOT widened; a second field was added beside the key set —
+`pending_prompts`, a flat list of `{writer, tool, input_hash, attention, since}`,
+grouped by writer in `pending_writers`' own ascending order and oldest-first within
+a writer. An old `state.json` (key set only) restores exactly as it always did, one
+residual prompt per writer; an older reader sees `pending_writers` unchanged and
+ignores the new field. Federation needed nothing: `internal/federation`'s view
+copies whole `state.Session` values, and no aggregate or remote consumer reads the
+pending block's values — `internal/label` reads the key set, and `PendingSummary`
+still counts writers. The federation churn §2.4 priced was for `CallID`, which is
+still not persisted, and which the latch re-earns in one tick.
+
+**Two clocks, and this is the part a later change is most likely to break.** A
+record's `since` is the prompt's own onset, because that is what dates it against
+its writer's transcript: `ownableCall` refuses a candidate call dated well before
+the prompt, so a restored prompt stamped with the RESTART instant could never own
+the call it was actually waiting on, and step 7's latch would be inert across every
+restart. The whole-file rules still date from the restart instant, which now lives
+on the writer's resolution anchor (`Restore` seeds it from the restore instant
+rather than from a restored onset). Collapsing the two back into one field
+reintroduces whichever of the two failures the surviving clock does not cover;
+`should hold a restored red against transcript evidence older than the restart`
+pins the direction that is a missed RED.
+
+**`PendingPrompt.Restored` became `PendingPrompt.Residual`,** and now means what
+the latch actually needs to know: this record stands for a writer's leftover red
+rather than for one call. A record-restored prompt is not residual and latches like
+any other, which is what closes §4c's carried-forward restriction. The legacy pin
+(`TestRestoredPromptShouldNeverBindACallID`) is unchanged and still passes.
+
+**One repair the plan did not name.** `restoredPending` accepted any
+`AttentionState` that `Valid()` accepted, and `Valid()` accepts `none` — so a
+record carrying `none` would have restored a prompt that folds to no attention,
+i.e. a red that comes back green. The repair now requires approval or user_input
+and otherwise falls through to the tool's own kind, which can only ever restore a
+colour.
+
+**The residual gap, stated plainly.** A call already ANSWERED when the daemon comes
+back cannot be identified: its `tool_use` is matched in the transcript, so
+`PendingCall` never offers it and the prompt cannot bind it. For a writer whose
+calls are ALL answered this costs nothing — `hydratePendingVerdicts` drops the
+whole writer at startup, as it always has. It bites only in the mixed case, where
+one of a writer's parallel calls was answered while the daemon was down and another
+still blocks: the answered prompt is restored with the writer and holds until a
+whole-file rule closes the set. That is a stale red where the pre-step-11 behaviour
+was a missed one, which is the trade §4 of
+[status-color-state-model.md](status-color-state-model.md) requires. Closing it
+needs per-CALL falsification at hydrate, which needs the call id — the one thing
+this step deliberately does not persist.
+
 ---
 
 ## 5. The probes that settle what nobody established

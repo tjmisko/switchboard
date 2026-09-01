@@ -1214,14 +1214,17 @@ func ownableCall(call transcript.PendingToolCall, prompt PendingPrompt) bool {
 }
 
 // latchablePrompt reports whether a prompt may still bind a call id — it has a
-// tool, it is not restored, and its latch has not gone terminal.
+// tool, it is not residual, and its latch has not gone terminal.
 //
-// A restored record may not bind: it stands for a writer's residual red rather
+// A residual record may not bind: it stands for a writer's leftover red rather
 // than for one call, so an id-matched clear against it would turn a single
 // honest red into a green with real calls still blocking (see
-// PendingPrompt.Restored).
+// PendingPrompt.Residual). A prompt restored from a per-call record is not
+// residual and latches like any other — that is how a red carried across a
+// restart still clears on its own call's result instead of waiting for the
+// writer's whole file to advance.
 func latchablePrompt(prompt PendingPrompt) bool {
-	if prompt.Tool == "" || prompt.Restored {
+	if prompt.Tool == "" || prompt.Residual {
 		return false
 	}
 	return prompt.Latch == CallLatchUnbound || prompt.Latch == CallLatchProposed
@@ -1326,7 +1329,14 @@ func reconcileRootRuntime(path string, runtime agentgraph.RuntimeState, since ti
 	return runtime
 }
 
+// clonePendingSets detaches a writer→open-set map. Empty in, nil out: the clone
+// is only ever read, and a nil map reads identically, so callers that hand the
+// result on (Compatibility.Clone) do not turn "no prompts" into an empty map that
+// encodes and compares differently from the absence it stands for.
 func clonePendingSets(pending map[string][]PendingPrompt) map[string][]PendingPrompt {
+	if len(pending) == 0 {
+		return nil
+	}
 	clone := make(map[string][]PendingPrompt, len(pending))
 	for writer, prompts := range pending {
 		clone[writer] = slices.Clone(prompts)

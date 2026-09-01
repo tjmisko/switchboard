@@ -37,14 +37,18 @@ type PendingPrompt struct {
 	// is meaningful only while Latch is CallLatchBound.
 	CallID string
 	Latch  CallLatchState
-	// Restored marks a prompt rebuilt from the persisted legacy block rather than
-	// opened by a hook. Such a record stands for a writer's residual RED, not for
-	// one call — the block carries one prompt per writer, so a writer that went
-	// down blocked on three calls comes back holding one (see restoredPending).
-	// Binding a call id to it would let that one id clear a red three real calls
-	// are still holding, so the latch refuses. It clears when the schema persists
-	// the set instead of the scalar (plan Phase 4 step 11).
-	Restored bool
+	// Residual marks a prompt rebuilt from a persisted block that could carry only
+	// ONE prompt per writer. Such a record stands for a writer's leftover RED rather
+	// than for one call — a writer that went down blocked on three calls comes back
+	// holding a single record — so binding a call id to it would let that one id
+	// clear a red three real calls are still holding, and the latch refuses
+	// (latchablePrompt).
+	//
+	// It is set for a prompt rebuilt from the legacy scalar and NOT for one rebuilt
+	// from a per-call record, which names exactly one call and may latch like any
+	// other. That distinction is what keeps an old state.json restoring as
+	// conservatively as it always did while a new one restores the real set.
+	Residual bool
 }
 
 // CallLatchState is how far the lazy call-identity latch has got with one
@@ -165,6 +169,11 @@ func (o *Observer) DrainPromptDiagnostics(key provider.RootKey) []string {
 // the legacy block's shape — while the adapter tracks the writer's whole open
 // set; the KEY SET, which is what the wire and the chip consume, is the same
 // either way (see projectedPending).
+//
+// PendingSets carries that whole open set beside it, unabridged. It is additive:
+// every existing consumer of Pending is unchanged, and a caller that supplies only
+// Pending (a pre-record state.json, or a test written against the legacy shape)
+// restores exactly as it did before.
 type Compatibility struct {
 	SessionID         string
 	Transcript        string
@@ -173,6 +182,7 @@ type Compatibility struct {
 	InFlightSubagents int
 	Workflows         []fanout.Workflow
 	Pending           map[string]PendingPrompt
+	PendingSets       map[string][]PendingPrompt
 	PendingWriters    []string
 	PendingTool       string
 }
@@ -183,6 +193,7 @@ func (c Compatibility) Clone() Compatibility {
 	clone.Workflows = append([]fanout.Workflow(nil), c.Workflows...)
 	clone.PendingWriters = append([]string(nil), c.PendingWriters...)
 	clone.Pending = clonePending(c.Pending)
+	clone.PendingSets = clonePendingSets(c.PendingSets)
 	return clone
 }
 
@@ -222,7 +233,13 @@ func (o *Observer) Restore(root provider.RootRef, restored Compatibility, at tim
 	rs.pending = restoredPending(restored, at)
 	clear(rs.promptAnchors)
 	for writer, prompts := range rs.pending {
-		rs.promptAnchors[writer] = newestPromptSince(prompts)
+		// The anchor is the RESTART instant, never a restored onset. Every whole-file
+		// resolution rule dates from it, and a pre-restart onset would make each of
+		// that writer's pre-restart entries read as evidence the wait ended — the
+		// missed RED the hydrate-time re-stamp has always existed to prevent. A
+		// restored prompt keeps its own onset in Since regardless, which is what dates
+		// it against its writer's transcript for the call latch.
+		rs.promptAnchors[writer] = writerResolutionAnchor(at, prompts)
 	}
 	rs.fanout.InFlight = restored.InFlightSubagents
 	rs.fanout.Workflows = append([]fanout.Workflow(nil), restored.Workflows...)
@@ -263,6 +280,7 @@ func projectCompatibility(rs *rootState, summary agentgraph.Summary) Compatibili
 		InFlightSubagents: rs.fanout.InFlight,
 		Workflows:         append([]fanout.Workflow(nil), rs.fanout.Workflows...),
 		Pending:           projectedPending(rs.pending),
+		PendingSets:       clonePendingSets(rs.pending),
 	}
 	projection.PendingWriters = pendingWritersForProjection(projection.Pending)
 	projection.PendingTool = derivedPendingTool(projection.Pending)
@@ -274,9 +292,11 @@ func projectCompatibility(rs *rootState, summary agentgraph.Summary) Compatibili
 // and the restore path actually consume — is unchanged, and for the single-prompt
 // case the value is byte-identical to the pre-container projection.
 //
-// The newest prompt is the one kept. Only one survives a daemon restart, and the
-// newest Since is the one that keeps the restored red alive longest under the
-// stale backstop; keeping the oldest would let a restart shorten a live red.
+// The newest prompt is the one kept. The set itself now survives a restart in
+// PendingSets, so this scalar is no longer what a restore reads — but it is still
+// what a reader that knows only the legacy shape sees, and the newest Since is the
+// one that keeps such a red alive longest under the stale backstop, where keeping
+// the oldest would shorten a live red.
 func projectedPending(pending map[string][]PendingPrompt) map[string]PendingPrompt {
 	projection := make(map[string]PendingPrompt, len(pending))
 	for writer, prompts := range pending {
@@ -323,25 +343,35 @@ func derivedPendingTool(pending map[string]PendingPrompt) string {
 	return pending[writers[0]].Tool
 }
 
-// restoredPending rebuilds the in-memory open sets from a persisted legacy
-// block. That block carries one prompt per writer, so a writer that was blocked
-// on three parallel calls comes back holding ONE, and the other two are gone —
-// M2's missed RED, reinstated for the window between the restart and whatever
-// transcript evidence resolves the survivor.
+// restoredPending rebuilds the in-memory open sets from a persisted block.
 //
-// Nothing re-learns them from hooks. PermissionRequest fires exactly once per
-// call (docs/claude-code-hook-schema.md §2), so no later edge re-opens a prompt
-// that was already open when the daemon went down; the writer's transcript is
-// the only recovery path, and its rules resolve the whole set at once rather
-// than naming the forgotten calls. Persisting the SET instead of the scalar is
-// the fix, and it belongs with the state-schema change already scheduled for
-// Phase 4 step 11 (askuserquestion-model-plan.md §4).
+// OWNERSHIP is taken from the widest evidence the block carries — the legacy
+// per-writer map, its wire key set, and the per-call records — because losing a
+// writer is the unrecoverable error: PermissionRequest fires exactly once per call
+// (docs/claude-code-hook-schema.md §2), so no later hook re-opens a prompt that was
+// already open when the daemon went down, and a writer dropped here is red nothing
+// can raise again.
 //
-// Until then a restored record is one writer's residual red, NOT a stand-in for
-// its open set. Anything that later binds a call identity to it — the lazy latch
-// in Phase 4 step 7 — must not then let that one id clear the writer's red, or
-// the restore path converts today's honest single red into a green with real
-// calls still blocking.
+// The SET is taken from PendingSets when the block carries records for that
+// writer, and that is the whole point of this phase. A block that carries only the
+// legacy scalar restores exactly ONE prompt per writer, so a writer that went down
+// blocked on three parallel calls came back holding one; answering the survivor
+// then took the chip green with two calls still blocking — M2's missed RED,
+// manufactured by the restart itself. Records close that.
+//
+// A prompt rebuilt from the scalar is marked Residual: it stands for a writer's
+// leftover red, not for one call, so nothing may bind a call identity to it (see
+// PendingPrompt.Residual). A prompt rebuilt from a record is NOT residual — it
+// names one call — so it may latch, and its own answer can close it without
+// touching its writer's other prompts.
+//
+// Two clocks, deliberately. Since is the record's own onset, which is what dates a
+// prompt against its writer's transcript and lets the latch tell the call it gates
+// from an older dispatch (ownableCall). The clock the WHOLE-FILE rules run from is
+// the restart instant, and it lives on the writer's resolution anchor, seeded in
+// Restore — keeping a pre-restart onset there would make every pre-restart
+// assistant entry read as "this writer resumed" and clear a red that was live
+// across the restart.
 func restoredPending(restored Compatibility, at time.Time) map[string][]PendingPrompt {
 	prompts := clonePending(restored.Pending)
 	if len(prompts) == 0 {
@@ -353,18 +383,59 @@ func restoredPending(restored Compatibility, at time.Time) map[string][]PendingP
 			prompts[writer] = PendingPrompt{Attention: agentgraph.AttentionApproval, Since: at}
 		}
 	}
+	// A writer named only by the records still owns its prompts. The placeholder is
+	// never read — the set branch below replaces it — it only puts that writer in
+	// the key set the loop walks.
+	for writer := range restored.PendingSets {
+		if _, owned := prompts[writer]; !owned {
+			prompts[writer] = PendingPrompt{Since: at}
+		}
+	}
 	pending := make(map[string][]PendingPrompt, len(prompts))
 	for writer, prompt := range prompts {
-		if prompt.Attention == "" || !prompt.Attention.Valid() {
-			prompt.Attention = attentionForTool(prompt.Tool)
+		if set := restored.PendingSets[writer]; len(set) > 0 {
+			pending[writer] = restoredPromptSet(set, at)
+			continue
 		}
-		if prompt.Since.IsZero() {
-			prompt.Since = at
-		}
-		prompt.CallID, prompt.Latch, prompt.Restored = "", CallLatchUnbound, true
-		pending[writer] = []PendingPrompt{prompt}
+		pending[writer] = []PendingPrompt{restoredPrompt(prompt, at, true)}
 	}
 	return pending
+}
+
+// restoredPromptSet rebuilds one writer's whole open set from its records,
+// oldest-first, and capped exactly as a live set is: a mirror that somehow carries
+// more prompts than a writer can hold must not restore past the ceiling the
+// append path enforces.
+func restoredPromptSet(set []PendingPrompt, at time.Time) []PendingPrompt {
+	prompts := make([]PendingPrompt, 0, len(set))
+	for _, prompt := range set {
+		prompts = append(prompts, restoredPrompt(prompt, at, false))
+	}
+	sort.SliceStable(prompts, func(i, j int) bool { return prompts[i].Since.Before(prompts[j].Since) })
+	if len(prompts) > maxPendingPromptsPerWriter {
+		prompts = prompts[len(prompts)-maxPendingPromptsPerWriter:]
+	}
+	return prompts
+}
+
+// restoredPrompt normalizes one rebuilt prompt. The latch state is always reset —
+// a call id is re-earned from the transcript rather than persisted
+// (askuserquestion-model-plan.md §2.4) — and the attention is repaired rather than
+// trusted.
+//
+// The attention repair rejects AttentionNone as well as an unset or unknown value,
+// which Valid() alone would accept: "none" is a colourless prompt, and a restored
+// prompt that folds to no attention is a red that comes back green. Falling through
+// to the tool's own kind can only ever restore a colour.
+func restoredPrompt(prompt PendingPrompt, at time.Time, residual bool) PendingPrompt {
+	if prompt.Attention != agentgraph.AttentionApproval && prompt.Attention != agentgraph.AttentionUserInput {
+		prompt.Attention = attentionForTool(prompt.Tool)
+	}
+	if prompt.Since.IsZero() {
+		prompt.Since = at
+	}
+	prompt.CallID, prompt.Latch, prompt.Residual = "", CallLatchUnbound, residual
+	return prompt
 }
 
 func runtimeFromLegacy(status string) agentgraph.RuntimeState {

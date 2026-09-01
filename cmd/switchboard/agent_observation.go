@@ -708,6 +708,16 @@ func sessionForKey(snapshot state.Snapshot, key provider.RootKey) (state.Session
 	return state.Session{}, false
 }
 
+// compatibilityFromState rebuilds the adapter's compatibility view from the
+// persisted block — the input to a restore, and to the re-observation of a session
+// whose graph went stale.
+//
+// Attention is NOT stamped here. It used to be hardcoded to AttentionApproval
+// because the block had nowhere to carry it, which republished every question-red
+// as an approval-red; now the per-call records carry the real one, and the legacy
+// map — which still carries none — is left blank so restoredPending derives it
+// from the tool rather than being handed a guess (askuserquestion-model-plan.md
+// §2.4).
 func compatibilityFromState(info *state.AgentInfo) claudeprovider.Compatibility {
 	if info == nil {
 		return claudeprovider.Compatibility{}
@@ -716,12 +726,13 @@ func compatibilityFromState(info *state.AgentInfo) claudeprovider.Compatibility 
 		SessionID: info.SessionID, Transcript: info.Transcript, Status: info.Status,
 		StatusSince: info.StatusSince, InFlightSubagents: info.InFlightSubagents,
 		PendingWriters: append([]string(nil), info.PendingWriters...), PendingTool: info.PendingTool,
-		Pending:   make(map[string]claudeprovider.PendingPrompt, len(info.Pending)),
-		Workflows: make([]fanout.Workflow, len(info.Workflows)),
+		Pending:     make(map[string]claudeprovider.PendingPrompt, len(info.Pending)),
+		PendingSets: pendingSetsFromRecords(info.PendingPrompts),
+		Workflows:   make([]fanout.Workflow, len(info.Workflows)),
 	}
 	for writer, prompt := range info.Pending {
 		compat.Pending[writer] = claudeprovider.PendingPrompt{
-			Tool: prompt.Tool, InputHash: prompt.InputHash, Attention: agentgraph.AttentionApproval, Since: prompt.Since,
+			Tool: prompt.Tool, InputHash: prompt.InputHash, Since: prompt.Since,
 		}
 	}
 	for i, workflow := range info.Workflows {
@@ -751,8 +762,70 @@ func applyClaudeCompatibility(info *state.AgentInfo, compat claudeprovider.Compa
 	if len(info.Pending) == 0 {
 		info.Pending = nil
 	}
+	info.PendingPrompts = pendingRecordsFromSets(compat.PendingSets)
 	info.PendingWriters = append([]string(nil), compat.PendingWriters...)
 	info.PendingTool = compat.PendingTool
+}
+
+// pendingRecordsFromSets flattens the adapter's writer→open-set map into the
+// persisted record list, writers in ascending order and each writer's prompts left
+// in their own oldest-first order. The order is stamped here rather than left to
+// map iteration because these records are encoded into the publish gate's change
+// key; a set that reordered itself would republish to every bar on every tick.
+//
+// The latch state is dropped on the way out. A call id is re-earned from the
+// transcript in one Observe tick, and re-earning it reflects what actually
+// happened across the restart, so persisting it would buy nothing for a schema
+// field and the federation churn that comes with one.
+func pendingRecordsFromSets(sets map[string][]claudeprovider.PendingPrompt) []state.PendingPromptRecord {
+	if len(sets) == 0 {
+		return nil
+	}
+	writers := make([]string, 0, len(sets))
+	for writer := range sets {
+		writers = append(writers, writer)
+	}
+	sort.Strings(writers)
+	records := make([]state.PendingPromptRecord, 0, len(sets))
+	for _, writer := range writers {
+		for _, prompt := range sets[writer] {
+			records = append(records, state.PendingPromptRecord{
+				Writer: writer, Tool: prompt.Tool, InputHash: prompt.InputHash,
+				Attention: string(prompt.Attention), Since: prompt.Since,
+			})
+		}
+	}
+	if len(records) == 0 {
+		return nil
+	}
+	return records
+}
+
+// pendingSetsFromRecords is the inverse, regrouping the flat record list by
+// writer in the adapter's own bare ("" = main) key spelling.
+//
+// The main thread is normalized on the way in because this reads a block from
+// either side of the wire projection: a live AgentInfo carries the bare key, while
+// every snapshot copy — which is what restoreClaude and expireCurrent actually
+// hand it — carries "main". Left untranslated the two spellings become two
+// writers, and the writer whose set was not found would be rebuilt from the legacy
+// scalar as a second, unclearable red beside its own prompts.
+func pendingSetsFromRecords(records []state.PendingPromptRecord) map[string][]claudeprovider.PendingPrompt {
+	if len(records) == 0 {
+		return nil
+	}
+	sets := make(map[string][]claudeprovider.PendingPrompt, len(records))
+	for _, record := range records {
+		writer := record.Writer
+		if writer == state.PendingWriterMain {
+			writer = ""
+		}
+		sets[writer] = append(sets[writer], claudeprovider.PendingPrompt{
+			Tool: record.Tool, InputHash: record.InputHash,
+			Attention: agentgraph.AttentionState(record.Attention), Since: record.Since,
+		})
+	}
+	return sets
 }
 
 // HandleHook is the RPC graph-aware hook callback. The incoming Claude

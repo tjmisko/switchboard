@@ -74,6 +74,25 @@ func canonicalSnapshot() Snapshot {
 					// function feeds the encoder directly rather than going through
 					// enrichForWire, exactly as StatusSinceWire above does.
 					PendingWriters: []string{"af5bd126402ac16c7", "main"},
+					// pending_prompts: one record per open CALL, where the key set above
+					// carries one per blocked WRITER — the main thread here is blocked on
+					// two parallel calls at once, which the key set alone cannot say.
+					// Grouped by writer in the same ascending order, oldest-first within a
+					// writer, and likewise set in its already-projected ("main") form.
+					PendingPrompts: []PendingPromptRecord{
+						{
+							Writer: "af5bd126402ac16c7", Tool: "AskUserQuestion", InputHash: "9f2c4a1b7d05e386",
+							Attention: "user_input", Since: time.Date(2026, 5, 28, 9, 2, 0, 0, time.UTC),
+						},
+						{
+							Writer: "main", Tool: "Bash", InputHash: "3c81de52b9a0f74e",
+							Attention: "approval", Since: time.Date(2026, 5, 28, 9, 2, 30, 0, time.UTC),
+						},
+						{
+							Writer: "main", Tool: "Edit", InputHash: "5a6072ce18bd493f",
+							Attention: "approval", Since: time.Date(2026, 5, 28, 9, 2, 45, 0, time.UTC),
+						},
+					},
 					// workflows: the active ultracode Workflow runs behind the
 					// in_flight_subagents count — set here to pin the field and its
 					// nested shape on the wire. Sorted by run_id.
