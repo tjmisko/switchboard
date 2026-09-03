@@ -71,7 +71,9 @@ cmd_update() {
     local text="$label"
     [ "$navigable" = "false" ] && text="$label ·"
 
-    args+=(--add item "$item" bottom
+    # Item position is always left/center/right -- it is independent of which
+    # screen edge the BAR itself is on.
+    args+=(--add item "$item" left
            --set "$item"
              label="$text" label.color="$color"
              background.color="$bg" background.corner_radius=4
