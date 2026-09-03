@@ -33,20 +33,41 @@ var backgroundSubcommands = map[string]struct{}{
 }
 
 // IsClaude returns true if the given process snapshot is an interactive Claude
-// Code session. The primary, cheap filter is comm == "claude" (the binary runs
-// under its own name on both Linux and macOS — it is a native signed binary, not
-// node, since claude v2.1.113). Background subcommand invocations (see
-// backgroundSubcommands) are rejected — those are processes, not sessions. The
-// exe check (claudeExeValid) is cheap insurance against name collisions and is
-// the only OS-dependent part of the predicate.
+// Code session. Identity comes from namedClaude; background subcommand
+// invocations (see backgroundSubcommands) are then rejected — those are
+// processes, not sessions — and claudeExeValid is cheap insurance against name
+// collisions.
 func IsClaude(p osproc.Info) bool {
-	if p.Comm != "claude" {
+	if !namedClaude(p) {
 		return false
 	}
 	if isBackgroundSubcommand(p.Args) {
 		return false
 	}
 	return claudeExeValid(p.Exe, runtime.GOOS)
+}
+
+// namedClaude reports whether the process was invoked under the name "claude".
+//
+// comm alone is NOT enough, because comm is a per-platform artifact of how a
+// kernel derives a process name rather than a stable fact about the program.
+// Linux takes it from the path passed to execve, so a versioned-symlink install
+// (~/.local/bin/claude -> ~/.local/share/claude/versions/2.1.259) reports
+// "claude". macOS resolves the symlink first and takes the target's basename,
+// so the SAME install reports comm "2.1.259" — the version string. Gating on
+// comm therefore made every macOS session undiscoverable no matter how correct
+// the process backend was.
+//
+// argv[0] is the portable fallback: it preserves the name the process was
+// actually invoked under on both platforms. The exe path is deliberately NOT an
+// identity signal here — it is validation (claudeExeValid). Admitting a process
+// solely because its executable sits under a /claude/ directory would classify
+// sibling helper binaries shipped in the same versioned payload as sessions.
+func namedClaude(p osproc.Info) bool {
+	if p.Comm == "claude" {
+		return true
+	}
+	return len(p.Args) > 0 && filepath.Base(p.Args[0]) == "claude"
 }
 
 // claudeExeValid reports whether exe is a plausible claude binary path for the
@@ -182,15 +203,17 @@ var codexHelpVersionFlags = map[string]struct{}{
 // IsCodex returns true only when the process snapshot proves both that it is the
 // real Codex executable and that the invocation enters an interactive TUI.
 //
-// Comm is necessary but not sufficient: codex-linux-sandbox has been observed
-// with comm=codex. Args[0], when readable, and Exe, when readable, must therefore
-// both have the exact basename "codex". A masked Exe is safe when Args[0] proves
-// identity; masked Args are not accepted because no remaining process field can
-// distinguish a bare TUI from `codex exec` or another utility invocation.
+// Comm is neither sufficient nor necessary, so it is not consulted at all.
+// Not sufficient: codex-linux-sandbox has been observed with comm=codex. Not
+// necessary: macOS derives comm from the resolved symlink target, so a
+// versioned install reports a version string rather than "codex" (see
+// namedClaude). Args[0], when readable, and Exe, when readable, must therefore
+// both have the exact basename "codex" — which was already the real identity
+// test here, with the comm gate contributing nothing but a macOS outage.
+// A masked Exe is safe when Args[0] proves identity; masked Args are not
+// accepted because no remaining process field can distinguish a bare TUI from
+// `codex exec` or another utility invocation.
 func IsCodex(p osproc.Info) bool {
-	if p.Comm != "codex" {
-		return false
-	}
 	if len(p.Args) == 0 || filepath.Base(p.Args[0]) != "codex" {
 		return false
 	}

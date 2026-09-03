@@ -65,6 +65,28 @@ func TestIsClaude(t *testing.T) {
 		}, false},
 		// Exclusion holds even when the kernel masked the exe.
 		{"daemon with masked exe", osproc.Info{Comm: "claude", Exe: "", Args: []string{"claude", "daemon", "run"}}, false},
+
+		// macOS sets p_comm from the RESOLVED binary, so the versioned-symlink
+		// install (~/.local/bin/claude -> …/versions/2.1.259) reports the
+		// version string. argv[0] is what still carries the name. Without this
+		// every macOS session was undiscoverable.
+		{"should discover session when comm is a version string", osproc.Info{
+			Comm: "2.1.259",
+			Exe:  "/Users/u/.local/share/claude/versions/2.1.259",
+			Args: []string{"claude"},
+		}, true},
+		{"should still filter daemon when comm is a version string", osproc.Info{
+			Comm: "2.1.259",
+			Exe:  "/Users/u/.local/share/claude/versions/2.1.259",
+			Args: []string{"/Users/u/.local/bin/claude", "daemon", "run"},
+		}, false},
+		// Why exe is validation and not identity: a sibling helper shipped in
+		// the same versioned payload sits under /claude/ but is not a session.
+		{"should reject sibling binary under a claude directory", osproc.Info{
+			Comm: "helper",
+			Exe:  "/Users/u/.local/share/claude/versions/2.1.259/helper",
+			Args: []string{"helper"},
+		}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -114,7 +136,7 @@ func TestClaudeExeValid(t *testing.T) {
 // the GOOS-parametric core so it runs on the Linux host.
 func TestIsClaudeDarwinLayout(t *testing.T) {
 	macClaude := osproc.Info{Comm: "claude", Exe: "/Users/u/.local/bin/claude"}
-	if !(macClaude.Comm == "claude" && !isBackgroundSubcommand(macClaude.Args) && claudeExeValid(macClaude.Exe, "darwin")) {
+	if !(namedClaude(macClaude) && !isBackgroundSubcommand(macClaude.Args) && claudeExeValid(macClaude.Exe, "darwin")) {
 		t.Errorf("darwin native-install claude not accepted: %+v", macClaude)
 	}
 	// A darwin daemon subcommand at the same path is still not a session.
@@ -209,9 +231,14 @@ func TestIsCodex(t *testing.T) {
 			true,
 		},
 		{
-			"wrong comm",
-			osproc.Info{Comm: "claude", Exe: "/usr/local/bin/codex", Args: []string{"codex"}},
-			false,
+			// comm is no longer consulted: macOS derives it from the resolved
+			// symlink target, so a versioned install reports a version string.
+			// Identity rests on argv[0] plus exe, which both still say codex.
+			// The protection comm used to appear to give (rejecting a mismatched
+			// binary) is really the exe check — see the sandbox wrapper case.
+			"should discover session when comm is a version string",
+			osproc.Info{Comm: "0.42.0", Exe: "/usr/local/bin/codex", Args: []string{"/usr/local/bin/codex"}},
+			true,
 		},
 		{
 			"sandbox wrapper regression with codex comm",
