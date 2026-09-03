@@ -45,7 +45,27 @@ $ ls -l ~/.local/bin/claude
 ```
 
 `~/.local/bin/claude` is a symlink into a versioned directory, and macOS derives
-`p_comm` from the **resolved** binary's basename. **[inferred]** Linux uses the
+`p_comm` from the **resolved** binary's basename.
+
+**[verified] The bug is layout-dependent, not platform-universal.** A controlled
+experiment with two symlinked binaries settles both halves of the mechanism:
+
+```
+LAYOUT         p_comm       argv[0] basename
+claude-style   9.9.9        claudelike      <- version-named FILE  -> broken
+cask-style     codex        casklike        <- version-named DIR   -> fine
+```
+
+It fires only when the installer names the binary FILE after the version, as
+claude's native installer does. A Homebrew cask puts the version in a DIRECTORY
+component (`…/Caskroom/codex/0.152.1/bin/codex`), so the resolved basename is
+still `codex` and comm reads correctly — codex installed that way was never
+affected. This is why the predicate must be layout-independent rather than
+enumerate known install shapes.
+
+The same experiment shows **`argv[0]` is the SYMLINK's name, not the resolved
+target's** — which is exactly why it survives where comm does not, and why it is
+the right identity signal. **[inferred]** Linux uses the
 path as passed to `execve`, symlink unresolved, so the same install reads
 `claude` there — worth 30 seconds on a Linux box to confirm this is a genuine
 platform divergence and not a latent bug on both.
@@ -437,9 +457,8 @@ unprivileged 330/563 = own-uid set; `KERN_PROC_ALL` 122–562 µs/563 procs;
 present at v0.21.3-Beta / absent at v0.20.3-Beta; every file:line in this
 document.
 
-**Not verified — treat as open:** the Linux `comm` mechanism (no Linux box);
-whether the versioned-symlink layout is universal (one install seen); whether
-`IsCodex` is hit in practice (no codex process running); `syscall(336)` ABI
+**Not verified — treat as open:** the Linux `comm` mechanism (no Linux box); whether a real
+codex TUI is discovered end to end (codex is now installed but was not run); `syscall(336)` ABI
 durability beyond 14.3.1 and amd64 struct offsets; kqueue at ~20 pids;
 **WezTerm's macOS `tty_name` form and socket dir** (not installed); all
 iTerm2/kitty/Ghostty/Terminal.app behavior (vendor docs only); Windows
