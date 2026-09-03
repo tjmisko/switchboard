@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Switchboard bottom bar for macOS (SketchyBar).
+#
+# Deliberately a BOTTOM bar: the macOS menu bar is at the top and already
+# crowded, and switchboard's Linux bottombar occupies the same screen edge, so
+# muscle memory carries across platforms.
+PLUGIN_DIR="$HOME/.config/sketchybar/plugins"
+
+sketchybar --bar position=bottom \
+                 height=32 \
+                 blur_radius=20 \
+                 color=0xdd1a1b26 \
+                 padding_left=8 \
+                 padding_right=8
+
+sketchybar --default icon.font="SF Pro:Semibold:13.0" \
+                     label.font="SF Pro:Semibold:13.0" \
+                     icon.color=0xffc0caf5 \
+                     label.color=0xffc0caf5 \
+                     padding_left=4 \
+                     padding_right=4 \
+                     label.padding_left=4 \
+                     label.padding_right=4
+
+# The summary sits left and always exists, so the bar is never empty and can
+# report "down" or "observe only" when there is nothing else to show.
+sketchybar --add item switchboard.summary left \
+           --set switchboard.summary \
+                 icon="◉" \
+                 label="switchboard: starting" \
+                 update_freq=2 \
+                 script="$PLUGIN_DIR/switchboard.sh update"
+
+# Session chips are added to the right of the summary by the plugin itself.
+sketchybar --update
