@@ -2,9 +2,13 @@
 # Render switchboard sessions as SketchyBar chips.
 #
 # SketchyBar is the macOS answer to Seam 4 (see docs/portability-plan.md). Like
-# the waybar renderer it consumes ONLY the public contract -- the RPC snapshot
-# that `switchboard-ctl --json list` prints -- so it stays ignorant of every
-# platform detail below it.
+# the waybar renderer it consumes ONLY the public contract -- the snapshot that
+# `switchboard-ctl --json list` prints -- so it stays ignorant of every platform
+# detail below it.
+#
+# Visual target is the Linux bottom bar: outlined pills floating on a
+# transparent bar, where the status colour is the BORDER and the TEXT rather
+# than a fill. Chips are centred and carry the full project name.
 #
 # Invoked two ways:
 #   switchboard.sh update   rebuild the chip set from the current snapshot
@@ -14,15 +18,24 @@ set -uo pipefail
 SB_CTL="${SWITCHBOARD_CTL:-$HOME/.local/bin/switchboard-ctl}"
 PREFIX="sb.session"
 
-# Status colours, 0xAARRGGBB. These mirror the semantics the daemon assigns, not
-# a theme: red is "needs you now", orange "waiting on you", green "busy".
-COLOR_PERMISSION=0xfff7768e # red    -- blocked on a permission prompt
-COLOR_IDLE=0xffe0af68       # orange -- finished, awaiting input
-COLOR_WORKING=0xff9ece6a    # green  -- actively working
-COLOR_DELEGATING=0xff7aa2f7 # blue   -- driving subagents
-COLOR_UNKNOWN=0xff565f89    # grey   -- status not yet known
-COLOR_LABEL=0xffc0caf5
-COLOR_FOCUSED_BG=0xff414868
+# Gruvbox-material, matching the Linux bar. Status semantics come from the
+# daemon, not from taste: red is "needs you now", amber "waiting on you", aqua
+# "busy".
+COLOR_PERMISSION=0xffea6962 # red    -- blocked on a permission prompt
+COLOR_IDLE=0xffd8a657       # amber  -- finished, awaiting input
+COLOR_WORKING=0xff89b482    # aqua   -- actively working
+COLOR_DELEGATING=0xffd3869b # purple -- driving subagents
+COLOR_UNKNOWN=0xff928374    # grey   -- status not yet known
+
+# Menlo rather than SF Mono: SF Mono ships only as Terminal.app resources and as
+# the private .SFNSMono system face, so SketchyBar cannot resolve it by family
+# name and silently falls back to a proportional font. Menlo is a real installed
+# family on every macOS.
+CHIP_FONT="Menlo:Bold:12.0"
+
+CHIP_FILL=0xcc1d2021        # dark translucent, so the pill reads on any wallpaper
+CHIP_FILL_FOCUSED=0xff3c3836
+COLOR_DIM=0xff928374
 
 color_for() {
   case "$1" in
@@ -38,54 +51,74 @@ cmd_focus() {
   "$SB_CTL" focus "pid:$1" >/dev/null 2>&1 || true
 }
 
+# The status item carries only what the chips cannot say themselves. A session
+# count would duplicate the chips, so it stays hidden unless something is
+# actually wrong or degraded -- which keeps the bar as clean as the target.
+set_status() {
+  local text="$1"
+  if [ -z "$text" ]; then
+    sketchybar --set switchboard.status drawing=off >/dev/null 2>&1
+    return
+  fi
+  sketchybar --set switchboard.status drawing=on label="$text" label.color="$COLOR_DIM" \
+    >/dev/null 2>&1
+}
+
 cmd_update() {
   local snapshot
   # A daemon that is down is a normal state, not an error: say so and stop.
   if ! snapshot="$("$SB_CTL" --json list 2>/dev/null)" || [ -z "$snapshot" ]; then
-    sketchybar --set switchboard.summary label="switchboard: down" icon.color="$COLOR_UNKNOWN" \
-      >/dev/null 2>&1
+    set_status "switchboard: down"
     drop_stale ""
     return 0
   fi
 
-  local count navigate
-  count=$(jq -r '.sessions | length' <<<"$snapshot")
+  local navigate count
   navigate=$(jq -r '.capabilities.navigate' <<<"$snapshot")
+  count=$(jq -r '.sessions | length' <<<"$snapshot")
 
-  # The summary carries the capability tier, because on macOS "nothing happened
-  # when I clicked" is usually Navigate being unavailable rather than a bug.
-  local summary="$count session(s)"
-  [ "$navigate" = "false" ] && summary="$summary · observe only"
-  sketchybar --set switchboard.summary label="$summary" icon.color="$COLOR_LABEL" >/dev/null 2>&1
+  if [ "$count" = "0" ]; then
+    set_status "no sessions"
+  elif [ "$navigate" = "false" ]; then
+    # Worth saying once, quietly: on stock macOS a click cannot raise a window,
+    # and without this a no-op click reads as a bug rather than a missing
+    # capability.
+    set_status "observe only"
+  else
+    set_status ""
+  fi
 
   local args=() keep=""
-  while IFS=$'\t' read -r pid status label focused navigable; do
+  while IFS=$'\t' read -r pid status label focused; do
     [ -z "$pid" ] && continue
     local item="$PREFIX.$pid"
     keep="$keep $item"
-    local color; color=$(color_for "$status")
-    local bg=0x00000000
-    [ "$focused" = "true" ] && bg="$COLOR_FOCUSED_BG"
-    # A non-navigable session still renders -- it is observable, just not
-    # jumpable. Dimming it is honest; hiding it would lose the session.
-    local text="$label"
-    [ "$navigable" = "false" ] && text="$label ·"
+    local color fill
+    color=$(color_for "$status")
+    fill="$CHIP_FILL"
+    [ "$focused" = "true" ] && fill="$CHIP_FILL_FOCUSED"
 
     # Item position is always left/center/right -- it is independent of which
     # screen edge the BAR itself is on.
-    args+=(--add item "$item" left
+    args+=(--add item "$item" center
            --set "$item"
-             label="$text" label.color="$color"
-             background.color="$bg" background.corner_radius=4
-             background.drawing=on background.height=20
+             label="$label"
+             label.color="$color"
+             label.font="$CHIP_FONT"
+             label.padding_left=8 label.padding_right=8
+             background.drawing=on
+             background.color="$fill"
+             background.border_color="$color"
+             background.border_width=1
+             background.corner_radius=9
+             background.height=22
              click_script="'$0' focus $pid")
   done < <(jq -r '
     .sessions[]
     | [ (.pid|tostring),
         ((.claude.status // .codex.status) // "unknown"),
         (.resolved_name // (.cwd | split("/") | last) // "?"),
-        (.focused|tostring),
-        ((.navigable // false)|tostring) ]
+        (.focused|tostring) ]
     | @tsv' <<<"$snapshot")
 
   [ ${#args[@]} -gt 0 ] && sketchybar "${args[@]}" >/dev/null 2>&1

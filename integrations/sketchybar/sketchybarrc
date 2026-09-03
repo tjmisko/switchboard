@@ -1,35 +1,40 @@
 #!/usr/bin/env bash
 # Switchboard bottom bar for macOS (SketchyBar).
 #
-# Deliberately a BOTTOM bar: the macOS menu bar is at the top and already
-# crowded, and switchboard's Linux bottombar occupies the same screen edge, so
-# muscle memory carries across platforms.
+# Deliberately a BOTTOM bar: the macOS menu bar owns the top edge, and
+# switchboard's Linux bottombar sits at the same edge, so muscle memory carries
+# across platforms.
+#
+# The bar itself is transparent. Chips carry their own dark translucent fill and
+# a status-coloured border, so they float over whatever is behind them -- the
+# look the Linux bar has.
 PLUGIN_DIR="$HOME/.config/sketchybar/plugins"
 
 sketchybar --bar position=bottom \
-                 height=32 \
-                 blur_radius=20 \
-                 color=0xdd1a1b26 \
-                 padding_left=8 \
-                 padding_right=8
+                 height=30 \
+                 color=0x00000000 \
+                 border_width=0 \
+                 padding_left=6 \
+                 padding_right=6 \
+                 y_offset=2
 
-sketchybar --default icon.font="SF Pro:Semibold:13.0" \
-                     label.font="SF Pro:Semibold:13.0" \
-                     icon.color=0xffc0caf5 \
-                     label.color=0xffc0caf5 \
-                     padding_left=4 \
-                     padding_right=4 \
-                     label.padding_left=4 \
-                     label.padding_right=4
+sketchybar --default label.font="Menlo:Bold:12.0" \
+                     label.padding_left=8 \
+                     label.padding_right=8 \
+                     padding_left=3 \
+                     padding_right=3 \
+                     background.drawing=off \
+                     icon.drawing=off
 
-# The summary sits left and always exists, so the bar is never empty and can
-# report "down" or "observe only" when there is nothing else to show.
-sketchybar --add item switchboard.summary left \
-           --set switchboard.summary \
-                 icon="◉" \
+# Chips are added to the centre by the plugin. This item is the only fixed one:
+# it stays hidden unless the daemon is down, there are no sessions, or Navigate
+# is unavailable -- so a healthy bar shows chips and nothing else.
+sketchybar --add item switchboard.status left \
+           --set switchboard.status \
                  label="switchboard: starting" \
+                 label.color=0xff928374 \
+                 label.font="Menlo:Bold:11.0" \
                  update_freq=2 \
                  script="$PLUGIN_DIR/switchboard.sh update"
 
-# Session chips are added to the right of the summary by the plugin itself.
 sketchybar --update
