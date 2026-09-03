@@ -43,3 +43,19 @@ macOS: chips still report status, but clicking cannot raise a window. See
 Chips depend on session discovery, which needs a working `osproc` darwin
 backend. Until that lands the bar renders correctly and reports
 `0 session(s) · observe only`.
+
+## Running the daemon at login
+
+`launchd/io.github.tjmisko.switchboard.plist` is the macOS analogue of
+`systemd/switchboard.service`. launchd does no variable expansion in
+`ProgramArguments`, so substitute the home directory when installing:
+
+```sh
+sed "s|__HOME__|$HOME|g" launchd/io.github.tjmisko.switchboard.plist \
+  > ~/Library/LaunchAgents/io.github.tjmisko.switchboard.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.tjmisko.switchboard.plist
+```
+
+`scripts/deploy` does not run here: it requires `systemctl`, reads `/proc` to
+verify the running revision, and uses `mv -T`, which is a GNU extension absent
+from BSD `mv`. Install by hand until a macOS deploy path exists.
