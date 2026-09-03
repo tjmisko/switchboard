@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tjmisko/switchboard/internal/proc"
+	"github.com/tjmisko/switchboard/internal/osproc"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/terminal"
 	"github.com/tjmisko/switchboard/internal/wm"
@@ -156,8 +156,8 @@ func TestUnattributedCodexHookClientIdentityRemainsDiagnosticOnly(t *testing.T) 
 				}
 			})
 			server := New(store, "", terminal.NewNone(), wm.NewNone())
-			server.readProc = func(pid int) (proc.Info, error) {
-				return proc.Info{PID: pid, PPID: 1, Comm: "sh"}, nil
+			server.readProc = func(pid int) (osproc.Info, error) {
+				return osproc.Info{PID: pid, PPID: 1, Comm: "sh"}, nil
 			}
 			delivered := false
 			server.SetAgentHookHandler(func(Request, state.Session) { delivered = true })

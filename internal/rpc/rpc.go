@@ -26,7 +26,6 @@ import (
 	"github.com/tjmisko/switchboard/internal/fanout"
 	"github.com/tjmisko/switchboard/internal/history"
 	"github.com/tjmisko/switchboard/internal/osproc"
-	"github.com/tjmisko/switchboard/internal/proc"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/statustune"
 	"github.com/tjmisko/switchboard/internal/terminal"
@@ -231,15 +230,22 @@ type Server struct {
 	// one, or several visible roots; it never causes delivery.
 	hookAttributionDiagnostic func(HookAttributionDiagnostic)
 	// readProc is the seam findTrackedAncestor walks the ppid chain through.
-	// Production is proc.Read; tests substitute a synthetic chain so hook
-	// attribution can be exercised against process shapes (a nested `claude -p`,
-	// a shell wrapper) that cannot be staged against a live /proc.
-	readProc func(int) (proc.Info, error)
+	// Production is the platform process source; tests substitute a synthetic
+	// chain so hook attribution can be exercised against process shapes (a
+	// nested `claude -p`, a shell wrapper) that cannot be staged against a live
+	// process table.
+	//
+	// It reads through osproc rather than internal/proc because internal/proc is
+	// /proc-backed and therefore Linux-only. It compiles everywhere, so this
+	// call site type-checked on macOS while failing at runtime for every pid:
+	// the walk could not resolve a single ancestor, so no hook ever bound to a
+	// session and every chip stayed grey.
+	readProc func(int) (osproc.Info, error)
 }
 
 func New(store *state.Store, socketPath string, term terminal.Locator, manager wm.Manager) *Server {
 	return &Server{store: store, socketPath: socketPath, term: term, wm: manager,
-		tun: statustune.Default(), readProc: proc.Read}
+		tun: statustune.Default(), readProc: osproc.New().Read}
 }
 
 // SetTuning overrides the status-color tuning (defaults from statustune.Default).
@@ -1358,7 +1364,7 @@ func coalesce(a, b string) string {
 // findTrackedAncestor walks up the ppid chain starting at pid, returning the
 // first PID that's a tracked session. Bounded depth keeps us out of trouble on
 // weird process states. readProc is injected (defaults to proc.Read at the call
-// site) so the walk is testable without a live /proc.
+// site) so the walk is testable without a live process table.
 //
 // The walk exists for ONE reason: a hook that ran inside a shell wrapper, where
 // getppid() is the wrapper rather than the agent. It stops at the nearest AGENT
@@ -1394,7 +1400,7 @@ func coalesce(a, b string) string {
 // hooks fired inside the window are lost. A `claude -p` shorter than one tick
 // gets no session id at all — an unnamed single-interval lane, the shape
 // switchboard already produces for a process that dies before transitioning.
-func findTrackedAncestor(m map[int]*state.Session, pid int, readProc func(int) (proc.Info, error)) int {
+func findTrackedAncestor(m map[int]*state.Session, pid int, readProc func(int) (osproc.Info, error)) int {
 	for depth := 0; pid > 1 && depth < 20; depth++ {
 		if _, ok := m[pid]; ok {
 			return pid
@@ -1403,7 +1409,7 @@ func findTrackedAncestor(m map[int]*state.Session, pid int, readProc func(int) (
 		if err != nil || info.PPID == 0 {
 			return 0
 		}
-		if discovery.Classify(osproc.FromProc(info)) != discovery.AgentNone {
+		if discovery.Classify(info) != discovery.AgentNone {
 			return 0
 		}
 		pid = info.PPID

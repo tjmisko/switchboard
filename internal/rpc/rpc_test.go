@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/history"
-	"github.com/tjmisko/switchboard/internal/proc"
+	"github.com/tjmisko/switchboard/internal/osproc"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/terminal"
 	"github.com/tjmisko/switchboard/internal/wm"
@@ -558,14 +558,14 @@ func TestPickSession(t *testing.T) {
 
 // chainReader builds a readProc that maps each pid to its ppid; an unknown pid
 // returns ErrGone. It counts calls so the depth bound can be asserted.
-func chainReader(chain map[int]int, calls *int) func(int) (proc.Info, error) {
-	return func(pid int) (proc.Info, error) {
+func chainReader(chain map[int]int, calls *int) func(int) (osproc.Info, error) {
+	return func(pid int) (osproc.Info, error) {
 		*calls++
 		ppid, ok := chain[pid]
 		if !ok {
-			return proc.Info{}, errors.New("gone")
+			return osproc.Info{}, errors.New("gone")
 		}
-		return proc.Info{PID: pid, PPID: ppid}, nil
+		return osproc.Info{PID: pid, PPID: ppid}, nil
 	}
 }
 
@@ -579,9 +579,9 @@ func tracked(pids ...int) map[int]*state.Session {
 
 // §5.5 findTrackedAncestor — self-match returns immediately without reading.
 func TestFindTrackedAncestorSelfMatch(t *testing.T) {
-	read := func(int) (proc.Info, error) {
+	read := func(int) (osproc.Info, error) {
 		t.Fatal("readProc must not be called on a self-match")
-		return proc.Info{}, nil
+		return osproc.Info{}, nil
 	}
 	if got := findTrackedAncestor(tracked(100), 100, read); got != 100 {
 		t.Errorf("self-match = %d, want 100", got)
@@ -635,17 +635,17 @@ func TestFindTrackedAncestorTerminators(t *testing.T) {
 	}
 }
 
-// procChainReader is chainReader's richer sibling: it serves whole proc.Info
+// procChainReader is chainReader's richer sibling: it serves whole osproc.Info
 // records, so a link in the chain can be made to CLASSIFY as an agent process.
 // chainReader is left alone deliberately — the records it returns carry no
 // Comm/Exe, so they classify as AgentNone and every pre-existing walk test above
 // exercises the unchanged path.
-func procChainReader(infos map[int]proc.Info, calls *int) func(int) (proc.Info, error) {
-	return func(pid int) (proc.Info, error) {
+func procChainReader(infos map[int]osproc.Info, calls *int) func(int) (osproc.Info, error) {
+	return func(pid int) (osproc.Info, error) {
 		*calls++
 		info, ok := infos[pid]
 		if !ok {
-			return proc.Info{}, errors.New("gone")
+			return osproc.Info{}, errors.New("gone")
 		}
 		return info, nil
 	}
@@ -653,11 +653,11 @@ func procChainReader(infos map[int]proc.Info, calls *int) func(int) (proc.Info, 
 
 // claudeProc is a process snapshot discovery.Classify accepts as a Claude
 // session. The /claude/ path segment is what claudeExeValid requires on Linux.
-func claudeProc(pid, ppid int, args ...string) proc.Info {
+func claudeProc(pid, ppid int, args ...string) osproc.Info {
 	if len(args) == 0 {
 		args = []string{"/home/u/.local/share/claude/claude"}
 	}
-	return proc.Info{PID: pid, PPID: ppid, Comm: "claude",
+	return osproc.Info{PID: pid, PPID: ppid, Comm: "claude",
 		Exe: "/home/u/.local/share/claude/claude", Args: args}
 }
 
@@ -669,7 +669,7 @@ func claudeProc(pid, ppid int, args ...string) proc.Info {
 func TestFindTrackedAncestorStopsAtUntrackedAgent(t *testing.T) {
 	// 300 (switchboard-ctl's parent shell) → 200 (claude -p, NOT tracked) →
 	// 100 (the interactive session, tracked).
-	infos := map[int]proc.Info{
+	infos := map[int]osproc.Info{
 		300: {PID: 300, PPID: 200, Comm: "sh", Exe: "/usr/bin/sh"},
 		200: claudeProc(200, 100, "/home/u/.local/share/claude/claude", "-p", "summarize"),
 		100: claudeProc(100, 1),
@@ -690,7 +690,7 @@ func TestFindTrackedAncestorStopsAtUntrackedAgent(t *testing.T) {
 // own identity. This is the other half of the race and the reason the fix is
 // self-correcting rather than a permanent drop.
 func TestFindTrackedAncestorTrackedAgentWinsFirst(t *testing.T) {
-	infos := map[int]proc.Info{
+	infos := map[int]osproc.Info{
 		300: {PID: 300, PPID: 200, Comm: "sh", Exe: "/usr/bin/sh"},
 		200: claudeProc(200, 100, "/home/u/.local/share/claude/claude", "-p", "summarize"),
 		100: claudeProc(100, 1),
@@ -705,7 +705,7 @@ func TestFindTrackedAncestorTrackedAgentWinsFirst(t *testing.T) {
 // whatever a hook command is wrapped in — must still be walked through, or the
 // guard would break every hook that does not exec switchboard-ctl directly.
 func TestFindTrackedAncestorNonAgentWrappersStillWalk(t *testing.T) {
-	infos := map[int]proc.Info{
+	infos := map[int]osproc.Info{
 		400: {PID: 400, PPID: 300, Comm: "env", Exe: "/usr/bin/env"},
 		300: {PID: 300, PPID: 200, Comm: "bash", Exe: "/usr/bin/bash"},
 		200: {PID: 200, PPID: 100, Comm: "sh", Exe: "/usr/bin/sh"},
@@ -721,7 +721,7 @@ func TestFindTrackedAncestorNonAgentWrappersStillWalk(t *testing.T) {
 // claudeExeValid rejects it, so it is an ordinary wrapper. Guards the guard
 // against being widened into a comm-only check.
 func TestFindTrackedAncestorImpostorDoesNotStopWalk(t *testing.T) {
-	infos := map[int]proc.Info{
+	infos := map[int]osproc.Info{
 		200: {PID: 200, PPID: 100, Comm: "claude", Exe: "/usr/bin/claude-impostor"},
 		100: claudeProc(100, 1),
 	}
@@ -757,7 +757,7 @@ func TestHandleHookIgnoresNestedHeadlessSession(t *testing.T) {
 		m[parentPID] = sess
 	})
 	s := New(store, "", terminal.NewNone(), wm.NewNone())
-	s.readProc = procChainReader(map[int]proc.Info{
+	s.readProc = procChainReader(map[int]osproc.Info{
 		hookPID:   {PID: hookPID, PPID: helperPID, Comm: "sh", Exe: "/usr/bin/sh"},
 		helperPID: claudeProc(helperPID, parentPID, "/home/u/.local/share/claude/claude", "-p", "summarize"),
 		parentPID: claudeProc(parentPID, 1),
