@@ -138,3 +138,15 @@ func TestWaybarBrokerUsesOneSmallGoHeap(t *testing.T) {
 		}
 	}
 }
+
+func TestWaybarProfilesAreMutuallyExclusiveAtRuntime(t *testing.T) {
+	const marker = "%h/.config/waybar/.switchboard-combined-v1"
+	legacy := readUnit(t, "switchboard-waybar.service")
+	publisher := readUnit(t, "switchboard-waybar-publisher.service")
+	if !hasUnitDirective(legacy, "ConditionPathExists=!"+marker) {
+		t.Errorf("legacy Waybar unit is not disabled by the combined-profile marker")
+	}
+	if !hasUnitDirective(publisher, "ConditionPathExists="+marker) {
+		t.Errorf("combined publisher unit is not selected by the combined-profile marker")
+	}
+}

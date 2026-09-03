@@ -94,8 +94,10 @@ reconciliation idempotent and resetting safely to hidden after Waybar restarts.
 This is a separate, explicit host profile. Install
 `systemd/switchboard-waybar-publisher.service` and create
 `~/.config/waybar/.switchboard-combined-v1` only as part of the config cutover.
-Do not run it alongside the legacy `switchboard-waybar.service`; that unit owns
-a second Waybar process by design.
+The marker conditions make the two units mutually exclusive even if both are
+enabled: the publisher requires the marker, while the legacy launcher requires
+its absence. Do not remove those conditions; an unguarded legacy unit owns a
+second Waybar process by design.
 
 The F8 owner must signal the desktop-owned Waybar once with `SIGUSR1`, flip its
 master marker, then call:

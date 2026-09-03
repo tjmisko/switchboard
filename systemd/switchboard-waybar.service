@@ -7,6 +7,10 @@ PartOf=graphical-session.target
 # a startup cycle. The watcher reconnects while the daemon is unavailable.
 Wants=switchboard.service
 ConditionPathExists=%h/.config/waybar/claude.jsonc
+# The combined profile owns both windows in the desktop Waybar process. Keep
+# the legacy launcher inert when that host-level cutover marker is present,
+# even if both units remain enabled during a reversible migration.
+ConditionPathExists=!%h/.config/waybar/.switchboard-combined-v1
 
 [Service]
 Type=simple
