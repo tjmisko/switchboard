@@ -48,6 +48,23 @@ writes the exact Waybar parent PID to `bottom-waybar.ready`. The broker checks
 that acknowledgement before sending RT signals, retaining dirty slots until it
 can safely catch up after startup.
 
+The split watcher records `PID starttime` as ownership at launch and retains it
+until that process generation exits. Readiness only controls update signals;
+transient process command-line reads cannot authorize a second launch. A stop
+request also retains ownership while Waybar is still exiting. PID-only records
+from older versions require command validation before adoption. Launch, exit,
+and identity failures are logged to the renderer unit's journal.
+
+To stop the split bottom bar for troubleshooting, stop its owner:
+
+```bash
+systemctl --user stop switchboard-waybar.service
+```
+
+This stops the watcher and all its children. Killing processes in an active unit
+allows `Restart=on-failure` to bring the watcher back. The unit remains enabled
+for its next normal activation; the separate top bar is unaffected.
+
 Treat the binary and config as one cutover: install the signal-mode config
 before restarting `switchboard-waybar.service`. A new watcher paired with the
 old `switchboard-waybar --slot` config cannot receive readiness and leaves the

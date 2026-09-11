@@ -203,7 +203,7 @@ func replaceFile(path string, body []byte) (err error) {
 
 func defaultOps() bottomBarOps {
 	return bottomBarOps{
-		isRunning: func(c bottomBarConfig) bool { return bottomPID(c) > 0 },
+		isRunning: bottomMayBeRunning,
 		start:     startBottom,
 		stop:      stopBottom,
 	}
@@ -329,14 +329,6 @@ func watchBottomBar(cfg bottomBarConfig) {
 	// never depends on a pipe writer arriving in time.
 	if err := publisher.stage(renderer.RenderSlotsAt(state.Snapshot{}, bottomBarSlots, time.Now())); err != nil {
 		fail("bottombar: preseed: %v", err)
-	}
-
-	// Reap bottom-bar processes we (or an F8 one-shot) start. We launch them
-	// detached with Release() and never Wait(), so when one is killed it would
-	// linger as a zombie under us — its parent — until we reap it. A one-shot
-	// reconcile cannot reap a child of ours, so the responsibility lands here.
-	if !cfg.attached {
-		go reapChildren()
 	}
 
 	for {
@@ -640,22 +632,22 @@ func ensureStarted(cfg bottomBarConfig) {
 	}
 }
 
-// ensureStopped stops the bottom waybar (and its module subprocesses) if it is
-// running, and clears the pidfile.
+// ensureStopped requests shutdown of the bottom Waybar. Ownership remains
+// recorded until that process generation exits.
 func ensureStopped(cfg bottomBarConfig) {
 	cfg.ops.stop(cfg)
 }
 
-// stopBottom is the production stop: signal the exact bottom Waybar through its
-// pidfd and clear its identity files. It is the default bottomBarOps.stop.
+// stopBottom requests termination through the exact process's pidfd. Keep the
+// identity until exit is observed: SIGTERM can be delayed or ignored, and a
+// subsequent show must not launch a second bar while this one is still alive.
 func stopBottom(cfg bottomBarConfig) {
 	if process, ok := openBottomProcess(cfg); ok {
-		// A pidfd remains bound to this process even if the numeric PID exits and
-		// is reused between validation and signaling.
-		_ = unix.PidfdSendSignal(process.pidfd, unix.SIGTERM, nil, 0)
-		_ = unix.Close(process.pidfd)
+		defer unix.Close(process.pidfd)
+		if err := unix.PidfdSendSignal(process.pidfd, unix.SIGTERM, nil, 0); err != nil && err != unix.ESRCH {
+			fmt.Fprintf(os.Stderr, "bottombar: terminate pid=%d: %v\n", process.pid, err)
+		}
 	}
-	_ = os.Remove(cfg.pidFile)
 	_ = os.Remove(cfg.readyFile)
 }
 
@@ -695,7 +687,14 @@ func startBottom(cfg bottomBarConfig) error {
 		reapFailedStart()
 		return err
 	}
-	_ = cmd.Process.Release()
+	fmt.Fprintf(os.Stderr, "bottombar: launched pid=%d starttime=%d\n", pid, started)
+	// Wait only for our own child. A global Wait4(-1) reaper could consume a
+	// failed launch before its cleanup, invalidating process-group ownership.
+	// One-shot callers may exit first; the child is then reparented normally.
+	go func() {
+		err := cmd.Wait()
+		fmt.Fprintf(os.Stderr, "bottombar: exited pid=%d starttime=%d result=%v\n", pid, started, err)
+	}()
 	return nil
 }
 
@@ -825,64 +824,115 @@ func reconcileAttachedVisibility(cfg bottomBarConfig, process bottomProcess, vis
 	}
 }
 
-// openBottomProcess binds a pidfd before validating the recorded identity.
-// Later signals target that kernel object, not a recyclable numeric PID.
+// openBottomProcess binds a pidfd before validating the recorded generation.
+// A PID+starttime record is the ownership established by startBottom, including
+// while the child is still in exec. /proc cmdline and comm are not startup
+// barriers: cmd.Start can return before they describe the new executable.
+// Only legacy PID-only records need command matching before adoption.
+//
+// Uncertain observations retain the record and prevent a replacement launch;
+// only confirmed exit, generation mismatch, or invalid identity discards it.
 func openBottomProcess(cfg bottomBarConfig) (bottomProcess, bool) {
 	b, err := os.ReadFile(cfg.pidFile)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "bottombar: read ownership: %v\n", err)
+		}
 		return bottomProcess{}, false
+	}
+	discard := func(reason string) {
+		fmt.Fprintf(os.Stderr, "bottombar: discard ownership: %s\n", reason)
+		if err := os.Remove(cfg.pidFile); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "bottombar: remove ownership: %v\n", err)
+		}
 	}
 	fields := strings.Fields(string(b))
 	if len(fields) < 1 || len(fields) > 2 {
-		_ = os.Remove(cfg.pidFile)
+		discard("malformed PID record")
 		return bottomProcess{}, false
 	}
 	pid, err := strconv.Atoi(fields[0])
 	if err != nil || pid <= 0 {
-		_ = os.Remove(cfg.pidFile)
+		discard("invalid PID")
 		return bottomProcess{}, false
+	}
+	var recorded uint64
+	if len(fields) == 2 {
+		recorded, err = strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			discard(fmt.Sprintf("pid=%d invalid starttime", pid))
+			return bottomProcess{}, false
+		}
 	}
 	pidfd, err := unix.PidfdOpen(pid, 0)
 	if err != nil {
-		_ = os.Remove(cfg.pidFile)
+		if err == unix.ESRCH {
+			discard(fmt.Sprintf("pid=%d exited", pid))
+		} else {
+			fmt.Fprintf(os.Stderr, "bottombar: retain pid=%d: pidfd_open: %v\n", pid, err)
+		}
 		return bottomProcess{}, false
 	}
-	fail := func() (bottomProcess, bool) {
+	fail := func(reason string, stale bool) (bottomProcess, bool) {
 		_ = unix.Close(pidfd)
-		_ = os.Remove(cfg.pidFile)
+		if stale {
+			discard(fmt.Sprintf("pid=%d %s", pid, reason))
+		} else {
+			fmt.Fprintf(os.Stderr, "bottombar: retain pid=%d: %s\n", pid, reason)
+		}
 		return bottomProcess{}, false
 	}
-	comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
-	if err != nil || strings.TrimSpace(string(comm)) != "waybar" {
-		return fail()
+	exited, err := bottomProcessExited(pidfd)
+	if err != nil {
+		return fail(fmt.Sprintf("poll exit: %v", err), false)
 	}
-	if !bottomCommandMatches(cfg, pid) {
-		return fail()
+	if exited {
+		return fail("exited", true)
 	}
 	started, err := processStartTime(pid)
 	if err != nil {
-		return fail()
+		return fail(fmt.Sprintf("read starttime: %v", err), os.IsNotExist(err))
 	}
 	if len(fields) == 2 {
-		recorded, err := strconv.ParseUint(fields[1], 10, 64)
-		if err != nil || recorded != started {
-			return fail()
+		if recorded != started {
+			return fail("starttime changed", true)
 		}
 	} else {
-		// Rolling upgrade: adopt a legacy PID-only record only after the exact
-		// command and live starttime checks above, then fence every later use.
+		comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+		if err != nil {
+			return fail(fmt.Sprintf("read legacy comm: %v", err), os.IsNotExist(err))
+		}
+		if strings.TrimSpace(string(comm)) == "" {
+			return fail("legacy comm unavailable during exec", false)
+		}
+		if strings.TrimSpace(string(comm)) != "waybar" {
+			return fail("legacy comm does not match Waybar", true)
+		}
+		matches, err := bottomCommandMatches(cfg, pid)
+		if err != nil {
+			return fail(fmt.Sprintf("read legacy command: %v", err), os.IsNotExist(err))
+		}
+		if !matches {
+			return fail("legacy command does not match bottom config", true)
+		}
+		// Upgrade only after validating a legacy record's command identity.
 		if err := replaceFile(cfg.pidFile, []byte(fmt.Sprintf("%d %d\n", pid, started))); err != nil {
-			// The open pidfd still makes this use safe. Keep the validated process
-			// rather than launching a duplicate, and retry the upgrade next time.
 			fmt.Fprintf(os.Stderr, "bottombar: upgrade pidfile identity: %v\n", err)
 		}
 	}
 	return bottomProcess{pid: pid, pidfd: pidfd, started: started}, true
 }
 
-// bottomPID is the lifecycle existence check. Signal paths keep the pidfd from
-// openBottomProcess through the send; callers that only need the number close
-// it immediately.
+// bottomMayBeRunning also blocks replacement when ownership could not be
+// checked. Signal paths still require a validated generation and open pidfd.
+func bottomMayBeRunning(cfg bottomBarConfig) bool {
+	if bottomPID(cfg) > 0 {
+		return true
+	}
+	_, err := os.Stat(cfg.pidFile)
+	return !os.IsNotExist(err)
+}
+
 func bottomPID(cfg bottomBarConfig) int {
 	process, ok := openBottomProcess(cfg)
 	if !ok {
@@ -892,18 +942,38 @@ func bottomPID(cfg bottomBarConfig) int {
 	return process.pid
 }
 
-func bottomCommandMatches(cfg bottomBarConfig, pid int) bool {
+func bottomProcessExited(pidfd int) (bool, error) {
+	fds := []unix.PollFd{{Fd: int32(pidfd), Events: unix.POLLIN}}
+	for {
+		_, err := unix.Poll(fds, 0)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		if fds[0].Revents&(unix.POLLERR|unix.POLLNVAL) != 0 {
+			return false, fmt.Errorf("unexpected pidfd events: %#x", fds[0].Revents)
+		}
+		return fds[0].Revents&(unix.POLLIN|unix.POLLHUP) != 0, nil
+	}
+}
+
+func bottomCommandMatches(cfg bottomBarConfig, pid int) (bool, error) {
 	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 	if err != nil {
-		return false
+		return false, err
+	}
+	if len(b) == 0 {
+		return false, fmt.Errorf("command line unavailable during exec")
 	}
 	args := strings.Split(strings.TrimRight(string(b), "\x00"), "\x00")
 	for i := 0; i+1 < len(args); i++ {
 		if args[i] == "-c" && args[i+1] == cfg.waybarConfig {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 func processStartTime(pid int) (uint64, error) {
@@ -930,19 +1000,6 @@ func processStartTimeFromStat(stat string) (uint64, error) {
 		return 0, fmt.Errorf("parse starttime: %w", err)
 	}
 	return started, nil
-}
-
-// reapChildren blocks on any child state change and reaps it, so killed
-// bottom-bar processes do not pile up as zombies. When we have no children,
-// Wait4 returns ECHILD; we sleep briefly to avoid spinning.
-func reapChildren() {
-	for {
-		var ws syscall.WaitStatus
-		_, err := syscall.Wait4(-1, &ws, 0, nil)
-		if err != nil {
-			time.Sleep(time.Second)
-		}
-	}
 }
 
 func mustFlock(path string) func() {
