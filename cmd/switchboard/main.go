@@ -27,6 +27,7 @@ import (
 	"github.com/tjmisko/switchboard/internal/history"
 	"github.com/tjmisko/switchboard/internal/mapping"
 	"github.com/tjmisko/switchboard/internal/osproc"
+	"github.com/tjmisko/switchboard/internal/pricing"
 	"github.com/tjmisko/switchboard/internal/proc"
 	"github.com/tjmisko/switchboard/internal/projectname"
 	claudeprovider "github.com/tjmisko/switchboard/internal/provider/claude"
@@ -112,6 +113,21 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	// Keep the public, credential-free spot-rate cache current during normal
+	// operation. Timeline reads stay deterministic and network-free: they only
+	// consume the atomically replaced last-known-good snapshot this owns.
+	priceManager := pricing.NewManager("")
+	go priceManager.RunRefreshLoop(ctx, func(diagnostics []pricing.Diagnostic, err error) {
+		for _, diagnostic := range diagnostics {
+			log.Printf("pricing: provider=%s freshness=%s models=%d fallback=%t refresh_error=%t hash=%s",
+				diagnostic.Provider, diagnostic.Freshness, diagnostic.ModelCount,
+				diagnostic.UsedFallback, diagnostic.RefreshError != "", diagnostic.VersionHash)
+		}
+		if err != nil {
+			log.Printf("pricing: category=refresh_failed count=1")
+		}
+	})
+
 	// Activity log (opt-in via $XDG_CONFIG_HOME/switchboard/history.json). The sink
 	// is best-effort and asynchronous, so recording an event never blocks the
 	// state lock the hook/reconcile paths hold. Project labels are resolved here
@@ -171,7 +187,7 @@ func main() {
 	// the daemon.
 	claudeObs := claudeprovider.NewObserver(sink.Dir(), claudeprovider.WithTuning(tun))
 	codexObs := codexObserverForMode(codexMode, func() codexObserver {
-		observer := codexprovider.NewObserver(codexprovider.Config{Diagnostic: func(category string) {
+		codexConfig := codexprovider.Config{Diagnostic: func(category string) {
 			// The adapter guarantees this callback contains only a finite, content-free
 			// protocol category. Keep the log equally content-free.
 			log.Printf("agent-observer: provider=codex category=%s count=1", category)
@@ -181,7 +197,9 @@ func main() {
 				diagnostic.Evidence, diagnostic.Source, diagnostic.Duration.Milliseconds(), diagnostic.RedDuration.Milliseconds(),
 				diagnostic.RedPublished, diagnostic.HumanEvidence, diagnostic.ClearedWithoutHumanEvidence,
 				diagnostic.SuppressedFalseRed, diagnostic.LegacyWouldPublishRed)
-		}})
+		}}
+		codexConfig = configureCodexUsagePersistence(codexConfig, sink)
+		observer := codexprovider.NewObserver(codexConfig)
 		log.Printf("agent-observer: provider=codex category=observer_constructed count=1")
 		return observer
 	})
@@ -300,6 +318,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("rpc: %v", err)
 	}
+}
+
+func configureCodexUsagePersistence(config codexprovider.Config, sink *history.Sink) codexprovider.Config {
+	if sink == nil || !sink.Enabled() {
+		return config
+	}
+	config.RolloutStateDir = filepath.Join(sink.Dir(), ".codex-usage-cursors")
+	config.UsageRecorder = codexprovider.NewHistoryUsageRecorder(sink)
+	return config
 }
 
 // endSession closes one session's lane: it records the session_end that bounds

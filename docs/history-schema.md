@@ -83,6 +83,14 @@ minimal log still labels each event by project.
 
 ## `Event`
 
+Canonical accounting adds `schema_version: 2`, `usage`, billing identity fields,
+`usage_event_id`, and `usage_revision`. Samples sharing an event identity are
+replacement snapshots; the greatest revision wins rather than being summed.
+Legacy samples without an identity retain additive semantics. `usage_cutover`
+records collection gaps, and `vendor_usage_snapshot` preserves separate
+cumulative vendor estimates. These additions do not revive retired memory
+sampling or change the live state schema. See [pricing.md](pricing.md).
+
 ```jsonc
 {
   "ts": "2026-06-26T14:32:07.412Z",  // RFC3339; the event instant

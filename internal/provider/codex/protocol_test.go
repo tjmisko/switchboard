@@ -323,11 +323,14 @@ func fixtureObserver(t *testing.T) (*Observer, provider.RootKey) {
 		t.Fatal(err)
 	}
 	observer := &Observer{
-		config: Config{Freshness: time.Minute, RecentTerminalLimit: 32, Now: func() time.Time { return fixtureNow }},
+		config: Config{Freshness: time.Minute, RecentTerminalLimit: 32, UsageDedupLimit: 2048, Now: func() time.Time { return fixtureNow }},
 		queue:  provider.NewInvalidationQueue(64), roots: map[provider.RootKey]*rootRecord{
 			key: {threadID: fixtureRoot, graph: state, observation: observation, generation: 1},
 		},
 		generation: 1, connected: true, pendingStatuses: make(map[string]rpcStatus),
+		pendingWaits: make(map[string][]rpcNotification), pendingUsage: make(map[string][]rpcNotification),
+		usageUpdates: make(chan UsageUpdate, 64), usageTotals: make(map[string]agentgraph.Usage),
+		usageFingerprints: make(map[string]struct{}),
 	}
 	t.Cleanup(func() {
 		observer.mu.Lock()

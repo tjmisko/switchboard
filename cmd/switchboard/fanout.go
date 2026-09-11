@@ -1,10 +1,11 @@
 package main
 
 import (
-	"os"
+	"log"
 	"strconv"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/agentgraph"
 	"github.com/tjmisko/switchboard/internal/fanout"
 	"github.com/tjmisko/switchboard/internal/history"
 	"github.com/tjmisko/switchboard/internal/label"
@@ -13,18 +14,19 @@ import (
 )
 
 // reconcileState is the per-session bookkeeping the reconciler carries ACROSS
-// ticks. The usage cursor is daemon-internal and keyed by pid; the label cursor
-// is keyed by session id (see observeLabel) and carries the pid it belongs to, so
-// both are pruned when the process they track dies. Subagent fanout detection is
-// delegated to the
+// ticks. Claude usage is tracked by stable session/transcript/message identity
+// in a durable cursor under the history directory, while the label cursor is
+// keyed by session id (see observeLabel) and carries the pid it belongs to.
+// Subagent fanout detection is delegated to the
 // Observer, which owns InFlightSubagents and the subagent_spawn/stop events and
 // keys its own durable state by session-id (so it survives a daemon restart or a
 // `claude --resume` rather than re-emitting historical spawns).
 type reconcileState struct {
-	fanout      *fanout.Observer
-	usageOffset map[int]int64          // pid -> transcript bytes already summed for usage
-	labels      map[string]labelCursor // labelKey -> last-emitted session label (change dedup)
-	names       *label.NameCache       // pid -> Claude session name, memoized against the file's stamp
+	fanout   *fanout.Observer
+	usage    *transcript.UsageTracker
+	usageErr string                 // last reported content-free cursor error; suppresses per-tick log spam
+	labels   map[string]labelCursor // labelKey -> last-emitted session label (change dedup)
+	names    *label.NameCache       // pid -> Claude session name, memoized against the file's stamp
 }
 
 // labelCursor is the last name emitted for one session, plus the pid hosting it.
@@ -38,17 +40,16 @@ type labelCursor struct {
 
 func newReconcileState(obs *fanout.Observer) *reconcileState {
 	return &reconcileState{
-		fanout:      obs,
-		usageOffset: map[int]int64{},
-		labels:      map[string]labelCursor{},
-		names:       &label.NameCache{},
+		fanout: obs,
+		labels: map[string]labelCursor{},
+		names:  &label.NameCache{},
 	}
 }
 
 // observe updates c.InFlightSubagents and emits any new subagent_spawn/stop and
 // usage_sample events for one claude session. It runs on a detached reconcile
-// snapshot before Store.Apply; sink.Record is non-blocking and all transcript
-// reads finish before the live session map is locked.
+// snapshot before Store.Apply; transcript reads and durable usage acknowledgments
+// finish before the live session map is locked.
 func (rs *reconcileState) observe(sink *history.Sink, sess *state.Session, c *state.AgentInfo, now time.Time) {
 	// The session label is derived from disk/window title, not the transcript, so
 	// it is tracked even before the transcript exists.
@@ -123,40 +124,91 @@ func (rs *reconcileState) observeFanout(sink *history.Sink, sess *state.Session,
 	}
 }
 
-// observeUsage samples the token delta since the last offset and emits one
-// usage_sample per model the delta touched, each tagged with Event.Model so the
-// deriver can price it at that model's rate. On first sight of a session it
-// primes the cursor to the current file size WITHOUT emitting, so a pre-existing
-// transcript's backlog is not dumped as one spike dated at daemon start — only
-// usage accrued while we are watching is recorded. Cost is deliberately NOT
-// computed here; the sample only carries the model name and raw token counts.
+// observeUsage backfills and incrementally reads the root plus every child
+// transcript through a durable, session-keyed UsageTracker. One event is emitted
+// per logical provider-message snapshot so exact model/tier/tool dimensions and the
+// provider timestamp survive until pricing. Streamed duplicates and revisions
+// are resolved before emission. Cost is deliberately NOT computed here.
 func (rs *reconcileState) observeUsage(sink *history.Sink, sess *state.Session, c *state.AgentInfo, now time.Time) {
-	off, primed := rs.usageOffset[sess.PID]
-	if !primed {
-		if fi, err := os.Stat(c.Transcript); err == nil {
-			rs.usageOffset[sess.PID] = fi.Size()
-		} else {
-			rs.usageOffset[sess.PID] = 0
-		}
+	if sink == nil || !sink.Enabled() || c.SessionID == "" {
 		return
 	}
-	byModel, newOff, err := transcript.UsageSinceByModel(c.Transcript, off)
+	if rs.usage == nil {
+		tracker, err := transcript.NewUsageTracker(sink.Dir())
+		if err != nil {
+			rs.reportUsageError(err)
+			return
+		}
+		rs.usage = tracker
+	}
+	if rs.usage == nil {
+		return
+	}
+	_, err := rs.usage.SyncSession(c.SessionID, c.Transcript, now, func(snapshots []transcript.UsageSnapshot) error {
+		events := make([]history.Event, 0, len(snapshots))
+		for _, snapshot := range snapshots {
+			ts := snapshot.Timestamp
+			if ts.IsZero() {
+				ts = now
+			}
+			ev := history.Event{
+				SchemaVersion: history.HistorySchemaVersion,
+				Ts:            ts, SessionID: c.SessionID, PID: sess.PID, Agent: sess.Agent, CWD: sess.CWD,
+				Source: agentgraph.SourceClaudeTranscript,
+				// A Claude Code transcript proves the client and model, but Claude Code
+				// can route through Anthropic, Bedrock, Vertex, or another configured
+				// backend. No current session field proves the execution provider,
+				// billing route, account kind, or auth mode, so those remain unknown.
+				UsageEventID: snapshot.UsageEventID, UsageSnapshot: true, UsageRevision: snapshot.UsageRevision,
+				UsageCoverage: snapshot.Coverage,
+			}
+			if snapshot.Cutover {
+				ev.Type = history.EventUsageCutover
+				events = append(events, ev)
+				continue
+			}
+			u := snapshot.Usage
+			canonical := history.UsageDelta{
+				InputTokens: u.InputTokens, CachedInputTokens: u.CacheReadTokens,
+				OutputTokens: u.OutputTokens, WebSearchRequests: u.WebSearchRequests,
+				WebFetchRequests: u.WebFetchRequests, CodeExecutionRequests: u.CodeExecutionRequests,
+				UnclassifiedServerToolUnits: u.UnclassifiedServerToolUnits,
+			}
+			if u.CacheCreationDetail {
+				canonical.CacheWrite5mInputTokens = u.CacheWrite5mTokens
+				canonical.CacheWrite1hInputTokens = u.CacheWrite1hTokens
+			} else {
+				canonical.CacheWriteInputTokens = u.CacheCreationTokens
+			}
+			ev.Type = history.EventUsageSample
+			ev.Usage = &canonical
+			ev.Model = snapshot.Model
+			ev.TokIn, ev.TokOut = u.InputTokens, u.OutputTokens
+			ev.TokCacheRead, ev.TokCacheCreate = u.CacheReadTokens, u.CacheCreationTokens
+			ev.TokCacheCreate5m, ev.TokCacheCreate1h = u.CacheWrite5mTokens, u.CacheWrite1hTokens
+			ev.ServiceTier, ev.Speed, ev.InferenceGeo = u.ServiceTier, u.Speed, u.InferenceGeo
+			ev.WebSearchRequests, ev.WebFetchRequests = u.WebSearchRequests, u.WebFetchRequests
+			ev.CodeExecutionRequests = u.CodeExecutionRequests
+			ev.UnclassifiedServerToolUnits = u.UnclassifiedServerToolUnits
+			ev.ProviderMessageID, ev.UsageSourceID = snapshot.ProviderMessageID, snapshot.SourceID
+			events = append(events, ev)
+		}
+		return sink.AppendDurable(events)
+	})
 	if err != nil {
+		rs.reportUsageError(err)
 		return
 	}
-	rs.usageOffset[sess.PID] = newOff
-	for model, u := range byModel {
-		if u.IsZero() {
-			continue
-		}
-		sink.Record(history.Event{
-			Ts: now, Type: history.EventUsageSample,
-			SessionID: c.SessionID, PID: sess.PID, Agent: sess.Agent, CWD: sess.CWD,
-			Model: model,
-			TokIn: u.InputTokens, TokOut: u.OutputTokens,
-			TokCacheRead: u.CacheReadTokens, TokCacheCreate: u.CacheCreationTokens,
-		})
+	rs.usageErr = ""
+}
+
+func (rs *reconcileState) reportUsageError(err error) {
+	message := err.Error()
+	if message == rs.usageErr {
+		return
 	}
+	rs.usageErr = message
+	log.Printf("claude-usage: %v", err)
 }
 
 // labelKey identifies the thing a label cursor is about: the session, once a hook
@@ -179,11 +231,6 @@ func labelKey(pid int, c *state.AgentInfo) string {
 // against a duplicate event per blip. The Observer's per-session state is pruned
 // against the set of live session-ids (it is keyed by session-id, not pid).
 func (rs *reconcileState) prune(m map[int]*state.Session) {
-	for pid := range rs.usageOffset {
-		if _, ok := m[pid]; !ok {
-			delete(rs.usageOffset, pid)
-		}
-	}
 	for key, cur := range rs.labels {
 		if _, ok := m[cur.pid]; !ok {
 			delete(rs.labels, key)

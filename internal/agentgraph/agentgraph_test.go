@@ -315,6 +315,7 @@ func TestReduceIgnoresUsage(t *testing.T) {
 	without := observation(Node{Runtime: RuntimeIdle}, Node{ID: "child", Lifecycle: LifecycleRunning})
 	with := without.Clone()
 	with.Nodes[0].Usage = Usage{InputTokens: 10, OutputTokens: 20, TotalTokens: 30, ModelContextWindow: 100}
+	with.Nodes[0].Billing = BillingIdentity{AgentClient: "codex", ExecutionProvider: "openai", Model: "gpt-test"}
 	with.Nodes[1].Usage = Usage{CachedInputTokens: 5, ReasoningOutputTokens: 7}
 	if got, want := Reduce(with, Summary{}, testNow), Reduce(without, Summary{}, testNow); !reflect.DeepEqual(got, want) {
 		t.Fatalf("usage changed reduction: got %#v, want %#v", got, want)

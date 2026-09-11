@@ -151,6 +151,11 @@ wall-clock, per-session sum, and fan-out-weighted — plus subagents launched an
 tokens used. See the [activity-log schema](docs/history-schema.md) and the
 [design plan](docs/usage-history-plan.md).
 
+Claude and Codex cost estimates use canonical usage snapshots and sourced public
+price catalogs. Unknown costs remain null; API-equivalent amounts are separate
+from vendor credits or billed estimates. See [pricing and deployment compatibility](docs/pricing.md)
+for collection semantics, freshness diagnostics, and dashboard validation.
+
 ## How it works
 
 ```

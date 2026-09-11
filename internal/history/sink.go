@@ -1,13 +1,18 @@
 package history
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,12 +26,34 @@ import (
 // A disabled Sink (history opt-out) is a valid zero-cost value: Record/Close are
 // no-ops and no goroutine or file is created.
 type Sink struct {
-	enabled bool
-	cfg     Config
-	dir     string
-	ch      chan Event
-	done    chan struct{}
+	enabled   bool
+	cfg       Config
+	dir       string
+	mu        sync.RWMutex
+	ch        chan sinkRequest
+	done      chan struct{}
+	closed    bool
+	closeOnce sync.Once
+	// Test seams for short-write and directory-sync fault injection.
+	writeLine func(*os.File, []byte) (int, error)
+	syncDir   func(string) error
 }
+
+type sinkRequest struct {
+	event   Event
+	durable bool
+	ack     chan sinkResult
+}
+
+type sinkResult struct {
+	written bool
+	err     error
+}
+
+var (
+	ErrSinkDisabled = errors.New("history sink disabled")
+	ErrSinkClosed   = errors.New("history sink closed")
+)
 
 // sinkBuffer bounds in-flight events; transitions are infrequent (low hundreds a
 // day) so this is generous headroom — it only fills if the disk stalls, which is
@@ -44,8 +71,10 @@ func NewSink(cfg Config) *Sink {
 	if !cfg.Enabled {
 		return s
 	}
-	s.ch = make(chan Event, sinkBuffer)
+	s.ch = make(chan sinkRequest, sinkBuffer)
 	s.done = make(chan struct{})
+	s.writeLine = func(f *os.File, line []byte) (int, error) { return f.Write(line) }
+	s.syncDir = syncDirectory
 	go s.run()
 	return s
 }
@@ -68,10 +97,78 @@ func (s *Sink) Record(ev Event) {
 	if s == nil || !s.enabled {
 		return
 	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return
+	}
 	select {
-	case s.ch <- ev:
+	case s.ch <- sinkRequest{event: ev}:
 	default: // buffer full — drop rather than block the daemon
 	}
+}
+
+// RecordDurable synchronously and idempotently appends a canonical usage
+// record. It blocks behind ordinary buffered events, fsyncs the day file, and
+// returns only after UpdateID+Revision is durable (or was already present).
+// This method is intentionally separate from Record's best-effort hot path.
+func (s *Sink) RecordDurable(ctx context.Context, ev Event) (bool, error) {
+	if s == nil || !s.enabled {
+		return false, ErrSinkDisabled
+	}
+	if ev.UsageEventID == "" {
+		return false, errors.New("durable history event requires usage_event_id")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ack := make(chan sinkResult, 1)
+	s.mu.RLock()
+	if s.closed {
+		s.mu.RUnlock()
+		return false, ErrSinkClosed
+	}
+	select {
+	case s.ch <- sinkRequest{event: ev, durable: true, ack: ack}:
+		s.mu.RUnlock()
+	case <-ctx.Done():
+		s.mu.RUnlock()
+		return false, ctx.Err()
+	}
+	select {
+	case result := <-ack:
+		return result.written, result.err
+	case <-ctx.Done():
+		// The queued write may still finish. Its stable event ID makes a retry
+		// safe; callers must not advance their source cursor on this result.
+		return false, ctx.Err()
+	}
+}
+
+// AppendDurable appends a batch of canonical usage records through the same
+// restart-idempotent writer as RecordDurable. A partially written batch can be
+// retried safely because every event carries a stable ID and monotonic
+// revision. This compatibility wrapper is used by collectors that discover
+// several authoritative snapshots in one transcript pass.
+func (s *Sink) AppendDurable(events []Event) error {
+	if s == nil || !s.enabled {
+		return ErrSinkDisabled
+	}
+	s.mu.RLock()
+	closed := s.closed
+	s.mu.RUnlock()
+	if closed {
+		return ErrSinkClosed
+	}
+	if len(events) == 0 {
+		return nil
+	}
+	for _, event := range events {
+		if _, err := s.RecordDurable(context.Background(), event); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Close flushes and stops the writer. Safe on a nil/disabled sink.
@@ -79,7 +176,12 @@ func (s *Sink) Close() {
 	if s == nil || !s.enabled {
 		return
 	}
-	close(s.ch)
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		close(s.ch)
+		s.mu.Unlock()
+	})
 	<-s.done
 }
 
@@ -96,15 +198,31 @@ func (s *Sink) run() {
 		}
 	}
 	defer closeFile()
+	seenUsage := s.loadUsageRevisions()
 
 	s.prune(time.Now()) // bound the store at startup
-	for ev := range s.ch {
+	for request := range s.ch {
+		ev := request.event
+		result := sinkResult{}
+		if request.durable {
+			if revision, exists := seenUsage[ev.UsageEventID]; exists && revision >= ev.UsageRevision {
+				if request.ack != nil {
+					request.ack <- result
+				}
+				continue
+			}
+		}
 		day := dayKey(ev.Ts)
 		if day != curDay {
 			closeFile()
 			nf, err := s.openDay(day)
 			if err != nil {
-				log.Printf("history: open %s: %v (dropping events)", day, err)
+				if request.durable {
+					result.err = err
+					request.ack <- result
+				} else {
+					log.Printf("history: open %s: %v (dropping events)", day, err)
+				}
 				continue
 			}
 			f, curDay = nf, day
@@ -114,10 +232,107 @@ func (s *Sink) run() {
 		s.scrub(&ev)
 		line, err := json.Marshal(ev)
 		if err != nil {
+			if request.durable {
+				result.err = err
+				request.ack <- result
+			}
 			continue
 		}
-		_, _ = f.Write(append(line, '\n'))
+		line = append(line, '\n')
+		start, seekErr := f.Seek(0, io.SeekEnd)
+		if seekErr != nil {
+			if request.durable {
+				result.err = seekErr
+				request.ack <- result
+			}
+			continue
+		}
+		n, writeErr := s.writeLine(f, line)
+		if writeErr != nil || n != len(line) {
+			if writeErr == nil {
+				writeErr = io.ErrShortWrite
+			}
+			writeErr = rollbackHistoryLine(f, start, writeErr)
+			if request.durable {
+				result.err = writeErr
+				request.ack <- result
+			}
+			continue
+		}
+		if request.durable {
+			if err := f.Sync(); err != nil {
+				result.err = rollbackHistoryLine(f, start, err)
+				request.ack <- result
+				continue
+			}
+			if err := s.syncDir(s.dir); err != nil {
+				result.err = rollbackHistoryLine(f, start, err)
+				request.ack <- result
+				continue
+			}
+			seenUsage[ev.UsageEventID] = ev.UsageRevision
+			result.written = true
+			request.ack <- result
+		}
 	}
+}
+
+// rollbackHistoryLine makes a failed durable attempt replay-safe. In
+// particular, fsyncing the truncation prevents a crash from leaving a torn
+// prefix that would absorb the retried JSON object into one unreadable line.
+func rollbackHistoryLine(f *os.File, start int64, cause error) error {
+	if err := f.Truncate(start); err != nil {
+		return fmt.Errorf("history line recovery after %v: %w", cause, err)
+	}
+	if _, err := f.Seek(0, io.SeekEnd); err != nil {
+		return fmt.Errorf("history line recovery after %v: %w", cause, err)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("history line recovery after %v: %w", cause, err)
+	}
+	return cause
+}
+
+func syncDirectory(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
+}
+
+// loadUsageRevisions rebuilds the idempotency index from retained day files.
+// The narrow decoder ignores all content-shaped fields and never logs malformed
+// lines or paths; a torn tail simply leaves its event eligible for replay.
+func (s *Sink) loadUsageRevisions() map[string]int64 {
+	seen := make(map[string]int64)
+	files, err := listDayFiles(s.dir)
+	if err != nil {
+		return seen
+	}
+	for _, day := range files {
+		f, err := os.Open(day.path)
+		if err != nil {
+			continue
+		}
+		scanner := bufio.NewScanner(f)
+		scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+		for scanner.Scan() {
+			var record struct {
+				UsageEventID  string `json:"usage_event_id"`
+				UsageRevision int64  `json:"usage_revision"`
+			}
+			if json.Unmarshal(scanner.Bytes(), &record) != nil {
+				continue
+			}
+			if record.UsageEventID != "" && record.UsageRevision >= seen[record.UsageEventID] {
+				seen[record.UsageEventID] = record.UsageRevision
+			}
+		}
+		_ = f.Close()
+	}
+	return seen
 }
 
 // openDay opens (creating) the append-only file for a local day.

@@ -7,9 +7,11 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/agentgraph"
 	"github.com/tjmisko/switchboard/internal/fanout"
 	"github.com/tjmisko/switchboard/internal/history"
 	"github.com/tjmisko/switchboard/internal/state"
@@ -68,7 +70,7 @@ func assistantUsageModelLine(model string, in, out int64) string {
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }
 
-func TestObserveUsageEmitsOneSamplePerModel(t *testing.T) {
+func TestObserveUsageEmitsOneSamplePerLogicalMessage(t *testing.T) {
 	dir := t.TempDir()
 	tpath := filepath.Join(dir, "t.jsonl")
 	writeLines(t, tpath, `{"type":"system"}`) // a baseline line so priming has something to skip past
@@ -93,18 +95,199 @@ func TestObserveUsageEmitsOneSamplePerModel(t *testing.T) {
 	sink.Close()
 
 	samples := eventsOfType(readEvents(t, histDir), history.EventUsageSample)
-	if len(samples) != 2 {
-		t.Fatalf("got %d usage samples, want one per distinct model: %+v", len(samples), samples)
+	if len(samples) != 3 {
+		t.Fatalf("got %d usage samples, want one per logical message: %+v", len(samples), samples)
 	}
 	byModel := map[string]history.Event{}
 	for _, s := range samples {
-		byModel[s.Model] = s
+		total := byModel[s.Model]
+		total.Model = s.Model
+		total.TokIn += s.TokIn
+		total.TokOut += s.TokOut
+		byModel[s.Model] = total
 	}
 	if o := byModel["claude-opus-4-8"]; o.TokIn != 120 || o.TokOut != 48 {
 		t.Errorf("opus sample = %+v, want summed 120/48", o)
 	}
 	if h := byModel["claude-haiku-4-5"]; h.TokIn != 10 || h.TokOut != 5 {
 		t.Errorf("haiku sample = %+v, want 10/5", h)
+	}
+}
+
+func TestObserveUsagePreservesClaudePricingDimensions(t *testing.T) {
+	dir := t.TempDir()
+	tpath := filepath.Join(dir, "session.jsonl")
+	writeLines(t, tpath, `{"type":"assistant","timestamp":"2026-08-25T10:11:12.123Z","uuid":"row-rich","message":{"id":"msg-rich","role":"assistant","model":"claude-opus-4-8","content":[],"usage":{"input_tokens":11,"output_tokens":12,"cache_read_input_tokens":13,"cache_creation_input_tokens":29,"cache_creation":{"ephemeral_5m_input_tokens":14,"ephemeral_1h_input_tokens":15},"service_tier":"priority","speed":"fast","inference_geo":"us","server_tool_use":{"web_search_requests":2,"web_fetch_requests":3,"code_execution_requests":1,"future_server_tool_requests":4}}}}`)
+
+	histDir := t.TempDir()
+	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()))
+	sess := &state.Session{PID: 7, Agent: "claude", CWD: "/home/u/proj",
+		Claude: &state.AgentInfo{SessionID: "s7", Transcript: tpath}}
+	rs.observe(sink, sess, sess.Claude, time.Now())
+	sink.Close()
+
+	samples := eventsOfType(readEvents(t, histDir), history.EventUsageSample)
+	if len(samples) != 1 {
+		t.Fatalf("got %d usage samples, want 1: %+v", len(samples), samples)
+	}
+	sample := samples[0]
+	if got := sample.Ts.Format(time.RFC3339Nano); got != "2026-08-25T10:11:12.123Z" {
+		t.Errorf("sample timestamp = %q, want provider timestamp", got)
+	}
+	if sample.ProviderMessageID != "msg-rich" || !strings.HasPrefix(sample.UsageSourceID, "cusrc_") ||
+		!strings.HasPrefix(sample.UsageEventID, "cuev_") || !sample.UsageSnapshot || sample.UsageRevision <= 0 ||
+		sample.Source != agentgraph.SourceClaudeTranscript {
+		t.Errorf("sample correlation = %+v", sample)
+	}
+	if sample.SchemaVersion != history.HistorySchemaVersion || sample.ExecutionProvider != "" ||
+		sample.BillingRoute != "" || sample.AccountKind != "" || sample.AuthMode != "" {
+		t.Errorf("sample billing identity = %+v", sample)
+	}
+	if sample.TokCacheCreate != 29 || sample.TokCacheCreate5m != 14 || sample.TokCacheCreate1h != 15 {
+		t.Errorf("cache dimensions = %+v", sample)
+	}
+	if sample.Usage == nil || sample.Usage.InputTokens != 11 || sample.Usage.OutputTokens != 12 ||
+		sample.Usage.CachedInputTokens != 13 || sample.Usage.CacheWriteInputTokens != 0 ||
+		sample.Usage.CacheWrite5mInputTokens != 14 || sample.Usage.CacheWrite1hInputTokens != 15 ||
+		sample.Usage.WebSearchRequests != 2 || sample.Usage.WebFetchRequests != 3 ||
+		sample.Usage.CodeExecutionRequests != 1 || sample.Usage.UnclassifiedServerToolUnits != 4 {
+		t.Errorf("canonical usage = %+v", sample.Usage)
+	}
+	if sample.ServiceTier != "priority" || sample.Speed != "fast" || sample.InferenceGeo != "us" || sample.WebSearchRequests != 2 || sample.WebFetchRequests != 3 {
+		t.Errorf("pricing dimensions = %+v", sample)
+	}
+}
+
+func TestObserveUsageMapsCombinedCacheWriteOnlyWhenTTLUnknown(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "session.jsonl")
+	writeLines(t, root, `{"type":"assistant","timestamp":"2026-08-25T10:00:00Z","uuid":"row-1","message":{"id":"msg-1","role":"assistant","model":"claude-opus-4-8","content":[],"usage":{"input_tokens":11,"output_tokens":12,"cache_creation_input_tokens":29}}}`)
+	histDir := t.TempDir()
+	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()))
+	sess := &state.Session{PID: 7, Agent: "claude", CWD: "/home/u/proj",
+		Claude: &state.AgentInfo{SessionID: "session-combined", Transcript: root}}
+	rs.observe(sink, sess, sess.Claude, time.Now())
+	sink.Close()
+
+	samples := eventsOfType(readEvents(t, histDir), history.EventUsageSample)
+	if len(samples) != 1 || samples[0].Usage == nil {
+		t.Fatalf("combined cache sample = %+v", samples)
+	}
+	u := samples[0].Usage
+	if u.CacheWriteInputTokens != 29 || u.CacheWrite5mInputTokens != 0 || u.CacheWrite1hInputTokens != 0 || samples[0].TokCacheCreate != 29 {
+		t.Fatalf("unknown-TTL cache mapping = canonical %+v legacy %+v", u, samples[0])
+	}
+}
+
+func TestObserveUsageLegacyCutoverCarriesCanonicalIdentity(t *testing.T) {
+	histDir := t.TempDir()
+	day := time.Now().Local().Format("2006-01-02")
+	legacy := fmt.Sprintf(`{"ts":%q,"type":"usage_sample","agent":"claude","session_id":"session-old","tok_in":10}`, time.Now().UTC().Format(time.RFC3339Nano)) + "\n"
+	if err := os.WriteFile(filepath.Join(histDir, day+".jsonl"), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(t.TempDir(), "session.jsonl")
+	writeLines(t, root, `{"type":"assistant","timestamp":"2026-08-25T10:00:00Z","uuid":"row-1","message":{"id":"msg-old","role":"assistant","model":"claude-opus-4-8","content":[],"usage":{"input_tokens":10,"output_tokens":2}}}`)
+	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()))
+	sess := &state.Session{PID: 7, Agent: "claude", CWD: "/home/u/proj",
+		Claude: &state.AgentInfo{SessionID: "session-old", Transcript: root}}
+	rs.observe(sink, sess, sess.Claude, time.Now())
+	sink.Close()
+
+	markers := eventsOfType(readEvents(t, histDir), history.EventUsageCutover)
+	if len(markers) != 1 {
+		t.Fatalf("cutover markers = %+v", markers)
+	}
+	marker := markers[0]
+	if marker.SchemaVersion != history.HistorySchemaVersion || marker.ExecutionProvider != "" ||
+		marker.BillingRoute != "" || marker.AccountKind != "" || marker.AuthMode != "" ||
+		marker.UsageCoverage != "partial_legacy_cutover" || marker.Usage != nil ||
+		!marker.UsageSnapshot || marker.UsageRevision <= 0 || !strings.HasPrefix(marker.UsageEventID, "cuev_") {
+		t.Fatalf("canonical cutover marker = %+v", marker)
+	}
+}
+
+func TestObserveUsageDurablyBackfillsMoreThanAsyncBuffer(t *testing.T) {
+	dir := t.TempDir()
+	tPath := filepath.Join(dir, "session.jsonl")
+	const messages = 700
+	lines := make([]string, messages)
+	for i := range lines {
+		lines[i] = fmt.Sprintf(`{"type":"assistant","timestamp":"2026-08-25T10:00:00Z","uuid":"row-%d","message":{"id":"msg-%d","role":"assistant","model":"claude-sonnet-5","content":[],"usage":{"input_tokens":%d,"output_tokens":1}}}`, i, i, i+1)
+	}
+	writeLines(t, tPath, lines...)
+
+	histDir := t.TempDir()
+	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()))
+	sess := &state.Session{PID: 7, Agent: "claude", CWD: "/home/u/proj",
+		Claude: &state.AgentInfo{SessionID: "session-large", Transcript: tPath}}
+	rs.observe(sink, sess, sess.Claude, time.Now())
+	sink.Close()
+
+	samples := eventsOfType(readEvents(t, histDir), history.EventUsageSample)
+	if len(samples) != messages {
+		t.Fatalf("durable backfill samples = %d, want %d", len(samples), messages)
+	}
+}
+
+func TestObserveUsageRetriesTransientTrackerInitialization(t *testing.T) {
+	dir := t.TempDir()
+	tPath := filepath.Join(dir, "session.jsonl")
+	writeLines(t, tPath, `{"type":"assistant","timestamp":"2026-08-25T10:00:00Z","uuid":"row-1","message":{"id":"msg-1","role":"assistant","model":"claude-sonnet-5","content":[],"usage":{"input_tokens":10,"output_tokens":2}}}`)
+
+	histDir := t.TempDir()
+	cursorPath := filepath.Join(histDir, "claude-usage-cursors-v1.json")
+	if err := os.WriteFile(cursorPath, []byte("not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()))
+	sess := &state.Session{PID: 7, Agent: "claude", CWD: "/home/u/proj",
+		Claude: &state.AgentInfo{SessionID: "session-retry", Transcript: tPath}}
+
+	rs.observe(sink, sess, sess.Claude, time.Now())
+	if rs.usage != nil {
+		t.Fatal("invalid cursor unexpectedly initialized tracker")
+	}
+	if err := os.WriteFile(cursorPath, []byte(`{"version":2,"sessions":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rs.observe(sink, sess, sess.Claude, time.Now())
+	if rs.usage == nil {
+		t.Fatal("tracker initialization was not retried after transient failure")
+	}
+	sink.Close()
+
+	samples := eventsOfType(readEvents(t, histDir), history.EventUsageSample)
+	if len(samples) != 1 || samples[0].ProviderMessageID != "msg-1" {
+		t.Fatalf("usage after initialization retry = %+v", samples)
+	}
+}
+
+func TestObserveUsageDisabledHistoryDoesNotAdvanceCursor(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "session.jsonl")
+	writeLines(t, root, `{"type":"assistant","timestamp":"2026-08-25T10:00:00Z","uuid":"row-1","message":{"id":"msg-1","role":"assistant","model":"claude-sonnet-5","content":[],"usage":{"input_tokens":10,"output_tokens":2}}}`)
+	histDir := t.TempDir()
+	rs := newReconcileState(fanout.NewObserver(t.TempDir()))
+	sess := &state.Session{PID: 7, Agent: "claude", CWD: "/home/u/proj",
+		Claude: &state.AgentInfo{SessionID: "session-disabled", Transcript: root}}
+
+	disabled := history.NewSink(history.Config{Enabled: false, Detail: history.DetailFull, Dir: histDir})
+	rs.observe(disabled, sess, sess.Claude, time.Now())
+	disabled.Close()
+	if rs.usage != nil {
+		t.Fatal("disabled history initialized or advanced a usage tracker")
+	}
+
+	enabled := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
+	rs.observe(enabled, sess, sess.Claude, time.Now())
+	enabled.Close()
+	samples := eventsOfType(readEvents(t, histDir), history.EventUsageSample)
+	if len(samples) != 1 || samples[0].ProviderMessageID != "msg-1" {
+		t.Fatalf("usage was not backfilled after enabling history: %+v", samples)
 	}
 }
 
@@ -367,10 +550,10 @@ func TestApplyFocusRecordsOnChangeOnly(t *testing.T) {
 	}
 }
 
-func TestObserveUsagePrimesThenSamples(t *testing.T) {
+func TestObserveUsageBackfillsThenSamples(t *testing.T) {
 	dir := t.TempDir()
 	tpath := filepath.Join(dir, "t.jsonl")
-	// Pre-existing backlog: must NOT be counted (it predates our watching).
+	// Pre-existing complete records are backfilled on first discovery.
 	writeLines(t, tpath, `{"type":"assistant","message":{"role":"assistant","content":[],"usage":{"input_tokens":9999,"output_tokens":9999}}}`)
 
 	histDir := t.TempDir()
@@ -379,7 +562,7 @@ func TestObserveUsagePrimesThenSamples(t *testing.T) {
 	sess := &state.Session{PID: 1, Agent: "claude", CWD: "/home/u/proj",
 		Claude: &state.AgentInfo{SessionID: "s1", Transcript: tpath}}
 
-	// First observe primes the usage cursor to EOF — no sample for the backlog.
+	// First observe emits the backlog using provider timestamps when available.
 	rs.observe(sink, sess, sess.Claude, time.Now())
 
 	// New usage accrues while we watch.
@@ -391,10 +574,10 @@ func TestObserveUsagePrimesThenSamples(t *testing.T) {
 	sink.Close()
 
 	samples := eventsOfType(readEvents(t, histDir), history.EventUsageSample)
-	if len(samples) != 1 {
-		t.Fatalf("got %d usage samples, want 1 (backlog primed away): %+v", len(samples), samples)
+	if len(samples) != 2 {
+		t.Fatalf("got %d usage samples, want backlog plus appended usage: %+v", len(samples), samples)
 	}
-	if samples[0].TokIn != 120 || samples[0].TokOut != 34 {
-		t.Errorf("usage sample = %+v, want only the post-priming delta (120/34)", samples[0])
+	if samples[0].TokIn != 9999 || samples[0].TokOut != 9999 || samples[1].TokIn != 120 || samples[1].TokOut != 34 {
+		t.Errorf("usage samples = %+v, want backlog 9999/9999 then appended 120/34", samples)
 	}
 }

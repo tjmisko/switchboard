@@ -30,7 +30,7 @@ func TestLoadHydratesPartialAgentGraphAxesAndOrder(t *testing.T) {
       "summary": {},
       "nodes": [
         {"id": "z", "parent_id": "root"},
-        {"id": "root"},
+		{"id": "root", "billing": {"agent_client":"codex", "execution_provider":"openai", "auth_mode":"api_key", "billing_route":"api", "model":"gpt-5.6-sol", "reasoning_effort":"high"}},
         {"id": "a", "parent_id": "root"}
       ]
     }
@@ -44,6 +44,11 @@ func TestLoadHydratesPartialAgentGraphAxesAndOrder(t *testing.T) {
 	sess := store.Snapshot().Sessions[0]
 	if sess.AgentGraph == nil {
 		t.Fatal("partial but structurally valid graph was dropped")
+	}
+	root := sess.AgentGraph.Nodes[0]
+	if root.Billing.ExecutionProvider != "openai" || root.Billing.AuthMode != "api_key" || root.Billing.BillingRoute != "api" ||
+		root.Billing.Model != "gpt-5.6-sol" || root.Billing.ReasoningEffort != "high" {
+		t.Fatalf("billing identity was not restored: %+v", root.Billing)
 	}
 	wantIDs := []string{"root", "a", "z"}
 	for i, want := range wantIDs {

@@ -81,6 +81,14 @@ func main() {
 		cmdSeedBench(args[1:])
 		return
 	}
+	// pricing inspects or refreshes the public spot-rate cache. It needs no
+	// daemon and never reads provider credentials.
+	if args[0] == "pricing" {
+		if err := cmdPricing(args[1:], *jsonOut, os.Stdout); err != nil {
+			fail("pricing: %v", err)
+		}
+		return
+	}
 
 	c, err := rpc.Dial(*socketPath)
 	if err != nil {
@@ -944,6 +952,8 @@ commands:
                             --json emits the structured data; needs no daemon.
   seed-bench [flags]      measure fanout history-seeding cost against a store
                             dir (see scripts/sb-bench-seed); needs no daemon.
+  pricing <sub> [flags]   public spot-rate cache: status or refresh; reports
+                            source, age, version hash, model count, and fallback.
 
 flags:
   --socket <path>         daemon socket (default: $XDG_RUNTIME_DIR/switchboard.sock)

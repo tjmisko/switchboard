@@ -123,6 +123,36 @@ func (u Usage) IsZero() bool {
 	return u == (Usage{})
 }
 
+// BillingIdentity records the non-secret provider dimensions needed to price
+// one node's usage. AgentClient identifies the local client implementation;
+// ExecutionProvider identifies the model backend and must not be inferred from
+// AgentClient. BillingRoute and AccountKind are coarse classifications only --
+// adapters must never place account identifiers or credentials in this value.
+//
+// Model, service tier, speed, and reasoning effort are retained at the node so
+// provider adapters can preserve request-level pricing dimensions before a
+// history projection aggregates them.
+type BillingIdentity struct {
+	AgentClient       string `json:"agent_client,omitempty"`
+	ExecutionProvider string `json:"execution_provider,omitempty"`
+	// AuthMode describes how the client authenticated. It is deliberately
+	// separate from BillingRoute: ChatGPT authentication does not prove whether
+	// a particular turn consumed an included allowance or purchased credits.
+	AuthMode        string `json:"auth_mode,omitempty"`
+	BillingRoute    string `json:"billing_route,omitempty"`
+	AccountKind     string `json:"account_kind,omitempty"`
+	Model           string `json:"model,omitempty"`
+	ServiceTier     string `json:"service_tier,omitempty"`
+	Speed           string `json:"speed,omitempty"`
+	InferenceGeo    string `json:"inference_geo,omitempty"`
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+}
+
+// IsZero reports whether no billing identity metadata was supplied.
+func (i BillingIdentity) IsZero() bool {
+	return i == (BillingIdentity{})
+}
+
 // Node is one explicitly identified thread in an observation. ParentID is
 // empty only for the root. Nickname, role, description, timestamps, and usage
 // are optional and do not affect status.
@@ -138,6 +168,7 @@ type Node struct {
 	StartedAt   time.Time
 	UpdatedAt   time.Time
 	CompletedAt time.Time
+	Billing     BillingIdentity
 	Usage       Usage
 }
 

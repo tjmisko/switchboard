@@ -1,0 +1,26 @@
+{
+  "method": "thread/tokenUsage/updated",
+  "params": {
+    "threadId": "01890f00-0000-7000-8000-000000000001",
+    "turnId": "turn-usage-1",
+    "tokenUsage": {
+      "last": {
+        "inputTokens": 100,
+        "cachedInputTokens": 60,
+        "cacheWriteInputTokens": 10,
+        "outputTokens": 20,
+        "reasoningOutputTokens": 8,
+        "totalTokens": 120
+      },
+      "total": {
+        "inputTokens": 1000,
+        "cachedInputTokens": 600,
+        "cacheWriteInputTokens": 100,
+        "outputTokens": 200,
+        "reasoningOutputTokens": 80,
+        "totalTokens": 1200
+      },
+      "modelContextWindow": 272000
+    }
+  }
+}

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -279,8 +280,8 @@ func TestShouldBroadcastWhenTheChangeKeyChanges(t *testing.T) {
 }
 
 // Suppression is not a one-shot: the daemon sits in it for hours. Every tick in
-// that stretch still owes the dashboard its events, so the count must track the
-// ticks and not the publishes.
+// that stretch still owes the dashboard its distinct messages, independently of
+// publishes. Repeated streamed fragments of one message must not be counted twice.
 func TestShouldRecordEveryTicksHistoryAcrossAStretchOfSuppressedPublishes(t *testing.T) {
 	const pid = 8102
 	store, flushHistory, histDir, transcriptPath, tick := suppressionFixture(t, pid, map[int]procState{pid: procAlive})
@@ -292,8 +293,9 @@ func TestShouldRecordEveryTicksHistoryAcrossAStretchOfSuppressedPublishes(t *tes
 	defer unsubscribe()
 
 	const ticks = 3
-	for range ticks {
-		appendUsageLines(t, transcriptPath, assistantUsageModelLine("claude-opus-4-8", 10, 4))
+	for i := range ticks {
+		line := fmt.Sprintf(`{"type":"assistant","message":{"id":"msg-%d","role":"assistant","model":"claude-opus-4-8","content":[],"usage":{"input_tokens":10,"output_tokens":4}}}`, i)
+		appendUsageLines(t, transcriptPath, line, line)
 		tick()
 	}
 

@@ -2,12 +2,191 @@ package history
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
+
+func TestRecordDurableIsRestartIdempotentAndLatestRevisionWins(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{Enabled: true, Detail: DetailMinimal, Dir: dir}
+	ts := time.Date(2026, 8, 25, 10, 0, 0, 0, time.Local)
+	event := Event{
+		SchemaVersion: HistorySchemaVersion, Ts: ts, Type: EventUsageSample,
+		SessionID: "root", ThreadID: "root", Agent: "codex",
+		UsageEventID: "codex-stable-id", UsageRevision: 1, UsageSnapshot: true,
+		Usage: &UsageDelta{InputTokens: 10, OutputTokens: 2, TotalTokens: 12},
+	}
+	sink := NewSink(cfg)
+	if written, err := sink.RecordDurable(context.Background(), event); err != nil || !written {
+		t.Fatalf("first durable write = %v, %v", written, err)
+	}
+	if written, err := sink.RecordDurable(context.Background(), event); err != nil || written {
+		t.Fatalf("same-process replay = %v, %v", written, err)
+	}
+	sink.Close()
+
+	restarted := NewSink(cfg)
+	if written, err := restarted.RecordDurable(context.Background(), event); err != nil || written {
+		t.Fatalf("restart replay = %v, %v", written, err)
+	}
+	event.UsageRevision = 2
+	event.Model = "gpt-revised"
+	if written, err := restarted.RecordDurable(context.Background(), event); err != nil || !written {
+		t.Fatalf("latest revision = %v, %v", written, err)
+	}
+	restarted.Close()
+	events := readDay(t, dir, dayKey(ts))
+	if len(events) != 2 || events[0].UsageRevision != 1 || events[1].UsageRevision != 2 {
+		t.Fatalf("durable events = %#v", events)
+	}
+}
+
+func TestRecordDurableRecoversTornLineBeforeRetry(t *testing.T) {
+	dir := t.TempDir()
+	sink := NewSink(Config{Enabled: true, Detail: DetailMinimal, Dir: dir})
+	ts := time.Date(2026, 8, 25, 11, 0, 0, 0, time.Local)
+	event := Event{
+		SchemaVersion: HistorySchemaVersion, Ts: ts, Type: EventUsageSample,
+		SessionID: "root", ThreadID: "root", Agent: "codex",
+		UsageEventID: "torn-line-id", UsageRevision: 1,
+		Usage: &UsageDelta{InputTokens: 7, TotalTokens: 7},
+	}
+	sink.writeLine = func(f *os.File, line []byte) (int, error) {
+		n, _ := f.Write(line[:len(line)/2])
+		return n, io.ErrUnexpectedEOF
+	}
+	if _, err := sink.RecordDurable(context.Background(), event); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("short write error = %v", err)
+	}
+	sink.writeLine = func(f *os.File, line []byte) (int, error) { return f.Write(line) }
+	if written, err := sink.RecordDurable(context.Background(), event); err != nil || !written {
+		t.Fatalf("retry = %v, %v", written, err)
+	}
+	sink.Close()
+	events := readDay(t, dir, dayKey(ts))
+	if len(events) != 1 || events[0].UsageEventID != event.UsageEventID {
+		t.Fatalf("history retained torn prefix: %#v", events)
+	}
+}
+
+func TestRecordDurableSurfacesDirectorySyncFailureWithoutDuplicateRetry(t *testing.T) {
+	dir := t.TempDir()
+	sink := NewSink(Config{Enabled: true, Detail: DetailMinimal, Dir: dir})
+	ts := time.Date(2026, 8, 25, 11, 30, 0, 0, time.Local)
+	event := Event{
+		SchemaVersion: HistorySchemaVersion, Ts: ts, Type: EventUsageSample,
+		SessionID: "root", ThreadID: "root", Agent: "codex",
+		UsageEventID: "directory-sync-id", UsageRevision: 1,
+		Usage: &UsageDelta{InputTokens: 9, TotalTokens: 9},
+	}
+	sink.syncDir = func(string) error { return errors.New("synthetic directory sync failure") }
+	if _, err := sink.RecordDurable(context.Background(), event); err == nil {
+		t.Fatal("directory sync failure was not surfaced")
+	}
+	sink.syncDir = syncDirectory
+	if written, err := sink.RecordDurable(context.Background(), event); err != nil || !written {
+		t.Fatalf("directory-sync retry = %v, %v", written, err)
+	}
+	sink.Close()
+	events := readDay(t, dir, dayKey(ts))
+	if len(events) != 1 || events[0].UsageEventID != event.UsageEventID {
+		t.Fatalf("directory-sync retry duplicated history: %#v", events)
+	}
+}
+
+func TestAppendDurableWritesBatchesLargerThanAsyncBuffer(t *testing.T) {
+	dir := t.TempDir()
+	sink := NewSink(Config{Enabled: true, Detail: DetailFull, Dir: dir})
+	at := time.Date(2026, 8, 25, 12, 0, 0, 0, time.Local)
+	events := make([]Event, sinkBuffer+200)
+	for i := range events {
+		events[i] = Event{
+			Ts: at, Type: EventUsageSample, Agent: "claude", SessionID: "session-1",
+			UsageEventID: fmt.Sprintf("usage-%04d", i), UsageRevision: 1,
+			UsageSnapshot: true, TokIn: int64(i + 1),
+		}
+	}
+	if err := sink.AppendDurable(events); err != nil {
+		t.Fatal(err)
+	}
+	sink.Close()
+	if got := len(readDay(t, dir, dayKey(at))); got != len(events) {
+		t.Fatalf("durable event count = %d, want %d", got, len(events))
+	}
+}
+
+func TestAppendDurableReportsFailureAndDisabledSink(t *testing.T) {
+	disabled := NewSink(Config{Enabled: false, Dir: t.TempDir()})
+	if err := disabled.AppendDurable([]Event{{Ts: time.Now(), Type: EventUsageSample}}); !errors.Is(err, ErrSinkDisabled) {
+		t.Fatalf("disabled append error = %v, want ErrSinkDisabled", err)
+	}
+
+	parent := t.TempDir()
+	notDir := filepath.Join(parent, "not-a-directory")
+	if err := os.WriteFile(notDir, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sink := NewSink(Config{Enabled: true, Detail: DetailFull, Dir: notDir})
+	err := sink.AppendDurable([]Event{{
+		Ts: time.Now(), Type: EventUsageSample, UsageEventID: "usage-1", UsageRevision: 1, UsageSnapshot: true,
+	}})
+	if err == nil {
+		t.Fatal("durable append unexpectedly succeeded against a non-directory")
+	}
+	sink.Close()
+}
+
+func TestAppendDurableConcurrentCloseAlwaysAcknowledgesOrRejects(t *testing.T) {
+	sink := NewSink(Config{Enabled: true, Detail: DetailFull, Dir: t.TempDir()})
+	const calls = 64
+	start := make(chan struct{})
+	results := make(chan error, calls)
+	var wg sync.WaitGroup
+	for i := 0; i < calls; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			results <- sink.AppendDurable([]Event{{
+				Ts: time.Now(), Type: EventUsageSample, Agent: "claude",
+				UsageEventID: fmt.Sprintf("usage-%d", i), UsageRevision: 1, UsageSnapshot: true,
+			}})
+		}(i)
+	}
+	close(start)
+	closed := make(chan struct{})
+	go func() {
+		sink.Close()
+		close(closed)
+	}()
+	wg.Wait()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close or a durable append blocked without acknowledgement")
+	}
+	close(results)
+	for err := range results {
+		if err != nil && !errors.Is(err, ErrSinkClosed) {
+			t.Fatalf("concurrent append error = %v, want nil or ErrSinkClosed", err)
+		}
+	}
+	if err := sink.AppendDurable([]Event{{Ts: time.Now(), Type: EventUsageSample}}); !errors.Is(err, ErrSinkClosed) {
+		t.Fatalf("post-close append error = %v, want ErrSinkClosed", err)
+	}
+	if err := sink.AppendDurable(nil); !errors.Is(err, ErrSinkClosed) {
+		t.Fatalf("post-close empty append error = %v, want ErrSinkClosed", err)
+	}
+	sink.Close()
+}
 
 // readDay reads and decodes every event in a day-file.
 func readDay(t *testing.T, dir, day string) []Event {

@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/tjmisko/switchboard/internal/pricing"
 )
 
 // Status strings as they appear in events (kept as local literals so this stays
@@ -110,6 +112,40 @@ type FocusSpan struct {
 	End   time.Time `json:"end"`
 }
 
+// PricingGroup retains the request-level dimensions that selected a rate. The
+// aggregate Cost is convenient, while these groups keep two exact models or
+// tiers in one session auditable instead of flattening their billing identity.
+type PricingGroup struct {
+	Identity BillingIdentity `json:"identity"`
+	Usage    UsageDelta      `json:"usage"`
+	Cost     CostEstimate    `json:"cost"`
+	Events   int64           `json:"events"`
+}
+
+const vendorUsageScopeLatestThread = "latest_cumulative_thread_snapshot"
+
+// ScopedVendorUsage is one latest provider-native cumulative snapshot with the
+// root/thread/source identity needed to audit its scope. It is never interpreted
+// as an additive usage delta.
+type ScopedVendorUsage struct {
+	SessionID     string              `json:"session_id,omitempty"`
+	ThreadID      string              `json:"thread_id,omitempty"`
+	UsageEventID  string              `json:"usage_event_id,omitempty"`
+	UsageRevision int64               `json:"usage_revision,omitempty"`
+	UsageSourceID string              `json:"usage_source_id,omitempty"`
+	Identity      BillingIdentity     `json:"identity"`
+	Snapshot      VendorUsageSnapshot `json:"snapshot"`
+}
+
+// VendorUsageAggregate sums only the latest snapshots for distinct thread
+// scopes. Cost contains vendor_estimated_usd/plan_credits only; Scope makes
+// explicit that these are cumulative thread figures, not a query-window delta.
+type VendorUsageAggregate struct {
+	Scope     string              `json:"scope"`
+	Snapshots []ScopedVendorUsage `json:"snapshots"`
+	Cost      CostEstimate        `json:"cost"`
+}
+
 // Swimlane is one session's lane on the timeline: its identity plus the ordered
 // intervals it passed through. Stacking swimlanes (each keyed by a distinct
 // session) is the parallel-sessions timeline. The v2 enrichments add the
@@ -147,11 +183,16 @@ type Swimlane struct {
 	Subagents []SubagentSpan `json:"subagents,omitempty"`
 	Focus     []FocusSpan    `json:"focus,omitempty"`
 
-	CostUSD        float64 `json:"cost_usd,omitempty"`
-	TokIn          int64   `json:"tok_in,omitempty"`
-	TokOut         int64   `json:"tok_out,omitempty"`
-	TokCacheRead   int64   `json:"tok_cache_read,omitempty"`
-	TokCacheCreate int64   `json:"tok_cache_create,omitempty"`
+	CostUSD        *pricing.USD          `json:"cost_usd"`
+	Cost           *CostEstimate         `json:"cost,omitempty"`
+	Usage          *UsageDelta           `json:"usage,omitempty"`
+	PricingGroups  []PricingGroup        `json:"pricing_groups,omitempty"`
+	VendorUsage    *VendorUsageAggregate `json:"vendor_usage,omitempty"`
+	TokIn          int64                 `json:"tok_in,omitempty"`
+	TokOut         int64                 `json:"tok_out,omitempty"`
+	TokCacheRead   int64                 `json:"tok_cache_read,omitempty"`
+	TokCacheCreate int64                 `json:"tok_cache_create,omitempty"`
+	UsageCoverage  string                `json:"usage_coverage,omitempty"`
 
 	// Suspect and friends are the trailing-interval plausibility post-check
 	// (suspect.go). Suspect means this lane's length is an artifact of the end
@@ -313,11 +354,20 @@ func (b *laneBuilder) closeLabel(t time.Time) {
 // token usage + recomputed cost (usage_sample), and the spans the session held
 // window focus (the global focus stream).
 func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
+	return BuildSwimlanesWithCatalogs(events, end, priceBook(time.Now()), time.Now())
+}
+
+// BuildSwimlanesWithCatalogs is BuildSwimlanes with an injected, immutable
+// catalog snapshot. Tests and CLI callers can guarantee every lane uses one
+// coherent pricing version even if a background refresh lands mid-fold.
+func BuildSwimlanesWithCatalogs(events []Event, end time.Time, catalogs pricing.CatalogSet, pricingNow time.Time) []Swimlane {
+	events = latestUsageSnapshots(events)
 	evs := append([]Event(nil), events...)
 	sort.SliceStable(evs, func(i, j int) bool { return evs[i].Ts.Before(evs[j].Ts) })
 
 	open := map[string]*laneBuilder{}
 	pidLane := map[int]string{} // pid → the lane key it currently feeds
+	coverageSeen := map[string]bool{}
 	var done []Swimlane
 	finish := func(b *laneBuilder, t time.Time) {
 		b.closeInterval(t)
@@ -398,7 +448,9 @@ func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
 		// holds its pages, so routing one would make every live pid look
 		// demonstrably alive forever, could close a prior session's lane on a
 		// reused pid, and could CREATE a lane the way usage_sample does below.
-		if ev.Type == EventFocus || ev.Type == EventActivity || ev.Type == legacyEventMemorySample {
+		// Vendor snapshots are cumulative accounting metadata, not liveness
+		// evidence; they are folded separately by session and thread.
+		if ev.Type == EventFocus || ev.Type == EventActivity || ev.Type == legacyEventMemorySample || ev.Type == EventVendorUsageSnapshot {
 			continue
 		}
 		key := laneKey(ev)
@@ -467,16 +519,44 @@ func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
 			b.closeLabel(ev.Ts)
 			b.curLabel = ev.Label
 			b.absorb(ev)
+		case EventUsageCutover:
+			if b == nil {
+				b = newLaneBuilder(ev)
+				open[key] = b
+			}
+			if coverageKey := usageCoverageGapKey(ev); coverageKey != "" && !coverageSeen[coverageKey] {
+				estimate := EstimateCoverageGap(ev)
+				b.lane.Cost = mergeCost(b.lane.Cost, estimate)
+				accumulatePricingGroup(&b.lane.PricingGroups, ev.PricingIdentity(), UsageDelta{}, estimate)
+				coverageSeen[coverageKey] = true
+			}
+			b.lane.UsageCoverage = ev.UsageCoverage
+			b.lane.CostUSD = legacyCostAlias(b.lane.Cost)
+			b.absorb(ev)
 		case EventUsageSample:
 			if b == nil {
 				b = newLaneBuilder(ev)
 				open[key] = b
 			}
-			b.lane.TokIn += ev.TokIn
-			b.lane.TokOut += ev.TokOut
-			b.lane.TokCacheRead += ev.TokCacheRead
-			b.lane.TokCacheCreate += ev.TokCacheCreate
-			b.lane.CostUSD += CostUSD(ev.Model, ev.TokIn, ev.TokOut, ev.TokCacheRead, ev.TokCacheCreate)
+			usage := ev.CanonicalUsage()
+			accumulateUsage(&b.lane.Usage, usage)
+			b.lane.TokIn += usage.InputTokens
+			b.lane.TokOut += usage.OutputTokens
+			b.lane.TokCacheRead += usage.CachedInputTokens
+			b.lane.TokCacheCreate += usage.CacheWriteInputTokens + usage.CacheWrite5mInputTokens + usage.CacheWrite1hInputTokens
+			estimate := estimateObservedUsage(ev, catalogs, pricingNow)
+			b.lane.Cost = mergeCost(b.lane.Cost, estimate)
+			accumulatePricingGroup(&b.lane.PricingGroups, ev.PricingIdentity(), usage, estimate)
+			if coverageKey := usageCoverageGapKey(ev); coverageKey != "" && !coverageSeen[coverageKey] {
+				gap := EstimateCoverageGap(ev)
+				b.lane.Cost = mergeCost(b.lane.Cost, gap)
+				accumulatePricingGroup(&b.lane.PricingGroups, ev.PricingIdentity(), UsageDelta{}, gap)
+				coverageSeen[coverageKey] = true
+			}
+			if ev.UsageCoverage != "" {
+				b.lane.UsageCoverage = ev.UsageCoverage
+			}
+			b.lane.CostUSD = legacyCostAlias(b.lane.Cost)
 			b.absorb(ev)
 		case EventSubagentSpawn:
 			if b == nil {
@@ -526,12 +606,14 @@ func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
 	// pid), so it is replayed separately and attached to each lane by session id,
 	// clamped to the lane's lifetime.
 	focusBySession := buildFocusSpans(evs, end)
+	vendorSnapshots := latestVendorSnapshotEvents(events)
 	for i := range done {
 		if id := done[i].SessionID; id != "" {
 			done[i].Focus = clampFocus(focusBySession[id], done[i].Start, done[i].End)
 		}
 		done[i].Names = slugSpans(done[i])
 		done[i].Name = canonicalLaneName(done[i])
+		done[i].VendorUsage = vendorUsageForLane(vendorSnapshots, done[i])
 	}
 	return done
 }
@@ -762,12 +844,17 @@ func Summarize(lanes []Swimlane, events []Event) Summary {
 // events) and the number of subagents launched (subagent_spawn events). It
 // complements Summary, which is interval-derived.
 type Totals struct {
-	TokIn          int64   `json:"tok_in"`
-	TokOut         int64   `json:"tok_out"`
-	TokCacheRead   int64   `json:"tok_cache_read"`
-	TokCacheCreate int64   `json:"tok_cache_create"`
-	Subagents      int     `json:"subagents"` // subagent_spawn count
-	CostUSD        float64 `json:"cost_usd"`  // recomputed window total ($)
+	TokIn          int64                 `json:"tok_in"`
+	TokOut         int64                 `json:"tok_out"`
+	TokCacheRead   int64                 `json:"tok_cache_read"`
+	TokCacheCreate int64                 `json:"tok_cache_create"`
+	Subagents      int                   `json:"subagents"` // subagent_spawn count
+	Usage          *UsageDelta           `json:"usage,omitempty"`
+	PricingGroups  []PricingGroup        `json:"pricing_groups,omitempty"`
+	VendorUsage    *VendorUsageAggregate `json:"vendor_usage,omitempty"`
+	Cost           *CostEstimate         `json:"cost,omitempty"`
+	CostUSD        *pricing.USD          `json:"cost_usd"` // nullable API-equivalent compatibility alias
+	UsageCoverage  string                `json:"usage_coverage,omitempty"`
 }
 
 // TotalTokens is the grand total across all four token classes.
@@ -778,15 +865,43 @@ func (t Totals) TotalTokens() int64 {
 // AggregateTotals sums the usage_sample tokens, recomputes their dollar cost
 // (per-sample, per-model), and counts the subagent_spawn events in a stream.
 func AggregateTotals(events []Event) Totals {
-	var t Totals
-	for _, ev := range events {
+	return AggregateTotalsWithCatalogs(events, priceBook(time.Now()), time.Now())
+}
+
+func AggregateTotalsWithCatalogs(events []Event, catalogs pricing.CatalogSet, pricingNow time.Time) Totals {
+	t := Totals{VendorUsage: foldVendorUsage(latestVendorSnapshotEvents(events))}
+	coverageSeen := map[string]bool{}
+	for _, ev := range latestUsageSnapshots(events) {
 		switch ev.Type {
+		case EventUsageCutover:
+			if coverageKey := usageCoverageGapKey(ev); coverageKey != "" && !coverageSeen[coverageKey] {
+				estimate := EstimateCoverageGap(ev)
+				t.Cost = mergeCost(t.Cost, estimate)
+				accumulatePricingGroup(&t.PricingGroups, ev.PricingIdentity(), UsageDelta{}, estimate)
+				coverageSeen[coverageKey] = true
+			}
+			t.UsageCoverage = ev.UsageCoverage
+			t.CostUSD = legacyCostAlias(t.Cost)
 		case EventUsageSample:
-			t.TokIn += ev.TokIn
-			t.TokOut += ev.TokOut
-			t.TokCacheRead += ev.TokCacheRead
-			t.TokCacheCreate += ev.TokCacheCreate
-			t.CostUSD += CostUSD(ev.Model, ev.TokIn, ev.TokOut, ev.TokCacheRead, ev.TokCacheCreate)
+			usage := ev.CanonicalUsage()
+			accumulateUsage(&t.Usage, usage)
+			t.TokIn += usage.InputTokens
+			t.TokOut += usage.OutputTokens
+			t.TokCacheRead += usage.CachedInputTokens
+			t.TokCacheCreate += usage.CacheWriteInputTokens + usage.CacheWrite5mInputTokens + usage.CacheWrite1hInputTokens
+			estimate := estimateObservedUsage(ev, catalogs, pricingNow)
+			t.Cost = mergeCost(t.Cost, estimate)
+			accumulatePricingGroup(&t.PricingGroups, ev.PricingIdentity(), usage, estimate)
+			if coverageKey := usageCoverageGapKey(ev); coverageKey != "" && !coverageSeen[coverageKey] {
+				gap := EstimateCoverageGap(ev)
+				t.Cost = mergeCost(t.Cost, gap)
+				accumulatePricingGroup(&t.PricingGroups, ev.PricingIdentity(), UsageDelta{}, gap)
+				coverageSeen[coverageKey] = true
+			}
+			if ev.UsageCoverage != "" {
+				t.UsageCoverage = ev.UsageCoverage
+			}
+			t.CostUSD = legacyCostAlias(t.Cost)
 		case EventSubagentSpawn:
 			t.Subagents++
 		}
@@ -799,14 +914,21 @@ func AggregateTotals(events []Event) Totals {
 // dollar half of the dashboard's plan gauge; the official utilization % comes
 // from a separate cached file the dashboard reads. (A4.)
 type PlanWindow struct {
-	Hours          float64   `json:"hours"`
-	From           time.Time `json:"from"`
-	To             time.Time `json:"to"`
-	CostUSD        float64   `json:"cost_usd"`
-	TokIn          int64     `json:"tok_in"`
-	TokOut         int64     `json:"tok_out"`
-	TokCacheRead   int64     `json:"tok_cache_read"`
-	TokCacheCreate int64     `json:"tok_cache_create"`
+	Hours         float64        `json:"hours"`
+	From          time.Time      `json:"from"`
+	To            time.Time      `json:"to"`
+	CostUSD       *pricing.USD   `json:"cost_usd"`
+	Cost          *CostEstimate  `json:"cost,omitempty"`
+	Usage         *UsageDelta    `json:"usage,omitempty"`
+	PricingGroups []PricingGroup `json:"pricing_groups,omitempty"`
+	// VendorUsageOmittedReason is set when cumulative provider snapshots were
+	// observed but excluded because this bounded window has no starting baseline.
+	VendorUsageOmittedReason string `json:"vendor_usage_omitted_reason,omitempty"`
+	TokIn                    int64  `json:"tok_in"`
+	TokOut                   int64  `json:"tok_out"`
+	TokCacheRead             int64  `json:"tok_cache_read"`
+	TokCacheCreate           int64  `json:"tok_cache_create"`
+	UsageCoverage            string `json:"usage_coverage,omitempty"`
 }
 
 // AggregatePlanWindow sums the usage_sample tokens and recomputes the dollar cost
@@ -814,18 +936,316 @@ type PlanWindow struct {
 // window width in hours. The producer owns this pricing so the dashboard never
 // duplicates it. Pass the events from ReadRange(from, to).
 func AggregatePlanWindow(events []Event, from, to time.Time) PlanWindow {
+	return AggregatePlanWindowWithCatalogs(events, from, to, priceBook(time.Now()), time.Now())
+}
+
+func AggregatePlanWindowWithCatalogs(events []Event, from, to time.Time, catalogs pricing.CatalogSet, pricingNow time.Time) PlanWindow {
 	pw := PlanWindow{Hours: to.Sub(from).Hours(), From: from, To: to}
-	for _, ev := range events {
-		if ev.Type != EventUsageSample {
+	coverageSeen := map[string]bool{}
+	if len(latestVendorSnapshotEvents(events)) > 0 {
+		pw.VendorUsageOmittedReason = "cumulative thread snapshots lack a window baseline; excluded from bounded plan cost"
+	}
+	for _, ev := range latestUsageSnapshots(events) {
+		if ev.Type != EventUsageSample && ev.Type != EventUsageCutover {
 			continue
 		}
-		pw.TokIn += ev.TokIn
-		pw.TokOut += ev.TokOut
-		pw.TokCacheRead += ev.TokCacheRead
-		pw.TokCacheCreate += ev.TokCacheCreate
-		pw.CostUSD += CostUSD(ev.Model, ev.TokIn, ev.TokOut, ev.TokCacheRead, ev.TokCacheCreate)
+		if ev.Ts.Before(from) || ev.Ts.After(to) {
+			continue
+		}
+		if ev.Type == EventUsageCutover {
+			if coverageKey := usageCoverageGapKey(ev); coverageKey != "" && !coverageSeen[coverageKey] {
+				estimate := EstimateCoverageGap(ev)
+				pw.Cost = mergeCost(pw.Cost, estimate)
+				accumulatePricingGroup(&pw.PricingGroups, ev.PricingIdentity(), UsageDelta{}, estimate)
+				coverageSeen[coverageKey] = true
+			}
+			pw.UsageCoverage = ev.UsageCoverage
+			pw.CostUSD = legacyCostAlias(pw.Cost)
+			continue
+		}
+		usage := ev.CanonicalUsage()
+		accumulateUsage(&pw.Usage, usage)
+		pw.TokIn += usage.InputTokens
+		pw.TokOut += usage.OutputTokens
+		pw.TokCacheRead += usage.CachedInputTokens
+		pw.TokCacheCreate += usage.CacheWriteInputTokens + usage.CacheWrite5mInputTokens + usage.CacheWrite1hInputTokens
+		estimate := estimateObservedUsage(ev, catalogs, pricingNow)
+		pw.Cost = mergeCost(pw.Cost, estimate)
+		accumulatePricingGroup(&pw.PricingGroups, ev.PricingIdentity(), usage, estimate)
+		if coverageKey := usageCoverageGapKey(ev); coverageKey != "" && !coverageSeen[coverageKey] {
+			gap := EstimateCoverageGap(ev)
+			pw.Cost = mergeCost(pw.Cost, gap)
+			accumulatePricingGroup(&pw.PricingGroups, ev.PricingIdentity(), UsageDelta{}, gap)
+			coverageSeen[coverageKey] = true
+		}
+		if ev.UsageCoverage != "" {
+			pw.UsageCoverage = ev.UsageCoverage
+		}
+		pw.CostUSD = legacyCostAlias(pw.Cost)
 	}
 	return pw
+}
+
+// latestUsageSnapshots applies the v2 usage upsert contract without changing
+// legacy history: usage events with no stable ID remain additive; for a shared
+// UsageEventID, the highest explicit revision wins, then the newest timestamp
+// (and the later record wins ties).
+// The function is intentionally applied before range filtering so a revision
+// cannot leave both an old in-range snapshot and a newer out-of-range snapshot
+// counted as distinct usage.
+func latestUsageSnapshots(events []Event) []Event {
+	winner := make(map[string]int)
+	for i, ev := range events {
+		if !isUsageUpsertEvent(ev) || ev.UsageEventID == "" {
+			continue
+		}
+		prev, ok := winner[ev.UsageEventID]
+		if !ok || ev.UsageRevision > events[prev].UsageRevision ||
+			(ev.UsageRevision == events[prev].UsageRevision &&
+				(ev.Ts.After(events[prev].Ts) || ev.Ts.Equal(events[prev].Ts))) {
+			winner[ev.UsageEventID] = i
+		}
+	}
+	if len(winner) == 0 {
+		return events
+	}
+	out := make([]Event, 0, len(events))
+	for i, ev := range events {
+		if isUsageUpsertEvent(ev) && ev.UsageEventID != "" && winner[ev.UsageEventID] != i {
+			continue
+		}
+		out = append(out, ev)
+	}
+	return out
+}
+
+func isUsageUpsertEvent(ev Event) bool {
+	return ev.Type == EventUsageSample || ev.Type == EventUsageCutover
+}
+
+func usageCoverageGapKey(ev Event) string {
+	if ev.UsageCoverage == "" || ev.UsageCoverage == "complete" || ev.UsageCoverage == "full" {
+		return ""
+	}
+	scope := ev.SessionID
+	if scope == "" {
+		scope = "pid:" + strconv.Itoa(ev.PID)
+	}
+	return ev.Agent + "\x00" + ev.ExecutionProvider + "\x00" + scope + "\x00" + ev.UsageCoverage
+}
+
+// latestVendorSnapshotEvents first resolves revisions of one logical snapshot,
+// then keeps only the newest cumulative snapshot for each provider/root/thread
+// scope. The second step is what prevents successive account/usage/read polls
+// (which can have different event IDs) from being summed as deltas.
+func latestVendorSnapshotEvents(events []Event) []Event {
+	idWinner := make(map[string]int)
+	for i, ev := range events {
+		if ev.Type != EventVendorUsageSnapshot || ev.VendorUsage == nil || ev.UsageEventID == "" {
+			continue
+		}
+		prev, ok := idWinner[ev.UsageEventID]
+		if !ok || vendorRevision(ev) > vendorRevision(events[prev]) ||
+			(vendorRevision(ev) == vendorRevision(events[prev]) &&
+				(vendorObservedAt(ev).After(vendorObservedAt(events[prev])) ||
+					vendorObservedAt(ev).Equal(vendorObservedAt(events[prev])))) {
+			idWinner[ev.UsageEventID] = i
+		}
+	}
+
+	type scopeKey struct {
+		provider string
+		session  string
+		thread   string
+	}
+	scopeFor := func(ev Event) scopeKey {
+		provider := ev.ExecutionProvider
+		if provider == "" {
+			provider = ev.Agent
+		}
+		session := ev.SessionID
+		if session == "" {
+			session = "pid:" + strconv.Itoa(ev.PID)
+		}
+		thread := ev.ThreadID
+		if ev.VendorUsage != nil && ev.VendorUsage.ThreadID != "" {
+			thread = ev.VendorUsage.ThreadID
+		}
+		if thread == "" {
+			thread = session
+		}
+		return scopeKey{provider: provider, session: session, thread: thread}
+	}
+
+	scopeWinner := make(map[scopeKey]int)
+	for i, ev := range events {
+		if ev.Type != EventVendorUsageSnapshot || ev.VendorUsage == nil {
+			continue
+		}
+		if ev.UsageEventID != "" && idWinner[ev.UsageEventID] != i {
+			continue
+		}
+		key := scopeFor(ev)
+		prev, ok := scopeWinner[key]
+		if !ok || vendorObservedAt(ev).After(vendorObservedAt(events[prev])) ||
+			vendorObservedAt(ev).Equal(vendorObservedAt(events[prev])) {
+			scopeWinner[key] = i
+		}
+	}
+
+	indices := make([]int, 0, len(scopeWinner))
+	for _, index := range scopeWinner {
+		indices = append(indices, index)
+	}
+	sort.Slice(indices, func(i, j int) bool {
+		a, b := scopeFor(events[indices[i]]), scopeFor(events[indices[j]])
+		if a.provider != b.provider {
+			return a.provider < b.provider
+		}
+		if a.session != b.session {
+			return a.session < b.session
+		}
+		return a.thread < b.thread
+	})
+	out := make([]Event, 0, len(indices))
+	for _, index := range indices {
+		out = append(out, events[index])
+	}
+	return out
+}
+
+func vendorObservedAt(ev Event) time.Time {
+	if ev.VendorUsage != nil && !ev.VendorUsage.ObservedAt.IsZero() {
+		return ev.VendorUsage.ObservedAt
+	}
+	return ev.Ts
+}
+
+func vendorRevision(ev Event) int64 {
+	if ev.UsageRevision != 0 {
+		return ev.UsageRevision
+	}
+	if ev.VendorUsage != nil {
+		return ev.VendorUsage.Revision
+	}
+	return 0
+}
+
+func vendorUsageForLane(events []Event, lane Swimlane) *VendorUsageAggregate {
+	matched := make([]Event, 0)
+	for _, ev := range events {
+		if lane.SessionID != "" {
+			if ev.SessionID == lane.SessionID {
+				matched = append(matched, ev)
+			}
+			continue
+		}
+		if ev.SessionID == "" && ev.PID == lane.PID {
+			matched = append(matched, ev)
+		}
+	}
+	return foldVendorUsage(matched)
+}
+
+func foldVendorUsage(events []Event) *VendorUsageAggregate {
+	if len(events) == 0 {
+		return nil
+	}
+	aggregate := &VendorUsageAggregate{Scope: vendorUsageScopeLatestThread}
+	for _, ev := range events {
+		if ev.VendorUsage == nil {
+			continue
+		}
+		snapshot := *ev.VendorUsage
+		threadID := snapshot.ThreadID
+		if threadID == "" {
+			threadID = ev.ThreadID
+		}
+		aggregate.Snapshots = append(aggregate.Snapshots, ScopedVendorUsage{
+			SessionID: ev.SessionID, ThreadID: threadID,
+			UsageEventID: ev.UsageEventID, UsageRevision: vendorRevision(ev),
+			UsageSourceID: ev.UsageSourceID, Identity: ev.PricingIdentity(), Snapshot: snapshot,
+		})
+		credits := snapshot.EstimatedUsageCredits
+		provider := ev.ExecutionProvider
+		if provider == "" {
+			provider = ev.Agent
+		}
+		cost := CostEstimate{
+			VendorEstimatedUSD: snapshot.EstimatedUsageUSD,
+			PlanCredits:        &credits,
+			Status:             pricing.CostEstimated,
+			Coverage:           1,
+			PricingProvider:    provider,
+			PricingKind:        "vendor_cumulative_snapshot",
+		}
+		if snapshot.Stale {
+			cost.Status = pricing.CostStale
+		}
+		if len(aggregate.Snapshots) == 1 {
+			aggregate.Cost = cost
+		} else {
+			aggregate.Cost = pricing.MergeEstimates(aggregate.Cost, cost)
+		}
+	}
+	if len(aggregate.Snapshots) == 0 {
+		return nil
+	}
+	return aggregate
+}
+
+func accumulateUsage(total **UsageDelta, delta UsageDelta) {
+	if *total == nil {
+		copy := delta
+		*total = &copy
+		return
+	}
+	(*total).InputTokens += delta.InputTokens
+	(*total).CachedInputTokens += delta.CachedInputTokens
+	(*total).CacheWriteInputTokens += delta.CacheWriteInputTokens
+	(*total).CacheWrite5mInputTokens += delta.CacheWrite5mInputTokens
+	(*total).CacheWrite1hInputTokens += delta.CacheWrite1hInputTokens
+	(*total).OutputTokens += delta.OutputTokens
+	(*total).ReasoningOutputTokens += delta.ReasoningOutputTokens
+	(*total).TotalTokens += delta.TotalTokens
+	(*total).WebSearchRequests += delta.WebSearchRequests
+	(*total).WebFetchRequests += delta.WebFetchRequests
+	(*total).CodeExecutionRequests += delta.CodeExecutionRequests
+	(*total).UnclassifiedServerToolUnits += delta.UnclassifiedServerToolUnits
+	if delta.ModelContextWindow > (*total).ModelContextWindow {
+		(*total).ModelContextWindow = delta.ModelContextWindow
+	}
+}
+
+func accumulatePricingGroup(groups *[]PricingGroup, identity BillingIdentity, usage UsageDelta, estimate CostEstimate) {
+	for i := range *groups {
+		if (*groups)[i].Identity != identity {
+			continue
+		}
+		accumulateUsageValue(&(*groups)[i].Usage, usage)
+		(*groups)[i].Cost = pricing.MergeEstimates((*groups)[i].Cost, estimate)
+		(*groups)[i].Events++
+		return
+	}
+	*groups = append(*groups, PricingGroup{Identity: identity, Usage: usage, Cost: estimate, Events: 1})
+}
+
+func accumulateUsageValue(total *UsageDelta, delta UsageDelta) {
+	total.InputTokens += delta.InputTokens
+	total.CachedInputTokens += delta.CachedInputTokens
+	total.CacheWriteInputTokens += delta.CacheWriteInputTokens
+	total.CacheWrite5mInputTokens += delta.CacheWrite5mInputTokens
+	total.CacheWrite1hInputTokens += delta.CacheWrite1hInputTokens
+	total.OutputTokens += delta.OutputTokens
+	total.ReasoningOutputTokens += delta.ReasoningOutputTokens
+	total.TotalTokens += delta.TotalTokens
+	total.WebSearchRequests += delta.WebSearchRequests
+	total.WebFetchRequests += delta.WebFetchRequests
+	total.CodeExecutionRequests += delta.CodeExecutionRequests
+	total.UnclassifiedServerToolUnits += delta.UnclassifiedServerToolUnits
+	if delta.ModelContextWindow > total.ModelContextWindow {
+		total.ModelContextWindow = delta.ModelContextWindow
+	}
 }
 
 // span is a half-open [start, end) time interval, the unit of the interval
