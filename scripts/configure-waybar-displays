@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""Prepare top Waybar/Hyprland display-mode configuration without editing inputs."""
+import argparse
+import json
+from pathlib import Path
+import re
+import shlex
+
+
+def jsonc(text):
+    # Strip comments only outside quoted strings; paths and URLs remain intact.
+    result=[]
+    i=0
+    quoted=False
+    while i<len(text):
+        if quoted:
+            result.append(text[i])
+            if text[i]=='\\' and i+1<len(text):
+                i+=1;result.append(text[i])
+            elif text[i]=='"':quoted=False
+            i+=1;continue
+        if text[i]=='"':quoted=True;result.append(text[i]);i+=1;continue
+        if text.startswith('//',i):
+            end=text.find('\n',i)
+            i=len(text) if end<0 else end
+            continue
+        if text.startswith('/*',i):
+            end=text.find('*/',i+2)
+            if end<0:raise ValueError('unterminated JSONC comment')
+            result.append(' ');i=end+2;continue
+        result.append(text[i]);i+=1
+    return json.loads(''.join(result))
+
+
+def top_config(text,module_path,ctl):
+    config=jsonc(text)
+    bars=config if isinstance(config,list) else [config]
+    top=[bar for bar in bars if bar.get('name')=='top']
+    if len(top)!=1:raise ValueError('expected exactly one named top bar')
+    top=top[0]
+    for position in ('modules-left','modules-center','modules-right'):
+        top[position]=[name for name in top.get(position,[]) if name not in ('custom/task','cffi/switchboard')]
+    top.pop('custom/task',None)
+    top['modules-right'].append('cffi/switchboard')
+    top['cffi/switchboard']={
+        'module_path':str(module_path),
+        'ctl':str(ctl),
+        'on-scroll-up':shlex.quote(str(ctl))+' cycle prev',
+        'on-scroll-down':shlex.quote(str(ctl))+' cycle next',
+        'on-click-right':'$HOME/.config/scripts/claude-picker',
+        'tooltip':True,
+    }
+    return '// Top bar with an optional live Switchboard circle view.\n'+json.dumps(config,indent=2)+'\n'
+
+
+def style_config(text):
+    text=re.sub(r'^#custom-task,?\s*\n','',text,flags=re.M)
+    text=re.sub(r'#custom-task\s*\{[^}]*\}\s*','',text)
+    declaration='@import url("switchboard-circles.css");'
+    if declaration not in text:text=declaration+'\n'+text
+    return text
+
+
+def hypr_config(text,ctl,hotkey):
+    command=shlex.quote(str(ctl))+' display mode toggle'
+    binding='hl.bind('+json.dumps(hotkey)+', hl.dsp.exec_cmd('+json.dumps(command,ensure_ascii=False)+'))'
+    lines=text.splitlines()
+    existing=[i for i,line in enumerate(lines) if 'switchboard-ctl' in line and 'display mode toggle' in line]
+    if existing:
+        if len(existing)!=1:raise ValueError('multiple display-mode bindings already exist')
+        lines[existing[0]]=binding
+    else:
+        # The local configuration uses mainMod=SUPER. Expand simple literal
+        # concatenation for a conflict check without executing any Lua config.
+        for line in lines:
+            if 'hl.bind(' not in line:continue
+            expr=line.split('hl.bind(',1)[1].split(',',1)[0]
+            expr=expr.replace('mainMod','"SUPER"').replace('altMod','"ALT"')
+            literal=''.join(re.findall(r'"([^"\\]*)"',expr))
+            if re.sub(r'\s+','',literal).upper()==re.sub(r'\s+','',hotkey).upper():
+                raise ValueError(f'hotkey already bound: {hotkey}')
+        indexes=[i for i,line in enumerate(lines) if 'switchboard-ctl cycle prev' in line]
+        if not indexes:raise ValueError('cannot locate existing Switchboard navigation bindings')
+        lines.insert(indexes[-1]+1,binding)
+    return '\n'.join(lines)+'\n'
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--top',type=Path,required=True)
+    parser.add_argument('--style',type=Path,required=True)
+    parser.add_argument('--hypr',type=Path,required=True)
+    parser.add_argument('--module-path',type=Path,required=True)
+    parser.add_argument('--ctl',type=Path,default=Path.home()/'.local/bin/switchboard-ctl')
+    parser.add_argument('--hotkey',default='SUPER + SHIFT + B')
+    parser.add_argument('--output-dir',type=Path,required=True)
+    args=parser.parse_args()
+    outputs={'config.jsonc':top_config(args.top.read_text(),args.module_path,args.ctl),
+             'style.css':style_config(args.style.read_text()),
+             'hyprland.lua':hypr_config(args.hypr.read_text(),args.ctl,args.hotkey),
+             'switchboard-circles.css':(Path(__file__).resolve().parent.parent/'waybar/circles/style.css').read_text()}
+    args.output_dir.mkdir(parents=True,exist_ok=True)
+    for name,text in outputs.items():(args.output_dir/name).write_text(text)
+    print(args.output_dir)
+
+
+if __name__=='__main__':main()

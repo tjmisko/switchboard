@@ -182,9 +182,11 @@ systemctl --user daemon-reload
 systemctl --user enable switchboard-waybar.service
 ```
 
-The normal top Waybar remains owned by Hyprland. The renderer unit owns only
-the auto-hiding Switchboard bottom process, replacing an unmonitored
-`switchboard-ctl bottombar watch` child. A Hyprland startup should import its
+The normal top Waybar remains owned by Hyprland. The renderer unit runs one
+`switchboard-ctl display serve` broker. In chips mode it owns the auto-hiding
+bottom process; in circles mode it publishes to the existing top Waybar's
+embedded adapter. See [display modes](display-modes.md) for the configuration
+and the presentation-independent session contract. A Hyprland startup should import its
 environment and start the graphical session target before launching the top
 bar:
 
@@ -206,7 +208,7 @@ Build that helper alongside the daemon selected by `SWITCHBOARD_BIN`. The
 bottom-bar watcher falls back to the legacy local-only RPC during a rolling
 upgrade, but mixed revisions should be temporary and visible in its journal.
 
-Do not also launch `switchboard-ctl bottombar watch` from Hyprland once the
+Do not also launch `switchboard-ctl display serve` or `bottombar watch` from Hyprland once the
 unit owns it.
 
 ## i3 + Polybar host

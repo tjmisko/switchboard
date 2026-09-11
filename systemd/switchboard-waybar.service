@@ -1,5 +1,5 @@
 [Unit]
-Description=Switchboard — Waybar bottom renderer
+Description=Switchboard — live display broker and Waybar renderer
 PartOf=graphical-session.target
 # Do not order this renderer after switchboard.service. A target is implicitly
 # ordered after units in its Wants= set, while switchboard.service is ordered
@@ -23,7 +23,7 @@ Environment=XDG_RUNTIME_DIR=%t
 # The watcher now owns all ten chip renders in one Go heap. Keep its GC
 # headroom modest; Waybar itself is a separate process and is unaffected.
 Environment=GOGC=50
-ExecStart=/bin/sh -c 'exec "$$0" bottombar watch' ${SWITCHBOARD_CTL}
+ExecStart=/bin/sh -c 'exec "$$0" display serve' ${SWITCHBOARD_CTL}
 Restart=on-failure
 RestartSec=2
 NoNewPrivileges=true

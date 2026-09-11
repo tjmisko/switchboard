@@ -1,4 +1,4 @@
-package barview
+package sessionview
 
 import (
 	"reflect"

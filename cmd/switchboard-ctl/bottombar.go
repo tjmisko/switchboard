@@ -3,9 +3,9 @@
 package main
 
 // The bottombar subcommand publishes the bottom ("claude") Waybar modules and
-// enforces a single visibility invariant:
+// owns the named-chip surface of a display-independent ordered session view:
 //
-//	bottom bar runs  <=>  (top bar visible)  AND  (>=1 aggregate agent session)
+//	bottom bar runs <=> chips mode AND master visible AND sessions exist
 //
 // Legacy `watch` mode owns a dedicated `waybar -c claude.jsonc` process.
 // `publish` mode attaches to a combined top+bottom Waybar process owned by the
@@ -13,11 +13,12 @@ package main
 // the configuration migration reversible instead of changing ownership and
 // process topology in one unguarded step.
 //
-// Two inputs drive the invariant, each owned by a different actor:
+// Three inputs drive the surface choice:
 //
 //	top visible : the F8 master toggle, recorded as the presence/absence of a
 //	              marker file (absent => visible). Owned by hypr-float-center.
-//	sessions    : the switchboard daemon's aggregate session count.
+//	sessions    : the switchboard daemon's aggregate ordered session list.
+//	mode        : persistent preference, changed by `display mode` or a hotkey.
 //
 // `bottombar watch` reacts to session changes (one subscribe stream + safety
 // ticker), renders every chip into signal-triggered Waybar files, and owns the
@@ -37,6 +38,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/display"
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/waybarchip"
@@ -53,15 +55,21 @@ const (
 )
 
 type bottomBarConfig struct {
-	socketPath   string
-	marker       string // master-visibility marker; present => top bar hidden
-	pidFile      string
-	lockFile     string
-	readyFile    string
-	visibleFile  string
-	slotDir      string
-	waybarConfig string
-	attached     bool
+	socketPath      string
+	marker          string // master-visibility marker; present => top bar hidden
+	pidFile         string
+	lockFile        string
+	readyFile       string
+	visibleFile     string
+	slotDir         string
+	waybarConfig    string
+	attached        bool
+	modeFile        string
+	viewFile        string
+	circlesFile     string
+	controlEvents   <-chan struct{}
+	lifecycleEvents chan struct{}
+	presentation    *presentationPublisher
 
 	ops bottomBarOps
 }
@@ -221,6 +229,9 @@ func bottomBarConfigDefault(socketPath string) bottomBarConfig {
 		visibleFile:  filepath.Join(run, "switchboard", "bottom-waybar.visible"),
 		slotDir:      filepath.Join(run, "switchboard"),
 		waybarConfig: envOr("SWITCHBOARD_BOTTOM_CONFIG", filepath.Join(home, ".config", "waybar", "claude.jsonc")),
+		modeFile:     display.ModePath(),
+		viewFile:     filepath.Join(run, "switchboard", "display.json"),
+		circlesFile:  filepath.Join(run, "switchboard", "waybar-circles.ini"),
 		ops:          defaultOps(),
 	}
 }
@@ -251,7 +262,7 @@ func cmdBottombar(args []string, socketPath string) {
 		reconcile(cfg)
 	case "stop":
 		unlock := mustFlock(cfg.lockFile)
-		ensureStopped(cfg)
+		setBottom(cfg, false)
 		unlock()
 	default:
 		fail("bottombar: unknown subcommand %q (want publish|reconcile-attached|watch|reconcile|stop)", sub)
@@ -294,7 +305,7 @@ func reconcile(cfg bottomBarConfig) {
 	defer unlock()
 	// Visibility may have changed while the daemon replied; re-read it under
 	// the lifecycle lock before deciding process state.
-	setBottom(cfg, shouldRun(topVisible(cfg), count))
+	reconcileDisplayMode(cfg, count)
 }
 
 // reconcileWith is reconcile when the caller already knows the session count
@@ -302,7 +313,16 @@ func reconcile(cfg bottomBarConfig) {
 func reconcileWith(cfg bottomBarConfig, count int) {
 	unlock := mustFlock(cfg.lockFile)
 	defer unlock()
-	setBottom(cfg, shouldRun(topVisible(cfg), count))
+	reconcileDisplayMode(cfg, count)
+}
+
+func reconcileDisplayMode(cfg bottomBarConfig, count int) {
+	mode, err := display.ReadMode(cfg.modeFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "display: %v\n", err)
+		return
+	}
+	setBottom(cfg, display.WantsBottom(mode, topVisible(cfg), count))
 }
 
 func setBottom(cfg bottomBarConfig, run bool) {
@@ -322,6 +342,19 @@ func setBottom(cfg bottomBarConfig, run bool) {
 // net for dropped snapshots (the daemon's subscriber channel drops on lag) and
 // for any master-toggle path that does not call reconcile directly.
 func watchBottomBar(cfg bottomBarConfig) {
+	ownership, err := claimDisplayPublisher(cfg.slotDir)
+	if err != nil {
+		fail("display: %v", err)
+	}
+	defer ownership.Close()
+	changes, closeWatch, err := watchDisplayFiles(cfg.modeFile, cfg.marker)
+	if err != nil {
+		fail("display: watch controls: %v", err)
+	}
+	defer closeWatch()
+	cfg.controlEvents = changes
+	cfg.lifecycleEvents = make(chan struct{}, 1)
+	cfg.presentation = newPresentationPublisher(cfg)
 	renderer := waybarchip.NewRenderer(0)
 	publisher := newSlotPublisher(cfg.slotDir, bottomBarSlots)
 	// Materialize every module's startup document before any watcher-owned
@@ -339,10 +372,21 @@ func watchBottomBar(cfg bottomBarConfig) {
 			fmt.Fprintf(os.Stderr, "bottombar: disconnect publish: %v\n", err)
 		}
 		flushSlotsWhenReady(cfg, publisher)
+		if mode, err := display.ReadMode(cfg.modeFile); err == nil {
+			if err := cfg.presentation.publish(state.Snapshot{}, mode, false, topVisible(cfg)); err != nil {
+				fmt.Fprintf(os.Stderr, "display: publish disconnect: %v\n", err)
+			}
+		}
 		// Connection dropped. Reconcile once (the daemon may be restarting),
 		// then retry. The ticker keeps things honest in the meantime.
 		reconcile(cfg)
-		time.Sleep(2 * time.Second)
+		timer := time.NewTimer(2 * time.Second)
+		select {
+		case <-timer.C:
+		case <-cfg.controlEvents:
+		case <-cfg.lifecycleEvents:
+		}
+		timer.Stop()
 	}
 }
 
@@ -360,7 +404,12 @@ func streamSnapshots(cfg bottomBarConfig, renderer *waybarchip.Renderer, publish
 	}
 	snapshots := make(chan state.Snapshot, 1)
 	go receiveBottomSnapshots(c, command, snapshots)
+	renderDisplaySnapshots(cfg, renderer, publisher, snapshots)
+}
 
+// renderDisplaySnapshots merges data, user controls and lifecycle events. The
+// transport supplies ordered full snapshots; it does not own presentation.
+func renderDisplaySnapshots(cfg bottomBarConfig, renderer *waybarchip.Renderer, publisher *slotPublisher, snapshots <-chan state.Snapshot) {
 	var latest state.Snapshot
 	var haveLatest bool
 	var readyPID, readyTries int
@@ -440,11 +489,51 @@ func streamSnapshots(cfg bottomBarConfig, renderer *waybarchip.Renderer, publish
 		reset(&readyTimer, &readyC, delay)
 	}
 	render := func(now time.Time) bool {
-		if err := publisher.stage(renderer.RenderSlotsAt(latest, bottomBarSlots, now)); err != nil {
-			fmt.Fprintf(os.Stderr, "bottombar: render: %v\n", err)
+		mode, err := display.ReadMode(cfg.modeFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "display: %v\n", err)
 			return false
 		}
+		publishView := func(visible bool) bool {
+			if cfg.presentation == nil {
+				return true
+			}
+			if err := cfg.presentation.publish(latest, mode, true, visible); err != nil {
+				fmt.Fprintf(os.Stderr, "display: publish: %v\n", err)
+				return false
+			}
+			return true
+		}
+		// Hide the compact surface before launching chips. When going the
+		// other way, show circles only after the old owned bar has exited.
+		if mode == display.Chips && !publishView(topVisible(cfg)) {
+			return false
+		}
+		if mode == display.Chips {
+			if err := publisher.stage(renderer.RenderSlotsAt(latest, bottomBarSlots, now)); err != nil {
+				fmt.Fprintf(os.Stderr, "bottombar: render: %v\n", err)
+				return false
+			}
+		}
 		reconcileWith(cfg, len(latest.Sessions))
+		if mode == display.Circles {
+			visible := topVisible(cfg)
+			if !cfg.attached {
+				unlock := mustFlock(cfg.lockFile)
+				visible = visible && !bottomMayBeRunning(cfg)
+				unlock()
+			}
+			if !publishView(visible) {
+				return false
+			}
+		}
+		if mode == display.Circles {
+			stop(readyTimer, &readyC)
+			stop(refreshTimer, &refreshC)
+			readyPID, readyTries, readyWarned = 0, 0, false
+			readyRetryAt = time.Time{}
+			return true
+		}
 		scheduleReady()
 		next := renderer.NextRefresh(latest, bottomBarSlots, now)
 		if next.IsZero() {
@@ -455,8 +544,21 @@ func streamSnapshots(cfg bottomBarConfig, renderer *waybarchip.Renderer, publish
 		return true
 	}
 
+	controlEvents := cfg.controlEvents
 	for {
 		select {
+		case _, ok := <-controlEvents:
+			if !ok {
+				controlEvents = nil
+				continue
+			}
+			if haveLatest {
+				render(time.Now())
+			}
+		case <-cfg.lifecycleEvents:
+			if haveLatest {
+				render(time.Now())
+			}
 		case snapshot, ok := <-snapshots:
 			if !ok {
 				return
@@ -694,6 +796,10 @@ func startBottom(cfg bottomBarConfig) error {
 	go func() {
 		err := cmd.Wait()
 		fmt.Fprintf(os.Stderr, "bottombar: exited pid=%d starttime=%d result=%v\n", pid, started, err)
+		select {
+		case cfg.lifecycleEvents <- struct{}{}:
+		default:
+		}
 	}()
 	return nil
 }

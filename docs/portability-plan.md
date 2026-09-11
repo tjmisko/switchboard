@@ -45,10 +45,10 @@ any bar can render it.*
 - **Abstraction:** `Clients() → []Window{address, pid, title, workspace}`; `Focus(ref)`; `Subscribe() → <-chan Event{focus-changed, window-closed, layout-changed}`. Address type becomes opaque (Hyprland `0x…`, sway `con_id`, X11 window id).
 - **Backends:** `hyprland` (existing), `sway/i3` (i3 IPC binary protocol over `$SWAYSOCK`/`$I3SOCK`; `get_tree` for clients, `[con_id=…] focus`, `SUBSCRIBE ["window"]` events), `x11` (EWMH: `_NET_CLIENT_LIST`, `_NET_WM_PID`, `_NET_ACTIVE_WINDOW`; focus via `_NET_ACTIVE_WINDOW` ClientMessage; events via root `PropertyNotify`), `none` (Observe only).
 
-### Seam 4 — UI  `internal/barview`, native bar adapters
-- **Today:** native clients prepare status, flags, and stable action selectors through `internal/barview`, then map that neutral model onto Waybar JSON or Polybar markup. Both use the aggregate subscription contract.
+### Seam 4 — UI  `internal/sessionview`, native bar adapters
+- **Today:** native clients prepare status, flags, and stable action selectors through `internal/sessionview`, then map that neutral model onto Waybar JSON or Polybar markup. Both use the aggregate subscription contract.
 - **Abstraction:** session aggregation and chip meaning are portable; layout and delivery remain adapter-owned. The daemon owns no UI.
-- **Backends:** Waybar/Hyprland (Linux), Polybar, state.json polling recipes, and the standalone TUI. New adapters consume `barview.Chip` rather than copying status or navigation rules.
+- **Backends:** Waybar/Hyprland (Linux), Polybar, state.json polling recipes, and the standalone TUI. New adapters consume `sessionview.Item` rather than copying status or navigation rules.
 - **Platform boundary:** the Waybar publisher is an optional Linux adapter. Pidfds, `/proc`, glibc realtime-signal numbering, and Hyprland visibility do not compile into other platforms. Build tags are permitted at this adapter boundary in addition to Seam 1; non-Linux `switchboard-ctl` retains the portable commands and reports that `bottombar` is unavailable.
 
 ---

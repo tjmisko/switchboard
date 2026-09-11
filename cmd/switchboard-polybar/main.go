@@ -14,10 +14,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tjmisko/switchboard/internal/barview"
 	sblabel "github.com/tjmisko/switchboard/internal/label"
 	"github.com/tjmisko/switchboard/internal/projectname"
 	"github.com/tjmisko/switchboard/internal/rpc"
+	"github.com/tjmisko/switchboard/internal/sessionview"
 	"github.com/tjmisko/switchboard/internal/state"
 )
 
@@ -145,7 +145,7 @@ func renderSnapshot(snap state.Snapshot, labels []string, options renderOptions)
 	if options.maxSessions > 0 && limit > options.maxSessions {
 		limit = options.maxSessions
 	}
-	chips := barview.Prepare(snap, limit)
+	chips := sessionview.Prepare(snap, limit)
 	parts := make([]string, 0, len(chips)+1)
 	for i, chip := range chips {
 		label := fmt.Sprintf("pid %d", chip.Session.PID)
@@ -161,10 +161,10 @@ func renderSnapshot(snap state.Snapshot, labels []string, options renderOptions)
 }
 
 func renderSession(session state.Session, label string, options renderOptions) string {
-	return renderChip(barview.Prepare(state.Snapshot{Sessions: []state.Session{session}}, 1)[0], label, options)
+	return renderChip(sessionview.Prepare(state.Snapshot{Sessions: []state.Session{session}}, 1)[0], label, options)
 }
 
-func renderChip(chipView barview.Chip, label string, options renderOptions) string {
+func renderChip(chipView sessionview.Item, label string, options renderOptions) string {
 	color := statusColor(chipView.Status, options.colors)
 	if chipView.Session.Suspended || chipView.Session.Headless {
 		color = options.colors.unknown
@@ -193,7 +193,7 @@ func colorize(color, text string) string {
 }
 
 func sessionStatus(session state.Session) string {
-	return barview.Status(session)
+	return sessionview.Status(session)
 }
 
 func statusColor(status string, colors palette) string {

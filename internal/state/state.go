@@ -1055,7 +1055,7 @@ func (s *Store) snapshotLocked() Snapshot {
 	// selectors (rpc.pickSession index, sessions[0]) nondeterministic across
 	// snapshots. A host-local snapshot has only its own workspaces to order by,
 	// so it passes no override.
-	SortChipOrder(sessions, nil)
+	SortSessionOrder(sessions, nil)
 	var caps *Capabilities
 	if s.caps != nil {
 		value := *s.caps
@@ -1105,7 +1105,7 @@ func enrichForWire(info *AgentInfo) *AgentInfo {
 	return &cp
 }
 
-// SortChipOrder sorts sessions into left-to-right bottom-bar order.
+// SortSessionOrder sorts the canonical session list for navigation and displays.
 //
 // workspace supplies a row's workspace key, overriding the session's own
 // Hyprland block whenever it reports one; returning false falls back to that
@@ -1120,18 +1120,18 @@ func enrichForWire(info *AgentInfo) *AgentInfo {
 // That is what makes the aggregate deterministic without teaching this
 // comparator about hostnames: PID and even StartedAt can repeat across hosts,
 // and the aggregate builder appends hosts in a fixed order.
-func SortChipOrder(sessions []Session, workspace func(Session) (int, bool)) {
+func SortSessionOrder(sessions []Session, workspace func(Session) (int, bool)) {
 	sort.SliceStable(sessions, func(i, j int) bool {
-		return lessChipOrder(sessions[i], sessions[j], workspace)
+		return lessSessionOrder(sessions[i], sessions[j], workspace)
 	})
 }
 
-// lessChipOrder defines the left-to-right chip order on the bottom bar:
+// lessSessionOrder defines the canonical session order:
 // sessions with a resolved workspace come first, ordered by numeric workspace
 // ID (so chips follow workspace order); within a workspace, and among
 // sessions whose workspace is not yet resolved, oldest-started wins.
 // Unresolved-workspace sessions are pushed to the end.
-func lessChipOrder(a, b Session, workspace func(Session) (int, bool)) bool {
+func lessSessionOrder(a, b Session, workspace func(Session) (int, bool)) bool {
 	aID, aResolved := chipWorkspace(a, workspace)
 	bID, bResolved := chipWorkspace(b, workspace)
 	if aResolved != bResolved {

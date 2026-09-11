@@ -33,6 +33,12 @@ jq -r '
 
 ## Waybar
 
+The presentation can switch between named bottom chips and compact circles in
+the existing top Waybar. Both consume the same ordered live session view. See
+[display modes](../display-modes.md) for the hotkey, native circle module, and
+JSON contract for other consumers. `bottombar watch` remains a compatibility
+alias; the service now calls `display serve`.
+
 The Hyprland bottom strip keeps ten real GTK modules (and therefore per-chip
 CSS and click targets) without ten resident renderers. `switchboard-ctl
 bottombar watch` owns one aggregate subscription, renders all slots, and

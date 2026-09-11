@@ -1,0 +1,28 @@
+/* The top adapter uses the same status, focus, remote and suspension flags as
+   named chips. Every session is a separate GTK widget, with no text label. */
+#switchboard-circles { margin: 0 6px 0 2px; padding: 0; }
+#switchboard-circle {
+  min-width: 12px;
+  min-height: 12px;
+  padding: 0;
+  margin: 0;
+  border: 1px solid #3f3f4a;
+  border-radius: 999px;
+  background-color: #242428;
+  background-image: none;
+  box-shadow: none;
+  text-shadow: none;
+  transition: border-color 100ms;
+}
+#switchboard-circle.working { background-color: #243024; border-color: #3d5c42; }
+#switchboard-circle.idle { background-color: #4e361a; border-color: #7a5526; }
+#switchboard-circle.permission { background-color: #5a1e1e; border-color: #8a3a3a; }
+#switchboard-circle.unknown { background-color: #242428; border-color: #3f3f4a; }
+#switchboard-circle.focused.working { border-color: #6fae6f; }
+#switchboard-circle.focused.idle { border-color: #e0a35c; }
+#switchboard-circle.focused.permission { border-color: #ec8080; }
+#switchboard-circle.focused.unknown { border-color: #8b8ba8; }
+#switchboard-circle.remote { min-width: 8px; min-height: 8px; border-width: 3px; border-style: double; }
+#switchboard-circle.suspended { opacity: 0.4; }
+#switchboard-circle.headless { background-color: transparent; border: 1px dotted rgba(120,120,150,0.35); }
+#switchboard-circle:hover { box-shadow: inset 0 0 0 1px rgba(255,255,255,0.15); }

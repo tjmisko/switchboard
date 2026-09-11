@@ -7,3 +7,7 @@
 # reporting a clean checkout as dirty, since its guard counts untracked files.
 .env
 .secrets
+
+# Python configuration/build helpers
+__pycache__/
+*.pyc

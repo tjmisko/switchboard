@@ -514,6 +514,22 @@ The original Switchboard was a Hyprland + wezterm + waybar appliance. That
 integration still ships as a Hyprland-specific extra; the portable core above
 does not depend on it.
 
+### Switchable displays
+
+Switchboard always exposes one ordered session list. Navigation follows that
+list even when no display is visible. `display mode chips` uses the named bottom
+strip; `display mode circles` uses compact status circles at the right of the
+existing top Waybar. `display mode toggle` switches between them. Both update
+live and share status, focus, remote, and suspension rules.
+
+The circles have no visible names; hover shows details and clicking focuses the
+exact session generation. The integration recipe binds **Super+Shift+B** to the
+mode toggle, preserving **Super+Alt+Left/Right** navigation and the F8 master
+visibility control. The top-bar task timer is removed by the configuration helper.
+
+See [display modes and the consumer contract](docs/display-modes.md) for setup,
+customization, the live JSON stream, and renderer invariants.
+
 ### Waybar — split and combined profiles
 
 The legacy profile runs the top bar and bottom agent strip as separate Waybar
@@ -525,7 +541,7 @@ The split uses two config files:
   directly. Its lifecycle is owned by `switchboard-ctl bottombar`.
 
 `claude.jsonc` declares 10 `custom/claude-N` modules so each chip is a real GTK
-widget with its own CSS. One `switchboard-ctl bottombar watch` subscription
+widget with its own CSS. One `switchboard-ctl display serve` subscription
 renders the whole slot set into atomic files under
 `$XDG_RUNTIME_DIR/switchboard/`. Waybar's signal mode runs a one-shot shell read
 only when a slot changes; no per-slot renderer or reader stays resident. The
@@ -591,23 +607,21 @@ Hyprland startup wiring:
 ```
 exec-once = systemctl --user import-environment HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY XDG_CURRENT_DESKTOP DISPLAY
 exec-once = systemctl --user start --no-block switchboard.service
-exec-once = switchboard-ctl bottombar watch
+exec-once = systemctl --user restart --no-block switchboard-waybar.service
 ```
 
 ### Auto-hiding the bottom bar
 
 ```
-bottom bar runs  ⟺  (top bar visible)  AND  (≥1 agent session)
+bottom bar runs  ⟺  chips mode AND master visible AND sessions exist
 ```
 
-Visibility is **process existence**, not a toggle: `switchboard-ctl bottombar`
-literally starts and kills the `waybar -c claude.jsonc` process, so the two bars
-never desync. The session-count input comes from the daemon stream (`bottombar
-watch`, plus a 3 s self-heal ticker); the top-bar-visibility input comes from
-the F8 master toggle, which touches a marker file and calls `bottombar
-reconcile` so the bottom bar follows in lockstep. The watcher kills Waybar by
-process group and reaps it; slot commands are short signal-triggered reads, not
-resident children.
+The broker follows the live aggregate stream and inotify events for mode and
+master visibility. `display serve` owns the split bottom process only in chips
+mode; circles are widgets inside the existing top Waybar. Process ownership
+survives startup and termination until pidfd exit is confirmed, so switching
+modes cannot orphan a bar and launch another. A three-second safety tick remains
+for recovery; normal mode and session changes are event-driven.
 
 Overridable via `SWITCHBOARD_WAYBAR_MARKER` and `SWITCHBOARD_BOTTOM_CONFIG`.
 This auto-hide logic is deeply Hyprland-specific and stays an opt-in extra, not

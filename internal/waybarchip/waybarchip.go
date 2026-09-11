@@ -29,12 +29,12 @@ import (
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/barlayout"
-	"github.com/tjmisko/switchboard/internal/barview"
 	"github.com/tjmisko/switchboard/internal/buildinfo"
 	"github.com/tjmisko/switchboard/internal/durfmt"
 	sblabel "github.com/tjmisko/switchboard/internal/label"
 	"github.com/tjmisko/switchboard/internal/projectname"
 	"github.com/tjmisko/switchboard/internal/rpc"
+	"github.com/tjmisko/switchboard/internal/sessionview"
 	"github.com/tjmisko/switchboard/internal/state"
 )
 
@@ -87,7 +87,7 @@ func (r *Renderer) RenderSlotsAt(snap state.Snapshot, slots int, now time.Time) 
 		labels[i] = r.labels.Chip(cfg, snap.Sessions[i])
 	}
 	labels = barlayout.Fit(labels, r.availPx, r.metrics)
-	chips := barview.Prepare(snap, slots)
+	chips := sessionview.Prepare(snap, slots)
 	for slot := range out {
 		out[slot] = renderPreparedSlot(chips, slot, labels, cfg, &r.labels, now)
 	}
@@ -343,10 +343,10 @@ func renderSlotAt(snap state.Snapshot, slot int, availPx float64, metrics barlay
 		labels[i] = cache.Chip(cfg, snap.Sessions[i])
 	}
 	labels = barlayout.Fit(labels, availPx, metrics)
-	return renderPreparedSlot(barview.Prepare(snap, slot+1), slot, labels, cfg, cache, now)
+	return renderPreparedSlot(sessionview.Prepare(snap, slot+1), slot, labels, cfg, cache, now)
 }
 
-func renderPreparedSlot(chips []barview.Chip, slot int, labels []string, cfg projectname.Config, cache *sblabel.NameCache, now time.Time) waybarOutput {
+func renderPreparedSlot(chips []sessionview.Item, slot int, labels []string, cfg projectname.Config, cache *sblabel.NameCache, now time.Time) waybarOutput {
 	if slot >= len(chips) {
 		return waybarOutput{Text: "", Class: []string{"empty"}}
 	}
@@ -356,7 +356,7 @@ func renderPreparedSlot(chips []barview.Chip, slot int, labels []string, cfg pro
 		Text:    labels[slot],
 		Tooltip: sessionTooltip(cfg, cache, s, now),
 		Class:   chip.Classes,
-		Alt:     barview.ColorClass(chip.Status),
+		Alt:     sessionview.ColorClass(chip.Status),
 	}
 }
 
@@ -384,7 +384,7 @@ func nextWaybarRefresh(snap state.Snapshot, slot int, now time.Time) time.Time {
 // chipClass maps a session status to the CSS class that paints its color.
 // delegating shares working's green; everything else maps to itself.
 func chipClass(status string) string {
-	return barview.ColorClass(status)
+	return sessionview.ColorClass(status)
 }
 
 // renderAggregate is the original single-module mode. Kept for ad-hoc
@@ -410,7 +410,7 @@ func renderAggregate(snap state.Snapshot, names *nameConfig, cache *sblabel.Name
 }
 
 func sessionStatus(s state.Session) string {
-	return barview.Status(s)
+	return sessionview.Status(s)
 }
 
 // sessionTooltip renders the hover card with pango markup:

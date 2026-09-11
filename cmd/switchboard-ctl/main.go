@@ -20,6 +20,7 @@ import (
 	sblabel "github.com/tjmisko/switchboard/internal/label"
 	"github.com/tjmisko/switchboard/internal/projectname"
 	"github.com/tjmisko/switchboard/internal/rpc"
+	"github.com/tjmisko/switchboard/internal/sessionview"
 	"github.com/tjmisko/switchboard/internal/state"
 )
 
@@ -47,6 +48,10 @@ func main() {
 	// bottombar publishes the bottom Waybar modules. Its legacy `watch` mode
 	// owns a split process; `publish` attaches to a combined desktop-owned
 	// process. Both tolerate a down daemon and reconnect on their own.
+	if args[0] == "display" {
+		cmdDisplay(args[1:], *socketPath)
+		return
+	}
 	if args[0] == "bottombar" {
 		cmdBottombar(args[1:], *socketPath)
 		return
@@ -452,41 +457,11 @@ func cmdCycle(c *rpc.Client, direction string) {
 }
 
 func cycleTargetSession(sessions []state.Session, direction string) (state.Session, bool) {
-	var ring []state.Session
-	for _, session := range sessions {
-		if sessionNavigable(session) {
-			ring = append(ring, session)
-		}
-	}
-	if len(ring) == 0 {
-		return state.Session{}, false
-	}
-	index := -1
-	for i := range ring {
-		if ring[i].Focused {
-			index = i
-			break
-		}
-	}
-	if direction == "next" || direction == "up" {
-		if index < 0 {
-			return ring[0], true
-		}
-		return ring[(index+1)%len(ring)], true
-	}
-	if index < 0 {
-		return ring[len(ring)-1], true
-	}
-	return ring[(index-1+len(ring))%len(ring)], true
+	return sessionview.Cycle(sessions, direction)
 }
 
 func sessionNavigable(session state.Session) bool {
-	if session.Headless {
-		return false
-	}
-	// Hostname is absent in host-local snapshots and in legacy unit fixtures;
-	// aggregate rows always carry it and therefore require the explicit hint.
-	return session.Hostname == "" || session.Navigable
+	return sessionview.Navigable(session)
 }
 
 // cycleTargetPID picks the session the cycle lands on. The ring is the
@@ -934,6 +909,8 @@ commands:
   codex-hook <event>      forward Codex hook enrichment (stdin = JSON)
   activity idle|active    report a global user-activity edge for the delegation
                             metrics (idle daemon, e.g. hypridle); session-less
+  display mode chips|circles|toggle  choose a presentation (navigation is unchanged)
+  display status|watch|serve          inspect mode, stream JSON, or run the broker
   bottombar [sub]         publish the Linux/Waybar bottom strip:
                             publish    attach to one combined Waybar process
                             reconcile-attached

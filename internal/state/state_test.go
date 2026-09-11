@@ -89,7 +89,7 @@ func TestSnapshotOrder_unresolvedWorkspaceGoesLastByStartedAt(t *testing.T) {
 	}
 }
 
-func TestSortChipOrder_injectedWorkspaceOverridesTheSessionsOwnWindow(t *testing.T) {
+func TestSortSessionOrder_injectedWorkspaceOverridesTheSessionsOwnWindow(t *testing.T) {
 	// The federated view's case: rows 2 and 4 are remote, so they carry no
 	// window of their own, and the key says where each is DISPLAYED here.
 	sessions := []Session{
@@ -98,7 +98,7 @@ func TestSortChipOrder_injectedWorkspaceOverridesTheSessionsOwnWindow(t *testing
 		{PID: 3, StartedAt: ts(30), Hyprland: ws(5)},
 		{PID: 4, StartedAt: ts(40)},
 	}
-	SortChipOrder(sessions, func(s Session) (int, bool) {
+	SortSessionOrder(sessions, func(s Session) (int, bool) {
 		if s.PID == 2 {
 			return 3, true
 		}
@@ -114,14 +114,14 @@ func TestSortChipOrder_injectedWorkspaceOverridesTheSessionsOwnWindow(t *testing
 	}
 }
 
-func TestSortChipOrder_injectedWorkspaceWinsOverAStaleWindow(t *testing.T) {
+func TestSortSessionOrder_injectedWorkspaceWinsOverAStaleWindow(t *testing.T) {
 	// A remote row may still carry its own desktop's workspace; the injected
 	// key is the one that means something on the machine drawing the bar.
 	sessions := []Session{
 		{PID: 1, StartedAt: ts(10), Hyprland: ws(1)},
 		{PID: 2, StartedAt: ts(20), Hyprland: ws(9)},
 	}
-	SortChipOrder(sessions, func(s Session) (int, bool) {
+	SortSessionOrder(sessions, func(s Session) (int, bool) {
 		if s.PID == 2 {
 			return -1, true
 		}

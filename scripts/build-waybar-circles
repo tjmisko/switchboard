@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""Build the optional GTK 3 Waybar extension using its installed runtime ABI."""
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+root=Path(__file__).resolve().parent.parent
+output=Path(sys.argv[1]) if len(sys.argv)>1 else root/".bin/libswitchboard-waybar.so"
+output.parent.mkdir(parents=True,exist_ok=True)
+flags=shlex.split(subprocess.check_output(["pkg-config","--cflags","--libs","gio-2.0"],text=True))
+revision=subprocess.check_output(["git","-C",str(root),"rev-parse","HEAD"],text=True).strip()
+if subprocess.check_output(["git","-C",str(root),"status","--porcelain"],text=True).strip():revision+="-dirty"
+subprocess.run([os.environ.get("CC","cc"),"-DSWITCHBOARD_DISPLAY_REVISION="+chr(34)+revision+chr(34),"-shared","-fPIC","-O2","-Wall","-Wextra","-Werror",str(root/"waybar/circles/module.c"),"-o",str(output),*flags,"-l:libgtk-3.so.0"],check=True)
+print(output)

@@ -79,7 +79,7 @@ func TestRendererUnitsAreSeparateOptInProfiles(t *testing.T) {
 			profile:     "Waybar",
 			condition:   "ConditionPathExists=%h/.config/waybar/claude.jsonc",
 			environment: "Environment=SWITCHBOARD_CTL=%h/go/bin/switchboard-ctl",
-			command:     "bottombar watch",
+			command:     "display serve",
 			other:       "polybar",
 		},
 		{

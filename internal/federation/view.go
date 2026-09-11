@@ -186,7 +186,7 @@ func (v *View) Snapshot() state.Snapshot {
 	// so they sort exactly as the host-local snapshot did; a remote row joins
 	// them at the workspace of the local window displaying it, and one whose
 	// window is unknown falls to the end as before.
-	state.SortChipOrder(out.Sessions, func(session state.Session) (int, bool) {
+	state.SortSessionOrder(out.Sessions, func(session state.Session) (int, bool) {
 		workspace, ok := workspaces[chipKey{host: session.Hostname, pid: session.PID}]
 		return workspace, ok
 	})
