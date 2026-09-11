@@ -4,16 +4,17 @@ package main
 
 import (
 	"encoding/json"
-	"github.com/tjmisko/switchboard/internal/waybarchip"
-	"golang.org/x/sys/unix"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/display"
 	"github.com/tjmisko/switchboard/internal/state"
+	"github.com/tjmisko/switchboard/internal/waybarchip"
+	"golang.org/x/sys/unix"
 )
 
 func TestDisplayModeChangeWakesAtomicFileWatcher(t *testing.T) {
@@ -82,11 +83,13 @@ func TestPresentationPublisherRetainsAllSessionsAcrossModeChange(t *testing.T) {
 	cfg := bottomBarConfig{viewFile: filepath.Join(dir, "display.json"), circlesFile: filepath.Join(dir, "waybar.ini")}
 	p := newPresentationPublisher(cfg)
 	snap := state.Snapshot{}
+	now := time.Date(2026, 9, 11, 14, 0, 0, 0, time.UTC)
 	for i := 0; i < 25; i++ {
-		snap.Sessions = append(snap.Sessions, state.Session{PID: i + 1, Remote: true, ResolvedName: "session", Hostname: "test", Navigable: true})
+		snap.Sessions = append(snap.Sessions, state.Session{PID: i + 1, Remote: true, ResolvedName: "session <&>", CWD: "/src/project<&>", Hostname: "test", Navigable: true, StartedAt: now.Add(-time.Hour), LocalWorkspace: i + 1})
 	}
+	chips := waybarchip.NewRenderer(1000).RenderSlotsAt(snap, len(snap.Sessions), now)
 	for _, mode := range []display.Mode{display.Chips, display.Circles} {
-		if err := p.publish(snap, mode, true, true); err != nil {
+		if err := p.publish(snap, mode, true, true, now); err != nil {
 			t.Fatal(err)
 		}
 		b, err := os.ReadFile(cfg.viewFile)
@@ -100,7 +103,49 @@ func TestPresentationPublisherRetainsAllSessionsAcrossModeChange(t *testing.T) {
 		if frame.Mode != mode || len(frame.Sessions) != 25 || frame.PublisherPID != os.Getpid() {
 			t.Fatalf("bad shared frame: %+v", frame)
 		}
+		for i, session := range frame.Sessions {
+			if session.TooltipMarkup != chips[i].Tooltip || !strings.Contains(session.TooltipMarkup, "&lt;&amp;&gt;") {
+				t.Fatalf("session %d lost the shared escaped hover card: %s", i, session.TooltipMarkup)
+			}
+		}
 	}
+}
+
+func TestQuietCircleTooltipBeyondBottomSlotsAdvancesWithoutSnapshot(t *testing.T) {
+	cfg := bottomLifecycleConfig(t)
+	cfg.modeFile = filepath.Join(cfg.slotDir, "mode")
+	cfg.viewFile = filepath.Join(cfg.slotDir, "display.json")
+	cfg.circlesFile = filepath.Join(cfg.slotDir, "circles.ini")
+	if _, err := setDisplayMode(cfg.modeFile, "circles"); err != nil {
+		t.Fatal(err)
+	}
+	cfg.presentation = newPresentationPublisher(cfg)
+	snap := state.Snapshot{Sessions: make([]state.Session, 25)}
+	for i := range snap.Sessions {
+		snap.Sessions[i] = state.Session{PID: i + 1, Hostname: "test", Remote: true, ResolvedName: "session"}
+	}
+	// Only the last circle has a clock. Its minute boundary must wake the
+	// renderer before the three-second recovery tick, with no fresh snapshot.
+	since := time.Now().Add(-59 * time.Second)
+	snap.Sessions[24].Claude = &state.AgentInfo{Status: state.StatusWorking, StatusSinceWire: &since}
+	snapshots := make(chan state.Snapshot, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		renderDisplaySnapshots(cfg, waybarchip.NewRenderer(1000), newSlotPublisher(cfg.slotDir, bottomBarSlots), snapshots)
+	}()
+	defer func() { close(snapshots); <-done }()
+	snapshots <- snap
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		body, _ := os.ReadFile(cfg.viewFile)
+		var frame display.Frame
+		if json.Unmarshal(body, &frame) == nil && len(frame.Sessions) == 25 && strings.Contains(frame.Sessions[24].TooltipMarkup, "working · 1m") {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("quiet circle hover did not advance at its minute boundary")
 }
 
 func TestLiveModeTransitionsKeepOneOwnerAndWakeOnExit(t *testing.T) {

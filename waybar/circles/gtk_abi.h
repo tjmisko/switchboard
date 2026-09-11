@@ -24,6 +24,7 @@ extern void gtk_widget_set_valign(GtkWidget *, int);
 extern void gtk_widget_set_can_focus(GtkWidget *, gboolean);
 extern void gtk_widget_set_name(GtkWidget *, const char *);
 extern void gtk_widget_set_tooltip_text(GtkWidget *, const char *);
+extern void gtk_widget_set_tooltip_markup(GtkWidget *, const char *);
 extern GtkStyleContext *gtk_widget_get_style_context(GtkWidget *);
 extern void gtk_style_context_add_class(GtkStyleContext *, const char *);
 extern void gtk_style_context_remove_class(GtkStyleContext *, const char *);

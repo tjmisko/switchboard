@@ -267,7 +267,7 @@ func TestRemoteTooltipDoesNotResolveCWDOnLocalFilesystem(t *testing.T) {
 		PID: 4, Hostname: "buildbox", Remote: true, CWD: remoteDir,
 		Agent: state.AgentKindClaude, Claude: &state.AgentInfo{Status: state.StatusIdle},
 	}
-	tip := sessionTooltip(projectname.DefaultConfig(), &sblabel.NameCache{}, s, time.Now())
+	tip := TooltipMarkup(projectname.DefaultConfig(), &sblabel.NameCache{}, s, time.Now())
 	// The full display name resolves from the basename alone, case-folded for
 	// the small-caps run; the host follows on line 2.
 	if !strings.Contains(tip, "<span variant='smallcaps'>switchboard</span>") {
@@ -379,7 +379,7 @@ func TestSessionTooltipDoesNotChangeAtSecondResolution(t *testing.T) {
 	}
 	seen := map[string]bool{}
 	for sec := range 90 {
-		seen[sessionTooltip(projectname.DefaultConfig(), &sblabel.NameCache{}, s, start.Add(time.Duration(sec)*time.Second))] = true
+		seen[TooltipMarkup(projectname.DefaultConfig(), &sblabel.NameCache{}, s, start.Add(time.Duration(sec)*time.Second))] = true
 	}
 	// 90 seconds spans one minute boundary, so at most two distinct cards.
 	if len(seen) > 2 {
@@ -402,7 +402,7 @@ func agentNodes(n int, startedAt time.Time) []state.AgentNode {
 
 func TestSessionTooltipWithoutAgentGraphKeepsLegacyDetail(t *testing.T) {
 	s := state.Session{PID: 1, CWD: "/tmp/x", Claude: &state.AgentInfo{Status: state.StatusDelegating, InFlightSubagents: 2}}
-	tip := sessionTooltip(projectname.Config{}, &sblabel.NameCache{}, s, time.Now())
+	tip := TooltipMarkup(projectname.Config{}, &sblabel.NameCache{}, s, time.Now())
 	if !strings.Contains(tip, "delegating · 2 agents") {
 		t.Fatalf("legacy fallback detail missing:\n%s", tip)
 	}
@@ -424,7 +424,7 @@ func TestSessionTooltipWithAgentGraphDoesNotDuplicateLegacyDetail(t *testing.T) 
 			Nodes: []state.AgentNode{{ID: "root"}, {ID: "child", ParentID: "root", Nickname: "canonical", Runtime: agentgraph.RuntimeActive}},
 		},
 	}
-	tip := sessionTooltip(projectname.Config{}, &sblabel.NameCache{}, s, now)
+	tip := TooltipMarkup(projectname.Config{}, &sblabel.NameCache{}, s, now)
 	if !strings.Contains(tip, "1 agent") {
 		t.Fatalf("graph roll-up missing:\n%s", tip)
 	}
@@ -446,7 +446,7 @@ func TestSessionTooltipLowercasesTheSmallCapsTitle(t *testing.T) {
 		{Match: []string{"webapp"}, Canonical: "sspi", Full: "SSPI Data Webapp"},
 	}}
 	s := state.Session{PID: 1, CWD: "/home/u/webapp", Claude: &state.AgentInfo{Status: state.StatusWorking}}
-	tip := sessionTooltip(cfg, &sblabel.NameCache{}, s, time.Now())
+	tip := TooltipMarkup(cfg, &sblabel.NameCache{}, s, time.Now())
 	if !strings.Contains(tip, "<span variant='smallcaps'>sspi data webapp</span>") {
 		t.Errorf("title should be case-folded for the small-caps run:\n%s", tip)
 	}
@@ -459,7 +459,7 @@ func TestSessionTooltipLowercasesTheSmallCapsTitle(t *testing.T) {
 // ahead of the host, which takes line 2.
 func TestSessionTooltipPairsProjectNameWithPathAheadOfHost(t *testing.T) {
 	s := state.Session{PID: 1, CWD: "/home/u/webapp", Claude: &state.AgentInfo{Status: state.StatusWorking}}
-	lines := strings.Split(sessionTooltip(projectname.Config{}, &sblabel.NameCache{}, s, time.Now()), "\n")
+	lines := strings.Split(TooltipMarkup(projectname.Config{}, &sblabel.NameCache{}, s, time.Now()), "\n")
 	if len(lines) < 2 {
 		t.Fatalf("card too short: %q", lines)
 	}
@@ -480,7 +480,7 @@ func TestSessionTooltipReportsTheLocalWorkspaceForRemoteSessions(t *testing.T) {
 		CWD: "/home/u/proj", LocalWorkspace: 7,
 		Claude: &state.AgentInfo{Status: state.StatusWorking},
 	}
-	tip := sessionTooltip(projectname.Config{}, &sblabel.NameCache{}, s, time.Now())
+	tip := TooltipMarkup(projectname.Config{}, &sblabel.NameCache{}, s, time.Now())
 	if !strings.Contains(tip, "ws 7") {
 		t.Errorf("remote card should report the local workspace:\n%s", tip)
 	}
@@ -545,7 +545,7 @@ func TestSessionTooltipShowsStatusDuration(t *testing.T) {
 				PID: 4821, CWD: "/home/u/proj",
 				Claude: &state.ClaudeInfo{Status: "permission", StatusSinceWire: &since},
 			}
-			tip := pangoPlain(sessionTooltip(projectname.Config{}, nil, s, now))
+			tip := pangoPlain(TooltipMarkup(projectname.Config{}, nil, s, now))
 			if !strings.Contains(tip, tc.want) {
 				t.Errorf("tooltip should contain %q:\n%s", tc.want, tip)
 			}
@@ -560,7 +560,7 @@ func TestSessionTooltipSuspendedShowsNoDuration(t *testing.T) {
 		PID: 4821, CWD: "/home/u/proj", Suspended: true,
 		Claude: &state.ClaudeInfo{Status: "working", StatusSinceWire: &since},
 	}
-	tip := sessionTooltip(projectname.Config{}, nil, s, now)
+	tip := TooltipMarkup(projectname.Config{}, nil, s, now)
 	// Suspended status (and its clock) is stale; show "suspended", not a counter.
 	if strings.Contains(tip, "5m") {
 		t.Errorf("suspended session should not show a stale duration:\n%s", tip)
@@ -752,7 +752,7 @@ func blockedSession(t *testing.T, writers []string, inflight int, names map[stri
 func TestSessionTooltipShouldNameTheBlockedTeammate(t *testing.T) {
 	s := blockedSession(t, []string{"af5bd126402ac16c7"}, 4,
 		map[string]string{"af5bd126402ac16c7": "escalate-cleanup"})
-	tip := sessionTooltip(projectname.Config{}, &sblabel.NameCache{}, s, blockedNow)
+	tip := TooltipMarkup(projectname.Config{}, &sblabel.NameCache{}, s, blockedNow)
 	if !strings.Contains(tip, "permission · escalate-cleanup · 45m") {
 		t.Errorf("tooltip should name the blocked teammate:\n%s", tip)
 	}
@@ -761,7 +761,7 @@ func TestSessionTooltipShouldNameTheBlockedTeammate(t *testing.T) {
 func TestSessionTooltipShouldNameEveryWriterWhenTwoAreBlockedAtOnce(t *testing.T) {
 	s := blockedSession(t, []string{"af5bd126402ac16c7", "main"}, 2,
 		map[string]string{"af5bd126402ac16c7": "escalate-cleanup"})
-	tip := sessionTooltip(projectname.Config{}, &sblabel.NameCache{}, s, blockedNow)
+	tip := TooltipMarkup(projectname.Config{}, &sblabel.NameCache{}, s, blockedNow)
 	if !strings.Contains(tip, "permission · escalate-cleanup, main · 45m") {
 		t.Errorf("tooltip should name both blocked writers:\n%s", tip)
 	}
@@ -771,7 +771,7 @@ func TestSessionTooltipShouldNameEveryWriterWhenTwoAreBlockedAtOnce(t *testing.T
 // what the red already means, so the hover stays exactly as it was.
 func TestSessionTooltipShouldLeaveASoloPermissionUnannotated(t *testing.T) {
 	s := blockedSession(t, []string{"main"}, 0, nil)
-	tip := sessionTooltip(projectname.Config{}, &sblabel.NameCache{}, s, blockedNow)
+	tip := TooltipMarkup(projectname.Config{}, &sblabel.NameCache{}, s, blockedNow)
 	if !strings.Contains(tip, "permission · 45m") {
 		t.Errorf("solo permission tooltip should be status + duration only:\n%s", tip)
 	}

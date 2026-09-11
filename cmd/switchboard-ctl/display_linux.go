@@ -14,6 +14,7 @@ import (
 	sblabel "github.com/tjmisko/switchboard/internal/label"
 	"github.com/tjmisko/switchboard/internal/projectname"
 	"github.com/tjmisko/switchboard/internal/state"
+	"github.com/tjmisko/switchboard/internal/waybarchip"
 	"golang.org/x/sys/unix"
 )
 
@@ -151,7 +152,7 @@ func newPresentationPublisher(cfg bottomBarConfig) *presentationPublisher {
 	started, _ := processStartTime(os.Getpid())
 	return &presentationPublisher{cfg: cfg, started: started}
 }
-func (p *presentationPublisher) publish(snap state.Snapshot, mode display.Mode, connected, visible bool) error {
+func (p *presentationPublisher) publish(snap state.Snapshot, mode display.Mode, connected, visible bool, now time.Time) error {
 	var stamp time.Time
 	if info, err := os.Stat(projectname.ConfigPath()); err == nil {
 		stamp = info.ModTime()
@@ -162,6 +163,9 @@ func (p *presentationPublisher) publish(snap state.Snapshot, mode display.Mode, 
 		p.namesLoaded = true
 	}
 	frame := display.Build(snap, mode, connected, visible, func(s state.Session) string { return p.labels.Chip(p.names, s) })
+	for i, session := range snap.Sessions {
+		frame.Sessions[i].TooltipMarkup = waybarchip.TooltipMarkup(p.names, &p.labels, session, now)
+	}
 	frame.PublisherPID, frame.PublisherStarted = os.Getpid(), p.started
 	body, err := frame.JSON()
 	if err != nil {

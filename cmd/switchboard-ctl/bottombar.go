@@ -373,7 +373,7 @@ func watchBottomBar(cfg bottomBarConfig) {
 		}
 		flushSlotsWhenReady(cfg, publisher)
 		if mode, err := display.ReadMode(cfg.modeFile); err == nil {
-			if err := cfg.presentation.publish(state.Snapshot{}, mode, false, topVisible(cfg)); err != nil {
+			if err := cfg.presentation.publish(state.Snapshot{}, mode, false, topVisible(cfg), time.Now()); err != nil {
 				fmt.Fprintf(os.Stderr, "display: publish disconnect: %v\n", err)
 			}
 		}
@@ -498,7 +498,7 @@ func renderDisplaySnapshots(cfg bottomBarConfig, renderer *waybarchip.Renderer, 
 			if cfg.presentation == nil {
 				return true
 			}
-			if err := cfg.presentation.publish(latest, mode, true, visible); err != nil {
+			if err := cfg.presentation.publish(latest, mode, true, visible, now); err != nil {
 				fmt.Fprintf(os.Stderr, "display: publish: %v\n", err)
 				return false
 			}
@@ -527,15 +527,16 @@ func renderDisplaySnapshots(cfg bottomBarConfig, renderer *waybarchip.Renderer, 
 				return false
 			}
 		}
+		refreshSlots := bottomBarSlots
 		if mode == display.Circles {
+			refreshSlots = len(latest.Sessions)
 			stop(readyTimer, &readyC)
-			stop(refreshTimer, &refreshC)
 			readyPID, readyTries, readyWarned = 0, 0, false
 			readyRetryAt = time.Time{}
-			return true
+		} else {
+			scheduleReady()
 		}
-		scheduleReady()
-		next := renderer.NextRefresh(latest, bottomBarSlots, now)
+		next := renderer.NextRefresh(latest, refreshSlots, now)
 		if next.IsZero() {
 			stop(refreshTimer, &refreshC)
 		} else {

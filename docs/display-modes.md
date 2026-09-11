@@ -21,6 +21,11 @@ The circle view has no fixed slot limit. Both views share working/idle/permissio
 colors, focus highlights, remote double borders, and suspended/headless flags.
 Each circle has a tooltip and a click target tied to the session's host, PID and
 start time, so reordering cannot redirect an already displayed circle's click.
+Circles default to 24px with 3px borders (6px double borders for remote sessions).
+They use the same formatted hover cards as bottom chips: project/path, host,
+status, task, coarse durations, workspace, PID, and agent summary. Unchanged
+cards are retained when another session updates; clocks refresh at their next
+visible boundary even when no new session snapshot arrives.
 Scroll uses the existing previous/next commands; right-click opens the picker.
 The current named-chip example retains its ten configured slots; the ordered
 session data and navigation are never truncated to those slots.
@@ -80,7 +85,9 @@ It reports a disconnected, empty view if its publisher exits. The frame contains
 `mode`, `visible`, `connected`, and an unlimited `sessions` array in canonical
 order. Each entry includes `key`, `index`, `hostname`, `pid`, `started_at`,
 `label`, `status`, `classes`, `focused`, `navigable`, `focus_selector`, and
-`tooltip`. Publisher PID/start time provide a liveness fence.
+plain-text `tooltip`. The optional `tooltip_markup` carries the escaped Pango
+hover card for compatible renderers. Publisher PID/start time provide a
+liveness fence.
 
 Consumers can draw a menu, panel, TUI, or other surface without sorting again or
 copying focus/status rules. They can also subscribe directly to the daemon's

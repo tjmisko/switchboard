@@ -81,6 +81,7 @@ type Session struct {
 	Navigable     bool      `json:"navigable"`
 	FocusSelector string    `json:"focus_selector,omitempty"`
 	Tooltip       string    `json:"tooltip"`
+	TooltipMarkup string    `json:"tooltip_markup,omitempty"`
 }
 
 // Build preserves the producer's complete order. Naming is injected so each
@@ -112,7 +113,7 @@ func (f Frame) WaybarData() []byte {
 	var b strings.Builder
 	fmt.Fprintf(&b, "[display]\nversion=%d\nmode=%s\nconnected=%t\nvisible=%t\npublisher_pid=%d\npublisher_started=%d\ncount=%d\n", f.Version, f.Mode, f.Connected, f.Visible, f.PublisherPID, f.PublisherStarted, len(f.Sessions))
 	for i, s := range f.Sessions {
-		fmt.Fprintf(&b, "\n[session-%d]\nkey=%s\nselector=%s\ntooltip=%s\nclasses=", i, keyString(s.Key), keyString(s.FocusSelector), keyString(s.Tooltip))
+		fmt.Fprintf(&b, "\n[session-%d]\nkey=%s\nselector=%s\ntooltip=%s\ntooltip_markup=%s\nclasses=", i, keyString(s.Key), keyString(s.FocusSelector), keyString(s.Tooltip), keyString(s.TooltipMarkup))
 		for _, class := range s.Classes {
 			b.WriteString(strings.ReplaceAll(keyString(class), ";", "\\;"))
 			b.WriteByte(';')

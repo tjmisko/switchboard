@@ -20,6 +20,8 @@ typedef struct {
     Display *display;
     GtkWidget *widget;
     char *selector;
+    char *tooltip;
+    gboolean tooltip_markup;
     char **classes;
     gboolean seen;
 } Circle;
@@ -100,6 +102,7 @@ static void free_circle(gpointer data) {
     Circle *circle = data;
     gtk_widget_destroy(circle->widget);
     g_free(circle->selector);
+    g_free(circle->tooltip);
     g_strfreev(circle->classes);
     g_free(circle);
 }
@@ -108,7 +111,7 @@ static Circle *make_circle(Display *display) {
     circle->display = display;
     circle->widget = gtk_button_new();
     gtk_widget_set_name(circle->widget, "switchboard-circle");
-    gtk_widget_set_size_request(circle->widget, 16, 16);
+    gtk_widget_set_size_request(circle->widget, 24, 24);
     gtk_widget_set_valign(circle->widget, 3); /* GTK_ALIGN_CENTER */
     gtk_widget_set_can_focus(circle->widget, FALSE);
     gtk_container_add((GtkContainer *)display->box, circle->widget);
@@ -127,6 +130,22 @@ static void set_classes(Circle *circle, char **classes) {
     circle->classes = classes;
     if (classes) for (char **item = classes; *item; ++item)
         gtk_style_context_add_class(style, *item);
+}
+static void set_tooltip(Circle *circle, GKeyFile *frame, const char *group) {
+    char *tooltip = g_key_file_get_string(frame, group, "tooltip_markup", NULL);
+    gboolean markup = tooltip && *tooltip;
+    if (!markup) {
+        g_free(tooltip);
+        tooltip = g_key_file_get_string(frame, group, "tooltip", NULL);
+    }
+    /* Other sessions' updates must not disturb an unchanged open hover card. */
+    if (markup != circle->tooltip_markup || g_strcmp0(tooltip, circle->tooltip) != 0) {
+        if (markup) gtk_widget_set_tooltip_markup(circle->widget, tooltip);
+        else gtk_widget_set_tooltip_text(circle->widget, tooltip);
+        g_free(circle->tooltip);
+        circle->tooltip = tooltip;
+        circle->tooltip_markup = markup;
+    } else g_free(tooltip);
 }
 static void render(Display *display) {
     GKeyFile *frame = g_key_file_new();
@@ -162,9 +181,7 @@ static void render(Display *display) {
         circle->seen = TRUE;
         g_free(circle->selector);
         circle->selector = g_key_file_get_string(frame, group, "selector", NULL);
-        char *tooltip = g_key_file_get_string(frame, group, "tooltip", NULL);
-        gtk_widget_set_tooltip_text(circle->widget, tooltip);
-        g_free(tooltip);
+        set_tooltip(circle, frame, group);
         set_classes(circle, g_key_file_get_string_list(frame, group, "classes", NULL, NULL));
         gtk_box_reorder_child((GtkBox *)display->box, circle->widget, i);
         gtk_widget_show(circle->widget);

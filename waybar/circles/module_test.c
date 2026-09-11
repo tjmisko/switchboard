@@ -11,6 +11,8 @@ struct _GtkWidget {
     GtkWidget *parent;
     char *name, *tooltip;
     gboolean visible;
+    gboolean tooltip_markup;
+    int tooltip_updates;
 };
 typedef struct {GObjectClass parent_class;} GtkWidgetClass;
 G_DEFINE_TYPE(GtkWidget, test_widget, G_TYPE_OBJECT)
@@ -42,11 +44,12 @@ void gtk_widget_destroy(GtkWidget *widget) {
 void gtk_widget_show(GtkWidget *widget) {widget->visible=TRUE;}
 void gtk_widget_hide(GtkWidget *widget) {widget->visible=FALSE;}
 void gtk_widget_set_no_show_all(GtkWidget *widget,gboolean value) {(void)widget;(void)value;}
-void gtk_widget_set_size_request(GtkWidget *widget,int width,int height) {(void)widget;g_assert_cmpint(width,==,16);g_assert_cmpint(height,==,16);}
+void gtk_widget_set_size_request(GtkWidget *widget,int width,int height) {(void)widget;g_assert_cmpint(width,==,24);g_assert_cmpint(height,==,24);}
 void gtk_widget_set_valign(GtkWidget *widget,int value) {(void)widget;(void)value;}
 void gtk_widget_set_can_focus(GtkWidget *widget,gboolean value) {(void)widget;(void)value;}
 void gtk_widget_set_name(GtkWidget *widget,const char *value) {g_free(widget->name);widget->name=g_strdup(value);}
-void gtk_widget_set_tooltip_text(GtkWidget *widget,const char *value) {g_free(widget->tooltip);widget->tooltip=g_strdup(value);}
+void gtk_widget_set_tooltip_text(GtkWidget *widget,const char *value) {g_free(widget->tooltip);widget->tooltip=g_strdup(value);widget->tooltip_markup=FALSE;widget->tooltip_updates++;}
+void gtk_widget_set_tooltip_markup(GtkWidget *widget,const char *value) {gtk_widget_set_tooltip_text(widget,value);widget->tooltip_markup=TRUE;}
 GtkStyleContext *gtk_widget_get_style_context(GtkWidget *widget) {return (GtkStyleContext*)widget;}
 void gtk_style_context_add_class(GtkStyleContext *style,const char *name) {g_hash_table_add(((GtkWidget*)style)->classes,g_strdup(name));}
 void gtk_style_context_remove_class(GtkStyleContext *style,const char *name) {g_hash_table_remove(((GtkWidget*)style)->classes,name);}
@@ -57,6 +60,7 @@ static void write_frame(const char *path, const char *mode, int count, int publi
     for(int i=0;i<count;++i) {
         int id=reverse?count-1-i:i;
         g_string_append_printf(frame,"[session-%d]\nkey=session-%d\nselector=host:test:pid:%d:started:2026-09-11T00:00:00Z\ntooltip=session;%d\\nstatus\nclasses=%s;focused;\n",i,id,id,id,reverse?"permission":"working");
+        if(id==0) g_string_append(frame,"tooltip_markup=<b>session &amp; &lt;0&gt;</b>\\n<span foreground='#a6e3a1'>working</span>\n");
     }
     GError *error=NULL;
     g_assert_true(g_file_set_contents_full(path,frame->str,-1,G_FILE_SET_CONTENTS_CONSISTENT,0600,&error));
@@ -84,13 +88,19 @@ int main(void) {
     g_assert_cmpuint(display->box->children->len,==,32);
     Circle *first=g_hash_table_lookup(display->circles,"session-0");
     GtkWidget *original=first->widget;
-    g_assert_cmpstr(original->tooltip,==,"session;0\nstatus");
+    g_assert_cmpstr(original->tooltip,==,"<b>session &amp; &lt;0&gt;</b>\n<span foreground='#a6e3a1'>working</span>");
+    g_assert_true(original->tooltip_markup);
+    g_assert_cmpint(original->tooltip_updates,==,1);
+    Circle *plain=g_hash_table_lookup(display->circles,"session-1");
+    g_assert_cmpstr(plain->widget->tooltip,==,"session;1\nstatus");
+    g_assert_false(plain->widget->tooltip_markup);
     g_assert_true(g_hash_table_contains(original->classes,"working"));
     write_frame(path,"circles",32,getpid(),TRUE);pump();
     g_assert_true(first->widget==original);
     g_assert_true(g_ptr_array_index(display->box->children,31)==original);
     g_assert_true(g_hash_table_contains(original->classes,"permission"));
     g_assert_false(g_hash_table_contains(original->classes,"working"));
+    g_assert_cmpint(original->tooltip_updates,==,1);
     write_frame(path,"chips",32,getpid(),FALSE);pump();g_assert_false(root->visible);
     write_frame(path,"circles",2,getpid(),FALSE);pump();
     g_assert_true(root->visible);g_assert_cmpuint(display->box->children->len,==,2);
@@ -103,6 +113,6 @@ int main(void) {
     write_frame(path,"circles",1,getpid(),FALSE);pump();g_assert_true(root->visible);
     wbcffi_deinit(display);gtk_widget_destroy(root);pump();
     unlink(path);rmdir(dir);g_free(path);g_free(dir);
-    puts("PASS: live rename, 32 circles, stable identity/reorder, status changes, mode/empty collapse, publisher death/recovery, cleanup");
+    puts("PASS: live rename, 32 circles, stable identity/reorder, markup/plain tooltips without redundant updates, status changes, mode/empty collapse, publisher death/recovery, cleanup");
     return 0;
 }

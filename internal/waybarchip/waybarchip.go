@@ -354,7 +354,7 @@ func renderPreparedSlot(chips []sessionview.Item, slot int, labels []string, cfg
 	s := chip.Session
 	return waybarOutput{
 		Text:    labels[slot],
-		Tooltip: sessionTooltip(cfg, cache, s, now),
+		Tooltip: TooltipMarkup(cfg, cache, s, now),
 		Class:   chip.Classes,
 		Alt:     sessionview.ColorClass(chip.Status),
 	}
@@ -413,7 +413,9 @@ func sessionStatus(s state.Session) string {
 	return sessionview.Status(s)
 }
 
-// sessionTooltip renders the hover card with pango markup:
+// TooltipMarkup renders the shared Waybar hover card with Pango markup.
+// Both named chips and compact circles use this formatter, independently of
+// their geometry and visible labels:
 //
 //	cyclops  ~/Projects/cyclops          (name in small caps, path dimmed)
 //	goosebook   ● working · 37m
@@ -435,7 +437,7 @@ func sessionStatus(s state.Session) string {
 // the module's JSON, so rewriting it makes waybar re-render the module and
 // dismiss any open hover; a field that ticks per second makes the card
 // unhoverable. See durfmt.Coarse for the measurement that motivated it.
-func sessionTooltip(cfg projectname.Config, cache *sblabel.NameCache, s state.Session, now time.Time) string {
+func TooltipMarkup(cfg projectname.Config, cache *sblabel.NameCache, s state.Session, now time.Time) string {
 	var full, task string
 	if s.Remote {
 		base := strings.TrimSpace(s.CWD)

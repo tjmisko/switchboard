@@ -2,11 +2,11 @@
    named chips. Every session is a separate GTK widget, with no text label. */
 #switchboard-circles { margin: 0 6px 0 2px; padding: 0; }
 #switchboard-circle {
-  min-width: 12px;
-  min-height: 12px;
+  min-width: 18px;
+  min-height: 18px;
   padding: 0;
   margin: 0;
-  border: 1px solid #3f3f4a;
+  border: 3px solid #3f3f4a;
   border-radius: 999px;
   background-color: #242428;
   background-image: none;
@@ -22,7 +22,7 @@
 #switchboard-circle.focused.idle { border-color: #e0a35c; }
 #switchboard-circle.focused.permission { border-color: #ec8080; }
 #switchboard-circle.focused.unknown { border-color: #8b8ba8; }
-#switchboard-circle.remote { min-width: 8px; min-height: 8px; border-width: 3px; border-style: double; }
+#switchboard-circle.remote { min-width: 12px; min-height: 12px; border-width: 6px; border-style: double; }
 #switchboard-circle.suspended { opacity: 0.4; }
-#switchboard-circle.headless { background-color: transparent; border: 1px dotted rgba(120,120,150,0.35); }
+#switchboard-circle.headless { background-color: transparent; border-style: dotted; border-color: rgba(120,120,150,0.35); }
 #switchboard-circle:hover { box-shadow: inset 0 0 0 1px rgba(255,255,255,0.15); }
