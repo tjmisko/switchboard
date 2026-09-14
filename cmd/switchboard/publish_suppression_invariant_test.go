@@ -327,35 +327,15 @@ func (m focusManager) ActiveWindow(context.Context) (string, error)     { return
 func (focusManager) Focus(context.Context, string) error                { return nil }
 func (focusManager) Subscribe(context.Context) (<-chan wm.Event, error) { return nil, nil }
 
-// sharedWindowFixture puts TWO agent sessions behind ONE window address, which
-// is what two wezterm splits (or tabs) in a single Hyprland window actually look
-// like to the daemon — a routine local layout, not a contrived one.
+// sharedWindowFixture models a legacy terminal with window-only focus. The
+// original focus implementation chose representatives using random map order,
+// producing history edges while the wire snapshot stayed unchanged. The old
+// guard below is retained as a skipped historical test; the pane-focus change
+// also makes this legacy selection deterministic. TestLegacySharedWindowDoesNotInventFocusHistory
+// now requires no edges, and the direct Apply-closure test covers recording
+// independently of that former bug.
 //
-// It is the one configuration in which an in-Apply sink.Record fires while the
-// change key holds still, and it is worth spelling out why, because the test
-// below is only meaningful if this stays true:
-//
-// applyFocus (main.go) recovers the previously-focused id by ranging the session
-// map and breaking at the first Focused session, then assigns the new id while
-// ranging the map a SECOND time, keeping the last Focused session it sees. With
-// two sessions focused, the first range yields one of them and the second range
-// yields the other, each order independently randomized by the runtime — so
-// prevID != newID on roughly half of all ticks and a focus event is recorded.
-// Meanwhile both sessions were already Focused and stay Focused, so not one byte
-// of the wire snapshot moves and Apply suppresses the publish.
-//
-// NOTE FOR WHOEVER FIXES THAT: the spurious focus event is a real daemon bug
-// (the dashboard's focus spans get chopped up by edges the user never caused).
-// It should be fixed. When it is, this test will go red with "0 focus events" —
-// that is the fix working, NOT this guard failing. Convert it to a t.Skip naming
-// the fix rather than deleting it, and lean on
-// TestShouldRunTheApplyClosureAndItsRecordsWhenTheChangeKeyIsUnchanged, which
-// pins the same invariant without depending on the bug.
-//
-// tick takes the sink per call so the settle ticks can run against a DISABLED
-// sink: the day-file then contains only the events of the measured stretch, and
-// an assertion on "did anything get recorded" cannot be satisfied by a settle
-// tick that ran before the measurement began.
+// tick takes a sink so setup can settle without recording measured events.
 func sharedWindowFixture(t *testing.T) (store *state.Store, tick func(sink *history.Sink)) {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
@@ -412,6 +392,7 @@ func drainBroadcasts(sub <-chan state.Broadcast) int {
 // focus is the event class this protects: 698 of today's ~8200 events, and the
 // input to the dashboard's focus spans.
 func TestShouldRecordFocusFromInsideApplyWhenApplySuppressesThePublish(t *testing.T) {
+	t.Skip("pane-aware focus and deterministic legacy focus selection eliminate the spurious edges this guard used; TestShouldRunTheApplyClosureAndItsRecordsWhenTheChangeKeyIsUnchanged covers recording independently")
 	store, tick := sharedWindowFixture(t)
 
 	// Settle (labels emitted, capabilities published, flags reconciled) against a

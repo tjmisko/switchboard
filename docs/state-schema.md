@@ -93,7 +93,7 @@ enrichment, graph, and display-name fields are omitted when unavailable.
 | `cwd` | string | always | Root working directory. It is display/project metadata and is never used to bind a provider thread. |
 | `tty` | string | always | Opaque controlling-terminal identity; may be empty on an Observe-only root. |
 | `started_at` | RFC 3339 timestamp | always | Process-lifetime discriminator recorded by discovery. |
-| `focused` | boolean | always | Whether the resolved window is active. |
+| `focused` | boolean | always | Whether the resolved window is active and, with the WezTerm integration, this session owns its active pane. |
 | `suspended` | boolean | omitted when false | Whether the root is job-control-stopped. |
 | `headless` | boolean | omitted when false | Whether the discovered run has no navigable interactive TUI. |
 | `local_workspace` | integer | omitted when unresolved | Federated aggregate only, and only on remote rows: the Hyprland workspace id **on the reading machine** of the window displaying this session. A remote row's own `hyprland` block is stripped (its coordinates locate the other desktop), so this is the only workspace a local reader can act on — it is what the bottom bar reports and what places the chip in workspace order. `0` means unresolved, the same convention as `workspace_id`. |

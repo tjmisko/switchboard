@@ -11,6 +11,7 @@ package mapping
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,6 +34,11 @@ type Resolver struct {
 // NewResolver builds a Resolver over the given terminal locator and WM manager.
 func NewResolver(term terminal.Locator, manager wm.Manager) *Resolver {
 	return &Resolver{term: term, wm: manager}
+}
+
+// ActiveWindow reads the same WM used for session mapping.
+func (r *Resolver) ActiveWindow(ctx context.Context) (string, error) {
+	return r.wm.ActiveWindow(ctx)
 }
 
 // SetWindowObserver installs a callback handed each WM client enumeration this
@@ -85,9 +91,10 @@ func (r *Resolver) Resolve(ctx context.Context, info osproc.Info) state.Session 
 	if pane.Mux != 0 {
 		if win := r.findWindow(resolveCtx, pane.Mux, pane.WindowID, pane.WindowTitle); win != nil {
 			sess.Hyprland = &state.HyprlandInfo{
-				Address:     win.Address,
-				Workspace:   win.Workspace,
-				WorkspaceID: win.WorkspaceID,
+				Address:      win.Address,
+				Workspace:    win.Workspace,
+				WorkspaceID:  win.WorkspaceID,
+				ActivePaneID: activePaneID(win.Title, pane.Mux, pane.WindowID),
 			}
 		}
 	}
@@ -120,6 +127,7 @@ func (r *Resolver) Reconcile(ctx context.Context, sess *state.Session) {
 			sess.Hyprland.Address = win.Address
 			sess.Hyprland.Workspace = win.Workspace
 			sess.Hyprland.WorkspaceID = win.WorkspaceID
+			sess.Hyprland.ActivePaneID = activePaneID(win.Title, pane.Mux, pane.WindowID)
 		}
 	}
 }
@@ -218,6 +226,7 @@ func (*Resolver) ReconcileFrom(sess *state.Session, panes map[string]terminal.Pa
 			sess.Hyprland.Address = win.Address
 			sess.Hyprland.Workspace = win.Workspace
 			sess.Hyprland.WorkspaceID = win.WorkspaceID
+			sess.Hyprland.ActivePaneID = activePaneID(win.Title, pane.Mux, pane.WindowID)
 		}
 	}
 }
@@ -244,6 +253,31 @@ func (r *Resolver) findWindow(ctx context.Context, muxPID, windowID int, windowT
 		return nil
 	}
 	return matchUniqueClient(clients, muxPID, windowID, windowTitle)
+}
+
+// The pane marker immediately precedes the existing window marker, keeping
+// older window joins compatible. Scope it to the matched mux/window, never to
+// a pane number found incidentally in the user's title. Pane zero is valid.
+func activePaneID(title string, muxPID, windowID int) *int {
+	marker := panebind.WindowMarker(panebind.LocalPaneRef{GUIPID: muxPID, WindowID: windowID})
+	title, ok := strings.CutSuffix(strings.TrimSpace(title), marker)
+	if !ok {
+		return nil
+	}
+	title = strings.TrimSpace(title)
+	start := strings.LastIndex(title, "[sbp:")
+	if start < 0 || (start > 0 && title[start-1] != ' ') || !strings.HasSuffix(title, "]") {
+		return nil
+	}
+	digits := title[start+5 : len(title)-1]
+	if digits == "" || strings.Trim(digits, "0123456789") != "" {
+		return nil
+	}
+	id, err := strconv.Atoi(digits)
+	if err != nil {
+		return nil
+	}
+	return &id
 }
 
 // matchUniqueClient returns the one OS window owned by the terminal pane.

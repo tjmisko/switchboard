@@ -531,11 +531,9 @@ func attentionRing(sessions []state.Session) []*state.Session {
 // to the adjacent tier. Thus orange always jumps to red while any red exists,
 // and an orange can never become a staircase to green.
 //
-// Skipping (rather than merely advancing past) the focused set is what makes
-// the wezterm split case safe. Focused is a WINDOW flag today, so two sessions
-// sharing one window both report it; skipping the whole set lands the press on
-// a genuinely different window instead of on a sibling pane, which would look
-// like another dead key.
+// Skip the entire focused set for legacy terminals that report window-only
+// focus. The WezTerm integration selects just one pane, so its siblings remain
+// valid targets in the same window.
 //
 // Returns nil when the bounded ring is empty, or when every member in the
 // allowed one-layer range is already focused. A less urgent session may exist

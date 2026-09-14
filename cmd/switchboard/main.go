@@ -279,6 +279,9 @@ func main() {
 	server := rpc.New(store, *socketPath, term, manager)
 	server.SetTuning(tun)
 	server.SetHistory(sink)
+	server.SetFocusObserver(func(ctx context.Context) {
+		reresolveAll(ctx, store, resolver, turn, sink)
+	})
 	server.SetAgentHookHandler(agentRuntime.HandleHook)
 	server.SetAgentDiagnosticSource(agentRuntime.Diagnostics)
 	server.SetHookAttributionDiagnostic(func(diagnostic rpc.HookAttributionDiagnostic) {
@@ -707,7 +710,7 @@ func drainWMEvents(ctx context.Context, store *state.Store, resolver *mapping.Re
 		}
 		timer.Stop()
 		pending = false
-		reresolveAll(ctx, store, resolver, turn)
+		reresolveAll(ctx, store, resolver, turn, sink)
 	}
 
 	for {
@@ -757,7 +760,7 @@ func drainWMEvents(ctx context.Context, store *state.Store, resolver *mapping.Re
 			}
 		case <-timer.C:
 			pending = false
-			reresolveAll(ctx, store, resolver, turn)
+			reresolveAll(ctx, store, resolver, turn, sink)
 		}
 	}
 }
@@ -805,9 +808,10 @@ func handleWMEvent(ctx context.Context, store *state.Store, resolver *mapping.Re
 			}
 		})
 	case wm.EventFocusChanged:
-		now := time.Now()
-		store.Apply(func(m map[int]*state.Session) {
-			applyFocus(m, evt.Address, sink, now)
+		turn.Do(func() {
+			store.Apply(func(m map[int]*state.Session) {
+				applyFocus(m, evt.Address, sink, time.Now())
+			})
 		})
 	case wm.EventLayoutChanged:
 		// Something changed — kick a reconcile on any session that might match.
@@ -819,7 +823,7 @@ func handleWMEvent(ctx context.Context, store *state.Store, resolver *mapping.Re
 		// is a worse failure than the one it would prevent. It takes the same turn
 		// as every other resolve, so reviving it cannot reintroduce the concurrent-
 		// enumeration inversion — it would only bypass the debounce's rationing.
-		reresolveAll(ctx, store, resolver, turn)
+		reresolveAll(ctx, store, resolver, turn, sink)
 	}
 }
 
@@ -830,7 +834,7 @@ func handleWMEvent(ctx context.Context, store *state.Store, resolver *mapping.Re
 // PER SESSION, so this is O(sessions) subprocess spawns — measured at 71% of the
 // daemon's CPU — and it runs inside store.Apply, holding the lock every RPC
 // reader and every hook queues behind. layoutDebounce exists to ration it.
-func reresolveAll(ctx context.Context, store *state.Store, resolver *mapping.Resolver, turn *resolveTurn) {
+func reresolveAll(ctx context.Context, store *state.Store, resolver *mapping.Resolver, turn *resolveTurn, sink *history.Sink) {
 	// Enumerate ONCE, outside the lock, exactly as reconcileOnce does. Hoisting
 	// only the reconciler left this path still resolving per-session under the
 	// lock, and a live 12-session box showed it immediately: the 5s spike train
@@ -839,6 +843,7 @@ func reresolveAll(ctx context.Context, store *state.Store, resolver *mapping.Res
 	// runs; this is what makes each run cheap.
 	turn.Do(func() {
 		panes, clients := resolver.Enumerate(ctx)
+		active, focusErr := resolver.ActiveWindow(ctx)
 		now := time.Now()
 		snapshot := store.Snapshot()
 		resolved := make(map[int]state.Session, len(snapshot.Sessions))
@@ -855,6 +860,11 @@ func reresolveAll(ctx context.Context, store *state.Store, resolver *mapping.Res
 				}
 				sess.Wezterm = value.Wezterm
 				sess.Hyprland = value.Hyprland
+			}
+			// Changing tabs changes the title marker without changing the active
+			// OS window. Publish that focus edge on the layout path too.
+			if focusErr == nil {
+				applyFocus(m, active, sink, now)
 			}
 		})
 	})
@@ -1114,7 +1124,8 @@ func recordReconcileTransition(sink *history.Sink, sess *state.Session, c *state
 }
 
 // applyFocus reconciles every session's Focused flag against the active window
-// address and records a focus event when the focused AGENT session changes. It
+// address and its active WezTerm pane, when the title integration supplies it.
+// It records a focus event when the focused AGENT session changes and
 // runs inside store.Apply (the caller holds the state lock): it reads the prior
 // Focused flags to recover which agent session was focused, flips them to match
 // activeAddr, and — only on a real change — sink.Records an EventFocus. The
@@ -1129,20 +1140,21 @@ func recordReconcileTransition(sink *history.Sink, sess *state.Session, c *state
 // active-window address ("" → no/unknown window, so all sessions unfocus). The
 // event carries only ids/pid/agent (no cwd) — focus is minimal-safe.
 func applyFocus(m map[int]*state.Session, activeAddr string, sink *history.Sink, now time.Time) {
+	previous := focusedSession(m)
 	prevID := ""
+	if previous != nil {
+		prevID = enrichmentID(previous)
+	}
 	for _, sess := range m {
-		if sess.Focused {
-			prevID = enrichmentID(sess)
-			break
+		focused := !sess.Headless && activeAddr != "" && sess.Hyprland != nil && sess.Hyprland.Address == activeAddr
+		if focused && sess.Wezterm != nil && sess.Hyprland.ActivePaneID != nil {
+			focused = sess.Wezterm.PaneID == *sess.Hyprland.ActivePaneID
 		}
+		sess.Focused = focused
 	}
 	newID, newPID, newAgent := "", 0, ""
-	for _, sess := range m {
-		focused := activeAddr != "" && sess.Hyprland != nil && sess.Hyprland.Address == activeAddr
-		sess.Focused = focused
-		if focused {
-			newID, newPID, newAgent = enrichmentID(sess), sess.PID, sess.Agent
-		}
+	if current := focusedSession(m); current != nil {
+		newID, newPID, newAgent = enrichmentID(current), current.PID, current.Agent
 	}
 	if newID == prevID {
 		return
@@ -1151,6 +1163,18 @@ func applyFocus(m map[int]*state.Session, activeAddr string, sink *history.Sink,
 		Ts: now, Type: history.EventFocus,
 		SessionID: newID, PID: newPID, Agent: newAgent,
 	})
+}
+
+// Legacy terminals can still have several sessions in a focused window. Pick
+// the same representative on both sides so map iteration cannot invent edges.
+func focusedSession(m map[int]*state.Session) *state.Session {
+	var chosen *state.Session
+	for _, sess := range m {
+		if sess.Focused && (chosen == nil || sess.PID < chosen.PID) {
+			chosen = sess
+		}
+	}
+	return chosen
 }
 
 // enrichmentID returns the session's agent session id (the stable history join

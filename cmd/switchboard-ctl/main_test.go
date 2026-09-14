@@ -221,9 +221,9 @@ func TestNextAttentionTarget(t *testing.T) {
 			wantPID:  0,
 		},
 		{
-			// Focused is a window flag, so two panes of one wezterm window both
-			// report it; skipping the whole focused set lands on a real move.
-			name:     "should skip a sibling pane sharing the focused window",
+			// Legacy terminals may report window-only focus; skipping that
+			// whole focused set still lands on a real move.
+			name:     "should skip legacy siblings sharing window-only focus",
 			sessions: []state.Session{focusedSess(1, "working"), focusedSess(2, "working"), sess(3, "idle")},
 			wantPID:  3,
 		},

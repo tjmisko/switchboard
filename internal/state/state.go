@@ -180,6 +180,10 @@ type HyprlandInfo struct {
 	Workspace   string `json:"workspace"`
 	WorkspaceID int    `json:"workspace_id"`
 	Monitor     string `json:"monitor"`
+	// ActivePaneID is the WezTerm pane in the visible tab, read from the
+	// compositor title marker. Nil means the integration has not supplied it.
+	// This live observation stays off the wire; Focused is its public projection.
+	ActivePaneID *int `json:"-"`
 }
 
 // AgentInfo is the per-session enrichment a coding agent's hooks feed in. The
@@ -1039,6 +1043,10 @@ func (s *Store) snapshotLocked() Snapshot {
 		}
 		if sess.Hyprland != nil {
 			value := *sess.Hyprland
+			if value.ActivePaneID != nil {
+				paneID := *value.ActivePaneID
+				value.ActivePaneID = &paneID
+			}
 			cp.Hyprland = &value
 		}
 		// Deep-copy the enrichment blocks so the snapshot never shares the live

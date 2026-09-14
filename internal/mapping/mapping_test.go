@@ -254,6 +254,16 @@ func TestReconcileFromMatchesReconcile(t *testing.T) {
 			},
 		},
 		{
+			name: "should preserve active pane zero from the formatted window marker",
+			seed: func() state.Session {
+				return state.Session{PID: 108, TTY: "/dev/pts/5", StartedAt: started}
+			},
+			panes: map[string]terminal.PaneRef{"/dev/pts/5": weztermPane},
+			clients: []wm.Window{
+				{Address: "0xAAA", PID: 4242, Title: "same [sbp:0] [sbw:4242:1]", WorkspaceID: 3},
+			},
+		},
+		{
 			name: "should leave the session untouched when no pane owns the tty",
 			seed: func() state.Session {
 				return state.Session{PID: 101, TTY: "/dev/pts/9", CWD: "/home/u", StartedAt: started}
@@ -347,7 +357,7 @@ func TestReconcileFromMatchesReconcile(t *testing.T) {
 			if !reflect.DeepEqual(got, want) {
 				t.Errorf("ReconcileFrom diverged from Reconcile\n got: %+v\nwant: %+v", got, want)
 			}
-			if got.Hyprland != nil && want.Hyprland != nil && *got.Hyprland != *want.Hyprland {
+			if got.Hyprland != nil && want.Hyprland != nil && !reflect.DeepEqual(got.Hyprland, want.Hyprland) {
 				t.Errorf("hyprland = %+v, want %+v", *got.Hyprland, *want.Hyprland)
 			}
 		})
@@ -425,5 +435,36 @@ func TestEnumerateWithoutAWindowObserverIsUnchanged(t *testing.T) {
 	resolver := NewResolver(mapLocator{panes: map[string]terminal.PaneRef{}}, sliceManager{clients: clients})
 	if _, got := resolver.Enumerate(context.Background()); !reflect.DeepEqual(got, clients) {
 		t.Fatalf("Enumerate clients = %+v, want %+v", got, clients)
+	}
+}
+
+func TestActivePaneMarkerIsScopedToTheExactWindow(t *testing.T) {
+	for _, tc := range []struct {
+		title string
+		want  int
+	}{
+		{"same [sbp:0] [sbw:10:3]", 0},
+		{"same [sbp:12] [sbw:10:3] ", 12},
+		{"same [sbp:12] [sbw:10:4]", -1},
+		{"same [sbp:12] [sbw:99:3]", -1},
+		{"same [sbp:12] unrelated [sbw:10:3]", -1},
+		{"same [sbp:-1] [sbw:10:3]", -1},
+		{"same [sbp:+1] [sbw:10:3]", -1},
+		{"same [sbp:] [sbw:10:3]", -1},
+		{"same [sbp:99999999999999999999999999] [sbw:10:3]", -1},
+		{"same [sbw:10:3]", -1},
+	} {
+		t.Run(tc.title, func(t *testing.T) {
+			got := activePaneID(tc.title, 10, 3)
+			if tc.want < 0 {
+				if got != nil {
+					t.Fatalf("unexpected pane %d", *got)
+				}
+				return
+			}
+			if got == nil || *got != tc.want {
+				t.Fatalf("pane = %v, want %d", got, tc.want)
+			}
+		})
 	}
 }

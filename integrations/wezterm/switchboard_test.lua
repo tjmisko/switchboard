@@ -37,6 +37,13 @@ local switchboard = dofile(module_path)
 assert(switchboard.marker(9) == '[sbw:4321:9]')
 assert(switchboard.format_window_title('project', { window_id = 9 }) == 'project [sbw:4321:9]')
 assert(switchboard.format_window_title('project [sbw:1:2]', { window_id = 9 }) == 'project [sbw:4321:9]')
+local tab_a = { window_id = 9, active_pane = { pane_id = 0 } }
+local tab_b = { window_id = 9, active_pane = { pane_id = 7 } }
+assert(switchboard.format_window_title('same', tab_a) == 'same [sbp:0] [sbw:4321:9]')
+assert(switchboard.format_window_title('same', tab_b) == 'same [sbp:7] [sbw:4321:9]')
+assert(switchboard.format_window_title('same [sbp:0] [sbw:4321:9]', tab_b) == 'same [sbp:7] [sbw:4321:9]')
+assert(switchboard.format_window_title('', tab_a) == '[sbp:0] [sbw:4321:9]')
+assert(switchboard.format_window_title('same [sbp:0] [sbw:4321:9]', nil) == 'same')
 
 switchboard.setup { ctl_path = '/trusted/switchboard-ctl' }
 assert(type(callbacks['user-var-changed']) == 'function')

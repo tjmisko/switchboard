@@ -124,13 +124,18 @@ end
 function M.format_window_title(base_title, tab)
   local title = tostring(base_title or '')
   title = title:gsub('%s*%[sbw:%d+:%d+%]%s*$', '')
+  title = title:gsub('%s*%[sbp:%d+%]%s*$', '')
   if not tab or tab.window_id == nil then
     return title
   end
-  if title == '' then
-    return M.marker(tab.window_id)
+  local marker = M.marker(tab.window_id)
+  if tab.active_pane and tab.active_pane.pane_id ~= nil then
+    marker = string.format('[sbp:%d] ', tab.active_pane.pane_id) .. marker
   end
-  return title .. ' ' .. M.marker(tab.window_id)
+  if title == '' then
+    return marker
+  end
+  return title .. ' ' .. marker
 end
 
 -- Register the non-title callbacks. ctl_path is local trusted configuration;

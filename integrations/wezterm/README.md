@@ -22,6 +22,18 @@ If the configuration already has a `format-window-title` callback, call
 callback instead of registering a second one. WezTerm executes only the first
 handler for this event.
 
+The formatter appends the active pane ID before the existing window marker:
+`[sbp:7] [sbw:4321:9]`. This lets the bars highlight only the session in the
+visible tab's active pane, even when several tabs have identical titles. Native
+tab and split changes update focus through the compositor's title event;
+`cycle next` and `cycle prev` refresh focus after navigation as well.
+An ordinary shell tab clears all agent highlights in that window.
+
+Update the installed `switchboard.lua` along with the daemon to enable this.
+Older formatters retain window-only highlighting. WezTerm's CLI `is_active`
+flag alone cannot identify the visible tab: it names the active pane in each
+tab, including hidden tabs.
+
 The module invokes only these fixed argument vectors, without a shell:
 
 ```text

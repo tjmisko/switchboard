@@ -123,12 +123,13 @@ func TestSnapshotEqualStartedAtSortsByPID(t *testing.T) {
 
 func TestSnapshotDetachesMutableSessionFields(t *testing.T) {
 	store := state.New("")
+	paneID := 0
 	store.Apply(func(m map[int]*state.Session) {
 		m[1] = &state.Session{
 			PID:       1,
 			StartedAt: time.Unix(1, 0),
 			Wezterm:   &state.WeztermInfo{WindowTitle: "old"},
-			Hyprland:  &state.HyprlandInfo{WorkspaceID: 1},
+			Hyprland:  &state.HyprlandInfo{WorkspaceID: 1, ActivePaneID: &paneID},
 			Claude: &state.AgentInfo{
 				Workflows: []state.WorkflowStatus{{RunID: "old"}},
 				Pending:   map[string]state.PendingPrompt{"writer": {Tool: "Read"}},
@@ -141,12 +142,14 @@ func TestSnapshotDetachesMutableSessionFields(t *testing.T) {
 		session := m[1]
 		session.Wezterm.WindowTitle = "new"
 		session.Hyprland.WorkspaceID = 2
+		*session.Hyprland.ActivePaneID = 1
 		session.Claude.Workflows[0].RunID = "new"
 		session.Claude.Pending["writer"] = state.PendingPrompt{Tool: "Write"}
 	})
 
 	got := snapshot.Sessions[0]
 	if got.Wezterm.WindowTitle != "old" || got.Hyprland.WorkspaceID != 1 ||
+		*got.Hyprland.ActivePaneID != 0 ||
 		got.Claude.Workflows[0].RunID != "old" || got.Claude.Pending["writer"].Tool != "Read" {
 		t.Fatalf("snapshot changed after a later Apply: %+v", got)
 	}

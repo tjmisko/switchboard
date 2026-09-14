@@ -33,6 +33,12 @@ jq -r '
 
 ## Waybar
 
+With the [WezTerm integration](../../integrations/wezterm/README.md), focus is
+specific to the active pane in the visible tab. Tabs sharing a Hyprland window
+remain separate session chips, and `switchboard-ctl cycle next|prev` visits
+each one in either direction. Update the installed Lua module with the daemon
+when upgrading from window-only focus.
+
 The presentation can switch between named bottom chips and compact circles in
 the existing top Waybar. Both consume the same ordered live session view. See
 [display modes](../display-modes.md) for the hotkey, native circle module, and

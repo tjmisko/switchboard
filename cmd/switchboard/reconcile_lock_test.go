@@ -173,7 +173,7 @@ func TestShouldNotHoldTheStoreLockAcrossEnumerationOnTheWMLayoutPath(t *testing.
 	store, loc, resolver, _ := reconcileFixture(t, 8)
 
 	got := measureWorstReaderWait(store, func() {
-		reresolveAll(context.Background(), store, resolver, nil)
+		reresolveAll(context.Background(), store, resolver, nil, nil)
 	})
 
 	// Found in production, not in a unit test: hoisting only the reconciler left
@@ -338,7 +338,7 @@ func runConcurrentResolves(t *testing.T, turn *resolveTurn) bool {
 	}()
 	go func() {
 		defer wg.Done()
-		reresolveAll(context.Background(), store, resolver, turn)
+		reresolveAll(context.Background(), store, resolver, turn, nil)
 	}()
 	wg.Wait()
 

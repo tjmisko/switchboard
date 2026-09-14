@@ -243,6 +243,7 @@ type Server struct {
 	paneBind    PaneBindHandler
 	paneState   PaneStateHandler
 	announce    BindingAnnouncer
+	afterFocus  func(context.Context)
 	// hookAttributionDiagnostic receives finite labels and, for a unique match,
 	// the already-discovered root PID. It observes whether an otherwise-
 	// unattributable plain-Codex hook carried a terminal identity matching zero,
@@ -268,6 +269,11 @@ func (s *Server) SetTuning(t statustune.Tuning) { s.tun = t }
 // SetHistory wires the activity-log sink the hook handler records transitions to.
 // Call once at startup before Serve. A nil sink (the default) records nothing.
 func (s *Server) SetHistory(h *history.Sink) { s.hist = h }
+
+// SetFocusObserver refreshes focus after a successful local navigation, before
+// acknowledging the RPC. A following cycle keypress then sees the new pane
+// even when no OS-window focus event fires. Install once before Serve.
+func (s *Server) SetFocusObserver(observe func(context.Context)) { s.afterFocus = observe }
 
 // SetFanout wires the subagent fanout Observer that a SubagentStart/Stop hook
 // triggers an immediate re-scan on (single source of truth, shared with the
@@ -624,6 +630,9 @@ func (s *Server) focusLocalTarget(ctx context.Context, target *state.Session) er
 	}
 	if !acted {
 		return fmt.Errorf("session %d has no window or pane to focus yet", target.PID)
+	}
+	if s.afterFocus != nil {
+		s.afterFocus(ctx)
 	}
 	return nil
 }
