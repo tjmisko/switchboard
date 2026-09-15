@@ -476,7 +476,7 @@ func cycleTargetPID(sessions []state.Session, direction string) (int, bool) {
 // cmdAttention jumps toward the most urgent populated tier. When focus is
 // already in that tier, it cycles peers there and may toggle at most one tier
 // above it, so repeated presses can never climb all the way from red to green.
-// Bound to mod+Shift+a in Hyprland.
+// Bound to mod+a in Hyprland.
 func cmdAttention(c *rpc.Client) {
 	target := nextAttentionTarget(mustList(c).Sessions)
 	if target == nil {
@@ -495,14 +495,23 @@ func cmdAttention(c *rpc.Client) {
 //
 // This ceiling is computed from the snapshot, not from the focused session.
 // Consequently repeated presses stay within the same bounded set instead of
-// using an orange as a staircase from red to green. Within each tier, snapshot
-// order is preserved. Unknown (grey) sessions are excluded —
+// using an orange as a staircase from red to green. Within each tier, follow
+// snapshot order to the right of focus, wrapping at the end. With no focused
+// navigable session, start at the left edge. Unknown (grey) sessions are excluded —
 // they are not actionable, and `cycle next|prev` already reaches every session
 // regardless of colour. Headless and unbound-remote rows are excluded by
 // sessionNavigable.
 func attentionRing(sessions []state.Session) []*state.Session {
-	var permission, idle, working []*state.Session
+	start := 0
 	for i := range sessions {
+		if sessionNavigable(sessions[i]) && sessions[i].Focused {
+			start = i + 1
+			break
+		}
+	}
+	var permission, idle, working []*state.Session
+	for step := range sessions {
+		i := (start + step) % len(sessions)
 		if !sessionNavigable(sessions[i]) {
 			continue
 		}
@@ -525,11 +534,12 @@ func attentionRing(sessions []state.Session) []*state.Session {
 }
 
 // nextAttentionTarget returns the session `attention` should focus. A press
-// from outside the most urgent populated tier always enters that tier at its
-// first member. A press from inside it advances to another un-focused peer in
-// the same tier; only when every urgent member is already focused may it toggle
-// to the adjacent tier. Thus orange always jumps to red while any red exists,
-// and an orange can never become a staircase to green.
+// from outside the most urgent populated tier enters that tier at its next
+// member to the right, wrapping at the end of the bar. A press from inside it
+// advances to another un-focused peer in the same tier; only when every urgent
+// member is already focused may it toggle to the adjacent tier, also to the
+// right. Thus orange always jumps to red while any red exists, and an orange
+// can never become a staircase to green.
 //
 // Skip the entire focused set for legacy terminals that report window-only
 // focus. The WezTerm integration selects just one pane, so its siblings remain
@@ -539,56 +549,14 @@ func attentionRing(sessions []state.Session) []*state.Session {
 // allowed one-layer range is already focused. A less urgent session may exist
 // outside that range; `cycle next|prev` remains the unrestricted navigator.
 func nextAttentionTarget(sessions []state.Session) *state.Session {
-	ring := attentionRing(sessions)
-	if len(ring) == 0 {
-		return nil
-	}
-
-	urgentTier := attentionTier(*ring[0])
-	urgentEnd := 0
-	for urgentEnd < len(ring) && attentionTier(*ring[urgentEnd]) == urgentTier {
-		urgentEnd++
-	}
-
-	// Focus outside the urgent tier (including an orange while red exists)
-	// always jumps to the first urgent session.
-	focusedUrgent := -1
-	for i := 0; i < urgentEnd; i++ {
-		if ring[i].Focused {
-			focusedUrgent = i
-			break
-		}
-	}
-	if focusedUrgent < 0 {
-		return ring[0]
-	}
-
-	// Stay at maximum urgency while another window in that tier is available.
-	for step := 1; step < urgentEnd; step++ {
-		if candidate := ring[(focusedUrgent+step)%urgentEnd]; !candidate.Focused {
-			return candidate
-		}
-	}
-	// Every urgent member is already focused. Toggle no more than one tier up.
-	for _, candidate := range ring[urgentEnd:] {
+	// The ring puts urgency first and orders each tier to the right of focus.
+	// Only exhausted (entirely focused) urgent tiers allow a one-layer toggle.
+	for _, candidate := range attentionRing(sessions) {
 		if !candidate.Focused {
 			return candidate
 		}
 	}
 	return nil
-}
-
-func attentionTier(session state.Session) int {
-	switch sessionStatus(session) {
-	case state.StatusPermission:
-		return 0
-	case state.StatusIdle:
-		return 1
-	case state.StatusWorking, state.StatusDelegating:
-		return 2
-	default:
-		return 3
-	}
 }
 
 // sessionStatus normalizes a missing or empty agent status to "unknown",
@@ -893,7 +861,8 @@ commands:
   status                  one-line summary
   pick                    emit exact-token<TAB>label<TAB>ws<TAB>cwd for fzf
   cycle next|prev         focus the next/previous session, wrapping
-  attention               jump to the most urgent populated colour. If already
+  attention               move right to the most urgent populated colour,
+                            wrapping at the end of the bar. If already
                             there, cycle its peers or toggle at most one layer
                             above it. With any red present, orange always jumps
                             to red and green is unreachable. Unknown (grey)

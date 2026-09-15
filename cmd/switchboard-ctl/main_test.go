@@ -149,6 +149,46 @@ func TestNextAttentionTarget(t *testing.T) {
 			wantPID:  2,
 		},
 		{
+			name:     "should move right from green between two orange sessions",
+			sessions: []state.Session{sess(1, "idle"), focusedSess(2, "working"), sess(3, "idle")},
+			wantPID:  3,
+		},
+		{
+			name:     "should move right from orange between two red sessions",
+			sessions: []state.Session{sess(1, "permission"), focusedSess(2, "idle"), sess(3, "permission")},
+			wantPID:  3,
+		},
+		{
+			name:     "should move right from green outside the red bounded ring",
+			sessions: []state.Session{sess(1, "permission"), focusedSess(2, "working"), sess(3, "idle"), sess(4, "permission")},
+			wantPID:  4,
+		},
+		{
+			name:     "should move right from unknown outside the ring",
+			sessions: []state.Session{sess(1, "idle"), focusedSess(2, "unknown"), sess(3, "idle")},
+			wantPID:  3,
+		},
+		{
+			name:     "should toggle right from a singleton red between orange sessions",
+			sessions: []state.Session{sess(1, "idle"), focusedSess(2, "permission"), sess(3, "idle")},
+			wantPID:  3,
+		},
+		{
+			name:     "should toggle right from a singleton orange between green sessions",
+			sessions: []state.Session{sess(1, "working"), focusedSess(2, "idle"), sess(3, "delegating")},
+			wantPID:  3,
+		},
+		{
+			name:     "should skip headless sessions while moving right to orange",
+			sessions: []state.Session{sess(1, "idle"), focusedSess(2, "working"), headlessSess(3, "idle", false), sess(4, "idle")},
+			wantPID:  4,
+		},
+		{
+			name:     "should wrap to orange on the left when none is to the right",
+			sessions: []state.Session{sess(1, "idle"), focusedSess(2, "working"), sess(3, "working")},
+			wantPID:  1,
+		},
+		{
 			name:     "should cycle to the next permission session when focused on one",
 			sessions: []state.Session{focusedSess(1, "permission"), sess(2, "permission"), sess(3, "idle")},
 			wantPID:  2,
