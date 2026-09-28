@@ -19,12 +19,17 @@ import (
 type fakeHerdrSource struct {
 	mu       sync.Mutex
 	statuses map[herdr.PaneKey]herdr.PaneStatus
+	active   map[string]string // focused pane by socket
 	servers  []string
 	changes  chan herdr.PaneKey
 }
 
 func newFakeHerdrSource() *fakeHerdrSource {
-	return &fakeHerdrSource{statuses: make(map[herdr.PaneKey]herdr.PaneStatus), changes: make(chan herdr.PaneKey, 16)}
+	return &fakeHerdrSource{
+		statuses: make(map[herdr.PaneKey]herdr.PaneStatus),
+		active:   make(map[string]string),
+		changes:  make(chan herdr.PaneKey, 64),
+	}
 }
 
 func (f *fakeHerdrSource) SetServers(_ context.Context, sockets []string) {
@@ -40,7 +45,30 @@ func (f *fakeHerdrSource) Status(key herdr.PaneKey) (herdr.PaneStatus, bool) {
 	return status, ok
 }
 
+func (f *fakeHerdrSource) ActivePane(socket string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.active[socket]
+}
+
 func (f *fakeHerdrSource) Changes() <-chan herdr.PaneKey { return f.changes }
+
+// focus moves the server's focused pane and signals every pane on it, as the
+// watcher does.
+func (f *fakeHerdrSource) focus(socket, paneID string) {
+	f.mu.Lock()
+	f.active[socket] = paneID
+	var keys []herdr.PaneKey
+	for key := range f.statuses {
+		if key.Socket == socket {
+			keys = append(keys, key)
+		}
+	}
+	f.mu.Unlock()
+	for _, key := range keys {
+		f.changes <- key
+	}
+}
 
 func (f *fakeHerdrSource) set(key herdr.PaneKey, agent, status string, since time.Time) {
 	f.mu.Lock()
@@ -208,7 +236,7 @@ func TestRunHerdrStatusShouldApplyASignalledPaneToItsSession(t *testing.T) {
 	source := newFakeHerdrSource()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go runHerdrStatus(ctx, store, source, nil)
+	go runHerdrStatus(ctx, store, source, nil, nil)
 
 	source.set(herdrKey, "claude", herdr.StatusWorking, time.Now())
 	source.changes <- herdrKey

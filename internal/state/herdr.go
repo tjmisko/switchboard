@@ -35,6 +35,11 @@ type HerdrInfo struct {
 	// StatusSince is when herdr's status last changed, for the legacy
 	// StatusSince of an edge herdr decides.
 	StatusSince time.Time `json:"-"`
+	// ActivePaneID is the pane herdr's focus is on, on this pane's server: the
+	// herdr counterpart of HyprlandInfo.ActivePaneID. "" means herdr has not
+	// said (its server is not followed). This live observation stays off the
+	// wire; Focused is its public projection.
+	ActivePaneID string `json:"-"`
 }
 
 // Raw herdr statuses, as the socket API spells them.
@@ -89,6 +94,8 @@ type HerdrReading struct {
 	Live bool
 	// Since is when herdr's status began.
 	Since time.Time
+	// ActivePaneID is the pane herdr's focus is on, "" when unknown.
+	ActivePaneID string
 }
 
 // SetHerdr records a reading of the session's herdr pane and re-projects the
@@ -110,7 +117,7 @@ func (s *Session) SetHerdr(r HerdrReading, now time.Time) (before, after string)
 		if s.Herdr == nil {
 			s.Herdr = &HerdrInfo{}
 		}
-		s.Herdr.PaneID, s.Herdr.Socket = r.PaneID, r.Socket
+		s.Herdr.PaneID, s.Herdr.Socket, s.Herdr.ActivePaneID = r.PaneID, r.Socket, r.ActivePaneID
 		status := s.publishedStatus(now)
 		return status, status
 	}
@@ -122,6 +129,7 @@ func (s *Session) SetHerdr(r HerdrReading, now time.Time) (before, after string)
 		h.StatusSince = r.Since
 	}
 	h.PaneID, h.Socket, h.Agent, h.Status, h.Live = r.PaneID, r.Socket, r.Agent, r.Status, r.Live
+	h.ActivePaneID = r.ActivePaneID
 	if !IsProviderAgent(s.Agent) {
 		before = s.graphStatus(now)
 		s.AgentGraph = herdrAgentGraph(s.Agent, r, s.AgentGraph, now)

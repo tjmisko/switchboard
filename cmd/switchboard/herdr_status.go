@@ -13,10 +13,12 @@ import (
 )
 
 // herdrStatusSource is the part of herdr.Watcher the daemon uses: herdr's live
-// agent status per pane, the servers to follow, and a lossy change signal.
+// agent status per pane, each server's focused pane, the servers to follow,
+// and a lossy change signal.
 type herdrStatusSource interface {
 	SetServers(ctx context.Context, sockets []string)
 	Status(herdr.PaneKey) (herdr.PaneStatus, bool)
+	ActivePane(socket string) string
 	Changes() <-chan herdr.PaneKey
 }
 
@@ -56,8 +58,10 @@ func applyHerdrPane(sess *state.Session, pane *terminal.PaneRef, source herdrSta
 		return
 	}
 	status, live := source.Status(herdr.PaneKey{Socket: socket, PaneID: paneID})
+	activePane := source.ActivePane(socket)
 	if h := sess.Herdr; h != nil && h.PaneID == paneID && h.Socket == socket &&
-		h.Agent == status.Agent && h.Status == status.Status && h.Live == live {
+		h.Agent == status.Agent && h.Status == status.Status && h.Live == live &&
+		h.ActivePaneID == activePane {
 		return
 	}
 	since := status.Since
@@ -68,6 +72,7 @@ func applyHerdrPane(sess *state.Session, pane *terminal.PaneRef, source herdrSta
 	before, after := sess.SetHerdr(state.HerdrReading{
 		PaneID: paneID, Socket: socket, TerminalID: status.TerminalID,
 		Agent: status.Agent, Status: status.Status, Live: live, Since: since,
+		ActivePaneID: activePane,
 	}, now)
 	if before == after {
 		return
@@ -123,7 +128,10 @@ func herdrLaneFacts(sess *state.Session) (since time.Time, sessionID string, sub
 // pane is re-read from the watcher and applied to the sessions in it. The
 // reconcile tick re-applies every session too, so a dropped signal only delays
 // an edge by one tick.
-func runHerdrStatus(ctx context.Context, store *state.Store, source herdrStatusSource, sink *history.Sink) {
+//
+// When herdr's focus moved, refocus re-derives which session the active window
+// shows: a pane switch inside herdr moves no OS window, so no WM event would.
+func runHerdrStatus(ctx context.Context, store *state.Store, source herdrStatusSource, sink *history.Sink, refocus func(context.Context)) {
 	for {
 		var first herdr.PaneKey
 		select {
@@ -144,13 +152,21 @@ func runHerdrStatus(ctx context.Context, store *state.Store, source herdrStatusS
 			}
 		}
 		now := time.Now()
+		focusMoved := false
 		store.Apply(func(m map[int]*state.Session) {
 			for _, sess := range m {
 				if sess.Herdr == nil || !keys[herdr.PaneKey{Socket: sess.Herdr.Socket, PaneID: sess.Herdr.PaneID}] {
 					continue
 				}
+				activeBefore := sess.Herdr.ActivePaneID
 				applyHerdrPane(sess, nil, source, sink, now)
+				if sess.Herdr.ActivePaneID != activeBefore {
+					focusMoved = true
+				}
 			}
 		})
+		if focusMoved && refocus != nil {
+			refocus(ctx)
+		}
 	}
 }

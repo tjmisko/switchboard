@@ -287,7 +287,9 @@ func main() {
 	// first window covers them.
 	go store.LogPublishStats(ctx, publishStatsInterval)
 	go runWMLoop(ctx, store, resolver, manager, sink, procSrc, forgetRoot, turn)
-	go runHerdrStatus(ctx, store, herdrWatcher, sink)
+	go runHerdrStatus(ctx, store, herdrWatcher, sink, func(ctx context.Context) {
+		refocus(ctx, store, resolver, turn, sink)
+	})
 	herdrFinder := newHerdrDiscovery(terminal.NewHerdr().(terminal.Snapshotter), herdrWatcher, herdr.Call, procSrc)
 	go runHerdrDiscovery(ctx, store, herdrFinder, herdrDiscoveryInterval, func(info osproc.Info, agent string, pane *terminal.PaneRef) {
 		appear(info, agent, false, pane)
@@ -900,6 +902,23 @@ func reresolveAll(ctx context.Context, store *state.Store, resolver *mapping.Res
 	})
 }
 
+// refocus re-derives every session's Focused flag against the WM's active
+// window. It serves an application whose visible pane changed with no WM event
+// at all: a herdr tab switch arrives only on herdr's own stream. A WezTerm tab
+// switch needs reresolveAll instead, because its observation rides the window
+// title, which only a re-resolve reads.
+func refocus(ctx context.Context, store *state.Store, resolver *mapping.Resolver, turn *resolveTurn, sink *history.Sink) {
+	turn.Do(func() {
+		active, err := resolver.ActiveWindow(ctx)
+		if err != nil {
+			return
+		}
+		store.Apply(func(m map[int]*state.Session) {
+			applyFocus(m, active, sink, time.Now())
+		})
+	})
+}
+
 // resolveTurn serializes the two producers of the session→window mapping: the
 // reconciler's tick and the WM layout path.
 //
@@ -1165,7 +1184,7 @@ func recordReconcileTransition(sink *history.Sink, sess *state.Session, c *state
 }
 
 // applyFocus reconciles every session's Focused flag against the active window
-// address and its active WezTerm pane, when the title integration supplies it.
+// address and the pane each application inside it shows (see showsInWindow).
 // It records a focus event when the focused AGENT session changes and
 // runs inside store.Apply (the caller holds the state lock): it reads the prior
 // Focused flags to recover which agent session was focused, flips them to match
@@ -1187,11 +1206,7 @@ func applyFocus(m map[int]*state.Session, activeAddr string, sink *history.Sink,
 		prevID = enrichmentID(previous)
 	}
 	for _, sess := range m {
-		focused := !sess.Headless && activeAddr != "" && sess.Hyprland != nil && sess.Hyprland.Address == activeAddr
-		if focused && sess.Wezterm != nil && sess.Hyprland.ActivePaneID != nil {
-			focused = sess.Wezterm.PaneID == *sess.Hyprland.ActivePaneID
-		}
-		sess.Focused = focused
+		sess.Focused = showsInWindow(sess, activeAddr)
 	}
 	newID, newPID, newAgent := "", 0, ""
 	if current := focusedSession(m); current != nil {
@@ -1204,6 +1219,26 @@ func applyFocus(m map[int]*state.Session, activeAddr string, sink *history.Sink,
 		Ts: now, Type: history.EventFocus,
 		SessionID: newID, PID: newPID, Agent: newAgent,
 	})
+}
+
+// showsInWindow reports whether the active window is showing the session. The
+// window is the outer layer; each application inside it that says which of its
+// panes is visible narrows the answer by one layer. A layer that has not said
+// (a nil or "" observation) leaves the answer at the layer outside it, so
+// several sessions can share focus only while an application stays silent.
+func showsInWindow(sess *state.Session, activeAddr string) bool {
+	if sess.Headless || activeAddr == "" || sess.Hyprland == nil || sess.Hyprland.Address != activeAddr {
+		return false
+	}
+	// WezTerm: the pane in the visible tab, from the window title's marker.
+	if sess.Wezterm != nil && sess.Hyprland.ActivePaneID != nil && sess.Wezterm.PaneID != *sess.Hyprland.ActivePaneID {
+		return false
+	}
+	// herdr: the pane its focus is on, from its event stream.
+	if sess.Herdr != nil && sess.Herdr.ActivePaneID != "" && sess.Herdr.PaneID != sess.Herdr.ActivePaneID {
+		return false
+	}
+	return true
 }
 
 // Legacy terminals can still have several sessions in a focused window. Pick
