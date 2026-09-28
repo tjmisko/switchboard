@@ -780,3 +780,66 @@ func TestHandleHookIgnoresNestedHeadlessSession(t *testing.T) {
 		t.Errorf("parent status = %q, want permission", got.Status)
 	}
 }
+
+// windowOnlyTerminal models foot: it locates the tty, but its window IS the
+// pane, so Activate has nothing finer than the WM step to do.
+type windowOnlyTerminal struct{}
+
+func (windowOnlyTerminal) Name() string    { return "foot" }
+func (windowOnlyTerminal) Available() bool { return true }
+func (windowOnlyTerminal) Locate(_ context.Context, tty string) (*terminal.PaneRef, error) {
+	return &terminal.PaneRef{Backend: "foot", Mux: 2001, TTY: tty}, nil
+}
+func (windowOnlyTerminal) Activate(context.Context, *terminal.PaneRef) error {
+	return terminal.ErrUnsupported
+}
+
+type focusRecordingWM struct{ focused []string }
+
+func (*focusRecordingWM) Name() string                                       { return "hyprland" }
+func (*focusRecordingWM) Available() bool                                    { return true }
+func (*focusRecordingWM) Clients(context.Context) ([]wm.Window, error)       { return nil, nil }
+func (*focusRecordingWM) ActiveWindow(context.Context) (string, error)       { return "", nil }
+func (*focusRecordingWM) Subscribe(context.Context) (<-chan wm.Event, error) { return nil, nil }
+func (m *focusRecordingWM) Focus(_ context.Context, ref string) error {
+	m.focused = append(m.focused, ref)
+	return nil
+}
+
+func TestFocusShouldSucceedOnTheWindowWhenTheTerminalHasNoFinerStep(t *testing.T) {
+	store := state.New("")
+	started := time.Now()
+	store.Apply(func(m map[int]*state.Session) {
+		m[42] = &state.Session{PID: 42, TTY: "/dev/pts/4", StartedAt: started,
+			Hyprland: &state.HyprlandInfo{Address: "0xfoot"}}
+	})
+	manager := &focusRecordingWM{}
+	s := New(store, "", windowOnlyTerminal{}, manager)
+
+	if err := s.FocusLocalSession(context.Background(), 42, started); err != nil {
+		t.Fatalf("focus err = %v, want nil: the window step acted", err)
+	}
+	if len(manager.focused) != 1 || manager.focused[0] != "0xfoot" {
+		t.Fatalf("WM focused %v, want [0xfoot]", manager.focused)
+	}
+}
+
+// A window-only terminal must not make an unmapped session look focusable: with
+// no window resolved (e.g. a foot server's ambiguous windows) nothing acted.
+func TestFocusShouldFailWhenAWindowOnlyTerminalSessionHasNoWindow(t *testing.T) {
+	store := state.New("")
+	started := time.Now()
+	store.Apply(func(m map[int]*state.Session) {
+		m[42] = &state.Session{PID: 42, TTY: "/dev/pts/4", StartedAt: started}
+	})
+	manager := &focusRecordingWM{}
+	s := New(store, "", windowOnlyTerminal{}, manager)
+
+	err := s.FocusLocalSession(context.Background(), 42, started)
+	if err == nil || !strings.Contains(err.Error(), "no window or pane") {
+		t.Fatalf("focus err = %v, want the no-window-or-pane error", err)
+	}
+	if len(manager.focused) != 0 {
+		t.Fatalf("WM focused %v, want nothing", manager.focused)
+	}
+}

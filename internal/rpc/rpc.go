@@ -613,6 +613,8 @@ func (s *Server) focusLocalTarget(ctx context.Context, target *state.Session) er
 	// focus the terminal pane by re-locating it from the (always-present) tty —
 	// so this works for wezterm and tmux without persisting backend-specific
 	// pane fields. At least one step must act, else there's nothing to focus.
+	// A terminal whose window IS the pane (foot) answers Activate with
+	// ErrUnsupported: it has no finer step, so only the WM step counts.
 	acted := false
 	if target.Hyprland != nil && target.Hyprland.Address != "" {
 		if err := s.wm.Focus(ctx, target.Hyprland.Address); err != nil {
@@ -622,10 +624,13 @@ func (s *Server) focusLocalTarget(ctx context.Context, target *state.Session) er
 	}
 	if target.TTY != "" {
 		if pane, err := s.term.Locate(ctx, target.TTY); err == nil && pane != nil {
-			if err := s.term.Activate(ctx, pane); err != nil {
+			switch err := s.term.Activate(ctx, pane); {
+			case err == nil:
+				acted = true
+			case errors.Is(err, terminal.ErrUnsupported):
+			default:
 				return fmt.Errorf("terminal activate: %w", err)
 			}
-			acted = true
 		}
 	}
 	if !acted {

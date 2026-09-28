@@ -287,8 +287,9 @@ func activePaneID(title string, muxPID, windowID int) *int {
 // window_title without that formatter suffix. Prefer the marker: it is a stable
 // exact join even when two windows share the same user-facing title. Fall back
 // to the legacy mux-pid + title join for terminals which have not installed the
-// integration. Either path fails closed on ambiguity and retries next tick
-// rather than guessing (decisions.md #4).
+// integration, or to the mux pid alone for a backend that reports no title.
+// Every path fails closed on ambiguity and retries next tick rather than
+// guessing (decisions.md #4).
 func matchUniqueClient(clients []wm.Window, muxPID, windowID int, windowTitle string) *wm.Window {
 	marker := panebind.WindowMarker(panebind.LocalPaneRef{GUIPID: muxPID, WindowID: windowID})
 	marked := uniqueClient(clients, func(c wm.Window) bool {
@@ -296,6 +297,16 @@ func matchUniqueClient(clients []wm.Window, muxPID, windowID int, windowTitle st
 	})
 	if marked.count > 0 {
 		return marked.one // nil when a duplicate marker makes the exact join ambiguous
+	}
+
+	// A backend with no window title to offer (foot has no IPC at all) can only
+	// name the process drawing the pane. That process's windows are the only
+	// ones that can show it, so the join is exact exactly when it owns ONE
+	// window — standalone foot, one process per window — and ambiguous when it
+	// owns several (a foot server's footclient windows share its pid), which
+	// fails closed like every other ambiguous join.
+	if windowTitle == "" {
+		return uniqueClient(clients, func(c wm.Window) bool { return c.PID == muxPID }).one
 	}
 
 	wantTitle := panetitle.Normalize(windowTitle)

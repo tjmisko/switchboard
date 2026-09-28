@@ -46,6 +46,73 @@ func TestMatchUniqueClient(t *testing.T) {
 	}
 }
 
+// Foot exposes no title, so its pane arrives with only the owning process. A
+// standalone foot window is its own process, which makes the pid alone an exact
+// join; a foot server's windows share one pid, which must fail closed.
+func TestMatchUniqueClientShouldJoinOnPidAloneWhenThePaneHasNoTitle(t *testing.T) {
+	standalone := []wm.Window{
+		{Address: "0xA", PID: 2001, Title: "✳ refactor-parser"},
+		{Address: "0xB", PID: 2002, Title: "✳ refactor-parser"},
+		{Address: "0xC", PID: 4242, Title: ""},
+	}
+	if got := matchUniqueClient(standalone, 2002, 0, ""); got == nil || got.Address != "0xB" {
+		t.Errorf("standalone foot join = %v, want 0xB", got)
+	}
+	if got := matchUniqueClient(standalone, 9999, 0, ""); got != nil {
+		t.Errorf("unknown foot pid = %v, want nil", got)
+	}
+
+	server := []wm.Window{
+		{Address: "0xA", PID: 3000, Title: "one"},
+		{Address: "0xB", PID: 3000, Title: "two"},
+	}
+	if got := matchUniqueClient(server, 3000, 0, ""); got != nil {
+		t.Errorf("foot server join = %v, want nil (two windows share the pid)", got)
+	}
+	if got := matchUniqueClient(server[:1], 3000, 0, ""); got == nil || got.Address != "0xA" {
+		t.Errorf("single-window foot server join = %v, want 0xA", got)
+	}
+}
+
+// End to end through the batched reconcile: a fresh foot session gains its
+// window, and a later ambiguity (a second footclient window opening on the same
+// server) keeps the address it already had rather than blanking or guessing.
+func TestReconcileFromShouldMapFootSessionsAndHoldThemThroughServerAmbiguity(t *testing.T) {
+	now := time.Date(2026, 9, 28, 12, 0, 0, 0, time.UTC)
+	pane := terminal.PaneRef{Backend: "foot", Mux: 3000, PaneID: 4, TTY: "/dev/pts/4"}
+	panes := map[string]terminal.PaneRef{"/dev/pts/4": pane}
+	sess := state.Session{PID: 100, TTY: "/dev/pts/4"}
+
+	var r *Resolver
+	r.ReconcileFrom(&sess, panes, []wm.Window{{Address: "0xA", PID: 3000, Workspace: "2", WorkspaceID: 2}}, now)
+	if sess.Hyprland == nil || sess.Hyprland.Address != "0xA" || sess.Hyprland.WorkspaceID != 2 {
+		t.Fatalf("Hyprland = %+v, want 0xA on workspace 2", sess.Hyprland)
+	}
+	if sess.Wezterm != nil {
+		t.Fatalf("Wezterm = %+v, want nil for a foot pane", sess.Wezterm)
+	}
+	if sess.Hyprland.ActivePaneID != nil {
+		t.Fatalf("ActivePaneID = %v, want nil: foot has no pane marker", *sess.Hyprland.ActivePaneID)
+	}
+
+	r.ReconcileFrom(&sess, panes, []wm.Window{
+		{Address: "0xA", PID: 3000, Workspace: "2", WorkspaceID: 2},
+		{Address: "0xB", PID: 3000, Workspace: "5", WorkspaceID: 5},
+	}, now)
+	if sess.Hyprland.Address != "0xA" {
+		t.Fatalf("after ambiguity Address = %q, want the prior 0xA", sess.Hyprland.Address)
+	}
+
+	fresh := state.Session{PID: 101, TTY: "/dev/pts/4"}
+	r.ReconcileFrom(&fresh, panes, []wm.Window{
+		{Address: "0xA", PID: 3000},
+		{Address: "0xB", PID: 3000},
+	}, now)
+	if fresh.Hyprland != nil {
+		t.Fatalf("fresh session under ambiguity Hyprland = %+v, want nil (Observe-only)", fresh.Hyprland)
+	}
+}
+
 // The WezTerm formatter changes only the compositor-visible title; `wezterm
 // cli list` continues to report the base title. A fresh daemon must therefore
 // consume the stable marker rather than requiring those two strings to be
