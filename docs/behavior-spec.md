@@ -204,6 +204,9 @@
   typed "navigate unsupported" error.)*
 - should dispatch `focuswindow address:<addr>` and then, if `Wezterm` is present,
   activate the pane — in that order — on success.
+- should announce the target to the focus-intent hook, when one is installed,
+  before either step, and settle it once with the navigation's error. The
+  daemon uses it to trust a herdr pane before herdr's event confirms it.
 
 ### 5.4 `handleHook(req)`  — §0.1 spec / behavior
 - should no-op when `status == ""`, `SessionID == ""`, **and** `Transcript == ""`.

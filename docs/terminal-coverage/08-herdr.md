@@ -70,6 +70,21 @@ herdr client, and an outer terminal with tabs shows the client's tab.
   status loop re-derives focus itself when the focused pane moves. herdr's
   focus is per server, not per client: with two client windows on one server,
   whichever window is active highlights herdr's focused pane.
+- **Trusted focus requests.** herdr's event stream polls every 100 ms
+  (`CONNECTION_POLL_INTERVAL`), so `pane.focused` trails a `pane.focus` ack by
+  up to that much, while the window raise before it fires a WM focus event
+  within a few milliseconds. Waiting for herdr lit the previous pane's chip
+  first, then moved it. A focus Switchboard requests is now trusted before any
+  of it runs (`claimHerdrFocus`, through `rpc.SetFocusIntent`): the watcher
+  records the target pane, and focus is re-derived against the active window,
+  so the raise's WM event already lights the right chip. herdr moves its focus
+  before it acks, so its later event confirms the claim and changes nothing. A
+  request herdr refuses is corrected by re-listing its panes.
+- **herdr's own latency.** A tab switch made with herdr's keys still reaches
+  the chips up to 100 ms late, through that stream poll. herdr's request reader
+  polls the same way: 19 of 100 of Switchboard's `pane.list` calls took about
+  101 ms against 1.3 ms at the median (measured 2026-09-28). Both are herdr's to
+  fix, by waking on an event or a readable socket instead of sleeping.
 - **herdr inside a WezTerm tab.** A herdr session has no `Wezterm` block (its
   own pane is herdr's), so the WezTerm tab layer does not narrow it: a herdr
   client in a background WezTerm tab still reads as shown while that WezTerm
