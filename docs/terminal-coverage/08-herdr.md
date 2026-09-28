@@ -61,10 +61,20 @@ herdr client, and an outer terminal with tabs shows the client's tab.
 
 ## Not covered / open
 
-- **Focus flag granularity.** Every agent in one herdr client window reads as
-  focused while that window is active: `applyFocus` refines by pane only for
-  WezTerm. herdr reports `focused` per pane, but using it needs a state field,
-  which is a schema decision.
+- **Focus flag granularity** (fixed on `fix/herdr-pane-focus`). Every agent in
+  one herdr client window used to read as focused while that window was
+  active. The watcher now follows herdr's focused pane (`pane.list`'s
+  `focused`, then `pane.focused` events) into `HerdrInfo.ActivePaneID`, the
+  counterpart of WezTerm's `HyprlandInfo.ActivePaneID`, and `showsInWindow`
+  narrows by it. A tab switch inside herdr moves no OS window, so the herdr
+  status loop re-derives focus itself when the focused pane moves. herdr's
+  focus is per server, not per client: with two client windows on one server,
+  whichever window is active highlights herdr's focused pane.
+- **herdr inside a WezTerm tab.** A herdr session has no `Wezterm` block (its
+  own pane is herdr's), so the WezTerm tab layer does not narrow it: a herdr
+  client in a background WezTerm tab still reads as shown while that WezTerm
+  window is active. Closing this needs the host pane id carried through the
+  chain's window join.
 - **Client choice** is "most recently started", a stand-in for herdr's
   last-used client. An upstream `client.list` API (pid, tty, last activity)
   would make it exact.

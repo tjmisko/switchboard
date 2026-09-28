@@ -290,6 +290,8 @@ as Lua rather than read as a dispatcher string. We speak only the Lua dialect.
 - `closewindow` should delete every session whose `Hyprland.Address == "0x"+Data`.
 - `activewindowv2` should set `Focused = (Hyprland.Address == "0x"+Data)` for
   sessions with a `Hyprland` block, and `Focused = false` for sessions without one.
+  Within that window, a session whose application says which pane is showing
+  (WezTerm's title marker, herdr's focused pane) is focused only in that pane.
 - `movewindowv2`, `windowtitlev2`, `openwindow` should re-`Reconcile` every live
   session.
 - should ignore any other event name.

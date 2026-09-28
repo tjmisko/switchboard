@@ -93,7 +93,7 @@ enrichment, graph, and display-name fields are omitted when unavailable.
 | `cwd` | string | always | Root working directory. It is display/project metadata and is never used to bind a provider thread. |
 | `tty` | string | always | Opaque controlling-terminal identity; may be empty on an Observe-only root. |
 | `started_at` | RFC 3339 timestamp | always | Process-lifetime discriminator recorded by discovery. |
-| `focused` | boolean | always | Whether the resolved window is active and, with the WezTerm integration, this session owns its active pane. |
+| `focused` | boolean | always | Whether the resolved window is active and shows this session. Each application inside the window that says which pane it shows narrows this: the WezTerm integration's active pane, and herdr's focused pane. An application that has not said leaves it at the window. |
 | `suspended` | boolean | omitted when false | Whether the root is job-control-stopped. |
 | `headless` | boolean | omitted when false | Whether the discovered run has no navigable interactive TUI. |
 | `local_workspace` | integer | omitted when unresolved | Federated aggregate only, and only on remote rows: the Hyprland workspace id **on the reading machine** of the window displaying this session. A remote row's own `hyprland` block is stripped (its coordinates locate the other desktop), so this is the only workspace a local reader can act on — it is what the bottom bar reports and what places the chip in workspace order. `0` means unresolved, the same convention as `workspace_id`. |
@@ -171,6 +171,11 @@ the two can be compared when they differ.
 | `socket` | string | API socket of the herdr server that owns the pane. |
 | `agent` | string | Agent herdr detected in the pane (`claude`, `codex`, …); omitted when none. |
 | `status` | string | herdr's raw status: `working`, `blocked`, `done`, `idle` or `unknown`; omitted until read. |
+
+herdr's focused pane (the one its tab and split selection shows) is read too,
+but stays off the wire: `focused` is its public projection. Only the session
+in that pane reads as focused while the window is active. When the daemon is
+not following the server, focus falls back to the window.
 
 | herdr `status` | Published `status` |
 |---|---|
