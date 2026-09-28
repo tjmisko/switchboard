@@ -124,19 +124,21 @@ func TestAutoShouldStayLiveWhenSeveralBackendsCompose(t *testing.T) {
 }
 
 // Omarchy's default terminal is foot, so auto must probe it alongside the
-// multiplexers — after tmux, which owns any pane nested inside a foot window.
-func TestNewAutoShouldProbeWindowTerminalsAfterTheInnermostMultiplexer(t *testing.T) {
+// multiplexers — after tmux and herdr, which own any pane nested inside a foot
+// window.
+func TestNewAutoShouldProbeWindowTerminalsAfterTheInnermostMultiplexers(t *testing.T) {
 	a := NewAuto().(auto)
 	var names []string
 	for _, c := range a.candidates {
 		names = append(names, c.Name())
 	}
-	want := []string{"tmux", "wezterm", "foot", "alacritty"}
+	want := []string{"tmux", "herdr", "wezterm", "foot", "alacritty"}
 	if strings.Join(names, " ") != strings.Join(want, " ") {
 		t.Fatalf("auto candidates = %v, want %v", names, want)
 	}
-	foot, alacritty := a.candidates[2].(ptyOwnerLocator), a.candidates[3].(ptyOwnerLocator)
-	if foot.scan != alacritty.scan {
-		t.Fatal("foot and alacritty walk /proc separately, want one shared scan")
+	herdr := a.candidates[1].(*herdrLocator)
+	foot, alacritty := a.candidates[3].(ptyOwnerLocator), a.candidates[4].(ptyOwnerLocator)
+	if foot.scan != alacritty.scan || herdr.scan != foot.scan {
+		t.Fatal("herdr, foot and alacritty walk /proc separately, want one shared scan")
 	}
 }

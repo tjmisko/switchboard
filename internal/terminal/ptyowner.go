@@ -191,6 +191,90 @@ func (s *processScan) ptyMasterIndexes(pid int) []int {
 	return indexes
 }
 
+// socketInodes returns the inode of every socket pid holds open, read from its
+// fd links ("socket:[N]") — the key the kernel socket table is joined on.
+func (s *processScan) socketInodes(pid int) []uint64 {
+	fdDir := filepath.Join(s.root, strconv.Itoa(pid), "fd")
+	entries, err := os.ReadDir(fdDir)
+	if err != nil {
+		return nil
+	}
+	var inodes []uint64
+	for _, entry := range entries {
+		target, err := os.Readlink(filepath.Join(fdDir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		digits, ok := strings.CutPrefix(target, "socket:[")
+		if !ok {
+			continue
+		}
+		inode, err := strconv.ParseUint(strings.TrimSuffix(digits, "]"), 10, 64)
+		if err == nil {
+			inodes = append(inodes, inode)
+		}
+	}
+	return inodes
+}
+
+// statFields returns /proc/<pid>/stat's fields after the parenthesised comm,
+// which may itself contain spaces and parentheses: index 0 is field 3 (state).
+func (s *processScan) statFields(pid int) []string {
+	data, err := os.ReadFile(filepath.Join(s.root, strconv.Itoa(pid), "stat"))
+	if err != nil {
+		return nil
+	}
+	end := strings.LastIndexByte(string(data), ')')
+	if end < 0 {
+		return nil
+	}
+	return strings.Fields(string(data[end+1:]))
+}
+
+// controllingTTY returns pid's controlling terminal as "/dev/pts/N" when it is a
+// pty. It reads stat's tty_nr rather than fd links: the controlling terminal is
+// the kernel's answer, where a process's stdio may be redirected anywhere.
+func (s *processScan) controllingTTY(pid int) (string, bool) {
+	fields := s.statFields(pid)
+	if pid <= 0 || len(fields) < 5 {
+		return "", false
+	}
+	ttyNr, err := strconv.ParseUint(fields[4], 10, 32)
+	if err != nil || ttyNr == 0 {
+		return "", false
+	}
+	index, ok := ptsIndexFromDev(uint32(ttyNr))
+	if !ok {
+		return "", false
+	}
+	return "/dev/pts/" + strconv.Itoa(index), true
+}
+
+// startTime returns pid's start time in clock ticks since boot (stat field 22),
+// or 0 when unreadable.
+func (s *processScan) startTime(pid int) uint64 {
+	fields := s.statFields(pid)
+	if len(fields) < 20 {
+		return 0
+	}
+	start, _ := strconv.ParseUint(fields[19], 10, 64)
+	return start
+}
+
+// unix98PTYSlaveMajor is the character major of every /dev/pts/N.
+const unix98PTYSlaveMajor = 136
+
+// ptsIndexFromDev decodes a kernel-encoded dev_t (new_encode_dev: 12-bit major,
+// 20-bit minor split around it) and returns the pts index when it is a pty slave.
+func ptsIndexFromDev(dev uint32) (int, bool) {
+	major := (dev >> 8) & 0xfff
+	minor := (dev & 0xff) | ((dev >> 12) & 0xfff00)
+	if major != unix98PTYSlaveMajor {
+		return 0, false
+	}
+	return int(minor), true
+}
+
 // readTTYIndex parses the "tty-index:" line of a pty master's fdinfo. A kernel
 // too old to print the field yields no index, which leaves the session
 // Observe-only rather than guessing.

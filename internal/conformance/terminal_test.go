@@ -2,6 +2,7 @@ package conformance_test
 
 import (
 	"context"
+	"hash/fnv"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -152,6 +153,22 @@ func TestAlacrittyLocatorConformance(t *testing.T) {
 	l := terminal.NewAlacritty()
 	conformance.RunLocatorContract(t, newLocatorFixture(locatorFixture{
 		l: l, pane: ptyOwnerPane, someTTY: someTTYOf(l),
+	}))
+}
+
+// herdrPane maps herdr's stable identity — the pane id on its server's socket —
+// into the neutral Pane's PaneID. The id is a string ("w1:p2"), so hash it;
+// offset by 1 so no pane collides with the contract's (0,0) "no identity".
+func herdrPane(r terminal.PaneRef) conformance.Pane {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(r.MuxSocket + "\x00" + r.Handle))
+	return conformance.Pane{PaneID: int(h.Sum32()>>1) + 1, TTY: r.TTY, WindowTitle: r.WindowTitle}
+}
+
+func TestHerdrLocatorConformance(t *testing.T) {
+	l := terminal.NewHerdr()
+	conformance.RunLocatorContract(t, newLocatorFixture(locatorFixture{
+		l: l, pane: herdrPane, someTTY: someTTYOf(l),
 	}))
 }
 

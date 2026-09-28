@@ -39,7 +39,7 @@ used only for the OS syscall layer).
 |------|----------|-----------|
 | **OS process** (Observe floor) | Linux `/proc` + `pidfd` · macOS *(planned)* | per-OS at build |
 | **Window manager** (Navigate) | Hyprland · sway · i3 · X11/EWMH · `none` | `HYPRLAND_INSTANCE_SIGNATURE` → `SWAYSOCK` → `I3SOCK` → `DISPLAY` |
-| **Terminal** (Navigate) | wezterm · tmux · foot · alacritty · `none` | tmux server socket · wezterm gui sockets · a running `foot` / `alacritty` process (composes when nested) |
+| **Terminal** (Navigate) | wezterm · tmux · herdr · foot · alacritty · `none` | tmux server socket · wezterm gui sockets · a running `herdr` / `foot` / `alacritty` process (composes when nested) |
 
 The daemon logs its chosen stack at startup and records it in the
 `capabilities` block of `state.json`.
@@ -273,7 +273,7 @@ another machine. See [machine-specific configuration](docs/machine-configuration
 for the renderer units, host-local drop-ins, and shared-dotfiles rules.
 
 Force a backend (e.g. to test degradation) with the daemon flags
-`-wm auto|hyprland|sway|i3|x11|none` and `-terminal auto|wezterm|tmux|foot|alacritty|none`.
+`-wm auto|hyprland|sway|i3|x11|none` and `-terminal auto|wezterm|tmux|herdr|foot|alacritty|none`.
 The Codex observer separately accepts `-codex-observer auto|off` (default
 `auto`).
 
@@ -497,12 +497,20 @@ labels, prompts, assistant content, commands, or raw provider payloads.
   launches them. Under `foot --server` or `alacritty msg create-window`, windows
   share one pid, so a session in a process with several windows stays
   Observe-only.
+- **herdr:** sessions in [herdr](https://herdr.dev) panes jump fully on Linux:
+  Switchboard selects the pane through herdr's socket API (every attached
+  client switches to its tab) and raises the window of an attached client,
+  found from the kernel's unix socket table, so any session name or
+  `HERDR_SOCKET_PATH` override works. With several clients attached it raises
+  the most recently started one. A pane of a detached server is selected but has
+  no window to raise. Clients attached over SSH (`herdr --remote`) are not
+  covered.
 - macOS support (Observe tier) is planned (see the plan).
 
 ## Status / roadmap
 
 Done: runtime-detecting `osproc` / `terminal` / `wm` seams behind a reusable
-conformance contract; Hyprland + sway/i3 + X11/EWMH WM backends; wezterm + tmux + foot + Alacritty
+conformance contract; Hyprland + sway/i3 + X11/EWMH WM backends; wezterm + tmux + herdr + foot + Alacritty
 terminal backends with per-session locator chaining; capability reporting;
 `claude-tui` reference renderer; provider-neutral root/child agent graphs;
 Codex app-server observation with bounded degradation; Claude compatibility
