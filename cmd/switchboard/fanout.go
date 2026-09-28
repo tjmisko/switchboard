@@ -27,6 +27,7 @@ type reconcileState struct {
 	usageErr string                 // last reported content-free cursor error; suppresses per-tick log spam
 	labels   map[string]labelCursor // labelKey -> last-emitted session label (change dedup)
 	names    *label.NameCache       // pid -> Claude session name, memoized against the file's stamp
+	herdr    herdrStatusSource      // herdr's agent status per pane; nil when not followed
 }
 
 // labelCursor is the last name emitted for one session, plus the pid hosting it.

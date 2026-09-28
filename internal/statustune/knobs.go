@@ -178,6 +178,13 @@ const (
 	// and has not moved past the stale cap, and its tail carries no unanswered
 	// tool, so the prompt is unanswerable. The graph's case 19.
 	RuleGraphStaleBackstop = "writer_stale_backstop"
+
+	// RuleHerdrAuthority — herdr decided the edge: the session runs in a herdr
+	// pane, and herdr is the status authority for every agent in one.
+	RuleHerdrAuthority = "herdr_authority"
+	// RuleHerdrReleased — the daemon stopped following the pane's herdr server,
+	// so the status went back to the provider graph's own.
+	RuleHerdrReleased = "herdr_released"
 )
 
 // KnobHint names the Tuning field that governs a rule's outcome, with a one-line
@@ -239,6 +246,8 @@ var ruleKnobs = map[string]KnobHint{
 	RuleGraphWriterResumed:      {"ResumeExitStatus", "the graph's transcript clear: the writer's own file showed the turn advanced past the prompt. The exit color is the reducer's, not this field — ResumeExitStatus governs the legacy reconciler — so what you can actually change here is TailBytes, how far back the tail is read"},
 	RuleGraphWriterInterrupted:  {"InterruptExitStatus", "the writer's own transcript showed the prompt interrupted or declined. As with writer_resumed the exit color comes from the reducer rather than this legacy field; TailBytes is the knob that changes what the tail can see"},
 	RuleGraphMainUnreadableTTL:  {"PermissionDecayTTL", "how long a red waits when the MAIN transcript cannot be read at all before the backstop releases it (default 30s). It stays main-only on purpose: a missing agent-<id>.jsonl is the normal state of a just-spawned teammate, so extending this to a child would release reds nobody answered"},
+	RuleHerdrAuthority:          {"", "herdr's own reading of the pane, projected onto Switchboard's statuses (blocked→permission, done→idle, idle kept delegating while the provider graph shows working subagents). Nothing in Tuning governs it: a wrong color here is herdr's detection, which `herdr agent explain <pane>` explains and a local manifest under ~/.config/herdr/agent-detection/ overrides"},
+	RuleHerdrReleased:           {"", "the herdr server stopped answering (or the pane left herdr) for longer than the watcher's grace period, so the provider graph's status took over again. Nothing to tune; it reverses on the next herdr status the daemon reads"},
 	RuleGraphStaleBackstop:      {"PendingWriterStaleCap", "how long one writer's transcript may sit quiescent before its prompt is dropped as unanswerable (default 30m). Applies ONLY to a writer whose tail carries no unanswered tool — one that still does is demonstrably blocked and is held red regardless. Raise it to let an abandoned teammate's red nag longer"},
 }
 

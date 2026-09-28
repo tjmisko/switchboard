@@ -82,6 +82,9 @@ type Session struct {
 
 	Wezterm  *WeztermInfo  `json:"wezterm,omitempty"`
 	Hyprland *HyprlandInfo `json:"hyprland,omitempty"`
+	// Herdr is set when the session runs in a herdr pane; herdr is then the
+	// authority for its status (see HerdrInfo).
+	Herdr *HerdrInfo `json:"herdr,omitempty"`
 	// Claude and Codex are the per-agent enrichment blocks; they share one shape
 	// (AgentInfo). Exactly one is populated, matching Agent — the other is
 	// omitted. The split keeps the frozen "claude" wire key intact for existing
@@ -1056,6 +1059,7 @@ func (s *Store) snapshotLocked() Snapshot {
 		cp.Codex = enrichForWire(sess.Codex)
 		cp.AgentGraph = sess.AgentGraph.Clone()
 		cp.DisplayName = cloneDisplayName(sess.DisplayName)
+		cp.Herdr = cloneHerdr(sess.Herdr)
 		sessions = append(sessions, cp)
 	}
 	// Sort into chip order, which carries a PID tie-break for determinism: equal

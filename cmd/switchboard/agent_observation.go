@@ -525,7 +525,7 @@ func (c *agentCoordinator) applyObservationWithRule(ref provider.RootRef, genera
 		}
 	}
 	applied, nativeOverride := false, false
-	afterPending, afterSession := "", beforeSession
+	afterStatus, afterPending, afterSession := "", "", beforeSession
 	nativeName, hasNativeName := observationRootName(observation)
 	authoritativeNativeName := ref.Provider == agentgraph.ProviderCodex &&
 		observation.Source == agentgraph.SourceCodexAppServer && observation.Complete && hasNativeName
@@ -534,11 +534,18 @@ func (c *agentCoordinator) applyObservationWithRule(ref provider.RootRef, genera
 		if sess == nil || !sess.StartedAt.Equal(ref.StartedAt) || agentgraph.ProviderKind(sess.Agent) != ref.Provider {
 			return
 		}
+		// The published status is read under the lock on both sides: herdr can
+		// move it between the snapshot above and here, and while herdr is the
+		// authority the graph's own summary is not what the chip shows.
+		if info := sess.Enrichment(); info != nil {
+			beforeStatus, beforeSince = info.Status, info.StatusSince
+		}
 		if ref.Provider == agentgraph.ProviderClaude {
 			applyClaudeCompatibility(sess.AgentBlock(state.AgentKindClaude), compat)
 		}
 		sess.SetAgentGraph(graph)
 		if info := sess.Enrichment(); info != nil {
+			afterStatus = info.Status
 			afterPending = info.PendingSummary()
 			if info.SessionID != "" {
 				afterSession = info.SessionID
@@ -575,12 +582,12 @@ func (c *agentCoordinator) applyObservationWithRule(ref provider.RootRef, genera
 	for _, event := range canonical {
 		c.sink.Record(event)
 	}
-	statusChanged := graph.Summary.Status != beforeStatus
+	statusChanged := afterStatus != beforeStatus
 	if statusChanged {
 		c.sink.Record(history.Event{
 			Ts: now, Type: history.EventTransition, SessionID: observation.RootID,
 			PID: ref.PID, Agent: string(ref.Provider), CWD: ref.CWD,
-			From: beforeStatus, To: graph.Summary.Status,
+			From: beforeStatus, To: afterStatus,
 			Rule: transitionRule(rule), DurPrevMs: history.HeldMs(beforeSince, now),
 			Subagents: graph.Summary.LiveChildren,
 		})
@@ -592,16 +599,16 @@ func (c *agentCoordinator) applyObservationWithRule(ref provider.RootRef, genera
 	// working/idle observations stay quiet; red holds remain visible because they
 	// are precisely where "I answered it and it is still red" needs an explanation.
 	if ref.Provider == agentgraph.ProviderClaude &&
-		(statusChanged || (rule != "" && (beforeStatus == state.StatusPermission || graph.Summary.Status == state.StatusPermission))) {
+		(statusChanged || (rule != "" && (beforeStatus == state.StatusPermission || afterStatus == state.StatusPermission))) {
 		pending := afterPending
-		if beforeStatus == state.StatusPermission && graph.Summary.Status != state.StatusPermission {
+		if beforeStatus == state.StatusPermission && afterStatus != state.StatusPermission {
 			pending = beforePending
 		}
 		age := time.Duration(0)
 		if !beforeSince.IsZero() && now.After(beforeSince) {
 			age = now.Sub(beforeSince)
 		}
-		from, to := beforeStatus, graph.Summary.Status
+		from, to := beforeStatus, afterStatus
 		if from == "" {
 			from = "unknown"
 		}

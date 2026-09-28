@@ -170,7 +170,8 @@ func ProjectAgentGraph(observation agentgraph.Observation, prior *AgentGraph, no
 // enrichment view. Root ID and summary status are the only compatibility fields
 // it changes: Claude in-flight/workflow/pending-writer data remains owned by the
 // Claude adapter. Legacy StatusSince moves only when the legacy status changes,
-// independently of structured count-only summary transitions.
+// independently of structured count-only summary transitions. While herdr is
+// the session's status authority (see HerdrInfo), its status wins.
 func (s *Session) SetAgentGraph(graph *AgentGraph) {
 	s.AgentGraph = graph.Clone()
 	if s.AgentGraph == nil {
@@ -197,10 +198,7 @@ func (s *Session) SetAgentGraph(graph *AgentGraph) {
 	}
 	info := s.AgentBlock(kind)
 	info.SessionID = s.AgentGraph.RootID
-	if info.Status != s.AgentGraph.Summary.Status {
-		info.Status = s.AgentGraph.Summary.Status
-		info.StatusSince = s.AgentGraph.Summary.Since
-	}
+	s.projectStatus(info, s.AgentGraph.Summary.Since)
 }
 
 func (g *AgentGraph) domainSummary() agentgraph.Summary {

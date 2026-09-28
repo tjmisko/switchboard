@@ -24,6 +24,7 @@ import (
 	"github.com/tjmisko/switchboard/internal/detect"
 	"github.com/tjmisko/switchboard/internal/discovery"
 	"github.com/tjmisko/switchboard/internal/fanout"
+	"github.com/tjmisko/switchboard/internal/herdr"
 	"github.com/tjmisko/switchboard/internal/history"
 	"github.com/tjmisko/switchboard/internal/mapping"
 	"github.com/tjmisko/switchboard/internal/osproc"
@@ -274,7 +275,10 @@ func main() {
 	// first window covers them.
 	go store.LogPublishStats(ctx, publishStatsInterval)
 	go runWMLoop(ctx, store, resolver, manager, sink, procSrc, forgetRoot, turn)
-	go runReconciler(ctx, store, resolver, manager, stack, *reconcileInterval, tun, sink, nil, forgetRoot, turn)
+	herdrWatcher := herdr.NewWatcher()
+	defer herdrWatcher.Close()
+	go runHerdrStatus(ctx, store, herdrWatcher, sink)
+	go runReconciler(ctx, store, resolver, manager, stack, *reconcileInterval, tun, sink, nil, forgetRoot, turn, herdrWatcher)
 
 	server := rpc.New(store, *socketPath, term, manager)
 	server.SetTuning(tun)
@@ -925,10 +929,11 @@ func resolveSession(ctx context.Context, resolver *mapping.Resolver, sess *state
 // Catches anything missed by event-driven updates (e.g. a session whose
 // mapping was incomplete when first created, the initial focus state, or a
 // hyprctl race).
-func runReconciler(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, interval time.Duration, tun statustune.Tuning, sink *history.Sink, obs *fanout.Observer, forget func(int), turn *resolveTurn) {
+func runReconciler(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, interval time.Duration, tun statustune.Tuning, sink *history.Sink, obs *fanout.Observer, forget func(int), turn *resolveTurn, herdrSrc herdrStatusSource) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	rstate := newReconcileState(obs)
+	rstate.herdr = herdrSrc
 	// The turn is taken around the WHOLE tick rather than threaded into
 	// reconcileOnce, so the enumeration and the writes it feeds cannot be split by
 	// the WM path landing an older observation between them. See resolveTurn.
@@ -963,6 +968,11 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 	// every chip click queued behind it. Measured before this change: p99 166ms,
 	// worst 1382ms, with the spike train landing exactly on the tick interval.
 	panes, clients := resolver.Enumerate(ctx)
+	// Follow exactly the herdr servers that own a pane this tick. A tick with no
+	// batch enumeration (nil) says nothing about them, so the set is kept.
+	if rstate.herdr != nil && panes != nil {
+		rstate.herdr.SetServers(ctx, herdrSockets(panes))
+	}
 	// Stamped AFTER the enumeration so TitleAt still means "when the title was
 	// sampled", which is what it meant when each session stamped its own clock on
 	// the way out of Locate. Stamping before would backdate every title by the
@@ -1040,6 +1050,16 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 			sess.Wezterm = item.after.Wezterm
 			sess.Hyprland = item.after.Hyprland
 			sess.ResolvedName = item.after.ResolvedName
+			// herdr's status is read here, under the lock, rather than prepared:
+			// the watcher lands edges between ticks, and a prepared copy would
+			// repaint an older one over them.
+			if rstate.herdr != nil {
+				var pane *terminal.PaneRef
+				if ref, ok := panes[sess.TTY]; ok {
+					pane = &ref
+				}
+				applyHerdrPane(sess, pane, rstate.herdr, sink, now)
+			}
 			// Refresh job-control suspension (Ctrl-Z). On ErrGone the sweep above has
 			// already dropped the session, so this only ever sees a live pid; leave
 			// the last-known value on any other read error rather than flapping. A
