@@ -1,6 +1,10 @@
 package state
 
-import "time"
+import (
+	"time"
+
+	"github.com/tjmisko/switchboard/internal/agentgraph"
+)
 
 // HerdrInfo is the herdr (herdr.dev) pane hosting a session and herdr's own
 // reading of the agent in it.
@@ -73,30 +77,116 @@ func (s *Session) herdrAuthority(provider string) (string, time.Time, bool) {
 	return status, s.Herdr.StatusSince, ok
 }
 
-// SetHerdr records herdr's reading of the session's pane and re-projects the
-// published status. live=false withdraws herdr's authority (the pane's server
-// is no longer followed), handing the status back to the provider graph.
+// HerdrReading is one reading of a session's herdr pane.
+type HerdrReading struct {
+	PaneID     string
+	Socket     string
+	TerminalID string // herdr's id for the pane's terminal; stable across moves
+	Agent      string
+	Status     string
+	// Live is whether the pane's server is followed now; false withdraws
+	// herdr's authority.
+	Live bool
+	// Since is when herdr's status began.
+	Since time.Time
+}
+
+// SetHerdr records a reading of the session's herdr pane and re-projects the
+// published status, returning it before and after so the caller can record a
+// transition when they differ.
 //
-// since is when herdr's status began. It returns the published status before
-// and after, so the caller can record a transition when they differ. A session
-// with no provider graph has no published status for herdr to replace yet and
-// is left unchanged.
-func (s *Session) SetHerdr(paneID, socket, agent, status string, live bool, since time.Time) (before, after string) {
+// A Claude or Codex session publishes herdr's status over its provider graph
+// (see projectStatus); one with no graph yet has nothing to replace and is left
+// unchanged. Any other agent has no provider adapter at all, so herdr is its
+// only source: the reading becomes its whole agent graph.
+func (s *Session) SetHerdr(r HerdrReading, now time.Time) (before, after string) {
 	if s.Herdr == nil {
 		s.Herdr = &HerdrInfo{}
 	}
 	h := s.Herdr
-	if h.Status != status {
-		h.StatusSince = since
+	if h.Status != r.Status {
+		h.StatusSince = r.Since
 	}
-	h.PaneID, h.Socket, h.Agent, h.Status, h.Live = paneID, socket, agent, status, live
+	h.PaneID, h.Socket, h.Agent, h.Status, h.Live = r.PaneID, r.Socket, r.Agent, r.Status, r.Live
+	if !IsProviderAgent(s.Agent) {
+		before = s.graphStatus(now)
+		s.AgentGraph = herdrAgentGraph(s.Agent, r, s.AgentGraph, now)
+		return before, s.graphStatus(now)
+	}
 	info := s.graphEnrichment()
 	if info == nil {
 		return "", ""
 	}
 	before = info.Status
-	s.projectStatus(info, since)
+	s.projectStatus(info, r.Since)
 	return before, info.Status
+}
+
+// IsProviderAgent reports whether Switchboard has a provider adapter for the
+// agent kind (Claude Code, Codex). Every other kind is discovered and observed
+// through herdr alone.
+func IsProviderAgent(kind string) bool {
+	return kind == AgentKindClaude || kind == AgentKindCodex
+}
+
+// graphStatus is the published status of a session with no enrichment block:
+// its graph's summary, "" while the graph is absent or expired.
+func (s *Session) graphStatus(now time.Time) string {
+	if s.AgentGraph == nil || !s.AgentGraph.Fresh(now) {
+		return ""
+	}
+	return s.AgentGraph.Summary.Status
+}
+
+// herdrGraphLease is how long a herdr-sourced graph stays fresh without a new
+// reading. herdr streams every change and the daemon re-reads each pane every
+// reconcile tick, but a reading that does not change is not re-applied, so the
+// lease must outlast any quiet stretch. Losing the server is what expires it:
+// that reading carries Live=false and a lease ending now.
+const herdrGraphLease = 30 * 24 * time.Hour
+
+// herdrAgentGraph turns a herdr reading into the one-node graph of an agent
+// herdr alone observes. The root id is herdr's terminal id, stable for the
+// life of the terminal the agent runs in.
+func herdrAgentGraph(agent string, r HerdrReading, prior *AgentGraph, now time.Time) *AgentGraph {
+	rootID := "herdr:" + r.TerminalID
+	if r.TerminalID == "" {
+		rootID = "herdr:" + r.Socket + "#" + r.PaneID
+	}
+	observedAt := r.Since
+	if observedAt.IsZero() || observedAt.After(now) {
+		observedAt = now
+	}
+	freshUntil := observedAt.Add(herdrGraphLease)
+	if !r.Live {
+		freshUntil = now // not followed: the reading reduces to unknown
+	}
+	runtime, attention := herdrNodeState(r.Status)
+	observation := agentgraph.Observation{
+		Provider: agentgraph.ProviderKind(agent), RootID: rootID, Source: agentgraph.SourceHerdr,
+		ObservedAt: observedAt, FreshUntil: freshUntil,
+		Nodes: []agentgraph.Node{{ID: rootID, Nickname: r.Agent, Runtime: runtime, Attention: attention, UpdatedAt: observedAt}},
+	}
+	graph, err := ProjectAgentGraph(observation, prior, now)
+	if err != nil {
+		return prior
+	}
+	return graph
+}
+
+// herdrNodeState maps herdr's status onto a graph node, so the reducer derives
+// the same legacy status HerdrLegacyStatus does.
+func herdrNodeState(status string) (agentgraph.RuntimeState, agentgraph.AttentionState) {
+	switch status {
+	case HerdrWorking:
+		return agentgraph.RuntimeActive, agentgraph.AttentionNone
+	case HerdrBlocked:
+		return agentgraph.RuntimeActive, agentgraph.AttentionApproval
+	case HerdrIdle, HerdrDone:
+		return agentgraph.RuntimeIdle, agentgraph.AttentionNone
+	default:
+		return agentgraph.RuntimeUnknown, agentgraph.AttentionNone
+	}
 }
 
 // graphEnrichment returns the enrichment block the provider graph projects

@@ -64,11 +64,11 @@ func applyHerdrPane(sess *state.Session, pane *terminal.PaneRef, source herdrSta
 	if since.IsZero() {
 		since = now
 	}
-	var priorSince time.Time
-	if info := sess.Enrichment(); info != nil {
-		priorSince = info.StatusSince
-	}
-	before, after := sess.SetHerdr(paneID, socket, status.Agent, status.Status, live, since)
+	priorSince, _, _ := herdrLaneFacts(sess)
+	before, after := sess.SetHerdr(state.HerdrReading{
+		PaneID: paneID, Socket: socket, TerminalID: status.TerminalID,
+		Agent: status.Agent, Status: status.Status, Live: live, Since: since,
+	}, now)
 	if before == after {
 		return
 	}
@@ -76,16 +76,16 @@ func applyHerdrPane(sess *state.Session, pane *terminal.PaneRef, source herdrSta
 	if _, decides := state.HerdrLegacyStatus(status.Status, ""); !live || !decides {
 		rule = statustune.RuleHerdrReleased
 	}
-	info := sess.Enrichment()
+	_, sessionID, subagents := herdrLaneFacts(sess)
 	reason := "herdr status=" + status.Status
 	if !live {
 		reason = "herdr server not followed"
 	}
 	sink.Record(history.Event{
 		Ts: now, Type: history.EventTransition,
-		SessionID: info.SessionID, PID: sess.PID, Agent: sess.Agent, CWD: sess.CWD,
+		SessionID: sessionID, PID: sess.PID, Agent: sess.Agent, CWD: sess.CWD,
 		From: before, To: after, Rule: rule, Reason: reason,
-		Subagents: info.InFlightSubagents, DurPrevMs: history.HeldMs(priorSince, now),
+		Subagents: subagents, DurPrevMs: history.HeldMs(priorSince, now),
 	})
 	from, to := before, after
 	if from == "" {
@@ -99,10 +99,24 @@ func applyHerdrPane(sess *state.Session, pane *terminal.PaneRef, source herdrSta
 		age = now.Sub(priorSince)
 	}
 	statustune.Decision{
-		PID: sess.PID, Session: shortSessionID(info.SessionID),
+		PID: sess.PID, Session: shortSessionID(sessionID),
 		From: from, To: to, Rule: rule, Reason: reason,
-		Subagents: info.InFlightSubagents, Age: age,
+		Subagents: subagents, Age: age,
 	}.Log()
+}
+
+// herdrLaneFacts returns the published status's start, the session id history
+// files it under, and its in-flight subagents. A Claude or Codex session has
+// them in its enrichment block; an agent herdr alone observes has only its
+// graph, whose root id is its session id.
+func herdrLaneFacts(sess *state.Session) (since time.Time, sessionID string, subagents int) {
+	if info := sess.Enrichment(); info != nil {
+		return info.StatusSince, info.SessionID, info.InFlightSubagents
+	}
+	if sess.AgentGraph != nil {
+		return sess.AgentGraph.Summary.Since, sess.AgentGraph.RootID, 0
+	}
+	return time.Time{}, "", 0
 }
 
 // runHerdrStatus lands herdr's status changes at event speed: each signalled

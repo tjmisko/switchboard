@@ -216,16 +216,20 @@ func main() {
 		agentRuntime.RequestCleanup()
 	}
 
-	onAgentAppeared := func(info osproc.Info) {
-		kind := discovery.Classify(info)
-		headless := kind == discovery.AgentClaude && discovery.IsHeadless(info)
+	herdrWatcher := herdr.NewWatcher()
+	defer herdrWatcher.Close()
+
+	// appear starts tracking one agent root: the process scanner's Claude and
+	// Codex finds, and herdr discovery's agents in herdr panes (herdrPane set),
+	// whose status herdr alone supplies.
+	appear := func(info osproc.Info, kind string, headless bool, herdrPane *terminal.PaneRef) {
 		suffix := ""
 		if headless {
 			suffix = " headless"
 		}
 		log.Printf("%s pid=%d cwd=%s tty=%s discovered%s", kind, info.PID, info.CWD, info.TTY, suffix)
 		sess := resolver.Resolve(ctx, info)
-		sess.Agent = string(kind)
+		sess.Agent = kind
 		sess.Headless = headless
 		store.Apply(func(m map[int]*state.Session) {
 			// A surviving hydrated root keeps its discovery-lifetime timestamp and
@@ -239,6 +243,10 @@ func main() {
 				sess.Claude, sess.Codex, sess.AgentGraph = prior.Claude, prior.Codex, prior.AgentGraph
 			}
 			m[sess.PID] = &sess
+			if herdrPane != nil {
+				applyHerdrPane(m[sess.PID], herdrPane, herdrWatcher, sink, time.Now())
+				sess = *m[sess.PID]
+			}
 		})
 		federated.AnnounceSession(ctx, sess)
 		agentRuntime.Request(providerRootKey(sess))
@@ -261,6 +269,10 @@ func main() {
 			log.Printf("watch pid=%d: %v (liveness sweep will close its lane)", info.PID, err)
 		}
 	}
+	onAgentAppeared := func(info osproc.Info) {
+		kind := discovery.Classify(info)
+		appear(info, string(kind), kind == discovery.AgentClaude && discovery.IsHeadless(info), nil)
+	}
 
 	go func() {
 		if err := scanner.Run(ctx, *scanInterval, onAgentAppeared); err != nil && ctx.Err() == nil {
@@ -275,9 +287,11 @@ func main() {
 	// first window covers them.
 	go store.LogPublishStats(ctx, publishStatsInterval)
 	go runWMLoop(ctx, store, resolver, manager, sink, procSrc, forgetRoot, turn)
-	herdrWatcher := herdr.NewWatcher()
-	defer herdrWatcher.Close()
 	go runHerdrStatus(ctx, store, herdrWatcher, sink)
+	herdrFinder := newHerdrDiscovery(terminal.NewHerdr().(terminal.Snapshotter), herdrWatcher, herdr.Call, procSrc)
+	go runHerdrDiscovery(ctx, store, herdrFinder, herdrDiscoveryInterval, func(info osproc.Info, agent string, pane *terminal.PaneRef) {
+		appear(info, agent, false, pane)
+	})
 	go runReconciler(ctx, store, resolver, manager, stack, *reconcileInterval, tun, sink, nil, forgetRoot, turn, herdrWatcher)
 
 	server := rpc.New(store, *socketPath, term, manager)
@@ -375,15 +389,27 @@ func endSession(m map[int]*state.Session, pid int, sink *history.Sink, forget fu
 // lane one tick late: it splits a running session into two lanes and permanently
 // under-counts the second. Liveness is judged ONLY on positive evidence of
 // death, never on inactivity (L4).
-func sessionDead(src osproc.Source, pid int) bool {
-	info, err := src.Read(pid)
+func sessionDead(src osproc.Source, sess *state.Session) bool {
+	info, err := src.Read(sess.PID)
 	if errors.Is(err, osproc.ErrGone) {
 		return true
 	}
 	if err != nil {
 		return false // transient / unsupported backend — re-check next tick
 	}
-	return discovery.Classify(info) == discovery.AgentNone
+	return !processIsSession(info, sess)
+}
+
+// processIsSession reports whether a live process is still the agent session
+// tracked under its pid. A Claude or Codex root must still classify as one. An
+// agent herdr alone observes has no classifier here, so its pid counts as its
+// own while it still runs on the session's terminal: a reused pid lands on some
+// other tty, or none.
+func processIsSession(info osproc.Info, sess *state.Session) bool {
+	if sess.Agent == "" || state.IsProviderAgent(sess.Agent) {
+		return discovery.Classify(info) != discovery.AgentNone
+	}
+	return sess.TTY != "" && info.TTY == sess.TTY
 }
 
 // sweepDeadSessions closes the lane of every tracked session whose process is
@@ -401,8 +427,8 @@ func sessionDead(src osproc.Source, pid int) bool {
 //
 // Deleting from a map while ranging it is safe in Go. Runs inside store.Apply.
 func sweepDeadSessions(m map[int]*state.Session, src osproc.Source, sink *history.Sink, forget func(int), now time.Time) {
-	for pid := range m {
-		if !sessionDead(src, pid) {
+	for pid, sess := range m {
+		if !sessionDead(src, sess) {
 			continue
 		}
 		if endSession(m, pid, sink, forget, now) {
@@ -443,7 +469,7 @@ func dropStaleSessions(store *state.Store, procSrc osproc.Source, sink *history.
 	for _, sess := range snapshot.Sessions {
 		info, err := procSrc.Read(sess.PID)
 		processes[sess.PID] = processVerdict{
-			alive:      err == nil && discovery.Classify(info) != discovery.AgentNone,
+			alive:      err == nil && processIsSession(info, &sess),
 			definitive: errors.Is(err, osproc.ErrGone) || err == nil,
 		}
 	}
@@ -797,7 +823,7 @@ func handleWMEvent(ctx context.Context, store *state.Store, resolver *mapping.Re
 		}
 		var dead []deadWindowRoot
 		for _, sess := range store.Snapshot().Sessions {
-			if sess.Hyprland == nil || sess.Hyprland.Address != evt.Address || !sessionDead(src, sess.PID) {
+			if sess.Hyprland == nil || sess.Hyprland.Address != evt.Address || !sessionDead(src, &sess) {
 				continue
 			}
 			dead = append(dead, deadWindowRoot{pid: sess.PID, startedAt: sess.StartedAt})
@@ -968,11 +994,6 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 	// every chip click queued behind it. Measured before this change: p99 166ms,
 	// worst 1382ms, with the spike train landing exactly on the tick interval.
 	panes, clients := resolver.Enumerate(ctx)
-	// Follow exactly the herdr servers that own a pane this tick. A tick with no
-	// batch enumeration (nil) says nothing about them, so the set is kept.
-	if rstate.herdr != nil && panes != nil {
-		rstate.herdr.SetServers(ctx, herdrSockets(panes))
-	}
 	// Stamped AFTER the enumeration so TitleAt still means "when the title was
 	// sampled", which is what it meant when each session stamped its own clock on
 	// the way out of Locate. Stamping before would backdate every title by the
@@ -996,7 +1017,7 @@ func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Re
 	for i := range snapshot.Sessions {
 		before := snapshot.Sessions[i]
 		item := preparedSession{before: before, after: cloneSessionForReconcile(before)}
-		item.dead = sessionDead(stack.OSProc, before.PID)
+		item.dead = sessionDead(stack.OSProc, &before)
 		if !item.dead {
 			resolveSession(ctx, resolver, &item.after, panes, clients, now)
 			// Resolve the session name on the machine that owns the process. In
@@ -1198,10 +1219,14 @@ func focusedSession(m map[int]*state.Session) *state.Session {
 }
 
 // enrichmentID returns the session's agent session id (the stable history join
-// key), or "" before any hook has supplied it.
+// key), or "" before any hook has supplied it. An agent herdr alone observes has
+// no hooks; its graph's root id (herdr's terminal id) is its session id.
 func enrichmentID(s *state.Session) string {
 	if info := s.Enrichment(); info != nil {
 		return info.SessionID
+	}
+	if !state.IsProviderAgent(s.Agent) && s.AgentGraph != nil {
+		return s.AgentGraph.RootID
 	}
 	return ""
 }

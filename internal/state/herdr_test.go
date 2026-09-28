@@ -17,6 +17,11 @@ func graphSession(status string, since time.Time) *Session {
 
 var herdrT0 = time.Date(2026, 9, 28, 12, 0, 0, 0, time.UTC)
 
+// reading is a herdr reading of pane w1:p1 running claude.
+func reading(status string, live bool, since time.Time) HerdrReading {
+	return HerdrReading{PaneID: "w1:p1", Socket: "/h.sock", TerminalID: "term_1", Agent: "claude", Status: status, Live: live, Since: since}
+}
+
 func TestHerdrLegacyStatusShouldMapEveryHerdrState(t *testing.T) {
 	for _, tc := range []struct {
 		herdr, provider, want string
@@ -44,7 +49,7 @@ func TestSetHerdrShouldOverrideTheProviderStatusWhenHerdrIsLive(t *testing.T) {
 	s := graphSession(StatusIdle, herdrT0)
 	now := herdrT0.Add(time.Minute)
 
-	before, after := s.SetHerdr("w1:p1", "/h.sock", "claude", HerdrBlocked, true, now)
+	before, after := s.SetHerdr(reading(HerdrBlocked, true, now), now)
 	if before != StatusIdle || after != StatusPermission {
 		t.Fatalf("SetHerdr = %q → %q, want idle → permission", before, after)
 	}
@@ -58,9 +63,9 @@ func TestSetHerdrShouldOverrideTheProviderStatusWhenHerdrIsLive(t *testing.T) {
 
 func TestSetHerdrShouldHandTheStatusBackToTheProviderWhenHerdrStopsBeingLive(t *testing.T) {
 	s := graphSession(StatusIdle, herdrT0)
-	s.SetHerdr("w1:p1", "/h.sock", "claude", HerdrWorking, true, herdrT0.Add(time.Minute))
+	s.SetHerdr(reading(HerdrWorking, true, herdrT0.Add(time.Minute)), herdrT0.Add(time.Minute))
 
-	before, after := s.SetHerdr("w1:p1", "/h.sock", "claude", HerdrWorking, false, herdrT0.Add(2*time.Minute))
+	before, after := s.SetHerdr(reading(HerdrWorking, false, herdrT0.Add(2*time.Minute)), herdrT0.Add(2*time.Minute))
 	if before != StatusWorking || after != StatusIdle {
 		t.Fatalf("SetHerdr = %q → %q, want working → idle (the provider's)", before, after)
 	}
@@ -71,7 +76,7 @@ func TestSetHerdrShouldHandTheStatusBackToTheProviderWhenHerdrStopsBeingLive(t *
 
 func TestSetHerdrShouldLeaveTheProviderStatusWhenHerdrReportsUnknown(t *testing.T) {
 	s := graphSession(StatusWorking, herdrT0)
-	before, after := s.SetHerdr("w1:p1", "/h.sock", "claude", HerdrUnknown, true, herdrT0.Add(time.Minute))
+	before, after := s.SetHerdr(reading(HerdrUnknown, true, herdrT0.Add(time.Minute)), herdrT0.Add(time.Minute))
 	if before != StatusWorking || after != StatusWorking {
 		t.Fatalf("SetHerdr = %q → %q, want working unchanged", before, after)
 	}
@@ -79,7 +84,7 @@ func TestSetHerdrShouldLeaveTheProviderStatusWhenHerdrReportsUnknown(t *testing.
 
 func TestSetHerdrShouldNotMoveStatusSinceWhenThePublishedStatusIsUnchanged(t *testing.T) {
 	s := graphSession(StatusWorking, herdrT0)
-	s.SetHerdr("w1:p1", "/h.sock", "claude", HerdrWorking, true, herdrT0.Add(time.Minute))
+	s.SetHerdr(reading(HerdrWorking, true, herdrT0.Add(time.Minute)), herdrT0.Add(time.Minute))
 	if !s.Claude.StatusSince.Equal(herdrT0) {
 		t.Fatalf("StatusSince = %v, want %v kept: working was already published", s.Claude.StatusSince, herdrT0)
 	}
@@ -87,7 +92,7 @@ func TestSetHerdrShouldNotMoveStatusSinceWhenThePublishedStatusIsUnchanged(t *te
 
 func TestSetHerdrShouldLeaveASessionWithoutAProviderGraphUnchanged(t *testing.T) {
 	s := &Session{PID: 10, Agent: AgentKindClaude}
-	before, after := s.SetHerdr("w1:p1", "/h.sock", "claude", HerdrWorking, true, herdrT0)
+	before, after := s.SetHerdr(reading(HerdrWorking, true, herdrT0), herdrT0)
 	if before != "" || after != "" || s.Claude != nil {
 		t.Fatalf("SetHerdr = %q → %q, claude=%+v; want nothing published", before, after, s.Claude)
 	}
@@ -100,7 +105,7 @@ func TestSetHerdrShouldLeaveASessionWithoutAProviderGraphUnchanged(t *testing.T)
 // over herdr's status.
 func TestSetAgentGraphShouldKeepHerdrsStatusWhenAProviderObservationLands(t *testing.T) {
 	s := graphSession(StatusIdle, herdrT0)
-	s.SetHerdr("w1:p1", "/h.sock", "claude", HerdrWorking, true, herdrT0.Add(time.Minute))
+	s.SetHerdr(reading(HerdrWorking, true, herdrT0.Add(time.Minute)), herdrT0.Add(time.Minute))
 
 	s.SetAgentGraph(&AgentGraph{RootID: "sess-1", Summary: AgentGraphSummary{Status: StatusPermission, Since: herdrT0.Add(2 * time.Minute)}})
 	if s.Claude.Status != StatusWorking {
@@ -113,7 +118,7 @@ func TestSetAgentGraphShouldKeepHerdrsStatusWhenAProviderObservationLands(t *tes
 
 func TestSetAgentGraphShouldKeepDelegatingWhenHerdrSeesAnIdlePrompt(t *testing.T) {
 	s := graphSession(StatusIdle, herdrT0)
-	s.SetHerdr("w1:p1", "/h.sock", "claude", HerdrIdle, true, herdrT0.Add(time.Minute))
+	s.SetHerdr(reading(HerdrIdle, true, herdrT0.Add(time.Minute)), herdrT0.Add(time.Minute))
 
 	s.SetAgentGraph(&AgentGraph{RootID: "sess-1", Summary: AgentGraphSummary{Status: StatusDelegating, Since: herdrT0.Add(2 * time.Minute)}})
 	if s.Claude.Status != StatusDelegating {
@@ -125,7 +130,7 @@ func TestSetAgentGraphShouldKeepDelegatingWhenHerdrSeesAnIdlePrompt(t *testing.T
 // confirms it; only the wire fields survive, and they carry no authority.
 func TestHerdrShouldCarryNoAuthorityWhenHydratedFromJSON(t *testing.T) {
 	live := graphSession(StatusIdle, herdrT0)
-	live.SetHerdr("w1:p1", "/h.sock", "claude", HerdrBlocked, true, herdrT0)
+	live.SetHerdr(reading(HerdrBlocked, true, herdrT0), herdrT0)
 	raw, err := json.Marshal(live)
 	if err != nil {
 		t.Fatal(err)
@@ -147,12 +152,52 @@ func TestSnapshotShouldDetachTheHerdrBlockWhenTheStoreChangesLater(t *testing.T)
 	store := New(filepath.Join(t.TempDir(), "state.json"))
 	store.Apply(func(m map[int]*Session) {
 		s := graphSession(StatusIdle, herdrT0)
-		s.SetHerdr("w1:p1", "/h.sock", "claude", HerdrWorking, true, herdrT0)
+		s.SetHerdr(reading(HerdrWorking, true, herdrT0), herdrT0)
 		m[s.PID] = s
 	})
 	snap := store.Snapshot()
 	store.Apply(func(m map[int]*Session) { m[10].Herdr.Status = HerdrBlocked })
 	if got := snap.Sessions[0].Herdr.Status; got != HerdrWorking {
 		t.Fatalf("snapshot herdr status = %q, want working: the snapshot shares the live block", got)
+	}
+}
+
+func TestSetHerdrShouldGiveAHerdrOnlyAgentAOneNodeGraph(t *testing.T) {
+	s := &Session{PID: 20, Agent: "opencode"}
+	r := reading(HerdrWorking, true, herdrT0)
+	r.Agent = "opencode"
+	before, after := s.SetHerdr(r, herdrT0.Add(time.Second))
+	if before != "" || after != StatusWorking {
+		t.Fatalf("SetHerdr = %q → %q, want unknown → working", before, after)
+	}
+	g := s.AgentGraph
+	if g == nil || g.RootID != "herdr:term_1" || g.Source != "herdr" || len(g.Nodes) != 1 {
+		t.Fatalf("graph = %+v, want one herdr-sourced node rooted at the terminal id", g)
+	}
+	if s.Claude != nil || s.Codex != nil {
+		t.Fatal("a herdr-only agent grew a claude/codex enrichment block")
+	}
+}
+
+func TestSetHerdrShouldExpireAHerdrOnlyAgentsGraphWhenHerdrIsLost(t *testing.T) {
+	s := &Session{PID: 20, Agent: "pi"}
+	s.SetHerdr(reading(HerdrBlocked, true, herdrT0), herdrT0.Add(time.Second))
+
+	before, after := s.SetHerdr(reading(HerdrBlocked, false, herdrT0), herdrT0.Add(time.Minute))
+	if before != StatusPermission || after != "" {
+		t.Fatalf("SetHerdr = %q → %q, want permission → unknown", before, after)
+	}
+}
+
+func TestSetHerdrShouldKeepAHerdrOnlyAgentsRootWhenItsPaneMoves(t *testing.T) {
+	s := &Session{PID: 20, Agent: "pi"}
+	s.SetHerdr(reading(HerdrIdle, true, herdrT0), herdrT0)
+	root := s.AgentGraph.RootID
+
+	moved := reading(HerdrIdle, true, herdrT0)
+	moved.PaneID = "w3:p1"
+	s.SetHerdr(moved, herdrT0.Add(time.Minute))
+	if s.AgentGraph.RootID != root || s.Herdr.PaneID != "w3:p1" {
+		t.Fatalf("root %q pane %q, want root %q kept across the move", s.AgentGraph.RootID, s.Herdr.PaneID, root)
 	}
 }

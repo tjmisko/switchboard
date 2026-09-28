@@ -103,6 +103,9 @@ const (
 	SourceClaudeTranscript  SourceKind = "claude_transcript"
 	SourceCodexRollout      SourceKind = "codex_rollout"
 	SourceRestoredLastKnown SourceKind = "restored_last_known"
+	// SourceHerdr is herdr's own per-pane agent status, the only source for an
+	// agent Switchboard has no provider adapter for.
+	SourceHerdr SourceKind = "herdr"
 )
 
 // Usage is optional token accounting for one node. Its zero value means usage

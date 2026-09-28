@@ -21,9 +21,10 @@ type PaneKey struct {
 
 // PaneStatus is herdr's current reading of the agent in one pane.
 type PaneStatus struct {
-	Agent  string    // detected agent label, "" when none
-	Status string    // StatusWorking, StatusBlocked, StatusDone, StatusIdle or StatusUnknown
-	Since  time.Time // when the watcher first saw this status
+	TerminalID string    // herdr's id for the pane's terminal; stable across moves
+	Agent      string    // detected agent label, "" when none
+	Status     string    // StatusWorking, StatusBlocked, StatusDone, StatusIdle or StatusUnknown
+	Since      time.Time // when the watcher first saw this status
 }
 
 // Watcher follows the agent status of every pane on a set of herdr servers.
@@ -291,7 +292,7 @@ func (w *Watcher) replace(socket string, panes []Pane) {
 	listed := make(map[string]bool, len(panes))
 	for _, p := range panes {
 		listed[p.PaneID] = true
-		if w.setLocked(server, p.PaneID, p.AgentName(), p.AgentStatus) {
+		if w.setLocked(server, p.PaneID, p.TerminalID, p.AgentName(), p.AgentStatus) {
 			changed = append(changed, PaneKey{Socket: socket, PaneID: p.PaneID})
 		}
 	}
@@ -308,19 +309,28 @@ func (w *Watcher) replace(socket string, panes []Pane) {
 func (w *Watcher) update(socket, paneID, agent, status string) {
 	w.mu.Lock()
 	server, ok := w.servers[socket]
-	changed := ok && paneID != "" && w.setLocked(server, paneID, agent, status)
+	changed := ok && paneID != "" && w.setLocked(server, paneID, "", agent, status)
 	w.mu.Unlock()
 	if changed {
 		w.signal(PaneKey{Socket: socket, PaneID: paneID})
 	}
 }
 
-func (w *Watcher) setLocked(server *watchedServer, paneID, agent, status string) bool {
+// setLocked records a pane's status. terminalID "" (status events carry none)
+// keeps the one the last list gave.
+func (w *Watcher) setLocked(server *watchedServer, paneID, terminalID, agent, status string) bool {
 	prior, ok := server.panes[paneID]
-	if ok && prior.Agent == agent && prior.Status == status {
+	if terminalID == "" {
+		terminalID = prior.TerminalID
+	}
+	if ok && prior.TerminalID == terminalID && prior.Agent == agent && prior.Status == status {
 		return false
 	}
-	server.panes[paneID] = PaneStatus{Agent: agent, Status: status, Since: w.now()}
+	since := w.now()
+	if ok && prior.Status == status {
+		since = prior.Since
+	}
+	server.panes[paneID] = PaneStatus{TerminalID: terminalID, Agent: agent, Status: status, Since: since}
 	return true
 }
 
