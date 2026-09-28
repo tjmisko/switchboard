@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"testing"
@@ -23,6 +24,7 @@ import (
 // pane is showing; only herdr's own stream does.
 type herdrFocusTerminal struct {
 	source *fakeHerdrSource
+	fail   bool
 }
 
 func (*herdrFocusTerminal) Name() string    { return "herdr" }
@@ -46,16 +48,25 @@ func (l *herdrFocusTerminal) Locate(ctx context.Context, tty string) (*terminal.
 	return &pane, nil
 }
 
-// Activate is herdr's pane.focus: herdr answers at once and announces the move
-// on its stream afterwards.
+// Activate is herdr's pane.focus: herdr moves its focus before it acks, but
+// announces the move on its stream only later. The test delivers that event
+// itself (source.focus), so nothing here depends on it arriving.
 func (l *herdrFocusTerminal) Activate(_ context.Context, pane *terminal.PaneRef) error {
-	l.source.focus(pane.MuxSocket, pane.Handle)
+	if l.fail {
+		return errors.New("herdr pane.focus: pane_not_found")
+	}
+	l.source.mu.Lock()
+	l.source.truth = pane.Handle
+	l.source.mu.Unlock()
 	return nil
 }
 
 type herdrFocusManager struct {
 	stubManager
 	active string
+	// raised runs inside Focus, as Hyprland's focus event lands a few
+	// milliseconds after the raise and before the pane step has finished.
+	raised func(addr string)
 }
 
 func (*herdrFocusManager) Clients(context.Context) ([]wm.Window, error) {
@@ -64,6 +75,9 @@ func (*herdrFocusManager) Clients(context.Context) ([]wm.Window, error) {
 func (m *herdrFocusManager) ActiveWindow(context.Context) (string, error) { return m.active, nil }
 func (m *herdrFocusManager) Focus(_ context.Context, addr string) error {
 	m.active = addr
+	if m.raised != nil {
+		m.raised(addr)
+	}
 	return nil
 }
 
@@ -77,6 +91,7 @@ func TestWaybarAndCycleShouldFollowHerdrsFocusedPaneWhenAgentsShareOneWindow(t *
 	}
 	source.set(herdr.PaneKey{Socket: testHerdrSock, PaneID: "w1:p4"}, "", herdr.StatusUnknown, started)
 	source.active[testHerdrSock] = "w1:p1"
+	source.truth = "w1:p1"
 
 	term := &herdrFocusTerminal{source: source}
 	manager := &herdrFocusManager{active: "0xherdr"}
@@ -101,6 +116,9 @@ func TestWaybarAndCycleShouldFollowHerdrsFocusedPaneWhenAgentsShareOneWindow(t *
 	})
 	server := rpc.New(store, "", term, manager)
 	server.SetFocusObserver(func(ctx context.Context) { reresolveAll(ctx, store, resolver, turn, nil) })
+	server.SetFocusIntent(func(ctx context.Context, target state.Session) func(error) {
+		return claimHerdrFocus(ctx, store, resolver.ActiveWindow, source, nil, target)
+	})
 	renderer := waybarchip.NewRenderer(2000)
 
 	focusIs := func(want int) (bool, string) {
@@ -131,9 +149,29 @@ func TestWaybarAndCycleShouldFollowHerdrsFocusedPaneWhenAgentsShareOneWindow(t *
 		}
 	}
 
+	assertFocus := func(want int) {
+		t.Helper()
+		if ok, why := focusIs(want); !ok {
+			t.Fatal(why)
+		}
+	}
+
 	reresolveAll(t.Context(), store, resolver, turn, nil)
 	awaitFocus(2000) // only the pane herdr shows, not all three in the window
 
+	// litNow lists the focused pids as the daemon has them at this instant.
+	litNow := func() []int {
+		var lit []int
+		for _, sess := range store.Snapshot().Sessions {
+			if sess.Focused {
+				lit = append(lit, sess.PID)
+			}
+		}
+		return lit
+	}
+
+	// A request Switchboard makes is trusted at once: the chip moves before the
+	// window is even raised, with herdr's own event still in flight.
 	for _, step := range []struct {
 		dir  string
 		want int
@@ -142,11 +180,54 @@ func TestWaybarAndCycleShouldFollowHerdrsFocusedPaneWhenAgentsShareOneWindow(t *
 		if !ok || target.PID != step.want {
 			t.Fatalf("cycle %s = pid %d, want %d", step.dir, target.PID, step.want)
 		}
+		var litOnRaise []int
+		manager.raised = func(string) { litOnRaise = litNow() }
 		if err := server.FocusLocalSession(t.Context(), target.PID, target.StartedAt); err != nil {
 			t.Fatal(err)
 		}
-		awaitFocus(step.want)
+		manager.raised = nil
+		if !slices.Equal(litOnRaise, []int{step.want}) {
+			t.Fatalf("cycle %s: lit on raise = %v, want only pid %d", step.dir, litOnRaise, step.want)
+		}
+		assertFocus(step.want)
+		// herdr's event, when it lands, confirms the claim and moves nothing.
+		source.focus(testHerdrSock, target.Herdr.PaneID)
+		time.Sleep(5 * time.Millisecond)
+		assertFocus(step.want)
 	}
+
+	// From another window: the WM focus event lands mid-navigation, before the
+	// pane step. It must already light the requested chip, never herdr's
+	// previous pane's.
+	manager.active = "0xother"
+	handleWMEvent(t.Context(), store, resolver, wm.Event{Kind: wm.EventFocusChanged, Address: "0xother"}, nil, nil, nil, turn)
+	assertFocus(0)
+	var litOnRaise []int
+	manager.raised = func(addr string) {
+		handleWMEvent(t.Context(), store, resolver, wm.Event{Kind: wm.EventFocusChanged, Address: addr}, nil, nil, nil, turn)
+		litOnRaise = litNow()
+	}
+	target := store.Snapshot().Sessions[2]
+	if err := server.FocusLocalSession(t.Context(), target.PID, target.StartedAt); err != nil {
+		t.Fatal(err)
+	}
+	manager.raised = nil
+	if !slices.Equal(litOnRaise, []int{target.PID}) {
+		t.Fatalf("lit on raise = %v, want only the requested pid %d", litOnRaise, target.PID)
+	}
+	assertFocus(target.PID)
+	source.focus(testHerdrSock, target.Herdr.PaneID)
+
+	// A request herdr refuses is corrected from herdr's own account.
+	term.fail = true
+	refused := store.Snapshot().Sessions[0]
+	if err := server.FocusLocalSession(t.Context(), refused.PID, refused.StartedAt); err == nil {
+		t.Fatal("failed activation acknowledged")
+	}
+	awaitFocus(target.PID)
+	term.fail = false
+	source.focus(testHerdrSock, "w1:p1") // back to the first pane for what follows
+	awaitFocus(2000)
 
 	// A tab switch inside herdr moves no OS window: herdr's stream alone
 	// carries it, with no WM event and no reconcile tick.
@@ -288,5 +369,40 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 			t.Fatalf("timed out waiting for %s", what)
 		}
 		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// refusingHerdrSource is a herdr server that is not followed: every claim is
+// refused.
+type refusingHerdrSource struct{ *fakeHerdrSource }
+
+func (refusingHerdrSource) Claim(string, string) bool { return false }
+
+func TestClaimHerdrFocusShouldDoNothingWhenTheTargetIsNotInAHerdrPane(t *testing.T) {
+	store := state.New("")
+	source := newFakeHerdrSource()
+	queried := false
+	settle := claimHerdrFocus(t.Context(), store, func(context.Context) (string, error) {
+		queried = true
+		return "", nil
+	}, source, nil, state.Session{PID: 1, Wezterm: &state.WeztermInfo{PaneID: 3}})
+	if settle != nil || queried || len(source.active) != 0 {
+		t.Fatalf("settle=%v queried=%v active=%v; want no claim and no WM query", settle != nil, queried, source.active)
+	}
+}
+
+func TestClaimHerdrFocusShouldDoNothingWhenHerdrsServerIsNotFollowed(t *testing.T) {
+	store := state.New("")
+	store.Apply(func(m map[int]*state.Session) {
+		m[1] = &state.Session{PID: 1, Hyprland: &state.HyprlandInfo{Address: "0xherdr"},
+			Herdr: &state.HerdrInfo{PaneID: "w1:p1", Socket: testHerdrSock}}
+	})
+	queried := false
+	settle := claimHerdrFocus(t.Context(), store, func(context.Context) (string, error) {
+		queried = true
+		return "0xherdr", nil
+	}, refusingHerdrSource{newFakeHerdrSource()}, nil, store.Snapshot().Sessions[0])
+	if settle != nil || queried {
+		t.Fatalf("settle=%v queried=%v; want nothing to settle and no WM query", settle != nil, queried)
 	}
 }

@@ -20,6 +20,7 @@ type fakeHerdrSource struct {
 	mu       sync.Mutex
 	statuses map[herdr.PaneKey]herdr.PaneStatus
 	active   map[string]string // focused pane by socket
+	truth    string            // the pane herdr's own focus is on, for Resync
 	servers  []string
 	changes  chan herdr.PaneKey
 }
@@ -52,6 +53,24 @@ func (f *fakeHerdrSource) ActivePane(socket string) string {
 }
 
 func (f *fakeHerdrSource) Changes() <-chan herdr.PaneKey { return f.changes }
+
+func (f *fakeHerdrSource) Claim(socket, paneID string) bool {
+	f.focus(socket, paneID)
+	return true
+}
+
+// Resync restores the focused pane herdr itself reports (truth), as a re-list
+// does, and signals the server's panes when it moved.
+func (f *fakeHerdrSource) Resync(_ context.Context, socket string) error {
+	f.mu.Lock()
+	truth := f.truth
+	moved := f.active[socket] != truth
+	f.mu.Unlock()
+	if moved {
+		f.focus(socket, truth)
+	}
+	return nil
+}
 
 // focus moves the server's focused pane and signals every pane on it, as the
 // watcher does.

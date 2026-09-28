@@ -302,6 +302,9 @@ func main() {
 	server.SetFocusObserver(func(ctx context.Context) {
 		reresolveAll(ctx, store, resolver, turn, sink)
 	})
+	server.SetFocusIntent(func(ctx context.Context, target state.Session) func(error) {
+		return claimHerdrFocus(ctx, store, resolver.ActiveWindow, herdrWatcher, sink, target)
+	})
 	server.SetAgentHookHandler(agentRuntime.HandleHook)
 	server.SetAgentDiagnosticSource(agentRuntime.Diagnostics)
 	server.SetHookAttributionDiagnostic(func(diagnostic rpc.HookAttributionDiagnostic) {

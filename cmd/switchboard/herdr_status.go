@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"log"
 	"slices"
 	"time"
 
@@ -167,6 +168,55 @@ func runHerdrStatus(ctx context.Context, store *state.Store, source herdrStatusS
 		})
 		if focusMoved && refocus != nil {
 			refocus(ctx)
+		}
+	}
+}
+
+// herdrFocusClaimer is the part of herdr.Watcher a trusted focus request uses.
+type herdrFocusClaimer interface {
+	herdrStatusSource
+	Claim(socket, paneID string) bool
+	Resync(ctx context.Context, socket string) error
+}
+
+// claimHerdrFocus trusts a focus request for a session in a herdr pane before
+// herdr confirms it. herdr's pane.focused event trails the request by up to
+// its stream's 100 ms poll, and the window raise that precedes it fires a WM
+// focus event within a few milliseconds. Left to wait, that WM event lights
+// the chip of herdr's previous pane, and herdr's event then moves the light:
+// a visible stutter. Claiming the pane first, and re-deriving focus against
+// the window active now, makes every later focus pass agree with the request
+// from the start. If the window is already active, the chip moves at once.
+//
+// It returns the settle func for rpc.SetFocusIntent: a navigation that failed
+// re-reads herdr's own account, which re-derives focus through the herdr
+// status loop. nil when the target is not in a followed herdr pane.
+func claimHerdrFocus(ctx context.Context, store *state.Store, activeWindow func(context.Context) (string, error), source herdrFocusClaimer, sink *history.Sink, target state.Session) func(error) {
+	if target.Herdr == nil || target.Herdr.Socket == "" || target.Herdr.PaneID == "" {
+		return nil
+	}
+	socket := target.Herdr.Socket
+	if !source.Claim(socket, target.Herdr.PaneID) {
+		return nil
+	}
+	active, activeErr := activeWindow(ctx)
+	now := time.Now()
+	store.Apply(func(m map[int]*state.Session) {
+		for _, sess := range m {
+			if sess.Herdr != nil && sess.Herdr.Socket == socket {
+				applyHerdrPane(sess, nil, source, sink, now)
+			}
+		}
+		if activeErr == nil {
+			applyFocus(m, active, sink, now)
+		}
+	})
+	return func(err error) {
+		if err == nil {
+			return
+		}
+		if resyncErr := source.Resync(context.WithoutCancel(ctx), socket); resyncErr != nil {
+			log.Printf("herdr focus: resync %s after a failed focus: %v", socket, resyncErr)
 		}
 	}
 }
