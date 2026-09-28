@@ -104,6 +104,7 @@ enrichment, graph, and display-name fields are omitted when unavailable.
 | `mem_tree_bytes` | integer | omitted when unmeasured | PSS + SwapPss for the root and all descendants. |
 | `wezterm` | object | optional | Wezterm locator data. |
 | `hyprland` | object | optional | Hyprland window data. |
+| `herdr` | object | optional | The herdr pane hosting the session and herdr's own agent status. While present and followed, herdr decides the published status. |
 | `claude` | object | optional | Claude compatibility enrichment. |
 | `codex` | object | optional | Codex compatibility enrichment. |
 | `agent_graph` | object | optional | Bounded provider-neutral root/child graph. |
@@ -154,6 +155,35 @@ fields always present when the block exists.
 | `workspace` | string | Workspace name the window is on. |
 | `workspace_id` | integer | Numeric Hyprland workspace id. Drives the bottom-bar chip ordering (chips follow workspace order). `0` means unresolved (Hyprland workspace ids are positive, or negative for special workspaces). A federated client's aggregate view omits this block on remote rows — a remote desktop's workspace numbers mean nothing locally — and places those chips by the workspace of the **local** window displaying the session's SSH pane, falling back to the end of the bar while that window is unknown. |
 | `monitor` | string | Monitor name. ⚠ Currently **never populated** (always `""`); reserved. See `docs/decisions.md`. |
+
+### `herdr` (`HerdrInfo`) — additive
+
+Present when the session runs in a [herdr](https://herdr.dev) pane. herdr is
+the status authority for every agent in one of its panes: while the daemon is
+following the pane's herdr server, the enrichment block's `status` (and so what
+every renderer shows) is herdr's, projected as below. The provider graph keeps
+running, and `agent_graph.summary.status` keeps the provider's own verdict, so
+the two can be compared when they differ.
+
+| Field | JSON type | Meaning |
+|-------|-----------|---------|
+| `pane_id` | string | herdr's public pane id, e.g. `w1:p2`. It changes when the pane moves to another workspace; the daemon follows it. |
+| `socket` | string | API socket of the herdr server that owns the pane. |
+| `agent` | string | Agent herdr detected in the pane (`claude`, `codex`, …); omitted when none. |
+| `status` | string | herdr's raw status: `working`, `blocked`, `done`, `idle` or `unknown`; omitted until read. |
+
+| herdr `status` | Published `status` |
+|---|---|
+| `working` | `working` |
+| `blocked` | `permission` |
+| `idle`, `done` | `idle`, or `delegating` when the provider graph shows working subagents (herdr reads the screen and cannot see background agents) |
+| `unknown` | the provider graph's own |
+
+The authority itself is not on the wire. A block read back from `state.json`
+after a restart decides nothing until the daemon hears from that herdr server
+again, and the provider's status resumes when the server has been unreachable
+for 10 seconds. Edges herdr decides are recorded in history with
+`rule: herdr_authority`, and the hand-back with `herdr_released`.
 
 ### `claude` / `codex` (`AgentInfo`) — claude stable, codex additive
 
@@ -475,7 +505,8 @@ display, so `nodes` is not an unbounded archive.
 Applying a graph updates only these legacy compatibility values:
 
 - the matching `claude.session_id` or `codex.session_id` becomes `root_id`;
-- its `status` becomes `summary.status`;
+- its `status` becomes `summary.status`, unless herdr is the session's status
+  authority (see `herdr` above);
 - its `status_since` moves when that legacy status changes.
 
 Claude-only `in_flight_subagents`, workflows, pending writers, transcript, and

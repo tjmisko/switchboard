@@ -504,7 +504,12 @@ labels, prompts, assistant content, commands, or raw provider payloads.
   `HERDR_SOCKET_PATH` override works. With several clients attached it raises
   the most recently started one. A pane of a detached server is selected but has
   no window to raise. Clients attached over SSH (`herdr --remote`) are not
-  covered.
+  covered. herdr is also the **status authority** for an agent in one of its
+  panes: Switchboard follows herdr's per-pane agent status over its event
+  stream and publishes it in place of the provider's (see the `herdr` block in
+  [docs/state-schema.md](docs/state-schema.md)). herdr reads the screen, so its
+  edges trail Claude's hooks by about a second, but it also clears a declined
+  prompt that fires no hook.
 - macOS support (Observe tier) is planned (see the plan).
 
 ## Status / roadmap
