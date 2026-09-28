@@ -361,3 +361,135 @@ func TestWatcherShouldReportNothingForAPaneItHasNotSeen(t *testing.T) {
 		t.Fatal("status reported for an unwatched socket")
 	}
 }
+
+func focusedPane(id, agent, status string) Pane {
+	p := agentPane(id, agent, status)
+	p.Focused = true
+	return p
+}
+
+func activePaneIs(w *Watcher, socket, want string) func() bool {
+	return func() bool { return w.ActivePane(socket) == want }
+}
+
+func TestWatcherShouldReportTheListedFocusedPaneWhenSubscribed(t *testing.T) {
+	s := newFakeServer(t, agentPane("w1:p1", "claude", StatusIdle), focusedPane("w1:p2", "claude", StatusIdle))
+	w := startWatcher(t, time.Minute, s.socket)
+	s.awaitSubscription(t)
+	eventually(t, "w1:p2 active", activePaneIs(w, s.socket, "w1:p2"))
+}
+
+// herdr emits pane.focused for a tab switch made inside a client, which moves
+// no OS window and so reaches Switchboard by no other route.
+func TestWatcherShouldMoveTheActivePaneWhenAPaneFocusedEventArrives(t *testing.T) {
+	s := newFakeServer(t, focusedPane("w1:p1", "claude", StatusIdle), agentPane("w1:p2", "claude", StatusIdle))
+	w := startWatcher(t, time.Minute, s.socket)
+	s.awaitSubscription(t)
+	eventually(t, "w1:p1 active", activePaneIs(w, s.socket, "w1:p1"))
+
+	s.push(`{"data":{"pane_id":"w1:p2","workspace_id":"w1"},"event":"pane.focused"}`)
+	eventually(t, "w1:p2 active", activePaneIs(w, s.socket, "w1:p2"))
+}
+
+func TestWatcherShouldSubscribeToPaneFocusEventsWhenItSubscribes(t *testing.T) {
+	var got []map[string]string
+	var mu sync.Mutex
+	s := newFakeServer(t, agentPane("w1:p1", "claude", StatusIdle))
+	w := newWatcher(Call, func(ctx context.Context, socket string) (net.Conn, error) {
+		var d net.Dialer
+		conn, err := d.DialContext(ctx, "unix", socket)
+		if err != nil {
+			return nil, err
+		}
+		return &recordingConn{Conn: conn, record: func(subs []map[string]string) {
+			mu.Lock()
+			defer mu.Unlock()
+			got = subs
+		}}, nil
+	}, time.Now, time.Minute)
+	w.SetServers(context.Background(), []string{s.socket})
+	t.Cleanup(w.Close)
+	s.awaitSubscription(t)
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, sub := range got {
+		if sub["type"] == "pane.focused" {
+			return
+		}
+	}
+	t.Fatalf("subscriptions = %v, want one for pane.focused", got)
+}
+
+// recordingConn captures the subscriptions of the one request written on it.
+type recordingConn struct {
+	net.Conn
+	record func([]map[string]string)
+}
+
+func (c *recordingConn) Write(b []byte) (int, error) {
+	var req struct {
+		Params struct {
+			Subscriptions []map[string]string `json:"subscriptions"`
+		} `json:"params"`
+	}
+	if json.Unmarshal(b, &req) == nil {
+		c.record(req.Params.Subscriptions)
+	}
+	return c.Conn.Write(b)
+}
+
+// Moving focus changes which pane of the server is showing, so every pane's
+// session must be re-read, not only the two the focus left and reached.
+func TestWatcherShouldSignalEveryPaneOfTheServerWhenFocusMoves(t *testing.T) {
+	s := newFakeServer(t, focusedPane("w1:p1", "claude", StatusIdle), agentPane("w1:p2", "claude", StatusIdle), agentPane("w1:p3", "pi", StatusIdle))
+	w := startWatcher(t, time.Minute, s.socket)
+	s.awaitSubscription(t)
+	eventually(t, "w1:p1 active", activePaneIs(w, s.socket, "w1:p1"))
+	eventually(t, "connected", func() bool { _, ok := w.Status(PaneKey{Socket: s.socket, PaneID: "w1:p3"}); return ok })
+	time.Sleep(20 * time.Millisecond) // let the second list's signals land before draining
+	for len(w.Changes()) > 0 {
+		<-w.Changes()
+	}
+
+	s.push(`{"data":{"pane_id":"w1:p2","workspace_id":"w1"},"event":"pane.focused"}`)
+	signalled := make(map[string]bool)
+	deadline := time.After(3 * time.Second)
+	for len(signalled) < 3 {
+		select {
+		case key := <-w.Changes():
+			signalled[key.PaneID] = true
+		case <-deadline:
+			t.Fatalf("signalled %v, want all three panes", signalled)
+		}
+	}
+}
+
+func TestWatcherShouldReportNoActivePaneWhenNoListedPaneIsFocused(t *testing.T) {
+	s := newFakeServer(t, focusedPane("w1:p1", "claude", StatusIdle))
+	w := startWatcher(t, time.Minute, s.socket)
+	s.awaitSubscription(t)
+	eventually(t, "w1:p1 active", activePaneIs(w, s.socket, "w1:p1"))
+
+	s.setPanes(agentPane("w1:p1", "claude", StatusIdle))
+	s.dropSubscriptions()
+	s.awaitSubscription(t)
+	eventually(t, "no active pane", activePaneIs(w, s.socket, ""))
+}
+
+func TestWatcherShouldReportNoActivePaneAfterGraceWhenTheServerStaysDown(t *testing.T) {
+	s := newFakeServer(t, focusedPane("w1:p1", "claude", StatusIdle))
+	w := startWatcher(t, 30*time.Millisecond, s.socket)
+	s.awaitSubscription(t)
+	eventually(t, "w1:p1 active", activePaneIs(w, s.socket, "w1:p1"))
+
+	s.close()
+	eventually(t, "active pane dropped after grace", activePaneIs(w, s.socket, ""))
+}
+
+func TestWatcherShouldReportNoActivePaneWhenTheSocketIsNotWatched(t *testing.T) {
+	w := startWatcher(t, time.Minute)
+	if got := w.ActivePane("/elsewhere.sock"); got != "" {
+		t.Fatalf("ActivePane = %q for an unwatched socket, want empty", got)
+	}
+}

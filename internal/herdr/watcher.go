@@ -56,6 +56,8 @@ type watchedServer struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 	panes  map[string]PaneStatus // by pane id
+	// activePane is the pane herdr's focus is on, "" when none is known.
+	activePane string
 	// connected is true while a subscription is streaming; lostAt is when it
 	// last stopped, zero before the first connection.
 	connected bool
@@ -135,6 +137,19 @@ func (w *Watcher) Status(key PaneKey) (PaneStatus, bool) {
 	return status, ok
 }
 
+// ActivePane returns the pane herdr's focus is on for the server at socket,
+// while its statuses count. It is "" when the server is not followed or reports
+// no focused pane; callers then cannot say which of its panes is showing.
+func (w *Watcher) ActivePane(socket string) string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	server, ok := w.servers[socket]
+	if !ok || !w.countsLocked(server) {
+		return ""
+	}
+	return server.activePane
+}
+
 func (w *Watcher) countsLocked(server *watchedServer) bool {
 	if server.connected {
 		return true
@@ -191,10 +206,11 @@ func (w *Watcher) stream(ctx context.Context, socket string) error {
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
 
-	subscriptions := make([]map[string]string, 0, len(lifecycleSubscriptions)+len(panes))
+	subscriptions := make([]map[string]string, 0, len(lifecycleSubscriptions)+1+len(panes))
 	for _, kind := range lifecycleSubscriptions {
 		subscriptions = append(subscriptions, map[string]string{"type": kind})
 	}
+	subscriptions = append(subscriptions, map[string]string{"type": "pane.focused"})
 	for _, p := range panes {
 		subscriptions = append(subscriptions, map[string]string{"type": "pane.agent_status_changed", "pane_id": p.PaneID})
 	}
@@ -258,6 +274,8 @@ func (w *Watcher) stream(ctx context.Context, socket string) error {
 				agent = *event.Data.Agent
 			}
 			w.update(socket, event.Data.PaneID, agent, event.Data.AgentStatus)
+		case "pane_focused":
+			w.setActive(socket, event.Data.PaneID)
 		case "pane_created", "pane_closed", "pane_moved", "pane_exited", "pane_agent_detected":
 			return errResubscribe
 		}
@@ -290,8 +308,12 @@ func (w *Watcher) replace(socket string, panes []Pane) {
 		return
 	}
 	listed := make(map[string]bool, len(panes))
+	active := ""
 	for _, p := range panes {
 		listed[p.PaneID] = true
+		if p.Focused {
+			active = p.PaneID
+		}
 		if w.setLocked(server, p.PaneID, p.TerminalID, p.AgentName(), p.AgentStatus) {
 			changed = append(changed, PaneKey{Socket: socket, PaneID: p.PaneID})
 		}
@@ -302,8 +324,34 @@ func (w *Watcher) replace(socket string, panes []Pane) {
 			changed = append(changed, PaneKey{Socket: socket, PaneID: id})
 		}
 	}
+	changed = append(changed, w.setActiveLocked(socket, server, active)...)
 	w.mu.Unlock()
 	w.signal(changed...)
+}
+
+// setActive records the pane herdr's focus moved to.
+func (w *Watcher) setActive(socket, paneID string) {
+	w.mu.Lock()
+	var changed []PaneKey
+	if server, ok := w.servers[socket]; ok {
+		changed = w.setActiveLocked(socket, server, paneID)
+	}
+	w.mu.Unlock()
+	w.signal(changed...)
+}
+
+// setActiveLocked moves a server's active pane. A move changes which of its
+// panes is showing, so it returns every pane of the server to signal.
+func (w *Watcher) setActiveLocked(socket string, server *watchedServer, paneID string) []PaneKey {
+	if server.activePane == paneID {
+		return nil
+	}
+	server.activePane = paneID
+	changed := make([]PaneKey, 0, len(server.panes))
+	for id := range server.panes {
+		changed = append(changed, PaneKey{Socket: socket, PaneID: id})
+	}
+	return changed
 }
 
 func (w *Watcher) update(socket, paneID, agent, status string) {

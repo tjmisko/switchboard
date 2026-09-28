@@ -27,6 +27,9 @@ type Pane struct {
 	// (JSON null) when none.
 	Agent       *string `json:"agent"`
 	AgentStatus string  `json:"agent_status"`
+	// Focused is true for the one pane herdr's focus is on: the focused pane
+	// of the active tab of the active workspace. At most one per server.
+	Focused bool `json:"focused"`
 }
 
 // AgentName returns the detected agent's label, or "" when none.
