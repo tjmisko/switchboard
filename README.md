@@ -509,8 +509,10 @@ Codex app-server observation with bounded degradation; Claude compatibility
 projection; canonical agent history/timeline output; a provider-neutral i3 +
 Polybar bottom bar; the Hyprland + Waybar two-bar appliance (appendix).
 
-Next: macOS OS backend (`libproc` + `kqueue`); verified eww recipes; the
-tmux→WM-window focus bridge.
+Next: jump-to-focus on every Omarchy terminal — kitty, the tmux→WM-window
+focus bridge, Hyprland focus edge cases, Ghostty — phased in
+[`docs/terminal-coverage/`](docs/terminal-coverage/README.md); macOS OS backend
+(`libproc` + `kqueue`); verified eww recipes.
 
 ---
 
