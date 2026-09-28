@@ -20,6 +20,7 @@ phase's preconditions name what it needs from earlier ones.
 | 05 | [Ghostty backend](05-ghostty.md) | **blocked** on a Ghostty release | no (not installed) |
 | 06 | [Shared-process disambiguation](06-shared-process-disambiguation.md) | **needs an owner decision** | yes |
 | 07 | [Omarchy 4 acceptance](07-omarchy-acceptance.md) | after 02–04 | no — needs an Omarchy 4 x86_64 install |
+| 08 | [herdr](08-herdr.md) | **done** (`0810878`, `972cfea`) | yes (herdr 0.9.1) |
 
 Why this order:
 
@@ -36,6 +37,8 @@ Why this order:
   agent's terminal, which is a product decision, not an engineering one.
 - **07** is the acceptance run on a real Omarchy install, which the dev box
   (Fedora Asahi, aarch64) is not.
+- **08 herdr** was taken out of order at the owner's request. It added the
+  generic `PaneRef.HostTTY` client bridge that **03 tmux** should reuse.
 
 ## Architecture the phases build on
 
