@@ -21,9 +21,11 @@ type auto struct {
 
 // NewAuto returns a self-redetecting terminal locator that composes whichever
 // backends are live, mirroring detect's auto precedence: tmux (innermost — it
-// owns the pane a claude actually runs in) then wezterm (the outer window).
+// owns the pane a claude actually runs in) then the outer windowed terminals,
+// wezterm and foot. The two outer backends can never both claim a tty: each
+// owns only the ptys its own processes drive.
 func NewAuto() Locator {
-	return auto{candidates: []Locator{NewTmux(), NewWezterm()}}
+	return auto{candidates: []Locator{NewTmux(), NewWezterm(), NewFoot()}}
 }
 
 // current resolves the currently-live backend set into a single Locator,

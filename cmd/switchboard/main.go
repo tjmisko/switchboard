@@ -88,7 +88,7 @@ func main() {
 	scanInterval := flag.Duration("scan-interval", 1*time.Second, "/proc scan interval")
 	reconcileInterval := flag.Duration("reconcile-interval", 5*time.Second, "full reconcile interval")
 	wmFlag := flag.String("wm", "auto", "WM backend: auto|hyprland|sway|i3|x11|none")
-	terminalFlag := flag.String("terminal", "auto", "terminal backend: auto|wezterm|tmux|none")
+	terminalFlag := flag.String("terminal", "auto", "terminal backend: auto|wezterm|tmux|foot|none")
 	historyDir := flag.String("history-dir", "", "activity-log directory (default $XDG_STATE_HOME/switchboard/history)")
 	codexObserverFlag := flag.String("codex-observer", string(defaultCodexObserverMode), "Codex app-server observer: auto|off")
 	codexDisplayNameModel := flag.String("codex-autoname-model", codexprovider.DefaultDisplayNameModel, "model for isolated Codex display-name generation")

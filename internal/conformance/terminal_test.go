@@ -121,6 +121,29 @@ func TestTmuxLocatorConformance(t *testing.T) {
 	}))
 }
 
+// footPane carries foot's identity: the terminal process plus the pts index,
+// which is unique among the ptys one foot server drives.
+func footPane(r terminal.PaneRef) conformance.Pane {
+	return conformance.Pane{Mux: r.Mux, PaneID: r.PaneID, TTY: r.TTY, WindowTitle: r.WindowTitle}
+}
+
+func footSomeTTY(ctx context.Context) (string, bool) {
+	panes, err := terminal.NewFoot().(terminal.Snapshotter).Snapshot(ctx)
+	if err != nil {
+		return "", false
+	}
+	for tty := range panes {
+		return tty, true
+	}
+	return "", false
+}
+
+func TestFootLocatorConformance(t *testing.T) {
+	conformance.RunLocatorContract(t, newLocatorFixture(locatorFixture{
+		l: terminal.NewFoot(), pane: footPane, someTTY: footSomeTTY,
+	}))
+}
+
 // The auto backend is what the daemon actually runs, and it resolves its
 // concrete backend per call — so the batch/single agreement has to hold through
 // that indirection too, not just for the backends in isolation.

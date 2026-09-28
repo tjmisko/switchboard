@@ -3,8 +3,8 @@
 // the portable join key (kernel-controlled, identical across terminals); only
 // the tool that resolves it is backend-specific.
 //
-// Backends: wezterm (existing), none (terminals without IPC → Observe only),
-// and tmux in Phase 3. Each adopts the internal/conformance Locator contract
+// Backends: wezterm, tmux, foot (no IPC: resolved from the pty master's
+// fdinfo, focused by the WM alone), and none (Observe only). Each adopts the internal/conformance Locator contract
 // (RunLocatorContract): an unknown tty resolves to no pane without error or
 // hang; an owned tty resolves to a pane with a stable (mux, pane) identity.
 package terminal

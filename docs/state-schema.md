@@ -641,7 +641,7 @@ compatibility:
     "observe": true,            // always true — the floor tier
     "navigate": true,           // focus works (terminal locator AND WM focus present)
     "wm": "hyprland",           // detected WM backend: hyprland|sway|i3|x11|none
-    "terminal": "wezterm"       // detected terminal backend: wezterm|tmux|none
+    "terminal": "wezterm"       // detected terminal backend: wezterm|tmux|foot|none, or a "+"-joined chain when several compose
   }
 }
 ```

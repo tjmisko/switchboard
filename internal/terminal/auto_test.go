@@ -121,3 +121,16 @@ func TestAutoShouldStayLiveWhenSeveralBackendsCompose(t *testing.T) {
 		t.Fatal("Available() = false, want true when multiple backends are live")
 	}
 }
+
+// Omarchy's default terminal is foot, so auto must probe it alongside the
+// multiplexers — after tmux, which owns any pane nested inside a foot window.
+func TestNewAutoShouldProbeFootAfterTheInnermostMultiplexer(t *testing.T) {
+	a := NewAuto().(auto)
+	var names []string
+	for _, c := range a.candidates {
+		names = append(names, c.Name())
+	}
+	if len(names) != 3 || names[0] != "tmux" || names[2] != "foot" {
+		t.Fatalf("auto candidates = %v, want [tmux wezterm foot]", names)
+	}
+}

@@ -129,3 +129,13 @@ func TestWMDetectionDiscoversHyprlandWithoutEnv(t *testing.T) {
 		t.Errorf("auto WM = %q, want hyprland (discovered without env)", got)
 	}
 }
+
+func TestForcingFootShouldSelectTheFootLocatorAndEnableNavigate(t *testing.T) {
+	s := Detect(Options{WM: "hyprland", Terminal: "foot"})
+	if got := s.Terminal.Name(); got != "foot" {
+		t.Fatalf("Terminal = %q, want foot", got)
+	}
+	if caps := s.Capabilities(); !caps.Navigate || caps.Terminal != "foot" {
+		t.Fatalf("caps = %+v, want Navigate with terminal foot", caps)
+	}
+}
