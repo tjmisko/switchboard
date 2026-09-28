@@ -97,7 +97,7 @@ enrichment, graph, and display-name fields are omitted when unavailable.
 | `suspended` | boolean | omitted when false | Whether the root is job-control-stopped. |
 | `headless` | boolean | omitted when false | Whether the discovered run has no navigable interactive TUI. |
 | `local_workspace` | integer | omitted when unresolved | Federated aggregate only, and only on remote rows: the Hyprland workspace id **on the reading machine** of the window displaying this session. A remote row's own `hyprland` block is stripped (its coordinates locate the other desktop), so this is the only workspace a local reader can act on — it is what the bottom bar reports and what places the chip in workspace order. `0` means unresolved, the same convention as `workspace_id`. |
-| `agent` | string | omitted until known | `claude` or `codex`; selects the matching enrichment block. |
+| `agent` | string | omitted until known | `claude` or `codex`, which select the matching enrichment block; or the label herdr gives an agent it detects in one of its panes (`pi`, `opencode`, `cursor`, …), which has no enrichment block and publishes its status through `agent_graph` (see `herdr`). |
 | `display_name` | object | omitted when absent | Switchboard-owned Codex display metadata, valid only for its exact conversation. It never changes the native Codex thread. |
 | `resolved_name` | string | omitted until resolved | Provider host's current Claude session name before project prefixing. Federated readers prefer this projection because only the provider host can safely resolve PID-keyed Claude metadata. It carries Claude `/name` or `/rename`; Codex generated and native names already travel in conversation-bound `display_name`/`agent_graph` state. |
 | `mem_agent_bytes` | integer | omitted when unmeasured | Root process PSS + SwapPss. |
@@ -179,10 +179,18 @@ the two can be compared when they differ.
 | `idle`, `done` | `idle`, or `delegating` when the provider graph shows working subagents (herdr reads the screen and cannot see background agents) |
 | `unknown` | the provider graph's own |
 
+An agent other than Claude or Codex in a herdr pane is discovered through
+herdr alone and becomes a session like any other (its `pid` is the pane's
+foreground process). It has no enrichment block: its whole `agent_graph` is
+one node with `source: "herdr"`, rooted at `herdr:<terminal id>`, and that
+root id is its history `session_id`. It lives while its process runs on the
+session's `tty`.
+
 The authority itself is not on the wire. A block read back from `state.json`
 after a restart decides nothing until the daemon hears from that herdr server
 again, and the provider's status resumes when the server has been unreachable
-for 10 seconds. Edges herdr decides are recorded in history with
+for 10 seconds. A restored status is kept, rather than flashed to unknown,
+until herdr answers after a restart. Edges herdr decides are recorded in history with
 `rule: herdr_authority`, and the hand-back with `herdr_released`.
 
 ### `claude` / `codex` (`AgentInfo`) — claude stable, codex additive

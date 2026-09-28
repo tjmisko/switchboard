@@ -509,7 +509,9 @@ labels, prompts, assistant content, commands, or raw provider payloads.
   stream and publishes it in place of the provider's (see the `herdr` block in
   [docs/state-schema.md](docs/state-schema.md)). herdr reads the screen, so its
   edges trail Claude's hooks by about a second, but it also clears a declined
-  prompt that fires no hook.
+  prompt that fires no hook. Agents herdr detects that Switchboard has no
+  adapter for (Pi, OpenCode, Cursor, Gemini, Copilot, …) appear as sessions
+  too, with herdr's status, when they run in a herdr pane.
 - macOS support (Observe tier) is planned (see the plan).
 
 ## Status / roadmap
