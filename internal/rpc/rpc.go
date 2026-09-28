@@ -244,6 +244,7 @@ type Server struct {
 	paneState   PaneStateHandler
 	announce    BindingAnnouncer
 	afterFocus  func(context.Context)
+	focusIntent func(context.Context, state.Session) func(error)
 	// hookAttributionDiagnostic receives finite labels and, for a unique match,
 	// the already-discovered root PID. It observes whether an otherwise-
 	// unattributable plain-Codex hook carried a terminal identity matching zero,
@@ -274,6 +275,15 @@ func (s *Server) SetHistory(h *history.Sink) { s.hist = h }
 // acknowledging the RPC. A following cycle keypress then sees the new pane
 // even when no OS-window focus event fires. Install once before Serve.
 func (s *Server) SetFocusObserver(observe func(context.Context)) { s.afterFocus = observe }
+
+// SetFocusIntent announces a local navigation before any of it runs, so the
+// daemon can trust the focus it is about to ask for instead of waiting for
+// each backend to confirm it. The returned settle func (nil for nothing to
+// settle) is called once with the navigation's error, so a claim that did not
+// happen can be corrected. Install once before Serve.
+func (s *Server) SetFocusIntent(intent func(context.Context, state.Session) func(error)) {
+	s.focusIntent = intent
+}
 
 // SetFanout wires the subagent fanout Observer that a SubagentStart/Stop hook
 // triggers an immediate re-scan on (single source of truth, shared with the
@@ -608,7 +618,25 @@ func (s *Server) focusLocalTarget(ctx context.Context, target *state.Session) er
 	if target.Headless {
 		return ErrHeadlessSession
 	}
+	var settle func(error)
+	if s.focusIntent != nil {
+		settle = s.focusIntent(ctx, *target)
+	}
+	err := s.navigate(ctx, target)
+	if settle != nil {
+		settle(err)
+	}
+	if err != nil {
+		return err
+	}
+	if s.afterFocus != nil {
+		s.afterFocus(ctx)
+	}
+	return nil
+}
 
+// navigate raises the target's window and activates its terminal pane.
+func (s *Server) navigate(ctx context.Context, target *state.Session) error {
 	// Best-effort, backend-agnostic: raise the WM window if we have its ref, and
 	// focus the terminal pane by re-locating it from the (always-present) tty —
 	// so this works for wezterm and tmux without persisting backend-specific
@@ -635,9 +663,6 @@ func (s *Server) focusLocalTarget(ctx context.Context, target *state.Session) er
 	}
 	if !acted {
 		return fmt.Errorf("session %d has no window or pane to focus yet", target.PID)
-	}
-	if s.afterFocus != nil {
-		s.afterFocus(ctx)
 	}
 	return nil
 }

@@ -6,9 +6,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -841,5 +843,56 @@ func TestFocusShouldFailWhenAWindowOnlyTerminalSessionHasNoWindow(t *testing.T) 
 	}
 	if len(manager.focused) != 0 {
 		t.Fatalf("WM focused %v, want nothing", manager.focused)
+	}
+}
+
+func TestFocusShouldAnnounceTheIntentBeforeRaisingTheWindowWhenAnIntentHookIsSet(t *testing.T) {
+	store := state.New("")
+	started := time.Now()
+	store.Apply(func(m map[int]*state.Session) {
+		m[42] = &state.Session{PID: 42, TTY: "/dev/pts/4", StartedAt: started,
+			Hyprland: &state.HyprlandInfo{Address: "0xfoot"}}
+	})
+	manager := &focusRecordingWM{}
+	s := New(store, "", windowOnlyTerminal{}, manager)
+	var order []string
+	var settled []error
+	s.SetFocusIntent(func(_ context.Context, target state.Session) func(error) {
+		order = append(order, fmt.Sprintf("intent pid %d, raised %d", target.PID, len(manager.focused)))
+		return func(err error) { settled = append(settled, err) }
+	})
+	s.SetFocusObserver(func(context.Context) { order = append(order, "observer") })
+
+	if err := s.FocusLocalSession(context.Background(), 42, started); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"intent pid 42, raised 0", "observer"}; !slices.Equal(order, want) {
+		t.Fatalf("order = %v, want %v", order, want)
+	}
+	if len(settled) != 1 || settled[0] != nil {
+		t.Fatalf("settled = %v, want one nil: the navigation succeeded", settled)
+	}
+}
+
+func TestFocusShouldSettleTheIntentWithTheErrorWhenNavigationFails(t *testing.T) {
+	store := state.New("")
+	started := time.Now()
+	store.Apply(func(m map[int]*state.Session) {
+		m[42] = &state.Session{PID: 42, TTY: "/dev/pts/4", StartedAt: started}
+	})
+	s := New(store, "", windowOnlyTerminal{}, &focusRecordingWM{})
+	var settled []error
+	observed := false
+	s.SetFocusIntent(func(context.Context, state.Session) func(error) {
+		return func(err error) { settled = append(settled, err) }
+	})
+	s.SetFocusObserver(func(context.Context) { observed = true })
+
+	err := s.FocusLocalSession(context.Background(), 42, started)
+	if err == nil || len(settled) != 1 || settled[0] != err {
+		t.Fatalf("err = %v, settled = %v; want the navigation error settled once", err, settled)
+	}
+	if observed {
+		t.Fatal("focus observer ran after a failed navigation")
 	}
 }
