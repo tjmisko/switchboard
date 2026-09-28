@@ -150,6 +150,43 @@ func (w *Watcher) ActivePane(socket string) string {
 	return server.activePane
 }
 
+// Claim records paneID as the server's focused pane ahead of herdr's own
+// event, for a focus Switchboard is about to request. herdr's pane.focus acks
+// only once the move is done, and its pane.focused event trails by up to its
+// 100 ms stream poll; trusting the request first keeps that trail off every
+// chip. herdr's event then confirms the claim and changes nothing. A claim
+// herdr never carried out is corrected by Resync. Claim reports false, and
+// records nothing, when the server's panes do not count.
+func (w *Watcher) Claim(socket, paneID string) bool {
+	w.mu.Lock()
+	server, ok := w.servers[socket]
+	if !ok || !w.countsLocked(server) {
+		w.mu.Unlock()
+		return false
+	}
+	changed := w.setActiveLocked(socket, server, paneID)
+	w.mu.Unlock()
+	w.signal(changed...)
+	return true
+}
+
+// Resync re-reads the server's panes, replacing whatever a claim or a missed
+// event left behind with herdr's own account.
+func (w *Watcher) Resync(ctx context.Context, socket string) error {
+	w.mu.Lock()
+	_, ok := w.servers[socket]
+	w.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	panes, err := ListPanes(ctx, w.call, socket)
+	if err != nil {
+		return err
+	}
+	w.replace(socket, panes)
+	return nil
+}
+
 func (w *Watcher) countsLocked(server *watchedServer) bool {
 	if server.connected {
 		return true

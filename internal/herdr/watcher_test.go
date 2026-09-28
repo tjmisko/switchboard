@@ -493,3 +493,62 @@ func TestWatcherShouldReportNoActivePaneWhenTheSocketIsNotWatched(t *testing.T) 
 		t.Fatalf("ActivePane = %q for an unwatched socket, want empty", got)
 	}
 }
+
+func TestWatcherShouldReportAClaimedPaneBeforeHerdrConfirmsIt(t *testing.T) {
+	s := newFakeServer(t, focusedPane("w1:p1", "claude", StatusIdle), agentPane("w1:p2", "claude", StatusIdle))
+	w := startWatcher(t, time.Minute, s.socket)
+	s.awaitSubscription(t)
+	eventually(t, "w1:p1 active", activePaneIs(w, s.socket, "w1:p1"))
+
+	if !w.Claim(s.socket, "w1:p2") {
+		t.Fatal("Claim refused on a connected server")
+	}
+	if got := w.ActivePane(s.socket); got != "w1:p2" {
+		t.Fatalf("ActivePane = %q right after the claim, want w1:p2", got)
+	}
+	s.push(`{"data":{"pane_id":"w1:p2","workspace_id":"w1"},"event":"pane_focused"}`)
+	time.Sleep(20 * time.Millisecond)
+	if got := w.ActivePane(s.socket); got != "w1:p2" {
+		t.Fatalf("ActivePane = %q after herdr confirmed, want w1:p2", got)
+	}
+}
+
+func TestWatcherShouldRefuseAClaimWhenTheServerIsNotWatched(t *testing.T) {
+	w := startWatcher(t, time.Minute)
+	if w.Claim("/elsewhere.sock", "w1:p1") {
+		t.Fatal("Claim accepted for an unwatched server")
+	}
+	if got := w.ActivePane("/elsewhere.sock"); got != "" {
+		t.Fatalf("ActivePane = %q, want empty", got)
+	}
+}
+
+func TestWatcherShouldRefuseAClaimWhenTheServerNoLongerCounts(t *testing.T) {
+	s := newFakeServer(t, focusedPane("w1:p1", "claude", StatusIdle))
+	w := startWatcher(t, 30*time.Millisecond, s.socket)
+	s.awaitSubscription(t)
+	eventually(t, "w1:p1 active", activePaneIs(w, s.socket, "w1:p1"))
+	s.close()
+	eventually(t, "server past grace", activePaneIs(w, s.socket, ""))
+
+	if w.Claim(s.socket, "w1:p1") {
+		t.Fatal("Claim accepted for a server past its grace")
+	}
+}
+
+// A focus herdr refused (its pane closed, say) leaves herdr where it was; the
+// resync puts the watcher back on herdr's account.
+func TestWatcherShouldRestoreHerdrsFocusWhenResyncedAfterAClaimHerdrDidNotCarryOut(t *testing.T) {
+	s := newFakeServer(t, focusedPane("w1:p1", "claude", StatusIdle), agentPane("w1:p2", "claude", StatusIdle))
+	w := startWatcher(t, time.Minute, s.socket)
+	s.awaitSubscription(t)
+	eventually(t, "w1:p1 active", activePaneIs(w, s.socket, "w1:p1"))
+
+	w.Claim(s.socket, "w1:p2")
+	if err := w.Resync(context.Background(), s.socket); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.ActivePane(s.socket); got != "w1:p1" {
+		t.Fatalf("ActivePane = %q after resync, want herdr's w1:p1", got)
+	}
+}
