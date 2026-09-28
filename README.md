@@ -39,7 +39,7 @@ used only for the OS syscall layer).
 |------|----------|-----------|
 | **OS process** (Observe floor) | Linux `/proc` + `pidfd` · macOS *(planned)* | per-OS at build |
 | **Window manager** (Navigate) | Hyprland · sway · i3 · X11/EWMH · `none` | `HYPRLAND_INSTANCE_SIGNATURE` → `SWAYSOCK` → `I3SOCK` → `DISPLAY` |
-| **Terminal** (Navigate) | wezterm · tmux · foot · `none` | tmux server socket · wezterm gui sockets · a running `foot` process (composes when nested) |
+| **Terminal** (Navigate) | wezterm · tmux · foot · alacritty · `none` | tmux server socket · wezterm gui sockets · a running `foot` / `alacritty` process (composes when nested) |
 
 The daemon logs its chosen stack at startup and records it in the
 `capabilities` block of `state.json`.
@@ -273,7 +273,7 @@ another machine. See [machine-specific configuration](docs/machine-configuration
 for the renderer units, host-local drop-ins, and shared-dotfiles rules.
 
 Force a backend (e.g. to test degradation) with the daemon flags
-`-wm auto|hyprland|sway|i3|x11|none` and `-terminal auto|wezterm|tmux|foot|none`.
+`-wm auto|hyprland|sway|i3|x11|none` and `-terminal auto|wezterm|tmux|foot|alacritty|none`.
 The Codex observer separately accepts `-codex-observer auto|off` (default
 `auto`).
 
@@ -490,17 +490,19 @@ labels, prompts, assistant content, commands, or raw provider payloads.
   exposing `codex app-server --stdio`; otherwise use `-codex-observer off` or
   the automatic degraded root-only behavior above.
 - **Navigate:** a supported WM (Hyprland / sway / i3 / X11) **and** terminal
-  (wezterm / tmux on `PATH`, or foot). Foot has no IPC: Switchboard reads which
-  foot process drives each pty from the pty master's `/proc` fdinfo, and the WM
-  raises that window. This is exact for standalone `foot` (one process per
-  window — Omarchy's default). Under `foot --server`, footclient windows share
-  one pid, so a session in a server with several windows stays Observe-only.
+  (wezterm / tmux on `PATH`, or foot / Alacritty). Foot and Alacritty have no
+  usable IPC: Switchboard reads which terminal process drives each pty from the
+  pty master's `/proc` fdinfo, and the WM raises that window. This is exact when
+  each window is its own process — plain `foot` / `alacritty`, as Omarchy
+  launches them. Under `foot --server` or `alacritty msg create-window`, windows
+  share one pid, so a session in a process with several windows stays
+  Observe-only.
 - macOS support (Observe tier) is planned (see the plan).
 
 ## Status / roadmap
 
 Done: runtime-detecting `osproc` / `terminal` / `wm` seams behind a reusable
-conformance contract; Hyprland + sway/i3 + X11/EWMH WM backends; wezterm + tmux + foot
+conformance contract; Hyprland + sway/i3 + X11/EWMH WM backends; wezterm + tmux + foot + Alacritty
 terminal backends with per-session locator chaining; capability reporting;
 `claude-tui` reference renderer; provider-neutral root/child agent graphs;
 Codex app-server observation with bounded degradation; Claude compatibility

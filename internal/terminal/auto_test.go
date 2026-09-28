@@ -2,6 +2,7 @@ package terminal
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -124,13 +125,18 @@ func TestAutoShouldStayLiveWhenSeveralBackendsCompose(t *testing.T) {
 
 // Omarchy's default terminal is foot, so auto must probe it alongside the
 // multiplexers — after tmux, which owns any pane nested inside a foot window.
-func TestNewAutoShouldProbeFootAfterTheInnermostMultiplexer(t *testing.T) {
+func TestNewAutoShouldProbeWindowTerminalsAfterTheInnermostMultiplexer(t *testing.T) {
 	a := NewAuto().(auto)
 	var names []string
 	for _, c := range a.candidates {
 		names = append(names, c.Name())
 	}
-	if len(names) != 3 || names[0] != "tmux" || names[2] != "foot" {
-		t.Fatalf("auto candidates = %v, want [tmux wezterm foot]", names)
+	want := []string{"tmux", "wezterm", "foot", "alacritty"}
+	if strings.Join(names, " ") != strings.Join(want, " ") {
+		t.Fatalf("auto candidates = %v, want %v", names, want)
+	}
+	foot, alacritty := a.candidates[2].(ptyOwnerLocator), a.candidates[3].(ptyOwnerLocator)
+	if foot.scan != alacritty.scan {
+		t.Fatal("foot and alacritty walk /proc separately, want one shared scan")
 	}
 }

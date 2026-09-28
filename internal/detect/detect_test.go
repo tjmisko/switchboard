@@ -139,3 +139,13 @@ func TestForcingFootShouldSelectTheFootLocatorAndEnableNavigate(t *testing.T) {
 		t.Fatalf("caps = %+v, want Navigate with terminal foot", caps)
 	}
 }
+
+func TestForcingAlacrittyShouldSelectTheAlacrittyLocatorAndEnableNavigate(t *testing.T) {
+	s := Detect(Options{WM: "hyprland", Terminal: "alacritty"})
+	if got := s.Terminal.Name(); got != "alacritty" {
+		t.Fatalf("Terminal = %q, want alacritty", got)
+	}
+	if caps := s.Capabilities(); !caps.Navigate || caps.Terminal != "alacritty" {
+		t.Fatalf("caps = %+v, want Navigate with terminal alacritty", caps)
+	}
+}

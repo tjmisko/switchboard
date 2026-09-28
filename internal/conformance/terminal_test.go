@@ -121,26 +121,37 @@ func TestTmuxLocatorConformance(t *testing.T) {
 	}))
 }
 
-// footPane carries foot's identity: the terminal process plus the pts index,
-// which is unique among the ptys one foot server drives.
-func footPane(r terminal.PaneRef) conformance.Pane {
+// ptyOwnerPane carries a pty-owner backend's identity (foot, Alacritty): the
+// terminal process plus the pts index, which is unique among the ptys one
+// multi-window process drives.
+func ptyOwnerPane(r terminal.PaneRef) conformance.Pane {
 	return conformance.Pane{Mux: r.Mux, PaneID: r.PaneID, TTY: r.TTY, WindowTitle: r.WindowTitle}
 }
 
-func footSomeTTY(ctx context.Context) (string, bool) {
-	panes, err := terminal.NewFoot().(terminal.Snapshotter).Snapshot(ctx)
-	if err != nil {
+func someTTYOf(l terminal.Locator) func(context.Context) (string, bool) {
+	return func(ctx context.Context) (string, bool) {
+		panes, err := l.(terminal.Snapshotter).Snapshot(ctx)
+		if err != nil {
+			return "", false
+		}
+		for tty := range panes {
+			return tty, true
+		}
 		return "", false
 	}
-	for tty := range panes {
-		return tty, true
-	}
-	return "", false
 }
 
 func TestFootLocatorConformance(t *testing.T) {
+	l := terminal.NewFoot()
 	conformance.RunLocatorContract(t, newLocatorFixture(locatorFixture{
-		l: terminal.NewFoot(), pane: footPane, someTTY: footSomeTTY,
+		l: l, pane: ptyOwnerPane, someTTY: someTTYOf(l),
+	}))
+}
+
+func TestAlacrittyLocatorConformance(t *testing.T) {
+	l := terminal.NewAlacritty()
+	conformance.RunLocatorContract(t, newLocatorFixture(locatorFixture{
+		l: l, pane: ptyOwnerPane, someTTY: someTTYOf(l),
 	}))
 }
 

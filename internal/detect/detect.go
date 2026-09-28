@@ -30,7 +30,7 @@ type Stack struct {
 // that one regardless of availability (useful for testing degradation).
 type Options struct {
 	WM       string // "auto" | "hyprland" | "sway" | "i3" | "x11" | "none"
-	Terminal string // "auto" | "wezterm" | "tmux" | "foot" | "none"
+	Terminal string // "auto" | "wezterm" | "tmux" | "foot" | "alacritty" | "none"
 }
 
 // Detect selects the backend stack for the current environment.
@@ -98,6 +98,8 @@ func detectTerminal(force string) terminal.Locator {
 		return terminal.NewTmux()
 	case "foot":
 		return terminal.NewFoot()
+	case "alacritty":
+		return terminal.NewAlacritty()
 	case "none":
 		return terminal.NewNone()
 	}
