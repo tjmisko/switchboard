@@ -3,6 +3,9 @@
 **Status: done** (`0810878`, `972cfea`, branch `terminal/herdr`, deployed).
 Verified live on the dev box (herdr 0.9.1).
 
+For how herdr and Switchboard divide the work overall, see
+[../herdr.md](../herdr.md).
+
 **Goal.** An agent in a [herdr](https://herdr.dev) pane jumps fully: herdr
 selects the pane, the WM raises the window of a terminal running an attached
 herdr client, and an outer terminal with tabs shows the client's tab.

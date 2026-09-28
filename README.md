@@ -511,7 +511,8 @@ labels, prompts, assistant content, commands, or raw provider payloads.
   edges trail Claude's hooks by about a second, but it also clears a declined
   prompt that fires no hook. Agents herdr detects that Switchboard has no
   adapter for (Pi, OpenCode, Cursor, Gemini, Copilot, …) appear as sessions
-  too, with herdr's status, when they run in a herdr pane.
+  too, with herdr's status, when they run in a herdr pane. See
+  [docs/herdr.md](docs/herdr.md) for how the two divide the work.
 - macOS support (Observe tier) is planned (see the plan).
 
 ## Status / roadmap
