@@ -3,8 +3,10 @@
 // the portable join key (kernel-controlled, identical across terminals); only
 // the tool that resolves it is backend-specific.
 //
-// Backends: wezterm, tmux, foot and alacritty (no IPC: resolved from the pty
-// master's fdinfo, focused by the WM alone), and none (Observe only). Each adopts the internal/conformance Locator contract
+// Backends: wezterm, tmux, herdr (a client/server multiplexer: its panes join
+// the window of an attached client through PaneRef.HostTTY), foot and alacritty
+// (no IPC: resolved from the pty master's fdinfo, focused by the WM alone), and
+// none (Observe only). Each adopts the internal/conformance Locator contract
 // (RunLocatorContract): an unknown tty resolves to no pane without error or
 // hang; an owned tty resolves to a pane with a stable (mux, pane) identity.
 package terminal
@@ -33,6 +35,13 @@ type PaneRef struct {
 	WindowTitle string // best-effort join key to the WM window title
 	TTY         string // the controlling tty this pane owns
 	CWD         string // decoded working directory, or "" if unavailable
+
+	// HostTTY is set by a multiplexer whose panes are drawn by a separate client
+	// process (herdr): the tty that client runs on, in some OUTER terminal. The
+	// chain resolves it through its other backends and copies that pane's window
+	// join (Mux, WindowID, WindowTitle) here, and activates it after this pane.
+	// "" when the pane is its own window or no client is attached.
+	HostTTY string
 }
 
 // ErrUnsupported is returned by a backend that cannot focus (the none backend,
