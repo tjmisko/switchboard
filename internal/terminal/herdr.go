@@ -1,18 +1,15 @@
 package terminal
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"net"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
+
+	"github.com/tjmisko/switchboard/internal/herdr"
 )
 
 // herdrLocator resolves ttys owned by herdr (herdr.dev), a terminal workspace
@@ -42,15 +39,11 @@ import (
 type herdrLocator struct {
 	scan    *processScan
 	sockets func() ([]unixSocket, error)
-	call    herdrCaller
+	call    herdr.Caller
 
 	mu   sync.Mutex
 	ttys map[herdrTerminalKey]string // pane terminal → its tty, see paneTTY
 }
-
-// herdrCaller performs one JSON API request against a server's API socket and
-// decodes the result into result (skipped when result is nil).
-type herdrCaller func(ctx context.Context, socket, method string, params, result any) error
 
 type herdrTerminalKey struct {
 	apiSocket  string
@@ -66,10 +59,10 @@ const herdrExe = "herdr"
 func NewHerdr() Locator { return newHerdr(newProcessScan("/proc", processScanTTL)) }
 
 func newHerdr(scan *processScan) *herdrLocator {
-	return newHerdrWith(scan, unixSocketTable, callHerdr)
+	return newHerdrWith(scan, unixSocketTable, herdr.Call)
 }
 
-func newHerdrWith(scan *processScan, sockets func() ([]unixSocket, error), call herdrCaller) *herdrLocator {
+func newHerdrWith(scan *processScan, sockets func() ([]unixSocket, error), call herdr.Caller) *herdrLocator {
 	return &herdrLocator{scan: scan, sockets: sockets, call: call, ttys: make(map[herdrTerminalKey]string)}
 }
 
@@ -104,10 +97,8 @@ func (l *herdrLocator) Snapshot(ctx context.Context) (map[string]PaneRef, error)
 	}
 	seen := make(map[herdrTerminalKey]bool)
 	for _, server := range topo.servers {
-		var list struct {
-			Panes []herdrPane `json:"panes"`
-		}
-		if err := l.call(ctx, server.apiSocket, "pane.list", struct{}{}, &list); err != nil {
+		list, err := herdr.ListPanes(ctx, l.call, server.apiSocket)
+		if err != nil {
 			return nil, fmt.Errorf("herdr %s: %w", server.apiSocket, err)
 		}
 		masters := make(map[int]bool)
@@ -115,7 +106,7 @@ func (l *herdrLocator) Snapshot(ctx context.Context) (map[string]PaneRef, error)
 			masters[index] = true
 		}
 		host := preferredHerdrClient(topo.clients[server.apiSocket])
-		for _, p := range list.Panes {
+		for _, p := range list {
 			key := herdrTerminalKey{apiSocket: server.apiSocket, terminalID: p.TerminalID}
 			seen[key] = true
 			tty, ok := l.paneTTY(ctx, server, p, masters)
@@ -139,7 +130,7 @@ func (l *herdrLocator) Snapshot(ctx context.Context) (map[string]PaneRef, error)
 //
 // Mux stays 0: the herdr server draws no window, so the WM join comes only from
 // the host client's terminal, which the chain copies in through HostTTY.
-func herdrPaneRef(server herdrServer, p herdrPane, tty, hostTTY string) PaneRef {
+func herdrPaneRef(server herdrServer, p herdr.Pane, tty, hostTTY string) PaneRef {
 	cwd := p.ForegroundCWD
 	if cwd == "" {
 		cwd = p.CWD
@@ -165,20 +156,11 @@ func (l *herdrLocator) Activate(ctx context.Context, ref *PaneRef) error {
 	return l.call(ctx, ref.MuxSocket, "pane.focus", map[string]string{"pane_id": ref.Handle}, nil)
 }
 
-// herdrPane is the subset of herdr's PaneInfo this backend reads.
-type herdrPane struct {
-	PaneID        string `json:"pane_id"`
-	TerminalID    string `json:"terminal_id"`
-	CWD           string `json:"cwd"`
-	ForegroundCWD string `json:"foreground_cwd"`
-	TerminalTitle string `json:"terminal_title"`
-}
-
 // paneTTY returns the pane's tty from the cache or, for a terminal not seen
 // before, from its shell's controlling tty. Either way the answer counts only
 // while the server holds that pty's master: a cached tty stays exact because a
 // terminal_id never changes pty, and a fresh one cannot be a recycled pid's.
-func (l *herdrLocator) paneTTY(ctx context.Context, server herdrServer, p herdrPane, masters map[int]bool) (string, bool) {
+func (l *herdrLocator) paneTTY(ctx context.Context, server herdrServer, p herdr.Pane, masters map[int]bool) (string, bool) {
 	if p.TerminalID == "" || p.PaneID == "" {
 		return "", false
 	}
@@ -354,64 +336,4 @@ func preferredHerdrClient(clients []herdrClient) herdrClient {
 		}
 	}
 	return best
-}
-
-// herdrCallTimeout bounds one API round trip. herdr answers from memory, so a
-// slow reply means a wedged server, and the reconcile tick must not wait on it.
-const herdrCallTimeout = time.Second
-
-// callHerdr sends one newline-delimited JSON request and reads its one-line
-// response. herdr serves one request per connection.
-func callHerdr(ctx context.Context, socket, method string, params, result any) error {
-	ctx, cancel := context.WithTimeout(ctx, herdrCallTimeout)
-	defer cancel()
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "unix", socket)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-	}
-
-	request, err := json.Marshal(struct {
-		ID     string `json:"id"`
-		Method string `json:"method"`
-		Params any    `json:"params"`
-	}{ID: "switchboard", Method: method, Params: params})
-	if err != nil {
-		return err
-	}
-	if _, err := conn.Write(append(request, '\n')); err != nil {
-		return err
-	}
-	line, err := bufio.NewReader(conn).ReadBytes('\n')
-	if err != nil {
-		return err
-	}
-	return decodeHerdrResponse(line, method, result)
-}
-
-func decodeHerdrResponse(line []byte, method string, result any) error {
-	var response struct {
-		Result json.RawMessage `json:"result"`
-		Error  *struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(line, &response); err != nil {
-		return fmt.Errorf("herdr %s: decode response: %w", method, err)
-	}
-	if response.Error != nil {
-		return fmt.Errorf("herdr %s: %s: %s", method, response.Error.Code, response.Error.Message)
-	}
-	if response.Result == nil {
-		return errors.New("herdr " + method + ": response has no result")
-	}
-	if result == nil {
-		return nil
-	}
-	return json.Unmarshal(response.Result, result)
 }

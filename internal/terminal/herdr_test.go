@@ -1,16 +1,16 @@
 package terminal
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/tjmisko/switchboard/internal/herdr"
 )
 
 // herdrFixture models one host: a /proc tree, the kernel's unix socket table,
@@ -18,17 +18,17 @@ import (
 type herdrFixture struct {
 	proc    fakeProc
 	sockets []unixSocket
-	panes   map[string][]herdrPane // API socket → pane.list
-	shells  map[string]int         // API socket + pane id → shell pid
-	failing map[string]error       // API socket → error for every call
-	calls   []string               // "method socket pane_id", in order
+	panes   map[string][]herdr.Pane // API socket → pane.list
+	shells  map[string]int          // API socket + pane id → shell pid
+	failing map[string]error        // API socket → error for every call
+	calls   []string                // "method socket pane_id", in order
 	inode   uint64
 }
 
 func newHerdrFixture(t *testing.T) *herdrFixture {
 	return &herdrFixture{
 		proc:    newFakeProc(t),
-		panes:   make(map[string][]herdrPane),
+		panes:   make(map[string][]herdr.Pane),
 		shells:  make(map[string]int),
 		failing: make(map[string]error),
 		inode:   9000,
@@ -81,7 +81,7 @@ func (f *herdrFixture) server(pid int, apiSocket string, panes ...herdrFixturePa
 		f.proc.fd(pid, 100+p.pts, "/dev/ptmx", ptmxInfo(p.pts))
 		f.proc.process(p.shell, "/usr/bin/bash")
 		f.stat(p.shell, ptsDev(p.pts), 200)
-		f.panes[apiSocket] = append(f.panes[apiSocket], herdrPane{
+		f.panes[apiSocket] = append(f.panes[apiSocket], herdr.Pane{
 			PaneID: p.id, TerminalID: "term_" + p.id, CWD: "/pane", ForegroundCWD: p.fgCWD, TerminalTitle: p.title,
 		})
 		f.shells[apiSocket+" "+p.id] = p.shell
@@ -402,52 +402,5 @@ func TestPtsIndexShouldDecodeTheKernelDevEncodingWhenTheIndexExceedsAByte(t *tes
 	}
 	if _, ok := ptsIndexFromDev(4<<8 | 1); ok { // /dev/tty1
 		t.Error("ptsIndexFromDev accepted a virtual console")
-	}
-}
-
-func TestDecodeHerdrResponseShouldSurfaceTheServersErrorCode(t *testing.T) {
-	err := decodeHerdrResponse([]byte(`{"id":"x","error":{"code":"not_found","message":"pane not found"}}`), "pane.focus", nil)
-	if err == nil || !strings.Contains(err.Error(), "not_found") {
-		t.Fatalf("err = %v, want the not_found code", err)
-	}
-	if err := decodeHerdrResponse([]byte(`{"id":"x"}`), "pane.focus", nil); err == nil {
-		t.Fatal("err = nil, want an error for a response with neither result nor error")
-	}
-}
-
-// The real transport: one newline-terminated request per connection, one line
-// back.
-func TestCallHerdrShouldRoundTripOneRequestWhenTheServerAnswersOnALine(t *testing.T) {
-	socket := filepath.Join(t.TempDir(), "herdr.sock")
-	ln, err := net.Listen("unix", socket)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	got := make(chan map[string]any, 1)
-	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		line, _ := bufio.NewReader(conn).ReadBytes('\n')
-		var req map[string]any
-		_ = json.Unmarshal(line, &req)
-		got <- req
-		_, _ = conn.Write([]byte(`{"id":"switchboard","result":{"type":"pane_list","panes":[{"pane_id":"w1:p1","terminal_id":"term_1"}]}}` + "\n"))
-	}()
-
-	var list struct {
-		Panes []herdrPane `json:"panes"`
-	}
-	if err := callHerdr(context.Background(), socket, "pane.list", struct{}{}, &list); err != nil {
-		t.Fatalf("callHerdr: %v", err)
-	}
-	if len(list.Panes) != 1 || list.Panes[0].PaneID != "w1:p1" {
-		t.Fatalf("panes = %+v, want w1:p1", list.Panes)
-	}
-	if req := <-got; req["method"] != "pane.list" {
-		t.Fatalf("request = %v, want method pane.list", req)
 	}
 }
