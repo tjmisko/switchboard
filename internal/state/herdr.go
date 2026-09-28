@@ -99,7 +99,21 @@ type HerdrReading struct {
 // (see projectStatus); one with no graph yet has nothing to replace and is left
 // unchanged. Any other agent has no provider adapter at all, so herdr is its
 // only source: the reading becomes its whole agent graph.
+//
+// A reading that is not live, for a block that was not live either, carries no
+// news: it is what the daemon sees at startup before the watcher reconnects.
+// The pane identity is still recorded, but the status (a hydrated one
+// included) waits for herdr to confirm or replace it rather than flashing to
+// unknown and back.
 func (s *Session) SetHerdr(r HerdrReading, now time.Time) (before, after string) {
+	if !r.Live && (s.Herdr == nil || !s.Herdr.Live) {
+		if s.Herdr == nil {
+			s.Herdr = &HerdrInfo{}
+		}
+		s.Herdr.PaneID, s.Herdr.Socket = r.PaneID, r.Socket
+		status := s.publishedStatus(now)
+		return status, status
+	}
 	if s.Herdr == nil {
 		s.Herdr = &HerdrInfo{}
 	}
@@ -120,6 +134,15 @@ func (s *Session) SetHerdr(r HerdrReading, now time.Time) (before, after string)
 	before = info.Status
 	s.projectStatus(info, r.Since)
 	return before, info.Status
+}
+
+// publishedStatus is the session's status as renderers read it: the
+// enrichment block's, else its graph's.
+func (s *Session) publishedStatus(now time.Time) string {
+	if info := s.Enrichment(); info != nil {
+		return info.Status
+	}
+	return s.graphStatus(now)
 }
 
 // IsProviderAgent reports whether Switchboard has a provider adapter for the
@@ -147,10 +170,15 @@ const herdrGraphLease = 30 * 24 * time.Hour
 
 // herdrAgentGraph turns a herdr reading into the one-node graph of an agent
 // herdr alone observes. The root id is herdr's terminal id, stable for the
-// life of the terminal the agent runs in.
+// life of the terminal the agent runs in; a reading without one keeps the
+// prior root.
 func herdrAgentGraph(agent string, r HerdrReading, prior *AgentGraph, now time.Time) *AgentGraph {
 	rootID := "herdr:" + r.TerminalID
-	if r.TerminalID == "" {
+	switch {
+	case r.TerminalID != "":
+	case prior != nil && prior.RootID != "":
+		rootID = prior.RootID
+	default:
 		rootID = "herdr:" + r.Socket + "#" + r.PaneID
 	}
 	observedAt := r.Since

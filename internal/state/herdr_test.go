@@ -201,3 +201,35 @@ func TestSetHerdrShouldKeepAHerdrOnlyAgentsRootWhenItsPaneMoves(t *testing.T) {
 		t.Fatalf("root %q pane %q, want root %q kept across the move", s.AgentGraph.RootID, s.Herdr.PaneID, root)
 	}
 }
+
+// At startup the watcher has not reconnected yet: its first reading of a
+// hydrated pane is "not live" with no status. That must not flash the chip.
+func TestSetHerdrShouldKeepAHydratedStatusWhenTheFirstReadingIsNotLive(t *testing.T) {
+	s := &Session{PID: 20, Agent: "pi"}
+	s.SetHerdr(reading(HerdrIdle, true, herdrT0), herdrT0)
+	s.Herdr.Live = false // what hydration from state.json leaves
+	root := s.AgentGraph.RootID
+
+	before, after := s.SetHerdr(HerdrReading{PaneID: "w1:p1", Socket: "/h.sock"}, herdrT0.Add(time.Minute))
+	if before != StatusIdle || after != StatusIdle || s.AgentGraph.RootID != root {
+		t.Fatalf("SetHerdr = %q → %q root %q, want idle kept under root %q", before, after, s.AgentGraph.RootID, root)
+	}
+
+	claude := graphSession(StatusWorking, herdrT0)
+	if before, after := claude.SetHerdr(HerdrReading{PaneID: "w1:p1", Socket: "/h.sock"}, herdrT0); before != after {
+		t.Fatalf("claude SetHerdr = %q → %q, want no change", before, after)
+	}
+}
+
+func TestSetHerdrShouldKeepTheRootWhenAReadingHasNoTerminalID(t *testing.T) {
+	s := &Session{PID: 20, Agent: "pi"}
+	s.SetHerdr(reading(HerdrIdle, true, herdrT0), herdrT0)
+	root := s.AgentGraph.RootID
+
+	r := reading(HerdrWorking, true, herdrT0.Add(time.Second))
+	r.TerminalID = ""
+	s.SetHerdr(r, herdrT0.Add(time.Second))
+	if s.AgentGraph.RootID != root || s.AgentGraph.Summary.Status != StatusWorking {
+		t.Fatalf("root %q status %q, want working under root %q", s.AgentGraph.RootID, s.AgentGraph.Summary.Status, root)
+	}
+}
