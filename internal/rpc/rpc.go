@@ -18,6 +18,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -77,6 +78,9 @@ type Request struct {
 	// or logs.
 	LastAssistantMessage string `json:"last_assistant_message,omitempty"`
 	Transcript           string `json:"transcript,omitempty"`
+	// HookCWD is provider lifecycle metadata. Only daemon-owned Codex hooks may
+	// use it for the unique-live-directory attribution rule.
+	HookCWD string `json:"hook_cwd,omitempty"`
 	// HookSource is Codex SessionStart.source (startup, resume, clear, compact).
 	// It is lifecycle metadata, not provider content, and lets the daemon avoid
 	// treating an immediate post-/clear continuation as a real idle interval.
@@ -128,9 +132,8 @@ type Request struct {
 	// NOT strip again at a use site: a second pass would eat an "agent-" that is
 	// genuinely part of the id.
 	//
-	// On SubagentStart/Stop both fields are best-effort context — the hook's job
-	// there is only to TRIGGER a fanout re-scan, which is keyed off the dir, so
-	// neither is required for correctness.
+	// SubagentStart/Stop also supply an exact lifecycle edge when AgentID is
+	// present; when absent the fanout directory scan remains the fallback.
 	AgentID   string `json:"agent_id,omitempty"`
 	AgentType string `json:"agent_type,omitempty"`
 
@@ -1047,7 +1050,17 @@ func (s *Server) dispatchAgentHook(req Request) {
 	for i := range snap.Sessions {
 		tracked[snap.Sessions[i].PID] = &snap.Sessions[i]
 	}
-	pid := findTrackedAncestor(tracked, req.PID, s.readProc)
+	pid, shared := findHookAncestor(tracked, req.PID, s.readProc)
+	if pid == 0 && shared && req.Agent == state.AgentKindCodex {
+		pid, category := s.uniqueCodexDirectory(tracked, req)
+		if s.hookAttributionDiagnostic != nil {
+			s.hookAttributionDiagnostic(HookAttributionDiagnostic{Category: category, MatchedPID: pid})
+		}
+		if pid != 0 {
+			s.agentHook(req, *tracked[pid])
+			return
+		}
+	}
 	if pid == 0 {
 		s.reportHookAttributionProbe(req, snap.Sessions)
 		return
@@ -1444,20 +1457,51 @@ func coalesce(a, b string) string {
 // gets no session id at all — an unnamed single-interval lane, the shape
 // switchboard already produces for a process that dies before transitioning.
 func findTrackedAncestor(m map[int]*state.Session, pid int, readProc func(int) (proc.Info, error)) int {
+	owner, _ := findHookAncestor(m, pid, readProc)
+	return owner
+}
+
+func findHookAncestor(m map[int]*state.Session, pid int, readProc func(int) (proc.Info, error)) (int, bool) {
 	for depth := 0; pid > 1 && depth < 20; depth++ {
 		if _, ok := m[pid]; ok {
-			return pid
+			return pid, false
 		}
 		info, err := readProc(pid)
 		if err != nil || info.PPID == 0 {
-			return 0
+			return 0, false
 		}
-		if discovery.Classify(osproc.FromProc(info)) != discovery.AgentNone {
-			return 0
+		if discovery.IsHookBoundary(osproc.FromProc(info)) {
+			return 0, discovery.IsCodexAppServer(osproc.FromProc(info))
 		}
 		pid = info.PPID
 	}
-	return 0
+	return 0, false
+}
+
+// The directory fallback is heuristic, not an exact client identity. It is
+// confined to app-server-owned hooks and refuses same-directory ambiguity.
+func (s *Server) uniqueCodexDirectory(tracked map[int]*state.Session, req Request) (int, string) {
+	if req.SessionID == "" || !filepath.IsAbs(req.HookCWD) || len(req.HookCWD) > 4096 {
+		return 0, "hook_shared_directory_absent"
+	}
+	cwd, matched := filepath.Clean(req.HookCWD), 0
+	for pid, sess := range tracked {
+		if sess.Agent != state.AgentKindCodex || sess.Headless || filepath.Clean(sess.CWD) != cwd {
+			continue
+		}
+		info, err := s.readProc(pid)
+		if err != nil || info.State == "Z" || !discovery.IsCodex(osproc.FromProc(info)) || filepath.Clean(info.CWD) != cwd {
+			continue
+		}
+		if matched != 0 {
+			return 0, "hook_shared_directory_ambiguous"
+		}
+		matched = pid
+	}
+	if matched == 0 {
+		return 0, "hook_shared_directory_unmatched"
+	}
+	return matched, "hook_shared_directory_unique"
 }
 
 // sessionLabel builds a stable, human-recognizable identifier for status log

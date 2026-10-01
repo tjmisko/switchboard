@@ -377,6 +377,9 @@ func (c *agentCoordinator) observe(ctx context.Context, ref provider.RootRef) {
 // taken too soon after its proposal — and a test driving two ticks in a row
 // cannot express that against a wall clock it does not control.
 func (c *agentCoordinator) observeAt(ctx context.Context, ref provider.RootRef, now time.Time) {
+	if ref.Provider == agentgraph.ProviderCodex {
+		c.pollCodexStoppedRoot(ref, now)
+	}
 	observer := c.observer(ref.Provider)
 	if observer == nil {
 		return

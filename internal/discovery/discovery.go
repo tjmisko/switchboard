@@ -188,6 +188,46 @@ var codexHelpVersionFlags = map[string]struct{}{
 // identity; masked Args are not accepted because no remaining process field can
 // distinguish a bare TUI from `codex exec` or another utility invocation.
 func IsCodex(p osproc.Info) bool {
+	return codexExecutable(p) && codexIsInteractive(p.Args)
+}
+
+// IsHookBoundary identifies agent runtimes that cannot be traversed to infer
+// hook ownership. Shared Codex app-servers are intentionally not switchable
+// sessions, but their launching TUI does not own all threads they later host.
+func IsHookBoundary(p osproc.Info) bool {
+	return Classify(p) != AgentNone || codexExecutable(p)
+}
+
+// IsCodexAppServer recognizes the shared execution boundary, including global
+// CLI options before the subcommand. Other Codex utilities never enable routing.
+func IsCodexAppServer(p osproc.Info) bool {
+	if !codexExecutable(p) {
+		return false
+	}
+	for i := 1; i < len(p.Args); i++ {
+		arg := p.Args[i]
+		if _, ok := codexGlobalFlags[arg]; ok {
+			continue
+		}
+		if _, ok := codexGlobalValueOptions[arg]; ok {
+			if i+1 >= len(p.Args) {
+				return false
+			}
+			i++
+			continue
+		}
+		if strings.HasPrefix(arg, "--") {
+			name, value, equals := strings.Cut(arg, "=")
+			if _, ok := codexGlobalValueOptions[name]; ok && equals && value != "" {
+				continue
+			}
+		}
+		return arg == "app-server"
+	}
+	return false
+}
+
+func codexExecutable(p osproc.Info) bool {
 	if p.Comm != "codex" {
 		return false
 	}
@@ -197,7 +237,7 @@ func IsCodex(p osproc.Info) bool {
 	if p.Exe != "" && filepath.Base(p.Exe) != "codex" {
 		return false
 	}
-	return codexIsInteractive(p.Args)
+	return true
 }
 
 // codexIsInteractive parses the global option prefix of an identity-validated

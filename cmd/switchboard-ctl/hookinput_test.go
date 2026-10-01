@@ -381,6 +381,23 @@ func TestParseClaudePreToolUseForwardsOnlyJoinMetadata(t *testing.T) {
 	}
 }
 
+func TestCodexHookDirectoryMetadataIsBoundedAndAbsolute(t *testing.T) {
+	for _, tc := range []struct{ cwd, agent, want string }{
+		{"/project/../switchboard", "codex", "/switchboard"},
+		{"relative", "codex", ""},
+		{"/switchboard", "claude", ""},
+		{"/" + strings.Repeat("x", 4096), "codex", ""},
+	} {
+		body, err := json.Marshal(map[string]string{"cwd": tc.cwd, "session_id": "thread"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := parseHookPayload(body, "PreToolUse", tc.agent).HookCWD; got != tc.want {
+			t.Fatalf("directory=%q want=%q", got, tc.want)
+		}
+	}
+}
+
 func TestCmdHookShouldForwardEmptyToolInputHashWhenPayloadHasNoToolInput(t *testing.T) {
 	req := hookRequestForPayload(t, `{
 		"session_id": "sess-1",

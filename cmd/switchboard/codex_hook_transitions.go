@@ -41,11 +41,13 @@ type codexPendingApproval struct {
 func (p *codexPendingApproval) finish(wg *sync.WaitGroup) { p.done.Do(wg.Done) }
 
 type codexHookRootState struct {
-	sessionID string
-	latestAt  time.Time
-	retired   map[string]struct{}
-	pending   map[string]codexPendingInput
-	approvals map[string]*codexPendingApproval
+	sessionID           string
+	latestAt            time.Time
+	transcript          string
+	transcriptStoppedAt time.Time
+	retired             map[string]struct{}
+	pending             map[string]codexPendingInput
+	approvals           map[string]*codexPendingApproval
 
 	// Standalone app-server snapshots retain topology but report interactive
 	// TUI roots as notLoaded. Preserve the last exact hook-owned root state under
@@ -233,6 +235,10 @@ func (c *agentCoordinator) handleCodexHookNow(ref provider.RootRef, req rpc.Requ
 		c.clearCodexApprovalsLocked(rootState)
 	}
 	commitCodexHookSession(rootState, rootID, now)
+	rootState.transcriptStoppedAt = time.Time{}
+	if req.Transcript != "" {
+		rootState.transcript = req.Transcript
+	}
 	pendingAttention, hookOwnsTransition := reduceCodexPendingInput(rootState, req)
 	approvalDeferred, approvalOwnsTransition := c.reduceCodexPendingApprovalLocked(rootState, ref, rootID, req, now)
 	hookOwnsTransition = hookOwnsTransition || approvalOwnsTransition
@@ -761,6 +767,8 @@ func commitCodexHookSession(state *codexHookRootState, rootID string, now time.T
 		clear(state.pending)
 		state.rootNode = agentgraph.Node{}
 		state.rootObservedAt = time.Time{}
+		state.transcript = ""
+		state.transcriptStoppedAt = time.Time{}
 		state.rootFreshUntil = time.Time{}
 		state.childQueue = nil
 		clear(state.childOverlays)
@@ -813,6 +821,7 @@ func (c *agentCoordinator) overlayCodexHookRootObservation(key provider.RootKey,
 		return observation
 	}
 	root, freshUntil := state.rootNode, state.rootFreshUntil
+	stoppedAt := state.transcriptStoppedAt
 	c.codexHookMu.Unlock()
 
 	for i := range observation.Nodes {
@@ -820,6 +829,14 @@ func (c *agentCoordinator) overlayCodexHookRootObservation(key provider.RootKey,
 			continue
 		}
 		if !codexRootStateUnavailable(observation.Nodes[i].Runtime, observation.Nodes[i].Attention) {
+			return observation
+		}
+		if !stoppedAt.IsZero() && observation.Nodes[i].Attention == agentgraph.AttentionNone {
+			observation.Nodes[i].Runtime = agentgraph.RuntimeIdle
+			observation.Nodes[i].UpdatedAt = stoppedAt
+			if observation.FreshUntil.IsZero() || freshUntil.Before(observation.FreshUntil) {
+				observation.FreshUntil = freshUntil
+			}
 			return observation
 		}
 		observation.Nodes[i].Runtime = root.Runtime

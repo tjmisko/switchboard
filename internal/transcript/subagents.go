@@ -14,8 +14,8 @@ package transcript
 import (
 	"bytes"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -39,16 +39,17 @@ import (
 // variants). AgentID also matches the SubagentStart/Stop hook's agent_id, so it is
 // the field to join on across the transcript, the metadata, and the hooks.
 type Subagent struct {
-	AgentID     string    // <id> from the agent-<id>.{meta.json,jsonl} FILENAME — the universal key/join (matches the SubagentStart/Stop hook agent_id)
-	AgentType   string    // agentType from the meta; "" for an orphan jsonl that has no sibling meta
-	Name        string    // name — the human-readable teammate name (e.g. "escalate-cleanup"); best-effort (only the fuller in-process-teammate metas carry it)
-	Description string    // description — best-effort (absent in minimal metas)
-	ToolUseID   string    // toolUseId — best-effort (absent ~36% of metas); for parent-transcript cross-check only
-	SpawnDepth  int       // spawnDepth — best-effort (absent → 0; 0 = launched by the main thread)
-	TaskKind    string    // taskKind — best-effort, e.g. "in_process_teammate"; "" if absent
-	HasMeta     bool      // false for an orphan agent-<id>.jsonl with no sibling meta
-	Done        bool      // the jsonl's last complete line has message.stop_reason == "end_turn"
-	ModTime     time.Time // the agent-<id>.jsonl's mtime, or the meta.json's mtime when no jsonl exists yet; zero only when neither is stat-able
+	AgentID       string    // <id> from the agent-<id>.{meta.json,jsonl} FILENAME — the universal key/join (matches the SubagentStart/Stop hook agent_id)
+	AgentType     string    // agentType from the meta; "" for an orphan jsonl that has no sibling meta
+	Name          string    // name — the human-readable teammate name (e.g. "escalate-cleanup"); best-effort (only the fuller in-process-teammate metas carry it)
+	Description   string    // description — best-effort (absent in minimal metas)
+	ToolUseID     string    // toolUseId — best-effort (absent ~36% of metas); for parent-transcript cross-check only
+	SpawnDepth    int       // spawnDepth — best-effort (absent → 0; 0 = launched by the main thread)
+	TaskKind      string    // taskKind — best-effort, e.g. "in_process_teammate"; "" if absent
+	HasMeta       bool      // false for an orphan agent-<id>.jsonl with no sibling meta
+	LatestEntryAt time.Time // newest conversational row, independent of filesystem flush time
+	Done          bool      // the jsonl's last complete line has message.stop_reason == "end_turn"
+	ModTime       time.Time // the agent-<id>.jsonl's mtime, or the meta.json's mtime when no jsonl exists yet; zero only when neither is stat-able
 }
 
 // subagentMeta is the subset of an agent-<id>.meta.json we parse. The real files
@@ -328,7 +329,7 @@ func SubagentsForTranscript(transcriptPath string) ([]Subagent, error) {
 				continue
 			}
 			s := upsert(id)
-			s.Done, s.ModTime = subagentJSONLState(filepath.Join(dir, name))
+			s.Done, s.ModTime, s.LatestEntryAt = subagentJSONLActivity(filepath.Join(dir, name))
 		}
 	}
 
@@ -340,53 +341,101 @@ func SubagentsForTranscript(transcriptPath string) ([]Subagent, error) {
 }
 
 // subagentJSONLState reads the subagent's own transcript at path and reports
-// whether it has finished — its last complete (newline-terminated) line has
-// message.stop_reason == "end_turn" — along with the file's mtime. A missing jsonl
-// (a meta-only spawn with no transcript yet) yields (false, zero time). Only a
-// bounded tail (subagentTailBytes) is read, never the whole file: the last line is
-// the bytes after the final interior newline of that tail, which is complete
-// because the read runs to EOF. Conservative — any read/parse failure, an empty
-// file, or a last line whose tail window began mid-line yields Done=false.
+// whether its last conversational entry is end_turn or a successful, exactly
+// correlated SubagentHandback result, along with the file's mtime. Provider
+// bookkeeping rows do not reopen a completed child. A bounded tail is read;
+// missing files and unreadable evidence yield Done=false.
 func subagentJSONLState(path string) (done bool, mod time.Time) {
-	f, err := os.Open(path)
+	done, mod, _ = subagentJSONLActivity(path)
+	return
+}
+
+func subagentJSONLActivity(path string) (done bool, mod, latest time.Time) {
+	fi, err := os.Stat(path)
 	if err != nil {
-		return false, time.Time{} // no jsonl yet (meta-only spawn)
-	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return false, time.Time{}
+		return
 	}
 	mod = fi.ModTime()
-	size := fi.Size()
-	if size == 0 {
-		return false, mod
-	}
-	var start int64
-	if size > subagentTailBytes {
-		start = size - subagentTailBytes
-	}
-	if _, err := f.Seek(start, io.SeekStart); err != nil {
-		return false, mod
-	}
-	data, err := io.ReadAll(f)
+	entries, err := readTailEntriesMode(path, subagentTailBytes, true)
 	if err != nil {
-		return false, mod
+		return
 	}
-	// Take the last complete line: drop trailing newline(s), then the bytes after
-	// the final interior newline. With no interior newline the segment is the whole
-	// read — complete only if we started at byte 0 (else it is a mid-line fragment).
-	data = bytes.TrimRight(data, "\r\n")
-	if i := bytes.LastIndexByte(data, '\n'); i >= 0 {
-		data = data[i+1:]
-	} else if start > 0 {
-		return false, mod
+	var last *entry
+	for i := range entries {
+		e := &entries[i]
+		if classify(*e) == SignalNone {
+			continue
+		}
+		last = e
+		if at, ok := e.parsedTime(); ok && at.After(latest) {
+			latest = at
+		}
 	}
-	var e entry
-	if json.Unmarshal(data, &e) != nil {
-		return false, mod
+	if last == nil {
+		return
 	}
-	return e.Message.StopReason == subagentTerminalReason, mod
+	if last.Message.StopReason == subagentTerminalReason {
+		done = true
+		return
+	}
+	// Handback returns through a tool result, so its writer never emits end_turn.
+	// Require the exact call and a successful result; a pending/failed handback
+	// or a later conversational row must keep the child live.
+	for _, result := range last.blocks() {
+		if result.Type != "tool_result" || result.IsError || result.ToolUseID == "" {
+			continue
+		}
+		for i := len(entries) - 2; i >= 0; i-- {
+			for _, call := range entries[i].blocks() {
+				if call.Type == "tool_use" && call.Name == "SubagentHandback" && call.ID == result.ToolUseID {
+					done = true
+					return
+				}
+			}
+		}
+	}
+	return
+}
+
+// taskCompletion reads provider bookkeeping only, never an ordinary user's
+// XML-looking prompt. Decode just the notification header; the report that
+// follows may contain arbitrary model text and is not an XML document.
+func taskCompletion(e entry) (string, time.Time) {
+	if !e.QueueTranscriptOnly || e.Message.Role != "user" {
+		return "", time.Time{}
+	}
+	for _, b := range e.blocks() {
+		text := strings.TrimSpace(b.Text)
+		if b.Type != "text" || !strings.HasPrefix(text, "<task-notification>") {
+			continue
+		}
+		var id, status string
+		decoder := xml.NewDecoder(strings.NewReader(text))
+		for {
+			token, err := decoder.Token()
+			if err != nil {
+				break
+			}
+			if element, ok := token.(xml.StartElement); ok {
+				switch element.Name.Local {
+				case "task-id":
+					if decoder.DecodeElement(&id, &element) != nil {
+						return "", time.Time{}
+					}
+				case "status":
+					if decoder.DecodeElement(&status, &element) != nil {
+						return "", time.Time{}
+					}
+					if status != "completed" || id == "" || strings.ContainsAny(id, "/\\") {
+						return "", time.Time{}
+					}
+					at, _ := e.parsedTime()
+					return id, at
+				}
+			}
+		}
+	}
+	return "", time.Time{}
 }
 
 // TaskResult is one tool_result seen in a transcript delta, tagged with whether
@@ -395,8 +444,10 @@ func subagentJSONLState(path string) (done bool, mod time.Time) {
 // with it — the Observer treats an ack as proof the spawn is asynchronous and
 // never as a completion — is policy that belongs to the caller.
 type TaskResult struct {
-	ToolUseID string // the tool_use this result answers
-	LaunchAck bool   // true when the payload only acknowledges the spawn
+	AgentID     string // exact completed task id from a provider-only notification
+	CompletedAt time.Time
+	ToolUseID   string // the tool_use this result answers
+	LaunchAck   bool   // true when the payload only acknowledges the spawn
 }
 
 // TasksSince reads new transcript bytes from offset to EOF (NOT tail-bounded) and
@@ -428,6 +479,9 @@ func TasksSince(path string, offset int64) (spawns []Task, results []TaskResult,
 		var e entry
 		if json.Unmarshal(raw, &e) != nil {
 			continue // tolerate stray/foreign lines
+		}
+		if id, at := taskCompletion(e); id != "" {
+			results = append(results, TaskResult{AgentID: id, CompletedAt: at})
 		}
 		for _, b := range e.blocks() {
 			switch b.Type {

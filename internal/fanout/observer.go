@@ -52,16 +52,23 @@ const DefaultWorkflowQuietGrace = 90 * time.Second
 // sessionState is the durable per-session bookkeeping carried across reconcile
 // ticks. Keyed by session-id (NOT pid) so a daemon restart or `claude --resume`
 // — new pid, same session-id, same subagents/ dir — reuses it after re-seeding.
+type childLifecycleEdge struct {
+	At      time.Time
+	Running bool
+}
+
 type sessionState struct {
-	seeded      bool
-	offset      int64           // forward cursor into the parent transcript
-	spawned     map[string]bool // agent_id -> spawn event already emitted
-	stopped     map[string]bool // agent_id -> stop event already emitted
-	resultDone  map[string]bool // tool_use_id -> its tool_result landed (cursor cross-check)
-	background  map[string]bool // tool_use_id -> run_in_background (cursor; for timeline tagging)
-	spawnedAt   map[string]time.Time
-	completedAt map[string]time.Time
-	suspect     map[string]SuspectReason
+	childEdges    map[string]childLifecycleEdge
+	notifications map[string]time.Time
+	seeded        bool
+	offset        int64           // forward cursor into the parent transcript
+	spawned       map[string]bool // agent_id -> spawn event already emitted
+	stopped       map[string]bool // agent_id -> stop event already emitted
+	resultDone    map[string]bool // tool_use_id -> its tool_result landed (cursor cross-check)
+	background    map[string]bool // tool_use_id -> run_in_background (cursor; for timeline tagging)
+	spawnedAt     map[string]time.Time
+	completedAt   map[string]time.Time
+	suspect       map[string]SuspectReason
 
 	// Workflow runs (subagents/workflows/wf_*/): one cursor per run, plus the
 	// start/stop already-emitted sets seeded from history so a restart mid-run
@@ -74,16 +81,18 @@ type sessionState struct {
 
 func newSessionState() *sessionState {
 	return &sessionState{
-		spawned:     map[string]bool{},
-		stopped:     map[string]bool{},
-		resultDone:  map[string]bool{},
-		background:  map[string]bool{},
-		spawnedAt:   map[string]time.Time{},
-		completedAt: map[string]time.Time{},
-		suspect:     map[string]SuspectReason{},
-		workflows:   map[string]*workflowCursor{},
-		wfAnnounced: map[string]bool{},
-		wfEnded:     map[string]bool{},
+		childEdges:    map[string]childLifecycleEdge{},
+		notifications: map[string]time.Time{},
+		spawned:       map[string]bool{},
+		stopped:       map[string]bool{},
+		resultDone:    map[string]bool{},
+		background:    map[string]bool{},
+		spawnedAt:     map[string]time.Time{},
+		completedAt:   map[string]time.Time{},
+		suspect:       map[string]SuspectReason{},
+		workflows:     map[string]*workflowCursor{},
+		wfAnnounced:   map[string]bool{},
+		wfEnded:       map[string]bool{},
 	}
 }
 
@@ -125,6 +134,36 @@ func NewObserver(historyDir string) *Observer {
 	return &Observer{dir: historyDir, staleCap: DefaultStaleCap, quietGrace: DefaultWorkflowQuietGrace, sessions: map[string]*sessionState{}}
 }
 
+// RecordChildLifecycle keeps exact hook lifecycle evidence alongside the scan.
+// A later start reopens the same stable ID; stale stops cannot override it.
+func (o *Observer) RecordChildLifecycle(sessionID, agentID string, running bool, at time.Time) {
+	if sessionID == "" || agentID == "" || at.IsZero() {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	ss := o.sessions[sessionID]
+	if ss == nil {
+		ss = newSessionState()
+		o.sessions[sessionID] = ss
+	}
+	if previous := ss.childEdges[agentID]; at.Before(previous.At) {
+		return
+	}
+	ss.childEdges[agentID] = childLifecycleEdge{At: at, Running: running}
+}
+
+func childDone(ss *sessionState, child transcript.Subagent) bool {
+	edge := ss.childEdges[child.AgentID]
+	if at := ss.notifications[child.AgentID]; !at.IsZero() && !at.Before(child.LatestEntryAt) && at.After(edge.At) {
+		return true
+	}
+	if !edge.At.IsZero() && !edge.At.Before(child.LatestEntryAt) {
+		return !edge.Running
+	}
+	return child.Done
+}
+
 // SetStaleCap overrides the force-close threshold (tuning/test hook).
 func (o *Observer) SetStaleCap(d time.Duration) {
 	o.mu.Lock()
@@ -162,15 +201,14 @@ func (o *Observer) Reconcile(sess *state.Session, c *state.AgentInfo, now time.T
 		// the same guard covers workflow runs, whose dirs are never deleted
 		// either). The index is one streaming pass over the log, built once per
 		// process and shared by every session — the per-session cost here is a
-		// map handover. Prime the cursor to EOF — the dir scan is the
-		// authoritative spawn source, so there is no need to re-read the whole
-		// transcript on every restart.
+		// map handover. Read the parent once to recover completion notifications
+		// and background acknowledgments; subsequent ticks use the byte cursor.
 		o.ensureSeedIndexLocked()
 		sets := o.seedIndex.Sets(c.SessionID)
 		delete(o.seedIndex, c.SessionID)
 		ss.spawned, ss.stopped = sets.Spawned, sets.Stopped
 		ss.wfAnnounced, ss.wfEnded = sets.WorkflowStarted, sets.WorkflowStopped
-		ss.offset = fileSize(c.Transcript)
+		ss.offset = 0 // recover exact completion notifications and launch acknowledgments once
 		ss.seeded = true
 	}
 
@@ -190,6 +228,12 @@ func (o *Observer) Reconcile(sess *state.Session, c *state.AgentInfo, now time.T
 			}
 		}
 		for _, r := range results {
+			if r.AgentID != "" {
+				if r.CompletedAt.After(ss.notifications[r.AgentID]) {
+					ss.notifications[r.AgentID] = r.CompletedAt
+				}
+				continue
+			}
 			// A launch ack is the ONLY thing the parent transcript ever says about an
 			// async fanout: it lands ~2s after the spawn and the real completion
 			// arrives later as a <task-notification> entry, never as a tool_result.
@@ -230,7 +274,7 @@ func (o *Observer) Reconcile(sess *state.Session, c *state.AgentInfo, now time.T
 		// terminal entry (universal — every subagent has one), else its parent
 		// tool_result landed, else a hard cap on a quiescent transcript force-closes a
 		// stalled/aborted subagent so in-flight can never leak.
-		done := s.Done
+		done := childDone(ss, s)
 		stale := false
 		// The parent tool_result is the real completion only for a FOREGROUND fanout.
 		// An async fanout's parent result is a spawn ack that lands ~2s after launch
@@ -242,10 +286,14 @@ func (o *Observer) Reconcile(sess *state.Session, c *state.AgentInfo, now time.T
 		// It cannot be relied on alone: it is fed by the run_in_background input flag,
 		// which no Agent spawn in the measured corpus has ever set (see
 		// transcript.launchAckPrefixes). The ack classification is what actually holds.
-		if !done && s.ToolUseID != "" && !ss.background[s.ToolUseID] && ss.resultDone[s.ToolUseID] {
+		if !done && s.ToolUseID != "" && !ss.background[s.ToolUseID] && ss.resultDone[s.ToolUseID] && !ss.childEdges[s.AgentID].Running && (ss.completedAt[s.AgentID].IsZero() || !s.LatestEntryAt.After(ss.completedAt[s.AgentID])) {
 			done = true
 		}
-		if !done && !s.ModTime.IsZero() && now.Sub(s.ModTime) > o.staleCap {
+		lastActivity := s.ModTime
+		if edge := ss.childEdges[s.AgentID]; edge.At.After(lastActivity) {
+			lastActivity = edge.At
+		}
+		if !done && !lastActivity.IsZero() && now.Sub(lastActivity) > o.staleCap {
 			done = true
 			stale = true
 		}
@@ -268,6 +316,12 @@ func (o *Observer) Reconcile(sess *state.Session, c *state.AgentInfo, now time.T
 				events = append(events, event)
 			}
 			continue
+		}
+		if ss.stopped[s.AgentID] && (!ss.childEdges[s.AgentID].At.IsZero() || s.LatestEntryAt.After(ss.completedAt[s.AgentID])) {
+			delete(ss.resultDone, s.ToolUseID)
+			delete(ss.stopped, s.AgentID)
+			delete(ss.completedAt, s.AgentID)
+			delete(ss.suspect, s.AgentID)
 		}
 		// Still running. Count toward the main thread's in-flight only for a direct
 		// child (depth 0/1 — anonymous Agent/Task fanouts are depth 1, named

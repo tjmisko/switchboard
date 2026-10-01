@@ -38,6 +38,8 @@ var (
 
 const defaultFreshness = 15 * time.Second
 
+const transcriptStopQuietWindow = 90 * time.Second
+
 const (
 	preToolCandidateTTL           = 60 * time.Second
 	maxPreToolCandidatesPerWriter = maxPendingPromptsPerWriter
@@ -145,9 +147,10 @@ type Observer struct {
 }
 
 type rootState struct {
-	ref       provider.RootRef
-	runtime   agentgraph.RuntimeState
-	runtimeAt time.Time
+	ref            provider.RootRef
+	runtime        agentgraph.RuntimeState
+	runtimeAt      time.Time
+	lastRootHookAt time.Time
 	// pending maps a writer ("" is the main thread) to every prompt that writer
 	// currently holds open, ordered oldest-first by Since. The writer routes
 	// evidence — no sibling may ever clear another writer's prompt — but the
@@ -324,7 +327,7 @@ func (o *Observer) Observe(ctx context.Context, root provider.RootRef, now time.
 	rs := o.ensureRootLocked(root)
 	pending := clonePendingSets(rs.pending)
 	anchors := maps.Clone(rs.promptAnchors)
-	runtime, runtimeAt := rs.runtime, rs.runtimeAt
+	runtime, runtimeAt, turnStartedAt, lastRootHookAt := rs.runtime, rs.runtimeAt, rs.turnStartedAt, rs.lastRootHookAt
 	tuning := o.tuning
 	o.mu.Unlock()
 
@@ -336,7 +339,7 @@ func (o *Observer) Observe(ctx context.Context, root provider.RootRef, now time.
 	}, now)
 	latches, latchDiagnostics := latchPendingCalls(root.Transcript, pending, tuning.TailBytes, now)
 	resolutions := resolvePending(root.Transcript, pending, anchors, structured.Snapshot, now, tuning)
-	runtime = reconcileRootRuntime(root.Transcript, runtime, runtimeAt, tuning.TailBytes)
+	runtime = reconcileRootRuntime(root.Transcript, runtime, runtimeAt, turnStartedAt, lastRootHookAt, now, tuning.TailBytes)
 
 	if err := ctx.Err(); err != nil {
 		return agentgraph.Observation{}, err
@@ -350,7 +353,7 @@ func (o *Observer) Observe(ctx context.Context, root provider.RootRef, now time.
 		return agentgraph.Observation{}, ErrSuperseded
 	}
 	rs.ref = root
-	if runtime != agentgraph.RuntimeUnknown {
+	if runtime != agentgraph.RuntimeUnknown && rs.lastRootHookAt.Equal(lastRootHookAt) && rs.runtimeAt.Equal(runtimeAt) {
 		if runtime != rs.runtime {
 			rs.runtimeAt = now
 		}
@@ -464,6 +467,9 @@ func (o *Observer) ApplyHook(signal HookSignal) HookResult {
 
 func (o *Observer) applyHookLocked(rs *rootState, signal HookSignal) (bool, string, int) {
 	writer := signal.AgentID
+	if writer == "" && signal.At.After(rs.lastRootHookAt) {
+		rs.lastRootHookAt = signal.At
+	}
 	changed := false
 	rule := statustune.RuleGraphHookNoChange
 	if signal.Event == "SessionStart" {
@@ -577,8 +583,7 @@ func (o *Observer) applyHookLocked(rs *rootState, signal HookSignal) (bool, stri
 			rule = statustune.RuleGraphChildActivity
 		}
 	case "SubagentStart", "SubagentStop":
-		// Directory/journal scan remains authoritative for spawn and completion.
-		// These hooks only invalidate the cached snapshot.
+		o.fanout.RecordChildLifecycle(rs.ref.ProviderSessionID, writer, signal.Event == "SubagentStart", signal.At)
 		rule = statustune.RuleGraphFanoutRescan
 	}
 	return changed, rule, depth
@@ -1589,15 +1594,14 @@ func writerQuiescentPastCap(path string, since, now time.Time, cap time.Duration
 	return now.Sub(quiescentSince) >= cap
 }
 
-func reconcileRootRuntime(path string, runtime agentgraph.RuntimeState, since time.Time, tailBytes int64) agentgraph.RuntimeState {
+func reconcileRootRuntime(path string, runtime agentgraph.RuntimeState, since, turnStartedAt, lastHookAt, now time.Time, tailBytes int64) agentgraph.RuntimeState {
 	if runtime != agentgraph.RuntimeIdle && runtime != agentgraph.RuntimeActive {
 		return runtime
 	}
-	fi, err := os.Stat(path)
-	if err != nil || !fi.ModTime().After(since) {
-		return runtime
+	signal, at, err := transcript.NewestRuntimeSignal(path, tailBytes)
+	if err == nil && signal == transcript.SignalStopped && !at.Before(turnStartedAt) && !at.Before(lastHookAt) && now.Sub(lastHookAt) >= transcriptStopQuietWindow {
+		return agentgraph.RuntimeIdle
 	}
-	signal, at, err := transcript.NewestSignal(path, tailBytes)
 	if err != nil || !at.After(since) {
 		return runtime
 	}

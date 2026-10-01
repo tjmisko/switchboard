@@ -589,6 +589,7 @@ func cmdHook(c *rpc.Client, event, agent string) {
 }
 
 type hookPayload struct {
+	CWD            string `json:"cwd"`
 	SessionID      string `json:"session_id"`
 	TranscriptPath string `json:"transcript_path"`
 	ToolName       string `json:"tool_name"`
@@ -622,6 +623,9 @@ func parseHookPayload(body []byte, event, agent string) rpc.Request {
 	}
 	req.SessionID = payload.SessionID
 	req.Transcript = payload.TranscriptPath
+	if agent == state.AgentKindCodex && filepath.IsAbs(payload.CWD) && len(payload.CWD) <= 4096 {
+		req.HookCWD = filepath.Clean(payload.CWD)
+	}
 	req.ToolName = payload.ToolName
 	req.ToolInputHash = hashToolInput(payload.ToolInput)
 	req.AgentID = firstNonEmpty(payload.AgentID, payload.AgentIDAlt)

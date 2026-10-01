@@ -153,11 +153,15 @@ func (o *Observer) snapshotLocked(root Root, ss *sessionState, now time.Time) (S
 		child.StartedAt = child.SpawnedAt
 		child.Background = sub.ToolUseID != "" && ss.background[sub.ToolUseID]
 
-		done := sub.Done
-		if !done && sub.ToolUseID != "" && !child.Background && ss.resultDone[sub.ToolUseID] {
+		done := childDone(ss, sub)
+		if !done && sub.ToolUseID != "" && !child.Background && ss.resultDone[sub.ToolUseID] && !ss.childEdges[sub.AgentID].Running && (ss.completedAt[sub.AgentID].IsZero() || !sub.LatestEntryAt.After(ss.completedAt[sub.AgentID])) {
 			done = true
 		}
-		stale := !done && !sub.ModTime.IsZero() && now.Sub(sub.ModTime) > o.staleCap
+		lastActivity := sub.ModTime
+		if edge := ss.childEdges[sub.AgentID]; edge.At.After(lastActivity) {
+			lastActivity = edge.At
+		}
+		stale := !done && !lastActivity.IsZero() && now.Sub(lastActivity) > o.staleCap
 		switch {
 		case stale:
 			child.Lifecycle = LifecycleInterrupted

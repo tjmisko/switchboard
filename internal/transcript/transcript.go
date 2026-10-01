@@ -88,6 +88,8 @@ const (
 	// SignalInterrupt means the user interrupted the turn ("[Request interrupted
 	// by user]"), which fires no Stop hook.
 	SignalInterrupt
+	// SignalStopped is terminal root evidence used only by NewestRuntimeSignal.
+	SignalStopped
 )
 
 func (s Signal) String() string {
@@ -96,6 +98,8 @@ func (s Signal) String() string {
 		return "activity"
 	case SignalInterrupt:
 		return "interrupt"
+	case SignalStopped:
+		return "stopped"
 	default:
 		return "none"
 	}
@@ -142,7 +146,11 @@ const DefaultTailBytes = 128 * 1024
 // because Claude Code writes it either as an array of typed blocks or, for some
 // user entries, as a bare string — blocks() reconciles both.
 type entry struct {
-	Timestamp string `json:"timestamp"`
+	Type                  string `json:"type"`
+	Subtype               string `json:"subtype"`
+	QueueTranscriptOnly   bool   `json:"queueTranscriptOnly"`
+	PreventedContinuation bool   `json:"preventedContinuation"`
+	Timestamp             string `json:"timestamp"`
 	// UUID identifies the transcript row. Current assistant rows also carry the
 	// provider message id below; UUID is a content-free fallback for older rows.
 	UUID    string `json:"uuid"`
@@ -366,6 +374,10 @@ func (e entry) parsedTime() (time.Time, bool) {
 // mid-file and tolerates stray/foreign/unparseable lines. A missing/unreadable
 // file (or empty path) returns a non-nil error so callers can apply a backstop.
 func readTailEntries(path string, maxBytes int64) ([]entry, error) {
+	return readTailEntriesMode(path, maxBytes, false)
+}
+
+func readTailEntriesMode(path string, maxBytes int64, requireComplete bool) ([]entry, error) {
 	if path == "" {
 		return nil, errors.New("transcript: empty path")
 	}
@@ -389,6 +401,9 @@ func readTailEntries(path string, maxBytes int64) ([]entry, error) {
 	data, err := io.ReadAll(f)
 	if err != nil {
 		return nil, err
+	}
+	if requireComplete && len(data) != 0 && data[len(data)-1] != '\n' {
+		return nil, errors.New("transcript: incomplete runtime tail")
 	}
 
 	lines := bytes.Split(data, []byte{'\n'})
@@ -1113,7 +1128,34 @@ func readNewLines(path string, byteOffset int64) ([]byte, int64, error) {
 // resumed work (→ working); a SignalInterrupt newer than that means a working
 // chip's turn was interrupted with no Stop hook (→ idle).
 func NewestSignal(path string, maxBytes int64) (Signal, time.Time, error) {
-	entries, err := readTailEntries(path, maxBytes)
+	return newestSignal(path, maxBytes, classify)
+}
+
+// NewestRuntimeSignal includes final answers and successful Stop summaries.
+// It is separate from prompt-resolution and hook anchors: terminal evidence
+// describes runtime, not whether an individual permission call was resolved.
+func NewestRuntimeSignal(path string, maxBytes int64) (Signal, time.Time, error) {
+	return newestSignalMode(path, maxBytes, true, func(e entry) Signal {
+		if e.Type == "system" && e.Subtype == "stop_hook_summary" && !e.PreventedContinuation {
+			return SignalStopped
+		}
+		if e.Message.Role == "assistant" && e.Message.StopReason == "end_turn" {
+			for _, b := range e.blocks() {
+				if b.Type == "text" {
+					return SignalStopped
+				}
+			}
+		}
+		return classify(e)
+	})
+}
+
+func newestSignal(path string, maxBytes int64, classifier func(entry) Signal) (Signal, time.Time, error) {
+	return newestSignalMode(path, maxBytes, false, classifier)
+}
+
+func newestSignalMode(path string, maxBytes int64, requireComplete bool, classifier func(entry) Signal) (Signal, time.Time, error) {
+	entries, err := readTailEntriesMode(path, maxBytes, requireComplete)
 	if err != nil {
 		return SignalNone, time.Time{}, err
 	}
@@ -1121,7 +1163,7 @@ func NewestSignal(path string, maxBytes int64) (Signal, time.Time, error) {
 	var newest time.Time
 	kind := SignalNone
 	for _, e := range entries {
-		k := classify(e)
+		k := classifier(e)
 		if k == SignalNone {
 			continue
 		}
@@ -1250,6 +1292,9 @@ func AnchorSince(path string, now, prev time.Time, intoWorking bool, maxBytes in
 // case matches — that is the real "agent is mid-turn" signal the resume self-heal
 // relies on.
 func classify(e entry) Signal {
+	if e.QueueTranscriptOnly {
+		return SignalNone
+	}
 	switch e.Message.Role {
 	case "assistant":
 		return SignalActivity

@@ -719,6 +719,29 @@ func TestFindTrackedAncestorNonAgentWrappersStillWalk(t *testing.T) {
 	}
 }
 
+func TestSharedCodexDaemonCannotAttributeHooksToLaunchingTUI(t *testing.T) {
+	for _, args := range [][]string{
+		{"codex", "app-server", "--listen", "unix://", "--managed-daemon"},
+		{"codex", "--config", "model=example", "app-server", "--stdio"},
+		{"codex", "exec", "prompt"},
+	} {
+		infos := map[int]proc.Info{
+			300: {PID: 300, PPID: 200, Comm: "sh", Exe: "/usr/bin/sh"},
+			200: {PID: 200, PPID: 100, Comm: "codex", Exe: "/opt/codex/bin/codex", Args: args},
+		}
+		calls := 0
+		if got := findTrackedAncestor(tracked(100), 300, procChainReader(infos, &calls)); got != 0 {
+			t.Fatalf("daemon-owned hook crossed runtime %v to PID %d", args, got)
+		}
+	}
+	// Ordinary TUI-owned hooks still resolve through a shell wrapper.
+	infos := map[int]proc.Info{300: {PID: 300, PPID: 100, Comm: "sh", Exe: "/usr/bin/sh"}}
+	calls := 0
+	if got := findTrackedAncestor(tracked(100), 300, procChainReader(infos, &calls)); got != 100 {
+		t.Fatalf("TUI-owned hook = %d, want 100", got)
+	}
+}
+
 // A non-claude binary that merely SHARES the name must not stop the walk —
 // claudeExeValid rejects it, so it is an ordinary wrapper. Guards the guard
 // against being widened into a comm-only check.
