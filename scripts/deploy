@@ -489,17 +489,16 @@ warn_stale_references() {
 	# "switchboard-dashboard".
 	pattern=$(printf '%s|' "${commands[@]}")
 	pattern="go/bin/(${pattern%|})([^-a-zA-Z0-9_]|$)"
-	# switchboard.service and switchboard-waybar.service name ~/go/bin as their
-	# SHIPPED default, which the host overlay overrides; that is intended and
-	# must not be reported. Excluding the whole systemd directory would instead
-	# hide real offenders like swayidle.service, so exclude only those two.
+	# The units this script installs name ~/go/bin as their SHIPPED default,
+	# which the host overlay overrides; that is intended and must not be
+	# reported. Excluding the whole systemd directory would instead hide real
+	# offenders like swayidle.service, so exclude only those units.
 	# Backups left by a migration are meant to hold the old paths; reporting
 	# them is noise that buries a real hit.
 	# -R, not -r: dotfile managers like stow make these files symlinks, which
 	# -r skips, and a skipped file is exactly where a stale path hides.
 	hits=$(grep -RlE "$pattern" "$HOME/.config" \
-		--exclude=switchboard.service \
-		--exclude=switchboard-waybar.service \
+		"${units[@]/#/--exclude=}" \
 		--exclude='*.bak' --exclude='*.bak-*' --exclude='*.orig' --exclude='*~' \
 		2>/dev/null || true)
 	if [ -n "$hits" ]; then

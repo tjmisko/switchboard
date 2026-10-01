@@ -316,6 +316,19 @@ func TestDeploy_shouldWarnAboutReleasePathsInSymlinkedConfig(t *testing.T) {
 	}
 }
 
+// Every unit deploy installs ships ~/go/bin as a default the host overlay
+// overrides. Reporting one, or its .wants symlink, buries real offenders.
+func TestDeploy_shouldNotFlagTheUnitsItInstalls(t *testing.T) {
+	sandbox := newSandboxDeploy(t)
+	out, err := sandbox.run(t, "0")
+	if err != nil {
+		t.Fatalf("deploy failed: %v\n%s", err, out)
+	}
+	if strings.Contains(out, "reference ~/go/bin directly") {
+		t.Errorf("deploy flagged its own shipped units:\n%s", out)
+	}
+}
+
 // A dry run builds nothing, so it must not claim the release lacks a module.
 func TestDeploy_shouldNotReportAMissingModuleOnADryRun(t *testing.T) {
 	sandbox := newSandboxDeploy(t)
