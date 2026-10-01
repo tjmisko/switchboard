@@ -288,6 +288,34 @@ func TestDeploy_shouldRefuseToReplaceACopiedModule(t *testing.T) {
 	}
 }
 
+// Stow and similar tools make ~/.config files symlinks into a dotfiles repo; a
+// release path hiding behind one is what broke the circles view.
+func TestDeploy_shouldWarnAboutReleasePathsInSymlinkedConfig(t *testing.T) {
+	sandbox := newSandboxDeploy(t)
+	dotfiles := filepath.Join(sandbox.home, "dotfiles")
+	if err := os.MkdirAll(dotfiles, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stale := `"module_path": "` + filepath.Join(sandbox.root, "releases", "4b09ce7", "libswitchboard-waybar.so") + `"`
+	if err := os.WriteFile(filepath.Join(dotfiles, "config.jsonc"), []byte(stale), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waybarDir := filepath.Join(sandbox.home, ".config", "waybar")
+	if err := os.MkdirAll(waybarDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(dotfiles, "config.jsonc"), filepath.Join(waybarDir, "config.jsonc")); err != nil {
+		t.Fatal(err)
+	}
+	out, err := sandbox.run(t, "0")
+	if err != nil {
+		t.Fatalf("deploy failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "name a release directory") || !strings.Contains(out, ".config/waybar/config.jsonc") {
+		t.Errorf("deploy did not flag the symlinked config naming a release:\n%s", out)
+	}
+}
+
 // deploy stamps the module with its own release version so the smoke test can
 // prove the staged module is the one this deploy built.
 func TestBuildWaybarCircles_shouldStampTheRevisionItIsGiven(t *testing.T) {
