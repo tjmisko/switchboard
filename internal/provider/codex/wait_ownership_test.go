@@ -321,7 +321,7 @@ func TestUnknownMechanicalWaitExpiresGrayWithoutAttention(t *testing.T) {
 	}
 }
 
-func TestUserInputMustBeBlockingAndNonResolvingToRequestAttention(t *testing.T) {
+func TestEveryOutstandingUserInputRequestsAttention(t *testing.T) {
 	for _, test := range []struct {
 		name             string
 		blocking         bool
@@ -329,8 +329,9 @@ func TestUserInputMustBeBlockingAndNonResolvingToRequestAttention(t *testing.T) 
 		want             agentgraph.AttentionState
 	}{
 		{name: "blocking", blocking: true, autoResolutionMs: nil, want: agentgraph.AttentionUserInput},
-		{name: "nonblocking", blocking: false, autoResolutionMs: nil, want: agentgraph.AttentionNone},
-		{name: "auto_resolving", blocking: true, autoResolutionMs: 100, want: agentgraph.AttentionNone},
+		{name: "nonblocking", blocking: false, autoResolutionMs: nil, want: agentgraph.AttentionUserInput},
+		{name: "auto_resolving", blocking: true, autoResolutionMs: 100, want: agentgraph.AttentionUserInput},
+		{name: "nonblocking_auto_resolving", blocking: false, autoResolutionMs: 100, want: agentgraph.AttentionUserInput},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			observer, key := newWaitObserver(t, 15*time.Millisecond, nil)
@@ -340,16 +341,17 @@ func TestUserInputMustBeBlockingAndNonResolvingToRequestAttention(t *testing.T) 
 			applyWaitNote(t, observer, rpcNotification{ID: json.RawMessage(`"input"`), Method: "item/tool/requestUserInput", Params: mustJSON(t, map[string]any{
 				"threadId": "root", "turnId": "turn", "itemId": "item", "isBlocking": test.blocking, "autoResolutionMs": test.autoResolutionMs,
 			})})
-			if test.want == agentgraph.AttentionNone {
-				time.Sleep(30 * time.Millisecond)
-			}
 			node := waitNode(t, observer, key)
 			if node.Attention != test.want {
 				t.Fatalf("attention = %s, want %s", node.Attention, test.want)
 			}
-			if test.want == agentgraph.AttentionNone && node.Runtime != agentgraph.RuntimeActive {
-				t.Fatalf("non-human input request stopped active runtime: %#v", node)
+			if node.Runtime != agentgraph.RuntimeActive {
+				t.Fatalf("input attention changed runtime: %#v", node)
 			}
+			applyWaitNote(t, observer, resolvedRequest(t, json.RawMessage(`"other"`)))
+			assertWaitAttention(t, observer, key, agentgraph.AttentionUserInput)
+			applyWaitNote(t, observer, resolvedRequest(t, json.RawMessage(`"input"`)))
+			assertWaitAttention(t, observer, key, agentgraph.AttentionNone)
 		})
 	}
 }

@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/tjmisko/switchboard/internal/agentgraph"
 )
 
 // graphSession is a Claude session whose provider graph reports status.
@@ -113,6 +115,38 @@ func TestSetAgentGraphShouldKeepHerdrsStatusWhenAProviderObservationLands(t *tes
 	}
 	if s.AgentGraph.Summary.Status != StatusPermission {
 		t.Fatalf("graph summary = %q, want the provider's permission recorded", s.AgentGraph.Summary.Status)
+	}
+}
+
+func TestFreshCodexInputAttentionOverridesHerdrAndReleasesOnResolution(t *testing.T) {
+	for _, herdrStatus := range []string{HerdrWorking, HerdrIdle, HerdrDone} {
+		t.Run(herdrStatus, func(t *testing.T) {
+			now := time.Now()
+			s := &Session{Agent: AgentKindCodex, Codex: &AgentInfo{Status: StatusWorking}}
+			s.SetHerdr(reading(herdrStatus, true, now), now)
+			graph := &AgentGraph{
+				RootID: "root", ObservedAt: now, FreshUntil: now.Add(time.Hour),
+				Summary: AgentGraphSummary{Status: StatusPermission, Attention: agentgraph.AttentionUserInput, Since: now},
+			}
+			s.SetAgentGraph(graph)
+			if s.Codex.Status != StatusPermission {
+				t.Fatalf("herdr hid input: status=%s", s.Codex.Status)
+			}
+			graph.Summary.Attention = agentgraph.AttentionNone
+			graph.Summary.Status = StatusWorking
+			s.SetAgentGraph(graph)
+			want, _ := HerdrLegacyStatus(herdrStatus, StatusWorking)
+			if s.Codex.Status != want {
+				t.Fatalf("herdr authority did not resume: got=%s want=%s", s.Codex.Status, want)
+			}
+			graph.Summary.Attention = agentgraph.AttentionUserInput
+			graph.Summary.Status = StatusPermission
+			graph.FreshUntil = now.Add(-time.Second)
+			s.SetAgentGraph(graph)
+			if s.Codex.Status != want {
+				t.Fatal("expired input overrode live herdr status")
+			}
+		})
 	}
 }
 

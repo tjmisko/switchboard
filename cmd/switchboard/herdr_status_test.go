@@ -269,9 +269,8 @@ func TestRunHerdrStatusShouldApplyASignalledPaneToItsSession(t *testing.T) {
 	t.Fatalf("status = %q, want working after the signal", store.Snapshot().Sessions[0].Claude.Status)
 }
 
-// A provider observation that lands while herdr is the authority must neither
-// repaint the chip nor record an edge the chip never showed.
-func TestProviderObservationShouldNotRepaintOrRecordWhenHerdrIsTheAuthority(t *testing.T) {
+// Codex attention must remain visible even when screen detection reports work.
+func TestCodexAttentionShouldOverrideHerdrWorkingAndRecordTheDisplayedEdge(t *testing.T) {
 	store := state.New("")
 	started := time.Now().Add(-time.Hour)
 	ref := seedCoordinatorSession(store, 4077, started, state.AgentKindCodex, "root", "/codex")
@@ -280,7 +279,7 @@ func TestProviderObservationShouldNotRepaintOrRecordWhenHerdrIsTheAuthority(t *t
 	coordinator.refreshTrackedRoots()
 	defer coordinator.Close()
 
-	now := time.Now()
+	now := time.Now().Add(-3 * time.Second)
 	observe := func(runtime agentgraph.RuntimeState, attention agentgraph.AttentionState, at time.Time) {
 		t.Helper()
 		observation := agentgraph.Observation{
@@ -303,16 +302,20 @@ func TestProviderObservationShouldNotRepaintOrRecordWhenHerdrIsTheAuthority(t *t
 
 	observe(agentgraph.RuntimeActive, agentgraph.AttentionApproval, now.Add(2*time.Second))
 	sess := store.Snapshot().Sessions[0]
-	if sess.Codex.Status != state.StatusWorking {
-		t.Fatalf("status = %q, want herdr's working to hold over the provider's approval", sess.Codex.Status)
+	if sess.Codex.Status != state.StatusPermission {
+		t.Fatalf("status = %q, want Codex approval attention to override herdr's working", sess.Codex.Status)
 	}
 	if sess.AgentGraph.Summary.Status != state.StatusPermission {
 		t.Fatalf("graph summary = %q, want the provider's own permission recorded", sess.AgentGraph.Summary.Status)
 	}
 	evs := transitionsIn(t, sink, dir)
+	found := false
 	for _, ev := range evs {
 		if ev.To == state.StatusPermission {
-			t.Fatalf("transitions = %+v, want no edge to permission: the chip never showed it", evs)
+			found = true
 		}
+	}
+	if !found {
+		t.Fatalf("transitions = %+v, want the displayed approval edge recorded", evs)
 	}
 }

@@ -289,6 +289,26 @@ func (o *Observer) RegisterHookBinding(key provider.RootKey, threadID string) er
 	return err
 }
 
+// DismissAsyncQuestions applies the provisional next-user-submission rule to
+// live async question items. It does not resolve JSON-RPC approval/input waits.
+func (o *Observer) DismissAsyncQuestions(key provider.RootKey, threadID string) {
+	o.mu.Lock()
+	record := o.roots[key]
+	if o.closed || record == nil || record.threadID != threadID || record.graph == nil || !record.graph.clearAsyncInputs(threadID) {
+		o.mu.Unlock()
+		return
+	}
+	observation, err := record.graph.observation(o.config.Now(), o.config.Freshness)
+	if err == nil {
+		record.observation = observation
+		o.scheduleExpiryLocked(key, record)
+	}
+	o.mu.Unlock()
+	if err == nil {
+		o.queue.Signal(key)
+	}
+}
+
 // ReconcileHookBinding exposes rotation/stale classification to the daemon
 // while preserving RegisterHookBinding for older observer implementations.
 func (o *Observer) ReconcileHookBinding(key provider.RootKey, threadID string) (BindingUpdate, error) {
@@ -684,6 +704,9 @@ func (o *Observer) installSnapshot(generation uint64, key provider.RootKey, thre
 		return
 	}
 	state.mergeTelemetryFrom(record.graph)
+	if record.generation == generation {
+		state.preserveInputAttention(record.graph)
+	}
 	state.applyAccountMetadata(o.account)
 	o.mergeRolloutLatestLocked(key, threadID, state)
 	observation, err := state.observation(now, o.config.Freshness)
@@ -995,7 +1018,6 @@ type notificationParams struct {
 	TargetItemID   string              `json:"targetItemId"`
 	RequestID      json.RawMessage     `json:"requestId"`
 	IsBlocking     bool                `json:"isBlocking"`
-	AutoResolution *uint64             `json:"autoResolutionMs"`
 	Thread         rpcThread           `json:"thread"`
 	Status         rpcStatus           `json:"status"`
 	Turn           rpcTurn             `json:"turn"`
@@ -1111,6 +1133,9 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 			}
 		case "item/started", "item/completed":
 			if state.nodes[params.ThreadID] != nil || state.nodes[params.Item.SenderThreadID] != nil {
+				if state.applyAsyncInputItem(params.ThreadID, params.Item) {
+					forcePublish = state.hasHumanAttention()
+				}
 				state.applyCollaboration(params.TurnID, params.Item)
 				for _, childID := range params.Item.ReceiverThreadIDs {
 					if pending, exists := o.pendingStatuses[childID]; exists {
@@ -1123,6 +1148,9 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 				touches = true
 			}
 		case "thread/archived", "thread/deleted":
+			if state.clearAsyncInputs(params.ThreadID) {
+				touches = true
+			}
 			if params.ThreadID == state.rootID && state.clearThreadWait(params.ThreadID) {
 				classificationSource = "thread_completed"
 				touches = true
@@ -1190,16 +1218,15 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 			}
 		case "item/tool/requestUserInput":
 			requestID, valid := parseRequestID(notification.ID)
-			autoResolving := params.AutoResolution != nil
-			owner, evidence := requestIgnored, "nonblocking_input"
-			if params.IsBlocking && !autoResolving {
-				owner, evidence = requestHuman, "blocking_user_input"
-			} else if autoResolving {
-				evidence = "auto_resolving_input"
+			// Every outstanding question needs attention, even when execution
+			// continues or the client may eventually resolve it automatically.
+			evidence := "user_input"
+			if params.IsBlocking {
+				evidence = "blocking_user_input"
 			}
 			episode := o.nextWaitEpisodeLocked()
 			if valid && state.addRequest(params.ThreadID, requestID, agentgraph.AttentionUserInput, params.TurnID, params.ItemID,
-				"user_input", episode, eventAt, owner, evidence) {
+				"user_input", episode, eventAt, requestHuman, evidence) {
 				classificationSource = "user_input_request"
 				if request, exists := state.request(params.ThreadID, requestID); exists {
 					diagnostics = append(diagnostics, requestStartDiagnostics(request, eventAt)...)
@@ -1316,6 +1343,11 @@ func observationHasHumanAttention(observation agentgraph.Observation) bool {
 
 func pendingWaitThread(method string, params notificationParams) string {
 	switch method {
+	case "item/started", "item/completed":
+		if params.Item.Type == "userMessage" || params.Item.hasAsyncQuestions() {
+			return params.ThreadID
+		}
+		return ""
 	case "thread/settings/updated", "item/autoApprovalReview/started", "item/autoApprovalReview/completed",
 		"item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval",
 		"item/tool/requestUserInput", "mcpServer/elicitation/request", "serverRequest/resolved":

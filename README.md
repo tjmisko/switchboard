@@ -432,8 +432,15 @@ immediately after compaction. Only content-free lifecycle metadata is used to
 correlate the wait; its question, answer, and raw tool input stay out of the
 daemon. The root-status hook fallback is partial and root-only. Active evidence
 remains fresh for 10 minutes, confirmed or timeout-fallback approval and
-user-input waits for 24 hours, and idle edges for 7 days. Structured questions
-remain immediately red. See
+user-input waits for 24 hours, and idle edges for 7 days. All outstanding
+structured questions are immediately red, including nonblocking requests and
+requests with an automatic-resolution timeout. A `request_user_input_async`
+hook or a live assistant-message item with structured questions opens an async
+input latch without stopping the runtime. Tool completion, turn completion,
+and ordinary progress preserve that red; the next user submission clears it.
+This is a provisional dismissal rule until Codex exposes exact answer
+correlation for async questions. Historical message items never reopen answered
+questions. See
 [Codex Auto-review attention ownership](docs/codex-auto-review-attention.md) for
 the evidence model and rollout diagnostics. A daemon restart during an
 already-open hook-only interview cannot reconstruct that wait and therefore
@@ -507,7 +514,9 @@ labels, prompts, assistant content, commands, or raw provider payloads.
   covered. herdr is also the **status authority** for an agent in one of its
   panes: Switchboard follows herdr's per-pane agent status over its event
   stream and publishes it in place of the provider's (see the `herdr` block in
-  [docs/state-schema.md](docs/state-schema.md)). herdr reads the screen, so its
+  [docs/state-schema.md](docs/state-schema.md)). Fresh Codex input/approval attention
+  takes precedence, keeping questions red while herdr reports work or idle.
+  herdr reads the screen, so its
   edges trail Claude's hooks by about a second, but it also clears a declined
   prompt that fires no hook. Agents herdr detects that Switchboard has no
   adapter for (Pi, OpenCode, Cursor, Gemini, Copilot, …) appear as sessions

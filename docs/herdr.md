@@ -71,6 +71,10 @@ stream (one subscription per server, re-subscribed whenever panes are created,
 closed or moved). A server's statuses keep counting for 10 seconds after its
 stream drops, then the provider's status takes over again.
 
+Fresh Codex input or approval attention takes precedence over herdr's status.
+An outstanding question remains red even while Codex continues working; after
+that attention clears, herdr resumes deciding the displayed status.
+
 Measured live with Claude Code: herdr's screen detection trails Claude's hooks by
 about 0.5–1 s when work starts and when a permission prompt opens. It is faster
 the other way: a declined prompt fires no hook, and herdr cleared that red

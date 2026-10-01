@@ -15,6 +15,8 @@ import (
 // Switchboard's legacy values by HerdrLegacyStatus. The provider graph keeps
 // running underneath it (children, names, usage), and AgentGraph.Summary keeps
 // the provider's own verdict, so the two can be compared when they disagree.
+// Fresh Codex input/approval attention takes precedence: a screen reporting work
+// cannot determine whether an asynchronous question still needs an answer.
 type HerdrInfo struct {
 	// PaneID is herdr's public pane id ("w1:p2"). It changes when the pane
 	// moves to another workspace; the reconciler refreshes it from the terminal
@@ -76,6 +78,10 @@ func HerdrLegacyStatus(herdr, provider string) (string, bool) {
 // provider's own, or false when herdr is not the authority right now.
 func (s *Session) herdrAuthority(provider string) (string, time.Time, bool) {
 	if s.Herdr == nil || !s.Herdr.Live {
+		return "", time.Time{}, false
+	}
+	if s.Agent == AgentKindCodex && s.AgentGraph != nil && s.AgentGraph.Fresh(time.Now()) &&
+		(s.AgentGraph.Summary.Attention == agentgraph.AttentionUserInput || s.AgentGraph.Summary.Attention == agentgraph.AttentionApproval) {
 		return "", time.Time{}, false
 	}
 	status, ok := HerdrLegacyStatus(s.Herdr.Status, provider)

@@ -27,6 +27,15 @@ type codexPendingInput struct {
 	turnID, toolUseID, writer, toolName, inputHash string
 }
 
+func (s *codexHookRootState) hasBlockingInput() bool {
+	for _, pending := range s.pending {
+		if !isCodexAsyncUserInputTool(pending.toolName) {
+			return true
+		}
+	}
+	return false
+}
+
 type codexPendingApproval struct {
 	turnID, toolUseID, writer, toolName, inputHash string
 	episode                                        uint64
@@ -240,14 +249,22 @@ func (c *agentCoordinator) handleCodexHookNow(ref provider.RootRef, req rpc.Requ
 		rootState.transcript = req.Transcript
 	}
 	pendingAttention, hookOwnsTransition := reduceCodexPendingInput(rootState, req)
+	inputBlocking := rootState.hasBlockingInput()
 	approvalDeferred, approvalOwnsTransition := c.reduceCodexPendingApprovalLocked(rootState, ref, rootID, req, now)
 	hookOwnsTransition = hookOwnsTransition || approvalOwnsTransition
 	c.codexHookMu.Unlock()
+	if req.Event == "UserPromptSubmit" {
+		if observer, ok := c.codex.(interface {
+			DismissAsyncQuestions(provider.RootKey, string)
+		}); ok {
+			observer.DismissAsyncQuestions(ref.Key(), rootID)
+		}
+	}
 	ref.ProviderSessionID = rootID
 	observation, mapped := codexHookObservation(rootID, req, ref.StartedAt, now)
 	var hookFallback agentgraph.Observation
 	if mapped {
-		observation = applyCodexPendingAttention(observation, pendingAttention, now)
+		observation = applyCodexPendingAttention(observation, pendingAttention, inputBlocking, now)
 		// Preserve the hook's own bounded deadline for a later app-server
 		// notLoaded snapshot. The published composed graph may correctly retain a
 		// live app-server's shorter horizon, but that must not shrink the hook
@@ -885,8 +902,9 @@ func codexRootStateUnavailable(runtime agentgraph.RuntimeState, attention agentg
 // leave two records — and only the id-keyed one has an exact close edge, so the
 // other would hold the red to the turn Stop. codexPendingInputFold collapses
 // them. Where neither edge carries an id nor an input hash there is nothing left
-// to correlate on, and the record is released by the turn Stop; that is the
-// honest bound, and it is the stale-red side of the trade.
+// to correlate on, and a blocking record is released by the turn Stop; that is
+// the honest bound, and it is the stale-red side of the trade. Async questions
+// instead survive the Stop and are dismissed by the next user submission.
 func reduceCodexPendingInput(state *codexHookRootState, req rpc.Request) (agentgraph.AttentionState, bool) {
 	ownedTransition := false
 	if (req.Event == "PreToolUse" || req.Event == "PermissionRequest") && isCodexHumanInputPermission(req.ToolName) {
@@ -897,7 +915,7 @@ func reduceCodexPendingInput(state *codexHookRootState, req rpc.Request) (agentg
 		codexPendingInputFold(state, pending, req)
 		ownedTransition = true
 	}
-	if req.Event == "PostToolUse" && isCodexHumanInputPermission(req.ToolName) {
+	if req.Event == "PostToolUse" && isCodexHumanInputPermission(req.ToolName) && !isCodexAsyncUserInputTool(req.ToolName) {
 		for key, pending := range state.pending {
 			if codexPendingInputMatches(pending, req) {
 				delete(state.pending, key)
@@ -922,7 +940,17 @@ func reduceCodexPendingInput(state *codexHookRootState, req rpc.Request) (agentg
 		// erasure that guard defends against is a Claude-shaped hazard, pinned
 		// there by internal/rpc/writer_match_test.go; it has no Codex instance.
 		for key, pending := range state.pending {
-			if req.TurnID == "" || pending.turnID == "" || pending.turnID == req.TurnID {
+			if !isCodexAsyncUserInputTool(pending.toolName) && (req.TurnID == "" || pending.turnID == "" || pending.turnID == req.TurnID) {
+				delete(state.pending, key)
+				ownedTransition = true
+			}
+		}
+	}
+	if req.Event == "UserPromptSubmit" {
+		// Async calls return before the answer and may outlive the turn. Until
+		// Codex supplies exact answer correlation, dismiss on the next submission.
+		for key, pending := range state.pending {
+			if isCodexAsyncUserInputTool(pending.toolName) {
 				delete(state.pending, key)
 				ownedTransition = true
 			}
@@ -1227,10 +1255,17 @@ func isCodexUserInputTool(tool string) bool {
 		tool = tool[dot+1:]
 	}
 	normalized := strings.ReplaceAll(strings.ToLower(tool), "_", "")
-	return normalized == "requestuserinput"
+	return normalized == "requestuserinput" || normalized == "requestuserinputasync"
 }
 
-func applyCodexPendingAttention(observation agentgraph.Observation, attention agentgraph.AttentionState, now time.Time) agentgraph.Observation {
+func isCodexAsyncUserInputTool(tool string) bool {
+	if dot := strings.LastIndex(tool, "."); dot >= 0 {
+		tool = tool[dot+1:]
+	}
+	return strings.EqualFold(strings.ReplaceAll(tool, "_", ""), "requestuserinputasync")
+}
+
+func applyCodexPendingAttention(observation agentgraph.Observation, attention agentgraph.AttentionState, blocking bool, now time.Time) agentgraph.Observation {
 	if attention == agentgraph.AttentionNone {
 		return observation
 	}
@@ -1238,7 +1273,9 @@ func applyCodexPendingAttention(observation agentgraph.Observation, attention ag
 		if observation.Nodes[i].ID != observation.RootID {
 			continue
 		}
-		observation.Nodes[i].Runtime = agentgraph.RuntimeIdle
+		if blocking {
+			observation.Nodes[i].Runtime = agentgraph.RuntimeIdle
+		}
 		observation.Nodes[i].Attention = attention
 		observation.Nodes[i].UpdatedAt = now
 		observation.FreshUntil = now.Add(codexHookAttentionFreshness)
@@ -1249,8 +1286,8 @@ func applyCodexPendingAttention(observation agentgraph.Observation, attention ag
 
 // overlayCodexPendingObservation keeps an observed standard-CLI question red
 // across generic app-server snapshots. The app-server item latch is not
-// reachable on that launch path, so only the exact PostToolUse/Stop hook may
-// release this independently owned evidence.
+// reachable on that launch path. Blocking input releases on its exact
+// PostToolUse/Stop; async input releases on the next user submission.
 func (c *agentCoordinator) overlayCodexPendingObservation(key provider.RootKey, observation agentgraph.Observation, now time.Time) agentgraph.Observation {
 	c.codexHookMu.Lock()
 	defer c.codexHookMu.Unlock()
@@ -1258,7 +1295,7 @@ func (c *agentCoordinator) overlayCodexPendingObservation(key provider.RootKey, 
 	if state == nil || state.sessionID != observation.RootID || len(state.pending) == 0 {
 		return observation
 	}
-	return applyCodexPendingAttention(observation, agentgraph.AttentionUserInput, now)
+	return applyCodexPendingAttention(observation, agentgraph.AttentionUserInput, state.hasBlockingInput(), now)
 }
 
 // overlayCodexApprovalObservation gives a published approval red the same
@@ -1302,7 +1339,7 @@ func (c *agentCoordinator) overlayCodexApprovalObservation(key provider.RootKey,
 	if state == nil || state.sessionID != observation.RootID || !codexApprovalRedPublishedLocked(state) {
 		return observation
 	}
-	return applyCodexPendingAttention(observation, agentgraph.AttentionApproval, now)
+	return applyCodexPendingAttention(observation, agentgraph.AttentionApproval, true, now)
 }
 
 // codexApprovalRedPublishedLocked reports whether any gate this root holds has
@@ -1356,7 +1393,9 @@ func codexHookObservation(rootID string, req rpc.Request, startedAt, now time.Ti
 	case "UserPromptSubmit", "PreToolUse", "PostToolUse":
 		runtime = agentgraph.RuntimeActive
 		if req.Event == "PreToolUse" && isCodexUserInputTool(req.ToolName) {
-			runtime = agentgraph.RuntimeIdle
+			if !isCodexAsyncUserInputTool(req.ToolName) {
+				runtime = agentgraph.RuntimeIdle
+			}
 			attention = agentgraph.AttentionUserInput
 		}
 	case "PermissionRequest":
@@ -1366,7 +1405,9 @@ func codexHookObservation(rootID string, req rpc.Request, startedAt, now time.Ti
 		// through codexHookApprovalGrace. Structured questions are human-owned.
 		runtime = agentgraph.RuntimeActive
 		if isCodexHumanInputPermission(req.ToolName) {
-			runtime = agentgraph.RuntimeIdle
+			if !isCodexAsyncUserInputTool(req.ToolName) {
+				runtime = agentgraph.RuntimeIdle
+			}
 			attention = agentgraph.AttentionUserInput
 		}
 	default:

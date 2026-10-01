@@ -104,7 +104,7 @@ enrichment, graph, and display-name fields are omitted when unavailable.
 | `mem_tree_bytes` | integer | omitted when unmeasured | PSS + SwapPss for the root and all descendants. |
 | `wezterm` | object | optional | Wezterm locator data. |
 | `hyprland` | object | optional | Hyprland window data. |
-| `herdr` | object | optional | The herdr pane hosting the session and herdr's own agent status. While present and followed, herdr decides the published status. |
+| `herdr` | object | optional | The herdr pane hosting the session and herdr's own agent status. While present and followed, herdr decides the published status except when fresh Codex input/approval attention requires red. |
 | `claude` | object | optional | Claude compatibility enrichment. |
 | `codex` | object | optional | Codex compatibility enrichment. |
 | `agent_graph` | object | optional | Bounded provider-neutral root/child graph. |

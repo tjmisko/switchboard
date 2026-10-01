@@ -67,6 +67,12 @@ type rpcItem struct {
 	SenderThreadID    string                   `json:"senderThreadId"`
 	ReceiverThreadIDs []string                 `json:"receiverThreadIds"`
 	AgentsStates      map[string]rpcAgentState `json:"agentsStates"`
+	// Only presence/count is needed; question text and options are discarded.
+	Questions []struct{} `json:"questions"`
+}
+
+func (item rpcItem) hasAsyncQuestions() bool {
+	return item.Type == "agentMessage" && len(item.Questions) > 0 && item.ID != ""
 }
 
 type rpcAgentState struct {
@@ -129,6 +135,8 @@ type nodeState struct {
 	guardian                  bool
 	executionProviderObserved bool
 	wait                      waitOwnershipState
+	asyncInputItems           map[string]struct{}
+	seenInputItems            map[string]struct{}
 }
 
 type graphState struct {
@@ -175,6 +183,8 @@ func (s *graphState) clone() *graphState {
 		copy.wait.classificationEpisode = 0
 		copy.wait.activeAutoReview = cloneSet(state.wait.activeAutoReview)
 		copy.wait.requests = cloneRequests(state.wait.requests)
+		copy.asyncInputItems = cloneSet(state.asyncInputItems)
+		copy.seenInputItems = cloneSet(state.seenInputItems)
 		out.nodes[id] = &copy
 	}
 	return out
@@ -267,7 +277,10 @@ func (s *graphState) applyStatus(state *nodeState, status rpcStatus) {
 	}
 	isWaiting := state.wait.rawApproval || state.wait.rawUserInput
 	if !isWaiting {
+		// Runtime flags describe blocking, not outstanding nonblocking input.
+		inputs := state.inputRequests()
 		state.clearTransientWait()
+		state.wait.requests = inputs
 	} else if !wasWaiting {
 		state.wait.classifiedUnknown = false
 	}
@@ -370,6 +383,98 @@ func (s *graphState) deriveAll() {
 	}
 }
 
+// Async questions have no answer request ID. For now, a user message dismisses
+// them, but ordinary progress and turn completion do not. Historical snapshots
+// never create these latches: a retained question may already have been answered.
+func (s *graphState) applyAsyncInputItem(threadID string, item rpcItem) bool {
+	state := s.nodes[threadID]
+	if state == nil || item.ID == "" || (item.Type != "userMessage" && !item.hasAsyncQuestions()) {
+		return false
+	}
+	if state.seenInputItems == nil {
+		state.seenInputItems = make(map[string]struct{})
+	}
+	key := item.Type + ":" + item.ID
+	if _, exists := state.seenInputItems[key]; exists {
+		return false
+	}
+	// Track both lifecycle events once: a delayed user-message completion
+	// must not dismiss a question that arrived after that message started.
+	if len(state.seenInputItems) >= 256 {
+		for id := range state.seenInputItems {
+			delete(state.seenInputItems, id)
+			break
+		}
+	}
+	state.seenInputItems[key] = struct{}{}
+	if item.Type == "userMessage" {
+		return s.clearAsyncInputs(threadID)
+	}
+	if state.asyncInputItems == nil {
+		state.asyncInputItems = make(map[string]struct{})
+	}
+	// All questions are dismissed together, so retaining more IDs adds no
+	// useful state. Bound tracking for long unattended conversations.
+	if len(state.asyncInputItems) >= 256 {
+		for id := range state.asyncInputItems {
+			delete(state.asyncInputItems, id)
+			break
+		}
+	}
+	state.asyncInputItems[item.ID] = struct{}{}
+	s.deriveAll()
+	return true
+}
+
+func (s *graphState) clearAsyncInputs(threadID string) bool {
+	changed := false
+	for id, state := range s.nodes {
+		if (id == threadID || threadID == s.rootID) && len(state.asyncInputItems) > 0 {
+			state.asyncInputItems = nil
+			changed = true
+		}
+	}
+	if changed {
+		s.deriveAll()
+	}
+	return changed
+}
+
+func (s *graphState) preserveInputAttention(previous *graphState) {
+	if previous == nil || previous.rootID != s.rootID {
+		return
+	}
+	for id, node := range s.nodes {
+		if prior := previous.nodes[id]; prior != nil {
+			node.asyncInputItems = cloneSet(prior.asyncInputItems)
+			node.seenInputItems = cloneSet(prior.seenInputItems)
+			// thread/read has no pending-input list. A same-connection snapshot
+			// cannot prove that a nonblocking request was answered.
+			for requestID, request := range prior.inputRequests() {
+				if id == s.rootID && s.rootTurnID != "" && request.turnID != "" && s.rootTurnID != request.turnID {
+					continue
+				}
+				node.ensureWaitMaps()
+				node.wait.requests[requestID] = request
+			}
+		}
+	}
+	s.deriveAll()
+}
+
+func (state *nodeState) inputRequests() map[rpcRequestID]requestEvidence {
+	var inputs map[rpcRequestID]requestEvidence
+	for id, request := range state.wait.requests {
+		if request.reason == agentgraph.AttentionUserInput {
+			if inputs == nil {
+				inputs = make(map[rpcRequestID]requestEvidence)
+			}
+			inputs[id] = request
+		}
+	}
+	return inputs
+}
+
 func (s *graphState) deriveNode(id string) {
 	state := s.nodes[id]
 	if state == nil {
@@ -377,6 +482,9 @@ func (s *graphState) deriveNode(id string) {
 	}
 	state.node.Runtime = state.baseRuntime
 	state.node.Attention = agentgraph.AttentionNone
+	if len(state.asyncInputItems) > 0 {
+		state.node.Attention = agentgraph.AttentionUserInput
+	}
 	for _, request := range state.wait.requests {
 		if request.owner != requestHuman {
 			continue
@@ -803,6 +911,8 @@ func (s *graphState) resetWaitOwnership() {
 	for _, state := range s.nodes {
 		state.stopClassification()
 		state.wait = waitOwnershipState{}
+		state.asyncInputItems = nil
+		state.seenInputItems = nil
 	}
 	s.deriveAll()
 }
