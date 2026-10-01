@@ -466,6 +466,8 @@ install_module_link() {
 note_waybar_module() {
 	local release=$1
 	wants_waybar_module || return 0
+	# A dry run built nothing, so the release has no module to inspect.
+	[ "$dry_run" -eq 0 ] || return 0
 	if [ ! -f "$release/$waybar_module" ]; then
 		warn "deploy: $release has no $waybar_module, so the circles view will not load
     until a release that has one is live."

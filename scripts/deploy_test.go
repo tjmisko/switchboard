@@ -316,6 +316,34 @@ func TestDeploy_shouldWarnAboutReleasePathsInSymlinkedConfig(t *testing.T) {
 	}
 }
 
+// A dry run builds nothing, so it must not claim the release lacks a module.
+func TestDeploy_shouldNotReportAMissingModuleOnADryRun(t *testing.T) {
+	sandbox := newSandboxDeploy(t)
+	repoDir, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", "scripts/deploy", "--dry-run", "--allow-dirty")
+	cmd.Dir = repoDir
+	cmd.Env = append(os.Environ(),
+		"HOME="+sandbox.home,
+		"SWITCHBOARD_DEPLOY_ROOT="+sandbox.root,
+		"SWITCHBOARD_LINK_DIR="+sandbox.binDir,
+		"SWITCHBOARD_MODULE_DIR="+sandbox.moduleDir,
+		"SWITCHBOARD_WAYBAR_MODULE=1",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("dry run failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "would build: libswitchboard-waybar.so") {
+		t.Errorf("dry run does not say it would build the module:\n%s", out)
+	}
+	if strings.Contains(string(out), "has no libswitchboard-waybar.so") {
+		t.Errorf("dry run reported a missing module it never tried to build:\n%s", out)
+	}
+}
+
 // deploy stamps the module with its own release version so the smoke test can
 // prove the staged module is the one this deploy built.
 func TestBuildWaybarCircles_shouldStampTheRevisionItIsGiven(t *testing.T) {
