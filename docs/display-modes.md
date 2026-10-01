@@ -106,17 +106,27 @@ The circle renderer uses Waybar's supported
 It uses the v1 string-configuration ABI, opaque GTK 3 function declarations, and
 GLib/GIO. It adds no per-circle processes or polling scripts. Building requires
 a C compiler, `pkg-config`, GLib/GIO development headers, and the GTK 3 runtime
-already used by Waybar:
+already used by Waybar.
+
+`scripts/deploy` builds the module into every release on a host where `waybar`
+is installed, loads it against the installed GTK runtime before going live, and
+publishes it at `~/.local/lib/switchboard/libswitchboard-waybar.so`, a link
+through `current`. Set `SWITCHBOARD_WAYBAR_MODULE=1` or `0` to force or skip the
+build, and `SWITCHBOARD_MODULE_DIR` to move the link (empty disables it). Point
+`module_path` at that link:
 
 ```bash
-scripts/build-waybar-circles /path/to/release/libswitchboard-waybar.so
+scripts/deploy
 scripts/configure-waybar-displays \
   --top ~/.config/waybar/config.jsonc \
   --style ~/.config/waybar/style.css \
   --hypr ~/.config/hypr/hyprland.lua \
-  --module-path /absolute/path/to/release/libswitchboard-waybar.so \
+  --module-path ~/.local/lib/switchboard/libswitchboard-waybar.so \
   --output-dir /tmp/switchboard-display-config
 ```
+
+`scripts/build-waybar-circles [output]` builds the module by hand, for
+development.
 
 The helper prepares files without modifying its inputs. It removes only the
 unused `custom/task` top-bar timer, appends `cffi/switchboard` at the far right,
@@ -126,9 +136,12 @@ files, install them at their corresponding config paths, reload Hyprland and
 the top Waybar, and restart the active display broker. Keep machine-local
 systemd overrides pointing at the same release as the daemon.
 
-Use an immutable release path for `module_path`: Waybar may retain loaded
-library handles when reloading its configuration. A different release path
-ensures the next reload loads the intended module. Edit
+Never point `module_path` at a release directory: deploy prunes old releases,
+and the circles view silently disappears at the next Waybar restart. Deploy
+warns about any `~/.config` file that names one. A running Waybar keeps its
+loaded module until it restarts, and a config reload may reuse the loaded
+handle for the same path, so restart the top Waybar after a deploy to pick up a
+new module. Edit
 `switchboard-circles.css` in the Waybar config directory to customize diameter,
 spacing, colors and borders. Removing or stopping the display broker does not
 stop the desktop's top bar.
