@@ -500,7 +500,10 @@ func cmdAttention(c *rpc.Client) {
 // navigable session, start at the left edge. Unknown (grey) sessions are excluded —
 // they are not actionable, and `cycle next|prev` already reaches every session
 // regardless of colour. Headless and unbound-remote rows are excluded by
-// sessionNavigable.
+// sessionNavigable. Suspended (Ctrl-Z'd) sessions are excluded too: their
+// status is frozen and they cannot act, so they neither join the ring nor bound
+// it. A focused suspended session still anchors "to the right of focus", and
+// `cycle next|prev` still reaches it.
 func attentionRing(sessions []state.Session) []*state.Session {
 	start := 0
 	for i := range sessions {
@@ -512,7 +515,7 @@ func attentionRing(sessions []state.Session) []*state.Session {
 	var permission, idle, working []*state.Session
 	for step := range sessions {
 		i := (start + step) % len(sessions)
-		if !sessionNavigable(sessions[i]) {
+		if !sessionNavigable(sessions[i]) || sessions[i].Suspended {
 			continue
 		}
 		switch sessionStatus(sessions[i]) {
@@ -869,8 +872,9 @@ commands:
                             wrapping at the end of the bar. If already
                             there, cycle its peers or toggle at most one layer
                             above it. With any red present, orange always jumps
-                            to red and green is unreachable. Unknown (grey)
-                            sessions are excluded; cycle remains unrestricted.
+                            to red and green is unreachable. Unknown (grey) and
+                            suspended sessions are excluded; cycle remains
+                            unrestricted.
   agent-diagnostics       show bounded provider diagnostic counters; --json
                             emits the raw content-free array
   name <sub>              project names: resolve --cwd --name, abbrev --cwd,

@@ -427,6 +427,83 @@ func TestNextAttentionTargetShouldExcludeHeadlessFromTheRing(t *testing.T) {
 	}
 }
 
+// suspendedSess builds a job-control-stopped session with the given pid,
+// status, and focus flag.
+func suspendedSess(pid int, status string, focused bool) state.Session {
+	s := sess(pid, status)
+	s.Suspended = true
+	s.Focused = focused
+	return s
+}
+
+func TestNextAttentionTargetSuspended(t *testing.T) {
+	tests := []struct {
+		name     string
+		sessions []state.Session
+		wantPID  int // 0 means expect nil
+	}{
+		{
+			name:     "should skip a suspended permission session and land on idle",
+			sessions: []state.Session{focusedSess(1, "working"), suspendedSess(2, "permission", false), sess(3, "idle")},
+			wantPID:  3,
+		},
+		{
+			// A frozen red must not bound the ring, or green would be unreachable.
+			name:     "should not let a suspended red bound the ring away from green",
+			sessions: []state.Session{suspendedSess(1, "permission", false), focusedSess(2, "idle"), sess(3, "working")},
+			wantPID:  3,
+		},
+		{
+			name:     "should return nil when every candidate is suspended",
+			sessions: []state.Session{suspendedSess(1, "permission", false), suspendedSess(2, "idle", false)},
+			wantPID:  0,
+		},
+		{
+			name:     "should move right of a focused suspended session",
+			sessions: []state.Session{sess(1, "idle"), suspendedSess(2, "idle", true), sess(3, "idle")},
+			wantPID:  3,
+		},
+		{
+			name:     "should leave the focused suspended session when it is the only one of its tier",
+			sessions: []state.Session{suspendedSess(1, "permission", true), sess(2, "working")},
+			wantPID:  2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := nextAttentionTarget(tt.sessions)
+			if tt.wantPID == 0 {
+				if got != nil {
+					t.Fatalf("expected nil, got pid %d", got.PID)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("expected pid %d, got nil", tt.wantPID)
+			}
+			if got.PID != tt.wantPID {
+				t.Fatalf("expected pid %d, got %d", tt.wantPID, got.PID)
+			}
+			if got.Suspended {
+				t.Fatalf("target pid %d is suspended", got.PID)
+			}
+		})
+	}
+}
+
+func TestCycleTargetShouldReachSuspendedSessions(t *testing.T) {
+	sessions := []state.Session{focusedSess(1, "working"), suspendedSess(2, "permission", false), sess(3, "idle")}
+	if target, ok := cycleTargetSession(sessions, "next"); !ok || target.PID != 2 {
+		t.Fatalf("cycle next = pid %d (ok=%t), want pid 2", target.PID, ok)
+	}
+	sessions[0].Focused = false
+	sessions[2].Focused = true
+	if target, ok := cycleTargetSession(sessions, "prev"); !ok || target.PID != 2 {
+		t.Fatalf("cycle prev = pid %d (ok=%t), want pid 2", target.PID, ok)
+	}
+}
+
 func TestCycleTargetPID(t *testing.T) {
 	focused := func(pid int) state.Session {
 		s := sess(pid, "working")
