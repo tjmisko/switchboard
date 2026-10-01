@@ -5,6 +5,7 @@
 # The model is one immutable directory per revision plus a `current` symlink:
 #
 #   $root/releases/<rev>/{switchboard,switchboard-ctl,switchboard-waybar}
+#   $root/releases/<rev>/libswitchboard-waybar.so   (hosts that run Waybar)
 #   $root/current -> releases/<rev>
 #
 # Everything that consumes a binary — both systemd units, the agent hooks, the
@@ -61,6 +62,14 @@ version_ldflag_path=github.com/tjmisko/switchboard/internal/buildinfo.Version
 # Where the stable command names are published. Desktop config should reference
 # these, never a release directory and never ~/go/bin. Set empty to opt out.
 link_dir=${SWITCHBOARD_LINK_DIR-$HOME/.local/bin}
+# The circles Waybar module ships in each release beside the binaries, and its
+# stable name lives here. Waybar's module_path should name that link. Set empty
+# to opt out.
+waybar_module=libswitchboard-waybar.so
+module_link_dir=${SWITCHBOARD_MODULE_DIR-$HOME/.local/lib/switchboard}
+# auto builds the module only where Waybar is installed, so a headless remote
+# never needs GTK. 1 forces the build and 0 skips it.
+waybar_module_mode=${SWITCHBOARD_WAYBAR_MODULE:-auto}
 
 dry_run=0
 allow_dirty=0
@@ -156,6 +165,15 @@ running_revision() {
 
 release_path_for() { printf '%s\n' "$releases_dir/$1"; }
 
+wants_waybar_module() {
+	case "$waybar_module_mode" in
+	1) return 0 ;;
+	0) return 1 ;;
+	auto) command -v waybar >/dev/null 2>&1 ;;
+	*) die "SWITCHBOARD_WAYBAR_MODULE must be auto, 1 or 0, not '$waybar_module_mode'" ;;
+	esac
+}
+
 current_target() {
 	[ -L "$current_link" ] || return 0
 	readlink -f "$current_link" 2>/dev/null || true
@@ -193,6 +211,13 @@ cmd_status() {
 				log "  $cmd (absent)"
 			fi
 		done
+	fi
+	if [ -n "$module_link_dir" ] && [ -L "$module_link_dir/$waybar_module" ]; then
+		log "module:   $module_link_dir/$waybar_module -> $(readlink "$module_link_dir/$waybar_module")"
+	elif [ -n "$module_link_dir" ] && [ -e "$module_link_dir/$waybar_module" ]; then
+		log "module:   $module_link_dir/$waybar_module is a FILE, not a link — it will not follow a deploy"
+	else
+		log "module:   (no link)"
 	fi
 	if [ -d "$releases_dir" ]; then
 		log "releases (newest first):"
@@ -242,6 +267,30 @@ smoke_test_staged() {
 			die "staged $cmd reports '$got', expected '$want' — the build did not stamp what we asked for"
 		fi
 	done
+	wants_waybar_module || return 0
+	smoke_test_module "$dir/$waybar_module" "$want"
+}
+
+# smoke_test_module loads the module the way Waybar will: dlopen with every
+# symbol bound now, against the GTK runtime actually installed. A module that
+# links but cannot load would otherwise surface as a silently missing widget
+# the next time the top bar restarts.
+smoke_test_module() {
+	local path=$1 want=$2 got
+	[ -f "$path" ] || die "staged $waybar_module is missing"
+	got=$(python3 - "$path" 2>&1 <<-'EOF'
+		import ctypes, sys
+		lib = ctypes.CDLL(sys.argv[1], mode=ctypes.RTLD_LOCAL)
+		for name in ("wbcffi_init", "wbcffi_deinit"):
+		    getattr(lib, name)
+		ctypes.c_size_t.in_dll(lib, "wbcffi_version")
+		revision = ctypes.c_char.in_dll(lib, "switchboard_display_revision")
+		print(ctypes.string_at(ctypes.addressof(revision)).decode())
+	EOF
+	) || die "staged $waybar_module does not load as a Waybar module: $got"
+	if [ "$got" != "$want" ]; then
+		die "staged $waybar_module reports '$got', expected '$want'"
+	fi
 }
 
 flip_current_to() {
@@ -389,6 +438,42 @@ install_command_links() {
 	done
 }
 
+# install_module_link does for the Waybar module what install_command_links
+# does for the commands. Naming a release directory in module_path is what
+# breaks: prune_releases deletes it a few deploys later, and the circles view
+# vanishes at the next Waybar restart with nothing logged.
+install_module_link() {
+	local path
+	wants_waybar_module || return 0
+	if [ -z "$module_link_dir" ]; then
+		log "  (module link disabled: SWITCHBOARD_MODULE_DIR is empty)"
+		return 0
+	fi
+	path=$module_link_dir/$waybar_module
+	if [ -e "$path" ] && [ ! -L "$path" ]; then
+		die "$path is a real file, not a symlink.
+    A copied module does not follow a deploy. Remove it, then re-run:
+      rm $path"
+	fi
+	log "  linking $waybar_module into $module_link_dir"
+	run mkdir -p "$module_link_dir"
+	run ln -sfn "$current_link/$waybar_module" "$path"
+}
+
+# note_waybar_module reports what the flip means for the top bar. Waybar keeps
+# a loaded module mapped until it restarts, and a config reload may reuse the
+# loaded handle for the same path, so a new module takes effect on restart.
+note_waybar_module() {
+	local release=$1
+	wants_waybar_module || return 0
+	if [ ! -f "$release/$waybar_module" ]; then
+		warn "deploy: $release has no $waybar_module, so the circles view will not load
+    until a release that has one is live."
+		return 0
+	fi
+	log "  restart the top Waybar to load this release's circles module"
+}
+
 # warn_stale_references reports configuration that still names a binary
 # directly instead of going through the links above. It only warns: these files
 # are the user's, not ours, and a deploy is no place to rewrite them.
@@ -459,6 +544,7 @@ cmd_rollback() {
 	if ! running_matches "$previous"; then
 		die "rollback to $previous did not take effect"
 	fi
+	note_waybar_module "$(release_path_for "$previous")"
 	log "rolled back to $previous"
 }
 
@@ -467,6 +553,9 @@ build_release() {
 	log "building $version"
 	if [ "$dry_run" -eq 1 ]; then
 		printf '  would build: %s\n' "${commands[*]}"
+		if wants_waybar_module; then
+			printf '  would build: %s\n' "$waybar_module"
+		fi
 		return 0
 	fi
 	mkdir -p "$releases_dir"
@@ -478,6 +567,11 @@ build_release() {
 			-ldflags "-X $version_ldflag_path=$version" \
 			-o "$stage_dir/$cmd" "./cmd/$cmd")
 	done
+	if wants_waybar_module; then
+		log "  build $waybar_module"
+		SWITCHBOARD_DISPLAY_REVISION=$version \
+			python3 "$script_dir/build-waybar-circles" "$stage_dir/$waybar_module" >/dev/null
+	fi
 	smoke_test_staged "$stage_dir" "$version"
 	mv -T "$stage_dir" "$target"
 	stage_dir=
@@ -515,6 +609,7 @@ cmd_deploy() {
 	# means a stale copy on PATH is caught pre-flight rather than after the
 	# flip has already gone live.
 	install_command_links
+	install_module_link
 
 	target=$(release_path_for "$version")
 	if [ -d "$target" ]; then
@@ -538,6 +633,7 @@ cmd_deploy() {
 		die "deploy did NOT take effect; nothing about the unit's state would have told you"
 	fi
 
+	note_waybar_module "$target"
 	warn_stale_references
 	prune_releases "$keep_releases"
 	log "deployed ${live_rev:-(none)} -> $version"

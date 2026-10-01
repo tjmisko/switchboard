@@ -141,3 +141,171 @@ func TestDeploy_shouldResolveItsOwnTreeWhenCDPATHIsSet(t *testing.T) {
 		t.Errorf("--dry-run resolved a tree other than %s:\n%s", repoDir, got)
 	}
 }
+
+// sandboxDeploy runs scripts/deploy against a throwaway HOME, deploy root and
+// link directories. A fake systemctl keeps it off the real user manager, and
+// the real Go caches keep the build from starting cold.
+type sandboxDeploy struct {
+	home, root, binDir, moduleDir string
+}
+
+func newSandboxDeploy(t *testing.T) sandboxDeploy {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("builds a full release")
+	}
+	home := t.TempDir()
+	fakeBin := filepath.Join(home, "fake-bin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fakeBin, "systemctl"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return sandboxDeploy{
+		home:      home,
+		root:      filepath.Join(home, "deploy-root"),
+		binDir:    filepath.Join(home, "bin"),
+		moduleDir: filepath.Join(home, "lib"),
+	}
+}
+
+func goEnv(t *testing.T, name string) string {
+	t.Helper()
+	out, err := exec.Command("go", "env", name).Output()
+	if err != nil {
+		t.Fatalf("go env %s: %v", name, err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func (s sandboxDeploy) run(t *testing.T, moduleMode string) (string, error) {
+	t.Helper()
+	repoDir, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", "scripts/deploy", "--allow-dirty", "--no-restart")
+	cmd.Dir = repoDir
+	cmd.Env = append(os.Environ(),
+		"HOME="+s.home,
+		"GOCACHE="+goEnv(t, "GOCACHE"),
+		"GOMODCACHE="+goEnv(t, "GOMODCACHE"),
+		"GOPATH="+goEnv(t, "GOPATH"),
+		"SWITCHBOARD_DEPLOY_ROOT="+s.root,
+		"SWITCHBOARD_LINK_DIR="+s.binDir,
+		"SWITCHBOARD_MODULE_DIR="+s.moduleDir,
+		"SWITCHBOARD_WAYBAR_MODULE="+moduleMode,
+	)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// The module needs a C toolchain, GLib/GIO headers and the GTK 3 runtime that
+// Waybar itself loads. A host without them cannot build or load it.
+func requireWaybarModuleToolchain(t *testing.T) {
+	t.Helper()
+	for _, tool := range []string{"cc", "pkg-config", "python3"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s not installed", tool)
+		}
+	}
+	if err := exec.Command("pkg-config", "--exists", "gio-2.0").Run(); err != nil {
+		t.Skip("gio-2.0 development files not installed")
+	}
+	if err := exec.Command("python3", "-c", "import ctypes; ctypes.CDLL('libgtk-3.so.0')").Run(); err != nil {
+		t.Skip("GTK 3 runtime not installed")
+	}
+}
+
+// Waybar's module_path must survive release pruning, so the module ships in
+// every release and is published through `current` like the commands.
+func TestDeploy_shouldShipTheWaybarModuleBehindAStableLinkWhenWaybarIsWanted(t *testing.T) {
+	requireWaybarModuleToolchain(t)
+	sandbox := newSandboxDeploy(t)
+	out, err := sandbox.run(t, "1")
+	if err != nil {
+		t.Fatalf("deploy failed: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(filepath.Join(sandbox.root, "current", "libswitchboard-waybar.so")); err != nil {
+		t.Fatalf("current release has no module: %v\n%s", err, out)
+	}
+	link := filepath.Join(sandbox.moduleDir, "libswitchboard-waybar.so")
+	target, err := os.Readlink(link)
+	if err != nil {
+		t.Fatalf("module link not published: %v\n%s", err, out)
+	}
+	if want := filepath.Join(sandbox.root, "current", "libswitchboard-waybar.so"); target != want {
+		t.Errorf("module link points at %s, want %s (through current, never a release)", target, want)
+	}
+	if !strings.Contains(out, "restart the top Waybar") {
+		t.Errorf("deploy did not say a Waybar restart loads the new module:\n%s", out)
+	}
+}
+
+func TestDeploy_shouldSkipTheWaybarModuleWhenDisabled(t *testing.T) {
+	sandbox := newSandboxDeploy(t)
+	out, err := sandbox.run(t, "0")
+	if err != nil {
+		t.Fatalf("deploy failed: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(filepath.Join(sandbox.root, "current", "libswitchboard-waybar.so")); !os.IsNotExist(err) {
+		t.Errorf("module built although SWITCHBOARD_WAYBAR_MODULE=0 (stat err: %v)", err)
+	}
+	if _, err := os.Lstat(filepath.Join(sandbox.moduleDir, "libswitchboard-waybar.so")); !os.IsNotExist(err) {
+		t.Errorf("module link published although SWITCHBOARD_WAYBAR_MODULE=0 (lstat err: %v)", err)
+	}
+}
+
+func TestDeploy_shouldRejectAnUnknownWaybarModuleMode(t *testing.T) {
+	sandbox := newSandboxDeploy(t)
+	out, err := sandbox.run(t, "yes")
+	if err == nil {
+		t.Fatalf("deploy accepted SWITCHBOARD_WAYBAR_MODULE=yes:\n%s", out)
+	}
+	if !strings.Contains(out, "must be auto, 1 or 0") {
+		t.Errorf("deploy failed without naming the valid modes:\n%s", out)
+	}
+}
+
+// A real file at the link path is a copy that would never follow a deploy.
+func TestDeploy_shouldRefuseToReplaceACopiedModule(t *testing.T) {
+	sandbox := newSandboxDeploy(t)
+	if err := os.MkdirAll(sandbox.moduleDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	copied := filepath.Join(sandbox.moduleDir, "libswitchboard-waybar.so")
+	if err := os.WriteFile(copied, []byte("stale copy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := sandbox.run(t, "1")
+	if err == nil {
+		t.Fatalf("deploy replaced a copied module:\n%s", out)
+	}
+	if b, _ := os.ReadFile(copied); string(b) != "stale copy" {
+		t.Error("deploy overwrote the copied module instead of refusing")
+	}
+}
+
+// deploy stamps the module with its own release version so the smoke test can
+// prove the staged module is the one this deploy built.
+func TestBuildWaybarCircles_shouldStampTheRevisionItIsGiven(t *testing.T) {
+	requireWaybarModuleToolchain(t)
+	module := filepath.Join(t.TempDir(), "libswitchboard-waybar.so")
+	build := exec.Command("python3", "build-waybar-circles", module)
+	build.Env = append(os.Environ(), "SWITCHBOARD_DISPLAY_REVISION=abc1234-dirty-20260930000000")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build failed: %v\n%s", err, out)
+	}
+	read := exec.Command("python3", "-c", `import ctypes, sys
+lib = ctypes.CDLL(sys.argv[1])
+print(ctypes.string_at(ctypes.addressof(ctypes.c_char.in_dll(lib, "switchboard_display_revision"))).decode())`, module)
+	out, err := read.Output()
+	if err != nil {
+		t.Fatalf("load module: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != "abc1234-dirty-20260930000000" {
+		t.Errorf("module reports %q, want the given revision", got)
+	}
+}
