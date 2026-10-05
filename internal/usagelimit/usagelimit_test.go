@@ -123,3 +123,17 @@ func assertReset(t *testing.T, got, want *time.Time) {
 		t.Fatalf("resets_at = %v, want %v", got.In(losAngeles), want.In(losAngeles))
 	}
 }
+
+func TestCodexResetFromMessageShouldReadADatedWeeklyReset(t *testing.T) {
+	assertReset(t, CodexResetFromMessage("You've hit your usage limit. … or try again at Oct 7th, 2026 5:15 PM.", at), ptr(la(10, 7, 17, 15)))
+	assertReset(t, CodexResetFromMessage("try again at Oct 8, 9 PM.", at), ptr(la(10, 8, 21, 0)))
+	assertReset(t, CodexResetFromMessage("try again at Foo 8th, 2026 9 PM.", at), nil)
+}
+
+func TestFromClaudeStopFailureShouldReadResetsAtWording(t *testing.T) {
+	verdict, limited := FromClaudeStopFailure("rate_limit", "You've hit your session limit · resets at 4pm (America/Los_Angeles)", at)
+	if !limited {
+		t.Fatal("not limited")
+	}
+	assertReset(t, verdict.ResetsAt, ptr(la(10, 5, 16, 0)))
+}

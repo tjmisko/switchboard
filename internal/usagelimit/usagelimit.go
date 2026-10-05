@@ -76,10 +76,10 @@ func CodexResetFromMessage(message string, at time.Time) *time.Time {
 
 var (
 	claudeLimitPattern = regexp.MustCompile(`hit your [a-z0-9 ]*limit`)
-	// resets 4pm (Area/City) | resets 8:20pm | resets Aug 25, 9pm (Area/City)
-	resetsPattern = regexp.MustCompile(`(?i)\bresets\s+(?:([A-Z][a-z]{2})[a-z]*\.?\s+(\d{1,2}),?\s+(?:at\s+)?)?(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\.?(?:\s*\(([^)]+)\))?`)
-	// try again at 5:15 PM | try again at 1pm
-	tryAgainAtPattern = regexp.MustCompile(`(?i)\btry again at\s+(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\b`)
+	// resets 4pm (Area/City) | resets at 8:20pm | resets Aug 25, 9pm (Area/City)
+	resetsPattern = regexp.MustCompile(`(?i)\bresets\s+(?:at\s+)?(?:([A-Z][a-z]{2})[a-z]*\.?\s+(\d{1,2}),?\s+(?:at\s+)?)?(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\.?(?:\s*\(([^)]+)\))?`)
+	// try again at 5:15 PM | try again at 1pm | try again at Oct 7th, 2026 5:15 PM
+	tryAgainAtPattern = regexp.MustCompile(`(?i)\btry again at\s+(?:([A-Z][a-z]{2})[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(?:(\d{4})\s+)?(?:at\s+)?)?(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\b`)
 	// Try again in ~47 min | try again in 2 hours
 	tryAgainInPattern = regexp.MustCompile(`(?i)\btry again in\s+~?\s*(\d+)\s*(min|minute|minutes|h|hr|hrs|hour|hours)\b`)
 
@@ -120,15 +120,25 @@ func parseResets(message string, at time.Time) *time.Time {
 	if match[1] == "" {
 		return nextClock(at, hour, minute, loc)
 	}
-	month, ok := monthByAbbrev[strings.ToLower(match[1])]
-	day, err := strconv.Atoi(match[2])
+	return datedClock(match[1], match[2], "", hour, minute, loc, at)
+}
+
+// datedClock builds "<Mon> <d>[, <yyyy>] h:mm" in loc. A date without a year
+// is the next one: "Jan 2" read on Dec 30.
+func datedClock(monthText, dayText, yearText string, hour, minute int, loc *time.Location, at time.Time) *time.Time {
+	month, ok := monthByAbbrev[strings.ToLower(monthText)]
+	day, err := strconv.Atoi(dayText)
 	if !ok || err != nil || day < 1 || day > 31 {
 		return nil
 	}
-	local := at.In(loc)
-	resetsAt := time.Date(local.Year(), month, day, hour, minute, 0, 0, loc)
-	// A date without a year is the next one: "Jan 2" read on Dec 30.
-	if resetsAt.Before(at.Add(-24 * time.Hour)) {
+	year := at.In(loc).Year()
+	if yearText != "" {
+		if year, err = strconv.Atoi(yearText); err != nil {
+			return nil
+		}
+	}
+	resetsAt := time.Date(year, month, day, hour, minute, 0, 0, loc)
+	if yearText == "" && resetsAt.Before(at.Add(-24*time.Hour)) {
 		resetsAt = resetsAt.AddDate(1, 0, 0)
 	}
 	return &resetsAt
@@ -139,11 +149,14 @@ func parseTryAgain(message string, at time.Time) *time.Time {
 	if match == nil {
 		return nil
 	}
-	hour, minute, ok := clock(match[1], match[2], match[3])
+	hour, minute, ok := clock(match[4], match[5], match[6])
 	if !ok {
 		return nil
 	}
-	return nextClock(at, hour, minute, time.Local)
+	if match[1] == "" {
+		return nextClock(at, hour, minute, time.Local)
+	}
+	return datedClock(match[1], match[2], match[3], hour, minute, time.Local, at)
 }
 
 func parseTryAgainIn(message string, at time.Time) *time.Time {

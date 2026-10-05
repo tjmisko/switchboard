@@ -98,8 +98,12 @@ func ReadRolloutState(path string) (RolloutState, error) {
 			continue
 		}
 		state = RolloutState{Runtime: next, At: event.Timestamp}
-		if next == agentgraph.RuntimeIdle && event.Payload.Error.usageLimit() {
-			state.UsageLimit = &RolloutUsageLimit{ResetsAt: limits.resetFor(event.Payload.Error.Message, event.Timestamp)}
+		if next != agentgraph.RuntimeIdle || len(event.Payload.Error) == 0 {
+			continue
+		}
+		var turnError rolloutTurnError
+		if json.Unmarshal(event.Payload.Error, &turnError) == nil && turnError.usageLimit() {
+			state.UsageLimit = &RolloutUsageLimit{ResetsAt: limits.resetFor(turnError.Message, event.Timestamp)}
 		}
 	}
 	return state, nil
@@ -109,8 +113,10 @@ type rolloutEvent struct {
 	Timestamp time.Time `json:"timestamp"`
 	Type      string    `json:"type"`
 	Payload   struct {
-		Type       string            `json:"type"`
-		Error      rolloutTurnError  `json:"error"`
+		Type string `json:"type"`
+		// Error stays raw until the row is known to be a turn end, so an
+		// unexpected shape can never cost a lifecycle marker its decode.
+		Error      json.RawMessage   `json:"error"`
 		RateLimits *rolloutRateLimit `json:"rate_limits"`
 	} `json:"payload"`
 }

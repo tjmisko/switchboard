@@ -127,3 +127,14 @@ func rolloutMarker(kind, timestamp string) string {
 }
 
 func itoa(v int64) string { return strconv.FormatInt(v, 10) }
+
+func TestReadRolloutStateShouldKeepAMarkerWhoseErrorIsNotAnObject(t *testing.T) {
+	line := `{"timestamp":"2026-10-05T19:30:00Z","type":"event_msg","payload":{"type":"task_complete","error":"stream closed"}}`
+	state, err := ReadRolloutState(rolloutFixtureWith(t, line))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Runtime != agentgraph.RuntimeIdle || !state.At.Equal(time.Date(2026, 10, 5, 19, 30, 0, 0, time.UTC)) || state.UsageLimit != nil {
+		t.Fatalf("state = %+v, want the later idle marker with no limit", state)
+	}
+}
