@@ -93,12 +93,16 @@ type Session struct {
 	// Herdr is set when the session runs in a herdr pane; herdr is then the
 	// authority for its status (see HerdrInfo).
 	Herdr *HerdrInfo `json:"herdr,omitempty"`
-	// Claude and Codex are the per-agent enrichment blocks; they share one shape
-	// (AgentInfo). Exactly one is populated, matching Agent — the other is
-	// omitted. The split keeps the frozen "claude" wire key intact for existing
-	// bar consumers while adding "codex" purely additively.
+	// Claude, Codex and Pi are the per-agent enrichment blocks; they share one
+	// shape (AgentInfo). At most one is populated, matching Agent — the others
+	// are omitted. The split keeps the frozen "claude" wire key intact for
+	// existing bar consumers while adding "codex" and "pi" purely additively.
 	Claude *AgentInfo `json:"claude,omitempty"`
 	Codex  *AgentInfo `json:"codex,omitempty"`
+	// Pi is allocated by the first Pi extension hook attributed to the
+	// session. Until then a Pi session has no block and publishes through its
+	// herdr graph alone.
+	Pi *AgentInfo `json:"pi,omitempty"`
 
 	// AgentGraph is the additive provider-neutral view of the root thread and
 	// its descendants. Child nodes are display/history detail only; they are not
@@ -111,8 +115,10 @@ type Session struct {
 const (
 	AgentKindClaude = "claude"
 	AgentKindCodex  = "codex"
-	// AgentKindPi is discovered through herdr and has no provider adapter; its
-	// hooks (switchboard-ctl pi-hook) carry only usage-limit evidence today.
+	// AgentKindPi is discovered through herdr. Its extension hooks
+	// (switchboard-ctl pi-hook) carry Pi's lifecycle into rpc, where today only
+	// their usage-limit evidence is applied; once a hook binds the session, its
+	// enrichment block is Pi and its graph root is Pi's session id (PiRootID).
 	AgentKindPi = "pi"
 )
 
@@ -140,6 +146,8 @@ func (s Session) Enrichment() *AgentInfo {
 		return s.Codex
 	case AgentKindClaude:
 		return s.Claude
+	case AgentKindPi:
+		return s.Pi
 	default:
 		if s.Claude != nil {
 			return s.Claude
@@ -160,6 +168,12 @@ func (s *Session) AgentBlock(kind string) *AgentInfo {
 			s.Codex = &AgentInfo{}
 		}
 		return s.Codex
+	}
+	if kind == AgentKindPi {
+		if s.Pi == nil {
+			s.Pi = &AgentInfo{}
+		}
+		return s.Pi
 	}
 	if s.Claude == nil {
 		s.Claude = &AgentInfo{}
@@ -1083,6 +1097,7 @@ func (s *Store) snapshotLocked() Snapshot {
 		// in-memory StatusSince onto the wire-only StatusSinceWire on that copy.
 		cp.Claude = enrichForWire(sess.Claude)
 		cp.Codex = enrichForWire(sess.Codex)
+		cp.Pi = enrichForWire(sess.Pi)
 		cp.AgentGraph = sess.AgentGraph.Clone()
 		cp.DisplayName = cloneDisplayName(sess.DisplayName)
 		cp.Herdr = cloneHerdr(sess.Herdr)
@@ -1448,12 +1463,25 @@ func (s *Store) Load() error {
 		sess := snap.Sessions[i]
 		hydratePendingWriters(sess.Claude)
 		hydratePendingWriters(sess.Codex)
+		hydratePiBlock(sess.Pi)
 		hydrateUsageLimit(&sess, hydratedAt)
 		hydrateAgentGraph(&sess, hydratedAt)
 		s.sessions[sess.PID] = &sess
 	}
 	s.mu.Unlock()
 	return nil
+}
+
+// hydratePiBlock restores a persisted Pi block's display state only: the
+// session id, transcript and last status. Nothing on it may claim live
+// authority after a restart, so its status date is re-earned, as for the other
+// blocks, and any prompt ownership or subagent count (which Pi never writes) is
+// dropped rather than trusted.
+func hydratePiBlock(info *AgentInfo) {
+	if info == nil {
+		return
+	}
+	*info = AgentInfo{SessionID: info.SessionID, Transcript: info.Transcript, Status: info.Status}
 }
 
 // hydratePendingWriters decodes a block's persisted pending_writers back into the
