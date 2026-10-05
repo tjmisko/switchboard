@@ -101,7 +101,7 @@ func projectUsageLimit(sess *Session, now time.Time) {
 	since := sess.UsageLimit.ObservedAt
 	// The cap is the account's, so a subagent stops with its root: a child
 	// the graph still counts live, or a root wait on one, is paused, not work.
-	for _, info := range []*AgentInfo{sess.Claude, sess.Codex} {
+	for _, info := range []*AgentInfo{sess.Claude, sess.Codex, sess.Pi} {
 		if info == nil {
 			continue
 		}
@@ -129,7 +129,7 @@ func publishedPermission(sess *Session) bool {
 // state.json, before its graph is re-projected. The capped turn has ended, so
 // the underlying status it stood over is idle. A lapsed record is dropped.
 func hydrateUsageLimit(sess *Session, now time.Time) {
-	for _, info := range []*AgentInfo{sess.Claude, sess.Codex} {
+	for _, info := range []*AgentInfo{sess.Claude, sess.Codex, sess.Pi} {
 		if info != nil && info.Status == StatusLimited {
 			info.Status = StatusIdle
 		}

@@ -98,7 +98,7 @@ enrichment, graph, and display-name fields are omitted when unavailable.
 | `usage_limit` | object | omitted unless active | The session's last turn ended on its provider's usage limit: `observed_at` (when), `resets_at` (omitted when the provider named no reset), `source` (`claude_stop_failure`, `codex_rollout`, `pi_hook`). While present, the session's published `status` and `agent_graph.summary.status` read `limited`, dated from `observed_at`, except over a live `permission`, which always wins. Dropped at `resets_at`, or a week after `observed_at` with no reset, or on the session's next activity hook. For Codex the evidence is a rollout tail: the root's, or a subagent's whose cap is newer than the root's last turn marker. Rollouts are found from hook `transcript_path` (per writer) and the app-server's `thread.path`, so a cap already on disk is seen after a daemon restart. |
 | `headless` | boolean | omitted when false | Whether the discovered run has no navigable interactive TUI. |
 | `local_workspace` | integer | omitted when unresolved | Federated aggregate only, and only on remote rows: the Hyprland workspace id **on the reading machine** of the window displaying this session. A remote row's own `hyprland` block is stripped (its coordinates locate the other desktop), so this is the only workspace a local reader can act on — it is what the bottom bar reports and what places the chip in workspace order. `0` means unresolved, the same convention as `workspace_id`. |
-| `agent` | string | omitted until known | `claude` or `codex`, which select the matching enrichment block; or the label herdr gives an agent it detects in one of its panes (`pi`, `opencode`, `cursor`, …), which has no enrichment block and publishes its status through `agent_graph` (see `herdr`). |
+| `agent` | string | omitted until known | `claude` or `codex`, which select the matching enrichment block; `pi`, which selects the `pi` block once a Pi extension hook has bound the session; or the label herdr gives another agent it detects in one of its panes (`opencode`, `cursor`, …), which has no enrichment block and publishes its status through `agent_graph` (see `herdr`). |
 | `display_name` | object | omitted when absent | Switchboard-owned Codex display metadata, valid only for its exact conversation. It never changes the native Codex thread. |
 | `resolved_name` | string | omitted until resolved | Provider host's current Claude session name before project prefixing. Federated readers prefer this projection because only the provider host can safely resolve PID-keyed Claude metadata. It carries Claude `/name` or `/rename`; Codex generated and native names already travel in conversation-bound `display_name`/`agent_graph` state. |
 | `mem_agent_bytes` | integer | omitted when unmeasured | Root process PSS + SwapPss. |
@@ -108,6 +108,7 @@ enrichment, graph, and display-name fields are omitted when unavailable.
 | `herdr` | object | optional | The herdr pane hosting the session and herdr's own agent status. While present and followed, herdr decides the published status except when fresh Codex input/approval attention requires red. |
 | `claude` | object | optional | Claude compatibility enrichment. |
 | `codex` | object | optional | Codex compatibility enrichment. |
+| `pi` | object | optional | Pi enrichment, present once a Pi extension hook has bound the session. Additive. |
 | `agent_graph` | object | optional | Bounded provider-neutral root/child graph. |
 
 ### `display_name` — schema v3
@@ -187,10 +188,13 @@ not following the server, focus falls back to the window.
 
 An agent other than Claude or Codex in a herdr pane is discovered through
 herdr alone and becomes a session like any other (its `pid` is the pane's
-foreground process). It has no enrichment block: its whole `agent_graph` is
-one node with `source: "herdr"`, rooted at `herdr:<terminal id>`, and that
-root id is its history `session_id`. It lives while its process runs on the
-session's `tty`.
+foreground process). Its whole `agent_graph` is one node with
+`source: "herdr"`, and that root id is its history `session_id`. The root is
+`herdr:<terminal id>`, except for a Pi session a Pi extension hook has bound:
+its root is then Pi's own session id (the UUID in its session file name), the
+same id as `pi.session_id`, and the graph's status projects into the `pi`
+block. Any other agent has no enrichment block. It lives while its process
+runs on the session's `tty`.
 
 The authority itself is not on the wire. A block read back from `state.json`
 after a restart decides nothing until the daemon hears from that herdr server
@@ -199,18 +203,24 @@ for 10 seconds. A restored status is kept, rather than flashed to unknown,
 until herdr answers after a restart. Edges herdr decides are recorded in history with
 `rule: herdr_authority`, and the hand-back with `herdr_released`.
 
-### `claude` / `codex` (`AgentInfo`) — claude stable, codex additive
+### `claude` / `codex` / `pi` (`AgentInfo`) — claude stable, codex and pi additive
 
-The legacy per-agent enrichment block. A session populates exactly one, under
+The legacy per-agent enrichment block. A session populates at most one, under
 the key matching its `agent`. Both share one shape (`AgentInfo`). Hooks can
 populate it, and `SetAgentGraph` also projects the graph root id and reduced
 legacy status into it so old consumers keep working. Renderers read whichever
 is present.
 
+The `pi` block holds Pi's session id, its session file as `transcript`,
+`status` and `status_since`. Pi writes no `in_flight_subagents`,
+`pending_writers` or `pending_prompts`. After a daemon restart a persisted
+`pi` block restores only `session_id`, `transcript` and `status`; it carries
+no live authority, and its `status_since` is re-earned.
+
 | Field | JSON type | Presence | Meaning |
 |-------|-----------|----------|---------|
-| `session_id` | string | omitted when empty | Provider root id (Claude session id or Codex thread id), supplied by exact provider evidence and/or hooks. It may change when a live root process starts a new provider session; consumers key navigation on the enclosing `Session.pid`, not this field alone. |
-| `transcript` | string | omitted when empty | Path to the session transcript when known: Claude Code's project `.jsonl`, or Codex's `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. |
+| `session_id` | string | omitted when empty | Provider root id (Claude session id, Codex thread id, or Pi session id), supplied by exact provider evidence and/or hooks. It may change when a live root process starts a new provider session; consumers key navigation on the enclosing `Session.pid`, not this field alone. |
+| `transcript` | string | omitted when empty | Path to the session transcript when known: Claude Code's project `.jsonl`, Codex's `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, or Pi's `~/.pi/agent/sessions/--<path>--/<ts>_<uuid>.jsonl`. |
 | `status_since` | RFC 3339 timestamp \| absent | optional | When `status` last transitioned to its current value — the wire projection of the daemon's in-memory `StatusSince`, stamped onto the snapshot. Renderers compute the hover duration (`idle · 3m`, `permission · 45s`) as `now - status_since`. **Omitted** (never `null`/zero) until the first status edge stamps it; absent on a block that only carries `session_id`/`transcript`. Additive (Phase: usage-history); consumers tolerate its absence. Formatted identically to `started_at`. |
 | `status` | string | always (when block present) | Legacy root-chip activity. One of: `working`, `idle`, `permission`, `delegating`, `limited`; `""` means no fresh authoritative reduction. `limited` is publication-only: it overlays whatever the provider decided while `usage_limit` is active, renders grey like unknown, and is never an attention target. `delegating` is an idle root with live descendant work and renders the **same green as `working`**. `permission` folds both approval and user-input waits; use `agent_graph.summary`/nodes when that distinction matters. Consumers must tolerate unknown future strings. |
 | `in_flight_subagents` | number | omitted when 0 | How many subagent `Task`s the main thread has launched but not yet collected, recomputed each reconcile tick from the transcript tail. It is the signal behind a `delegating` chip; renderers show it as "N agents" in the tooltip, and `switchboard-ctl list --json` exposes it so a green chip's true state (genuinely working vs delegating) is visible. Claude-only. |
@@ -523,6 +533,10 @@ Applying a graph updates only these legacy compatibility values:
 - its `status` becomes `summary.status`, unless herdr is the session's status
   authority (see `herdr` above);
 - its `status_since` moves when that legacy status changes.
+
+For a Pi session the graph is herdr's one-node graph, and it updates only the
+`pi` block's `status` and `status_since`; `pi.session_id` comes from the Pi
+hook that bound the session and is the graph's root id, never the reverse.
 
 Claude-only `in_flight_subagents`, workflows, pending writers, transcript, and
 other compatibility fields remain owned by the Claude adapter. Existing

@@ -143,6 +143,26 @@ type Request struct {
 	UsageLimit         bool       `json:"usage_limit,omitempty"`
 	UsageLimitResetsAt *time.Time `json:"usage_limit_resets_at,omitempty"`
 
+	// Pi extension lifecycle metadata (integrations/pi/switchboard.ts), set
+	// only on pi-hook requests. None of it is provider content: a count, a
+	// flag, a path, the user-set session name, and usage figures.
+	//
+	// OpenDialogs is the number of dialogs open now (Pi's ui_prompt span plus
+	// herdr's blocked counter) on PermissionRequest/PermissionResolved. It is
+	// a count rather than an edge so a lost or reordered hook self-corrects;
+	// nil means the hook did not say.
+	OpenDialogs *int `json:"open_dialogs,omitempty"`
+	// Busy is SessionStart's !ctx.isIdle(): a reload landed mid-run.
+	Busy bool `json:"busy,omitempty"`
+	// PreviousSessionFile is SessionStart's previousSessionFile on /new,
+	// /resume and /fork, which pairs a rotated session with its predecessor.
+	PreviousSessionFile string `json:"previous_session_file,omitempty"`
+	// SessionName is Pi's /name, bounded at the ctl edge.
+	SessionName string `json:"session_name,omitempty"`
+	// Usage is one assistant message's token counts and Pi's own cost for it,
+	// on the Usage event.
+	Usage *HookUsage `json:"usage,omitempty"`
+
 	// HookClientHints are bounded terminal identity candidates
 	// observed by the hook subprocess. They are diagnostic-only: the daemon may
 	// compare them with already-discovered Codex roots, but they never authorize
@@ -155,6 +175,22 @@ type Request struct {
 	// for its timeout, "active" when input resumes. Exactly those two values are
 	// valid; handleActivity rejects anything else.
 	Activity string `json:"activity,omitempty"`
+}
+
+// HookUsage is one Pi assistant message's usage as Pi reports it. CostTotal
+// is Pi's own figure in USD, nil when Pi supplied none; a supplied cost is
+// never repriced from the rate table. MessageID is the provider's response
+// id when Pi has one, the key that keeps a resent message from counting twice.
+type HookUsage struct {
+	MessageID        string   `json:"message_id,omitempty"`
+	Provider         string   `json:"provider,omitempty"`
+	Model            string   `json:"model,omitempty"`
+	InputTokens      int64    `json:"input_tokens,omitempty"`
+	OutputTokens     int64    `json:"output_tokens,omitempty"`
+	CacheReadTokens  int64    `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens int64    `json:"cache_write_tokens,omitempty"`
+	TotalTokens      int64    `json:"total_tokens,omitempty"`
+	CostTotal        *float64 `json:"cost_total,omitempty"`
 }
 
 // HookClientHint is an opaque terminal identity candidate. Values come only

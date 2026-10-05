@@ -241,7 +241,7 @@ func main() {
 			if prior := m[sess.PID]; prior != nil && prior.Agent == sess.Agent {
 				sess.StartedAt = prior.StartedAt
 				sess.DisplayName = prior.DisplayName
-				sess.Claude, sess.Codex, sess.AgentGraph = prior.Claude, prior.Codex, prior.AgentGraph
+				sess.Claude, sess.Codex, sess.Pi, sess.AgentGraph = prior.Claude, prior.Codex, prior.Pi, prior.AgentGraph
 			}
 			m[sess.PID] = &sess
 			if herdrPane != nil {
@@ -1298,10 +1298,11 @@ func focusedSession(m map[int]*state.Session) *state.Session {
 }
 
 // enrichmentID returns the session's agent session id (the stable history join
-// key), or "" before any hook has supplied it. An agent herdr alone observes has
-// no hooks; its graph's root id (herdr's terminal id) is its session id.
+// key), or "" before any hook has supplied it. An agent herdr alone observes
+// has its graph's root id as its session id: herdr's terminal id, or Pi's own
+// session id once a Pi hook has bound it.
 func enrichmentID(s *state.Session) string {
-	if info := s.Enrichment(); info != nil {
+	if info := s.Enrichment(); info != nil && info.SessionID != "" {
 		return info.SessionID
 	}
 	if !state.IsProviderAgent(s.Agent) && s.AgentGraph != nil {

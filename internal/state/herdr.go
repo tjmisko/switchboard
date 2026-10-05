@@ -111,7 +111,8 @@ type HerdrReading struct {
 // A Claude or Codex session publishes herdr's status over its provider graph
 // (see projectStatus); one with no graph yet has nothing to replace and is left
 // unchanged. Any other agent has no provider adapter at all, so herdr is its
-// only source: the reading becomes its whole agent graph.
+// only source: the reading becomes its whole agent graph, which a Pi session
+// a hook has bound roots at Pi's session id and projects into its Pi block.
 //
 // A reading that is not live, for a block that was not live either, carries no
 // news: it is what the daemon sees at startup before the watcher reconnects.
@@ -137,9 +138,14 @@ func (s *Session) SetHerdr(r HerdrReading, now time.Time) (before, after string)
 	h.PaneID, h.Socket, h.Agent, h.Status, h.Live = r.PaneID, r.Socket, r.Agent, r.Status, r.Live
 	h.ActivePaneID = r.ActivePaneID
 	if !IsProviderAgent(s.Agent) {
-		before = s.graphStatus(now)
-		s.AgentGraph = herdrAgentGraph(s.Agent, r, s.AgentGraph, now)
-		return before, s.graphStatus(now)
+		before = s.publishedStatus(now)
+		s.AgentGraph = herdrAgentGraph(s.Agent, r, s.AgentGraph, s.boundRootID(), now)
+		// A Pi session a hook has bound publishes through its own block, so
+		// the herdr graph projects into it; until then it has none.
+		if info := s.graphEnrichment(); info != nil {
+			s.projectStatus(info, r.Since)
+		}
+		return before, s.publishedStatus(now)
 	}
 	info := s.graphEnrichment()
 	if info == nil {
@@ -183,10 +189,10 @@ func (s *Session) graphStatus(now time.Time) string {
 const herdrGraphLease = 30 * 24 * time.Hour
 
 // herdrAgentGraph turns a herdr reading into the one-node graph of an agent
-// herdr alone observes. The root id is herdr's terminal id, stable for the
-// life of the terminal the agent runs in; a reading without one keeps the
-// prior root.
-func herdrAgentGraph(agent string, r HerdrReading, prior *AgentGraph, now time.Time) *AgentGraph {
+// herdr alone observes. The root id is boundRootID when a provider hook has
+// bound one (see PiRootID), else herdr's terminal id, stable for the life of
+// the terminal the agent runs in; a reading without one keeps the prior root.
+func herdrAgentGraph(agent string, r HerdrReading, prior *AgentGraph, boundRootID string, now time.Time) *AgentGraph {
 	rootID := "herdr:" + r.TerminalID
 	switch {
 	case r.TerminalID != "":
@@ -195,6 +201,7 @@ func herdrAgentGraph(agent string, r HerdrReading, prior *AgentGraph, now time.T
 	default:
 		rootID = "herdr:" + r.Socket + "#" + r.PaneID
 	}
+	rootID = PiRootID(boundRootID, rootID)
 	observedAt := r.Since
 	if observedAt.IsZero() || observedAt.After(now) {
 		observedAt = now
@@ -231,6 +238,24 @@ func herdrNodeState(status string) (agentgraph.RuntimeState, agentgraph.Attentio
 	}
 }
 
+// PiRootID chooses a Pi session's graph root: Pi's own session id once a hook
+// has bound it, else the herdr root (herdr:<terminal id>) it has until then.
+func PiRootID(boundSessionID, herdrRootID string) string {
+	if boundSessionID != "" {
+		return boundSessionID
+	}
+	return herdrRootID
+}
+
+// boundRootID is the provider session id a hook has bound to a herdr-observed
+// session, "" while none has. Only Pi binds one.
+func (s *Session) boundRootID() string {
+	if s.Agent != AgentKindPi || s.Pi == nil {
+		return ""
+	}
+	return s.Pi.SessionID
+}
+
 // graphEnrichment returns the enrichment block the provider graph projects
 // into, or nil when the session has no graph (and so no status to replace).
 func (s *Session) graphEnrichment() *AgentInfo {
@@ -242,6 +267,8 @@ func (s *Session) graphEnrichment() *AgentInfo {
 		return s.Claude
 	case AgentKindCodex:
 		return s.Codex
+	case AgentKindPi:
+		return s.Pi
 	}
 	return nil
 }

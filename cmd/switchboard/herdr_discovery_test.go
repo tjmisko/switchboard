@@ -356,3 +356,26 @@ func TestApplyHerdrPaneShouldPublishAHerdrOnlyAgentsStatusThroughItsGraph(t *tes
 		t.Fatalf("transitions = %+v, want one pi edge to permission with a session id", evs)
 	}
 }
+
+// Once a Pi hook binds the session, its history and its graph are keyed by
+// Pi's own session id; an empty block still falls back to the herdr root.
+func TestEnrichmentIDShouldBePiSessionIDWhenAPiHookHasBoundTheSession(t *testing.T) {
+	sess := &state.Session{PID: 901, Agent: "pi", TTY: "/dev/pts/7"}
+	source := newFakeHerdrSource()
+	source.set(herdrKey, "pi", herdr.StatusWorking, herdrT0)
+	sink, _ := newTestSink(t)
+	ref := herdrRef
+	applyHerdrPane(sess, &ref, source, sink, herdrT0.Add(time.Second))
+	herdrRoot := sess.AgentGraph.RootID
+
+	sess.AgentBlock(state.AgentKindPi)
+	if got := enrichmentID(sess); got != herdrRoot {
+		t.Fatalf("unbound enrichmentID = %q, want the herdr root %q", got, herdrRoot)
+	}
+	sess.Pi.SessionID = "0199a1b2-pi"
+	source.set(herdrKey, "pi", herdr.StatusIdle, herdrT0.Add(2*time.Second))
+	applyHerdrPane(sess, &ref, source, sink, herdrT0.Add(3*time.Second))
+	if got := enrichmentID(sess); got != "0199a1b2-pi" || sess.AgentGraph.RootID != "0199a1b2-pi" {
+		t.Fatalf("bound enrichmentID = %q, root = %q, want Pi's session id for both", got, sess.AgentGraph.RootID)
+	}
+}

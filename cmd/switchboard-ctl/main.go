@@ -644,8 +644,8 @@ func parseHookPayloadAt(body []byte, event, agent string, observedAt time.Time) 
 	}
 	req.SessionID = payload.SessionID
 	req.Transcript = payload.TranscriptPath
-	if agent == state.AgentKindCodex && filepath.IsAbs(payload.CWD) && len(payload.CWD) <= 4096 {
-		req.HookCWD = filepath.Clean(payload.CWD)
+	if agent == state.AgentKindCodex {
+		req.HookCWD = boundedHookPath(payload.CWD)
 	}
 	req.ToolName = payload.ToolName
 	req.ToolInputHash = hashToolInput(payload.ToolInput)
@@ -664,7 +664,78 @@ func parseHookPayloadAt(body []byte, event, agent string, observedAt time.Time) 
 	if event == "StopFailure" {
 		classifyUsageLimit(&req, payload, agent, observedAt)
 	}
+	if agent == state.AgentKindPi {
+		carryPiLifecycle(&req, body, event)
+	}
 	return req
+}
+
+const (
+	maxPiSessionName = 256
+	maxPiUsageLabel  = 128
+	maxHookPath      = 4096
+)
+
+// piHookPayload is the Pi extension's lifecycle metadata. It decodes apart from
+// hookPayload so a malformed Pi field cannot cost the shared session identity.
+type piHookPayload struct {
+	OpenDialogs         *int     `json:"open_dialogs"`
+	Busy                bool     `json:"busy"`
+	PreviousSessionFile string   `json:"previous_session_file"`
+	SessionName         string   `json:"session_name"`
+	MessageID           string   `json:"message_id"`
+	Provider            string   `json:"provider"`
+	Model               string   `json:"model"`
+	InputTokens         int64    `json:"input_tokens"`
+	OutputTokens        int64    `json:"output_tokens"`
+	CacheReadTokens     int64    `json:"cache_read_tokens"`
+	CacheWriteTokens    int64    `json:"cache_write_tokens"`
+	TotalTokens         int64    `json:"total_tokens"`
+	CostTotal           *float64 `json:"cost_total"`
+}
+
+// carryPiLifecycle bounds the Pi extension's metadata onto the request, each
+// field only on the event that defines it.
+func carryPiLifecycle(req *rpc.Request, body []byte, event string) {
+	var payload piHookPayload
+	if json.Unmarshal(body, &payload) != nil {
+		return
+	}
+	switch event {
+	case "SessionStart":
+		req.Busy = payload.Busy
+		req.PreviousSessionFile = boundedHookPath(payload.PreviousSessionFile)
+		req.SessionName = truncatePrompt(payload.SessionName, maxPiSessionName)
+	case "PermissionRequest", "PermissionResolved":
+		if payload.OpenDialogs != nil {
+			count := max(*payload.OpenDialogs, 0)
+			req.OpenDialogs = &count
+		}
+	case "Usage":
+		usage := rpc.HookUsage{
+			MessageID:        truncatePrompt(payload.MessageID, maxPiUsageLabel),
+			Provider:         truncatePrompt(payload.Provider, maxPiUsageLabel),
+			Model:            truncatePrompt(payload.Model, maxPiUsageLabel),
+			InputTokens:      max(payload.InputTokens, 0),
+			OutputTokens:     max(payload.OutputTokens, 0),
+			CacheReadTokens:  max(payload.CacheReadTokens, 0),
+			CacheWriteTokens: max(payload.CacheWriteTokens, 0),
+			TotalTokens:      max(payload.TotalTokens, 0),
+		}
+		if payload.CostTotal != nil && *payload.CostTotal >= 0 {
+			cost := *payload.CostTotal
+			usage.CostTotal = &cost
+		}
+		req.Usage = &usage
+	}
+}
+
+// boundedHookPath admits only a clean absolute path of bounded length.
+func boundedHookPath(path string) string {
+	if !filepath.IsAbs(path) || len(path) > maxHookPath {
+		return ""
+	}
+	return filepath.Clean(path)
 }
 
 // classifyUsageLimit reads a failed turn's error text on this side of the
