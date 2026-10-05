@@ -388,3 +388,142 @@ func TestGhostLaneIsBoundedBySessionEnd(t *testing.T) {
 		t.Errorf("final interval runs to %v, past the death at %v — still a ghost", last.End, death)
 	}
 }
+
+// deathCapturingProcSource is a fakeProcSource whose Watch keeps each
+// registered death callback so the test decides when, and how late, it fires.
+type deathCapturingProcSource struct {
+	fakeProcSource
+	deaths []func()
+}
+
+func (f *deathCapturingProcSource) Watch(_ context.Context, _ int, onDeath func()) error {
+	f.deaths = append(f.deaths, onDeath)
+	return nil
+}
+
+// lifetimeSession is a tracked session with an explicit discovery lifetime.
+func lifetimeSession(pid int, agent, sid string, startedAt time.Time) *state.Session {
+	s := trackedSession(pid, sid)
+	s.Agent = agent
+	s.StartedAt = startedAt
+	return s
+}
+
+// L9: a pidfd death callback is bound to the session lifetime it was registered
+// for, not to the bare pid. The sweep can close a session first and the scanner
+// re-discover its recycled pid as a new session before the old pidfd's callback
+// runs; an unfenced endSession(pid) then ended the replacement, writing a
+// session_end for a live session and dropping it from the store.
+func TestDeathCallbackIsFencedBySessionLifetime(t *testing.T) {
+	const pid = 7070
+	oldStart := time.Date(2026, 10, 5, 9, 0, 0, 0, time.UTC)
+	died := time.Date(2026, 10, 5, 9, 30, 0, 0, time.UTC)
+	clock := func() time.Time { return died }
+
+	replacements := []struct {
+		name        string
+		replacement *state.Session
+	}{
+		{
+			name:        "should not end a replacement session when the previous lifetime's death callback fires late",
+			replacement: lifetimeSession(pid, "claude", "sid-new", oldStart.Add(20*time.Minute)),
+		},
+		{
+			name:        "should not end a replacement session of another agent when the previous lifetime's death callback fires late",
+			replacement: lifetimeSession(pid, "codex", "sid-new", oldStart),
+		},
+	}
+	for _, row := range replacements {
+		t.Run(row.name, func(t *testing.T) {
+			histDir := t.TempDir()
+			sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
+			store := state.New(filepath.Join(t.TempDir(), "state.json"))
+			old := lifetimeSession(pid, "claude", "sid-old", oldStart)
+			store.Apply(func(m map[int]*state.Session) { m[pid] = old })
+
+			src := &deathCapturingProcSource{}
+			var forgotten []int
+			forget := func(p int) { forgotten = append(forgotten, p) }
+			if err := watchSessionDeath(context.Background(), src, store, lifetimeOf(old), sink, forget, clock); err != nil {
+				t.Fatalf("watchSessionDeath: %v", err)
+			}
+
+			// The sweep closes the old lifetime first, then the scanner re-discovers
+			// the recycled pid as a new session...
+			store.Apply(func(m map[int]*state.Session) { endSession(m, pid, sink, forget, died) })
+			store.Apply(func(m map[int]*state.Session) { m[pid] = row.replacement })
+			// ...and only now does the old pidfd's callback run.
+			src.deaths[0]()
+			sink.Close()
+
+			ends := eventsOfType(readEvents(t, histDir), history.EventSessionEnd)
+			if len(ends) != 1 || ends[0].SessionID != "sid-old" {
+				t.Fatalf("session_end events = %+v, want exactly one, for sid-old", ends)
+			}
+			store.Apply(func(m map[int]*state.Session) {
+				if got := m[pid]; got != row.replacement {
+					t.Errorf("m[%d] = %+v after the stale callback, want the replacement left tracked", pid, got)
+				}
+			})
+			if len(forgotten) != 1 {
+				t.Errorf("forgot %v, want only the sweep's single forget of pid %d", forgotten, pid)
+			}
+		})
+	}
+
+	t.Run("should end the session whose lifetime died when its death callback fires", func(t *testing.T) {
+		histDir := t.TempDir()
+		sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
+		store := state.New(filepath.Join(t.TempDir(), "state.json"))
+		sess := lifetimeSession(pid, "claude", "sid-1", oldStart)
+		store.Apply(func(m map[int]*state.Session) { m[pid] = sess })
+
+		src := &deathCapturingProcSource{}
+		var forgotten []int
+		if err := watchSessionDeath(context.Background(), src, store, lifetimeOf(sess), sink, func(p int) { forgotten = append(forgotten, p) }, clock); err != nil {
+			t.Fatalf("watchSessionDeath: %v", err)
+		}
+		if len(src.deaths) != 1 {
+			t.Fatalf("registered %d death callbacks, want 1", len(src.deaths))
+		}
+		src.deaths[0]()
+		sink.Close()
+
+		ends := eventsOfType(readEvents(t, histDir), history.EventSessionEnd)
+		if len(ends) != 1 {
+			t.Fatalf("got %d session_end events, want 1", len(ends))
+		}
+		if ends[0].SessionID != "sid-1" || ends[0].PID != pid || !ends[0].Ts.Equal(died) {
+			t.Errorf("session_end = %+v, want sid-1/pid %d stamped by the injected clock at %v", ends[0], pid, died)
+		}
+		store.Apply(func(m map[int]*state.Session) {
+			if _, tracked := m[pid]; tracked {
+				t.Errorf("pid %d still tracked after its death callback", pid)
+			}
+		})
+		if len(forgotten) != 1 || forgotten[0] != pid {
+			t.Errorf("forgot %v, want the scanner to forget pid %d", forgotten, pid)
+		}
+	})
+
+	t.Run("should record one session_end when the death callback and the sweep both observe one death", func(t *testing.T) {
+		histDir := t.TempDir()
+		sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
+		store := state.New(filepath.Join(t.TempDir(), "state.json"))
+		sess := lifetimeSession(pid, "claude", "sid-1", oldStart)
+		store.Apply(func(m map[int]*state.Session) { m[pid] = sess })
+
+		src := &deathCapturingProcSource{fakeProcSource: fakeProcSource{st: map[int]procState{pid: procGone}}}
+		if err := watchSessionDeath(context.Background(), src, store, lifetimeOf(sess), sink, func(int) {}, clock); err != nil {
+			t.Fatalf("watchSessionDeath: %v", err)
+		}
+		src.deaths[0]()
+		store.Apply(func(m map[int]*state.Session) { sweepDeadSessions(m, src, sink, func(int) {}, died) })
+		src.deaths[0]()
+		sink.Close()
+
+		if ends := eventsOfType(readEvents(t, histDir), history.EventSessionEnd); len(ends) != 1 {
+			t.Fatalf("got %d session_end events for one death, want exactly 1", len(ends))
+		}
+	})
+}
