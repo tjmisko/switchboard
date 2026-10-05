@@ -421,17 +421,35 @@ func (o *Observer) Observe(ctx context.Context, root provider.RootRef, now time.
 			rs.resolvedRule = statustune.RuleGraphChildTerminal
 		}
 	}
-	observation, err := o.rebuildLocked(rs, now, agentgraph.SourceClaudeTranscript, scanErr == nil && structured.Snapshot.Complete)
+	if scanErr != nil {
+		return o.rebuildAfterFailedScanLocked(rs, now, scanErr)
+	}
+	observation, err := o.rebuildLocked(rs, now, agentgraph.SourceClaudeTranscript, structured.Snapshot.Complete)
 	if err != nil {
 		return observation, err
 	}
-	if scanErr != nil {
-		// Preserve the last graph as a partial, newly-dated observation while making
-		// the I/O failure visible to orchestration. Legacy Reconcile likewise holds
-		// its last count rather than replacing it with a guessed zero.
-		return observation, scanErr
-	}
 	return observation.Clone(), nil
+}
+
+// rebuildAfterFailedScanLocked answers an Observe tick whose fanout scan failed.
+// A failed read is not evidence, so it must not extend the root's authority: the
+// graph keeps the ObservedAt and FreshUntil of the last observation that was,
+// and reaches unknown at that observation's own deadline if every scan after it
+// fails. The rebuild itself still runs, over the fanout already merged, so the
+// held child count matches what legacy Reconcile holds rather than a guessed
+// zero, and this tick's prompt resolutions reach the projection with the rule
+// that explains them. With no prior observation there is nothing to hold, and
+// the empty result sends the coordinator down its snapshot_pending path.
+func (o *Observer) rebuildAfterFailedScanLocked(rs *rootState, now time.Time, scanErr error) (agentgraph.Observation, error) {
+	prior := rs.observation
+	if prior.ObservedAt.IsZero() {
+		return agentgraph.Observation{}, scanErr
+	}
+	observation, err := o.rebuildAtLocked(rs, now, prior.ObservedAt, prior.FreshUntil, prior.Source, false)
+	if err != nil {
+		return observation, err
+	}
+	return observation, scanErr
 }
 
 // ApplyHook ingests one exact Claude hook edge. It performs no filesystem I/O;
@@ -997,6 +1015,13 @@ func clearTerminalPrompts(rs *rootState, observedAt time.Time) bool {
 }
 
 func (o *Observer) rebuildLocked(rs *rootState, now time.Time, source agentgraph.SourceKind, complete bool) (agentgraph.Observation, error) {
+	return o.rebuildAtLocked(rs, now, now, now.Add(o.freshness), source, complete)
+}
+
+// rebuildAtLocked is rebuildLocked with the observation's freshness window
+// supplied. now is still the instant the summary is reduced at, so a window
+// that has already closed reduces to unknown.
+func (o *Observer) rebuildAtLocked(rs *rootState, now, observedAt, freshUntil time.Time, source agentgraph.SourceKind, complete bool) (agentgraph.Observation, error) {
 	nodes := []agentgraph.Node{{
 		ID: rs.ref.ProviderSessionID, Runtime: rs.runtime, Attention: foldPromptAttention(rs.pending[""]),
 		Lifecycle: agentgraph.LifecycleRunning, StartedAt: rs.ref.StartedAt,
@@ -1045,8 +1070,8 @@ func (o *Observer) rebuildLocked(rs *rootState, now time.Time, source agentgraph
 
 	observation := agentgraph.Observation{
 		Provider: agentgraph.ProviderClaude, RootID: rs.ref.ProviderSessionID,
-		Nodes: nodes, Source: source, ObservedAt: now,
-		FreshUntil: now.Add(o.freshness), Complete: complete,
+		Nodes: nodes, Source: source, ObservedAt: observedAt,
+		FreshUntil: freshUntil, Complete: complete,
 	}
 	normalized, err := agentgraph.Normalize(observation)
 	if err != nil {

@@ -759,6 +759,151 @@ func TestObserverConcurrentApplyObserveForgetClose(t *testing.T) {
 	}
 }
 
+// A failed fanout scan is not evidence. Before phase 0a it rebuilt the graph
+// dated at the failing tick, so every failed read bought the root another
+// freshness window and a session whose subagent directory could not be read
+// never expired to unknown.
+func TestFailedFanoutScanDoesNotRenewFreshness(t *testing.T) {
+	// observeWorkingRootWithLiveChild leaves the root working with one live child
+	// and returns the instant of its last successful scan.
+	observeWorkingRootWithLiveChild := func(t *testing.T, o *Observer, root provider.RootRef, now time.Time) time.Time {
+		t.Helper()
+		o.ApplyHook(HookSignal{Root: root, Event: "SessionStart", At: now})
+		o.ApplyHook(HookSignal{Root: root, Event: "UserPromptSubmit", At: now.Add(time.Second)})
+		writeClaudeChild(t, claudeSubagentDir(root), "live", "general-purpose", "work", "", now)
+		scannedAt := now.Add(2 * time.Second)
+		observation, err := o.Observe(context.Background(), root, scannedAt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !observation.Complete || observation.ObservedAt != scannedAt {
+			t.Fatalf("baseline observation = %+v, want a complete scan dated %v", observation, scannedAt)
+		}
+		return scannedAt
+	}
+
+	t.Run("should keep the prior FreshUntil when the fan-out scan fails", func(t *testing.T) {
+		o, root, now := newTestObserver(t)
+		defer o.Close()
+		scannedAt := observeWorkingRootWithLiveChild(t, o, root, now)
+		breakFanoutScan(t, root)
+
+		failedAt := scannedAt.Add(10 * time.Second)
+		observation, err := o.Observe(context.Background(), root, failedAt)
+		if err == nil {
+			t.Fatal("a failed fanout scan returned no error")
+		}
+		if observation.ObservedAt != scannedAt || observation.FreshUntil != scannedAt.Add(time.Minute) {
+			t.Fatalf("failed scan dated the graph [%v, %v), want the last scan's [%v, %v)",
+				observation.ObservedAt, observation.FreshUntil, scannedAt, scannedAt.Add(time.Minute))
+		}
+		if observation.Complete {
+			t.Fatal("a failed scan's observation claims to be complete")
+		}
+		if observation.Source != agentgraph.SourceClaudeTranscript {
+			t.Fatalf("source = %q, want the held observation's own source", observation.Source)
+		}
+	})
+
+	t.Run("should let the graph expire to unknown at its original deadline when every scan after it fails", func(t *testing.T) {
+		o, root, now := newTestObserver(t)
+		defer o.Close()
+		scannedAt := observeWorkingRootWithLiveChild(t, o, root, now)
+		deadline := scannedAt.Add(time.Minute)
+		breakFanoutScan(t, root)
+
+		for _, at := range []time.Time{scannedAt.Add(20 * time.Second), deadline.Add(-time.Nanosecond)} {
+			observation, err := o.Observe(context.Background(), root, at)
+			if err == nil {
+				t.Fatal("a failed fanout scan returned no error")
+			}
+			assertSummary(t, observation, at, agentgraph.LegacyWorking, agentgraph.AttentionNone)
+		}
+		observation, err := o.Observe(context.Background(), root, deadline)
+		if err == nil {
+			t.Fatal("a failed fanout scan returned no error")
+		}
+		if observation.Fresh(deadline) {
+			t.Fatalf("graph still fresh at its original deadline %v: %+v", deadline, observation)
+		}
+		if got := agentgraph.Reduce(observation, agentgraph.Summary{}, deadline); got.Runtime != agentgraph.RuntimeUnknown || got.LegacyStatus != "" {
+			t.Fatalf("summary at the deadline = %+v, want unknown", got)
+		}
+		if got := o.Projection(root.Key()).Status; got != "" {
+			t.Fatalf("projection status at the deadline = %q, want unknown", got)
+		}
+	})
+
+	t.Run("should resume a fresh observation on the first successful scan after failures", func(t *testing.T) {
+		o, root, now := newTestObserver(t)
+		defer o.Close()
+		scannedAt := observeWorkingRootWithLiveChild(t, o, root, now)
+		restore := breakFanoutScan(t, root)
+		for _, at := range []time.Time{scannedAt.Add(30 * time.Second), scannedAt.Add(90 * time.Second)} {
+			if _, err := o.Observe(context.Background(), root, at); err == nil {
+				t.Fatal("a failed fanout scan returned no error")
+			}
+		}
+		restore()
+
+		recoveredAt := scannedAt.Add(100 * time.Second)
+		observation, err := o.Observe(context.Background(), root, recoveredAt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if observation.ObservedAt != recoveredAt || observation.FreshUntil != recoveredAt.Add(time.Minute) || !observation.Complete {
+			t.Fatalf("recovered observation = [%v, %v) complete=%v, want a complete scan dated [%v, %v)",
+				observation.ObservedAt, observation.FreshUntil, observation.Complete, recoveredAt, recoveredAt.Add(time.Minute))
+		}
+		assertSummary(t, observation, recoveredAt, agentgraph.LegacyWorking, agentgraph.AttentionNone)
+		if _, ok := graphNodesByID(observation.Nodes)["live"]; !ok {
+			t.Fatalf("recovered observation lost the live child: %+v", observation.Nodes)
+		}
+	})
+
+	t.Run("should not fabricate idle or drop children when a scan fails", func(t *testing.T) {
+		o, root, now := newTestObserver(t)
+		defer o.Close()
+		scannedAt := observeWorkingRootWithLiveChild(t, o, root, now)
+		breakFanoutScan(t, root)
+
+		failedAt := scannedAt.Add(10 * time.Second)
+		observation, err := o.Observe(context.Background(), root, failedAt)
+		if err == nil {
+			t.Fatal("a failed fanout scan returned no error")
+		}
+		nodes := graphNodesByID(observation.Nodes)
+		if got := nodes[root.ProviderSessionID].Runtime; got != agentgraph.RuntimeActive {
+			t.Fatalf("root runtime after a failed scan = %q, want the held active", got)
+		}
+		child, ok := nodes["live"]
+		if !ok || child.Lifecycle.Terminal() {
+			t.Fatalf("failed scan dropped or ended the live child: %+v", observation.Nodes)
+		}
+		got := agentgraph.Reduce(observation, agentgraph.Summary{}, failedAt)
+		if got.LegacyStatus != agentgraph.LegacyWorking || got.LiveChildren != 1 {
+			t.Fatalf("summary after a failed scan = %+v, want working with the one live child", got)
+		}
+		if got := o.Projection(root.Key()).InFlightSubagents; got != 1 {
+			t.Fatalf("projected in-flight count after a failed scan = %d, want the held 1", got)
+		}
+	})
+
+	t.Run("should return an empty observation when the first scan fails", func(t *testing.T) {
+		o, root, now := newTestObserver(t)
+		defer o.Close()
+		breakFanoutScan(t, root)
+
+		observation, err := o.Observe(context.Background(), root, now)
+		if err == nil {
+			t.Fatal("a failed fanout scan returned no error")
+		}
+		if observation.RootID != "" || len(observation.Nodes) != 0 {
+			t.Fatalf("first failed scan invented a graph: %+v", observation)
+		}
+	})
+}
+
 func newTestObserver(t *testing.T) (*Observer, provider.RootRef, time.Time) {
 	t.Helper()
 	base := t.TempDir()
@@ -776,6 +921,35 @@ func newTestObserver(t *testing.T) (*Observer, provider.RootRef, time.Time) {
 		ProviderSessionID: sid, Transcript: transcriptPath, CWD: "/project",
 	}
 	return NewObserver(t.TempDir(), WithFreshness(time.Minute)), root, now
+}
+
+func claudeSubagentDir(root provider.RootRef) string {
+	return filepath.Join(filepath.Dir(root.Transcript), root.ProviderSessionID, "subagents")
+}
+
+// breakFanoutScan fails every fanout scan of root until the returned restore is
+// called. A regular file stands where the subagent directory was, so ReadDir
+// fails with ENOTDIR — a real I/O error, unlike the ErrNotExist the scanner
+// reads as "no fanouts" — and, unlike a permission bit, it fails as root too.
+func breakFanoutScan(t *testing.T, root provider.RootRef) (restore func()) {
+	t.Helper()
+	dir := claudeSubagentDir(root)
+	aside := dir + ".aside"
+	if err := os.Rename(dir, aside); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return func() {
+		t.Helper()
+		if err := os.Remove(dir); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(aside, dir); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func writeClaudeChild(t *testing.T, subdir, id, role, description, stopReason string, mod time.Time) {
