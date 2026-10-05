@@ -100,7 +100,7 @@ func (v *View) SetRouteWorkspace(lookup func(string, int, time.Time) (int, bool)
 // Snapshot returns a freshly detached aggregate. Local sessions are stamped
 // only on this copy, preserving the frozen host-local state.json shape.
 func (v *View) Snapshot() state.Snapshot {
-	local := v.local.Snapshot()
+	local := v.local.PublishedSnapshot()
 	remote := map[string]state.Snapshot(nil)
 	if v.remote != nil {
 		remote = v.remote.Snapshot()

@@ -571,7 +571,9 @@ func (o *Observer) applyHookLocked(rs *rootState, signal HookSignal) (bool, stri
 		} else if setChildRuntime(rs, writer, signal.AgentType, agentgraph.RuntimeActive, signal.At) {
 			changed = true
 		}
-	case "Stop":
+	// StopFailure ends the turn exactly as Stop does: Claude Code fires it, and
+	// not Stop, when an API error (a usage limit, an overload) ends the turn.
+	case "Stop", "StopFailure":
 		if writer == "" {
 			if rs.runtime != agentgraph.RuntimeIdle {
 				changed = true
@@ -1135,7 +1137,7 @@ func validateRoot(root provider.RootRef) error {
 
 func recognizedHook(event string) bool {
 	switch event {
-	case "UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest", "Stop", "SessionStart", "SubagentStart", "SubagentStop":
+	case "UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest", "Stop", "StopFailure", "SessionStart", "SubagentStart", "SubagentStop":
 		return true
 	default:
 		return false

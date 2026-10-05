@@ -51,6 +51,7 @@ func TestStatusFromHookEvent(t *testing.T) {
 		{"claude", "PostToolUse", "working"},
 		{"claude", "PermissionRequest", "permission"},
 		{"claude", "Stop", "idle"},
+		{"claude", "StopFailure", "idle"}, // an API error ends the turn too
 		{"claude", "SessionStart", "idle"},
 		{"claude", "PreToolUse", ""}, // claude does not wire PreToolUse here
 		{"claude", "Bogus", ""},

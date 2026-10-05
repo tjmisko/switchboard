@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"log"
+	"maps"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,6 +32,7 @@ type fakeCodexCoordinatorObserver struct {
 	forgets      map[provider.RootKey]int
 	closes       int
 	observes     int
+	threadPaths  map[string]string // RolloutPaths answer for every bound root
 }
 
 type fakeRolloutBinding struct {
@@ -89,6 +91,15 @@ func (f *fakeCodexCoordinatorObserver) RegisterHookRollout(key provider.RootKey,
 	f.rollouts = append(f.rollouts, fakeRolloutBinding{key: key, rootID: rootID, path: path})
 	f.mu.Unlock()
 	return nil
+}
+
+func (f *fakeCodexCoordinatorObserver) RolloutPaths(key provider.RootKey, threadID string) map[string]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.bindings[key] != threadID {
+		return nil
+	}
+	return maps.Clone(f.threadPaths)
 }
 
 func (f *fakeCodexCoordinatorObserver) binding(key provider.RootKey) string {

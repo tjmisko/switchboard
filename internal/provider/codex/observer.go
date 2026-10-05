@@ -309,6 +309,29 @@ func (o *Observer) DismissAsyncQuestions(key provider.RootKey, threadID string) 
 	}
 }
 
+// RolloutPaths returns the rollout file the app-server named for each thread in
+// the root's current graph, keyed by thread ID. It answers only for the exact
+// thread bound to key; a thread the server gave no path is absent.
+func (o *Observer) RolloutPaths(key provider.RootKey, threadID string) map[string]string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	record := o.roots[key]
+	if o.closed || record == nil || record.threadID != threadID || record.graph == nil {
+		return nil
+	}
+	var paths map[string]string
+	for id, node := range record.graph.nodes {
+		if node.rolloutPath == "" {
+			continue
+		}
+		if paths == nil {
+			paths = make(map[string]string)
+		}
+		paths[id] = node.rolloutPath
+	}
+	return paths
+}
+
 // ReconcileHookBinding exposes rotation/stale classification to the daemon
 // while preserving RegisterHookBinding for older observer implementations.
 func (o *Observer) ReconcileHookBinding(key provider.RootKey, threadID string) (BindingUpdate, error) {

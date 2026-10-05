@@ -74,6 +74,40 @@ type codexHookRootState struct {
 	childLastApplied map[string]codexChildHookCursor
 	childProvider    map[string]agentgraph.Node
 	receiveSequence  uint64
+
+	// childTranscripts holds each subagent's own rollout, keyed by agent_id. A
+	// hook fired inside a subagent carries the root's session_id but the
+	// child's transcript_path, so it must never become the root's transcript.
+	// childTranscriptOrder evicts the oldest past codexChildTranscriptLimit.
+	childTranscripts     map[string]string
+	childTranscriptOrder []string
+}
+
+// codexChildTranscriptLimit bounds the child rollouts one root remembers. The
+// usage-limit scan reads each one's tail, so the bound is also a read bound.
+const codexChildTranscriptLimit = 64
+
+// rememberTranscript files a hook's transcript_path under the writer that
+// fired it: the root's own rollout when agentID is empty, a child's otherwise.
+func (s *codexHookRootState) rememberTranscript(agentID, path string) {
+	if path == "" {
+		return
+	}
+	if agentID == "" {
+		s.transcript = path
+		return
+	}
+	if s.childTranscripts == nil {
+		s.childTranscripts = make(map[string]string)
+	}
+	if _, known := s.childTranscripts[agentID]; !known {
+		s.childTranscriptOrder = append(s.childTranscriptOrder, agentID)
+	}
+	s.childTranscripts[agentID] = path
+	for len(s.childTranscriptOrder) > codexChildTranscriptLimit {
+		delete(s.childTranscripts, s.childTranscriptOrder[0])
+		s.childTranscriptOrder = s.childTranscriptOrder[1:]
+	}
 }
 
 type codexChildHookEdge struct {
@@ -245,9 +279,7 @@ func (c *agentCoordinator) handleCodexHookNow(ref provider.RootRef, req rpc.Requ
 	}
 	commitCodexHookSession(rootState, rootID, now)
 	rootState.transcriptStoppedAt = time.Time{}
-	if req.Transcript != "" {
-		rootState.transcript = req.Transcript
-	}
+	rootState.rememberTranscript(req.AgentID, req.Transcript)
 	pendingAttention, hookOwnsTransition := reduceCodexPendingInput(rootState, req)
 	inputBlocking := rootState.hasBlockingInput()
 	approvalDeferred, approvalOwnsTransition := c.reduceCodexPendingApprovalLocked(rootState, ref, rootID, req, now)
@@ -345,6 +377,7 @@ func (c *agentCoordinator) enqueueCodexChildHook(ref provider.RootRef, req rpc.R
 	if rootState.sessionID == "" {
 		rootState.sessionID = rootID
 	}
+	rootState.rememberTranscript(req.AgentID, req.Transcript)
 	if len(rootState.childQueue) >= codexChildHookQueueLimit {
 		c.codexHookMu.Unlock()
 		c.recordDiagnostic(agentgraph.ProviderCodex, "subagent_hook_queue_full", now)
@@ -791,6 +824,8 @@ func commitCodexHookSession(state *codexHookRootState, rootID string, now time.T
 		clear(state.childOverlays)
 		clear(state.childLastApplied)
 		clear(state.childProvider)
+		clear(state.childTranscripts)
+		state.childTranscriptOrder = nil
 		state.receiveSequence = 0
 	}
 	state.sessionID = rootID
@@ -1373,6 +1408,7 @@ func (c *agentCoordinator) forgetCodexHookState(key provider.RootKey) {
 	c.clearCodexApprovalsLocked(c.codexHookRoots[key])
 	delete(c.codexHookRoots, key)
 	c.codexHookMu.Unlock()
+	c.forgetCodexLimitScan(key)
 	c.cancelCodexNaming(key, true)
 }
 

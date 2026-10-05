@@ -2,6 +2,7 @@ package codex
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -41,7 +42,10 @@ type rpcThread struct {
 	UpdatedAt      int64           `json:"updatedAt"`
 	Status         rpcStatus       `json:"status"`
 	Source         json.RawMessage `json:"source"`
-	Turns          []rpcTurn       `json:"turns"`
+	// Path is the thread's rollout file (Thread.path, marked unstable by the
+	// protocol). It is exact, so it binds a rollout without a hook.
+	Path  string    `json:"path"`
+	Turns []rpcTurn `json:"turns"`
 }
 
 type rpcStatus struct {
@@ -137,6 +141,7 @@ type nodeState struct {
 	wait                      waitOwnershipState
 	asyncInputItems           map[string]struct{}
 	seenInputItems            map[string]struct{}
+	rolloutPath               string
 }
 
 type graphState struct {
@@ -205,6 +210,9 @@ func (s *graphState) upsertThread(thread rpcThread, root bool) {
 		state.node.Nickname = strings.TrimSpace(thread.Name)
 	}
 	state.node.Role = thread.AgentRole
+	if path := strings.TrimSpace(thread.Path); path != "" && filepath.IsAbs(path) {
+		state.rolloutPath = filepath.Clean(path)
+	}
 	state.node.Billing.AgentClient = string(agentgraph.ProviderCodex)
 	if provider := strings.TrimSpace(thread.ModelProvider); provider != "" {
 		state.node.Billing.ExecutionProvider = provider

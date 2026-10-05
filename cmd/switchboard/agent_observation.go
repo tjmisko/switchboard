@@ -98,6 +98,9 @@ type agentCoordinator struct {
 	codexApprovalGrace time.Duration
 	codexWaitEpisode   uint64
 	codexTimerWG       sync.WaitGroup
+
+	codexLimitMu    sync.Mutex
+	codexLimitScans map[provider.RootKey]*codexLimitScan
 }
 
 type codexNamingState struct {
@@ -378,6 +381,7 @@ func (c *agentCoordinator) observe(ctx context.Context, ref provider.RootRef) {
 // cannot express that against a wall clock it does not control.
 func (c *agentCoordinator) observeAt(ctx context.Context, ref provider.RootRef, now time.Time) {
 	if ref.Provider == agentgraph.ProviderCodex {
+		c.scanCodexUsageLimit(ref, now)
 		c.pollCodexStoppedRoot(ref, now)
 	}
 	observer := c.observer(ref.Provider)

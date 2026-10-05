@@ -43,6 +43,14 @@ type Session struct {
 	// to navigate to, so renderers style it inert and focus/cycle/pick skip
 	// it. Omitted when false.
 	Headless bool `json:"headless,omitempty"`
+	// UsageLimit is set while the session's last turn ended on its provider's
+	// usage limit. Publication reads its status as limited while the record is
+	// active (ProjectPublished); omitted otherwise.
+	UsageLimit *UsageLimit `json:"usage_limit,omitempty"`
+	// usageLimitActivityAt is the newest activity ClearUsageLimit has seen, so
+	// RecordUsageLimit can refuse evidence that the session has already outrun.
+	// In-memory only; a restart forgets it, which costs at most one stale read.
+	usageLimitActivityAt time.Time
 	// Navigable is populated only on detached aggregate copies. It says an
 	// exact local route candidate exists now; every action still revalidates the
 	// pane, window, liveness, and StartedAt before acting. Host-local snapshots
@@ -103,6 +111,9 @@ type Session struct {
 const (
 	AgentKindClaude = "claude"
 	AgentKindCodex  = "codex"
+	// AgentKindPi is discovered through herdr and has no provider adapter; its
+	// hooks (switchboard-ctl pi-hook) carry only usage-limit evidence today.
+	AgentKindPi = "pi"
 )
 
 // Status values stored in AgentInfo.Status. The first three are hook-driven and
@@ -117,6 +128,7 @@ const (
 	StatusIdle       = "idle"
 	StatusPermission = "permission"
 	StatusDelegating = "delegating"
+	// StatusLimited (usage_limit.go) is publication-only and never stored.
 )
 
 // Enrichment returns the populated per-agent block for this session (selected by
@@ -843,7 +855,7 @@ func (s *Store) Apply(fn func(map[int]*Session)) {
 		heldFrom = time.Now()
 	}
 	fn(s.sessions)
-	snap := s.snapshotLocked()
+	snap := s.publishedLocked()
 	gen, changed := s.adoptPublishedLocked(snap)
 	if lockHoldWarn > 0 {
 		if held := time.Since(heldFrom); held > lockHoldWarn {
@@ -1036,6 +1048,20 @@ func (s *Store) Snapshot() Snapshot {
 	return s.snapshotLocked()
 }
 
+// PublishedSnapshot is Snapshot as consumers see it (ProjectPublished). Daemon
+// logic reads Snapshot, whose statuses are the provider FSM's own; every path
+// that hands a snapshot to a renderer, a client, or state.json reads this.
+func (s *Store) PublishedSnapshot() Snapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.publishedLocked()
+}
+
+func (s *Store) publishedLocked() Snapshot {
+	snap := s.snapshotLocked()
+	return ProjectPublished(snap, snap.UpdatedAt)
+}
+
 func (s *Store) snapshotLocked() Snapshot {
 	sessions := make([]Session, 0, len(s.sessions))
 	for _, sess := range s.sessions {
@@ -1060,6 +1086,7 @@ func (s *Store) snapshotLocked() Snapshot {
 		cp.AgentGraph = sess.AgentGraph.Clone()
 		cp.DisplayName = cloneDisplayName(sess.DisplayName)
 		cp.Herdr = cloneHerdr(sess.Herdr)
+		cp.UsageLimit = cloneUsageLimit(sess.UsageLimit)
 		sessions = append(sessions, cp)
 	}
 	// Sort into chip order, which carries a PID tie-break for determinism: equal
@@ -1333,7 +1360,7 @@ func (s *Store) CurrentBroadcast() Broadcast {
 	if b != nil {
 		return *b
 	}
-	built := NewBroadcast(s.Snapshot())
+	built := NewBroadcast(s.PublishedSnapshot())
 	s.frameMu.Lock()
 	s.lastBroadcast = &built
 	s.frameMu.Unlock()
@@ -1421,6 +1448,7 @@ func (s *Store) Load() error {
 		sess := snap.Sessions[i]
 		hydratePendingWriters(sess.Claude)
 		hydratePendingWriters(sess.Codex)
+		hydrateUsageLimit(&sess, hydratedAt)
 		hydrateAgentGraph(&sess, hydratedAt)
 		s.sessions[sess.PID] = &sess
 	}

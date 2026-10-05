@@ -77,6 +77,11 @@ type AgentGraphSummary struct {
 	UserInputNodes int                       `json:"user_input_nodes"`
 	ErrorNodes     int                       `json:"error_nodes"`
 	Since          time.Time                 `json:"since,omitzero"`
+	// PausedChildren is publication-only: the children a usage-limited session
+	// would otherwise count live. The cap stops them with their root, so they
+	// are moved out of LiveChildren rather than shown as work (see
+	// ProjectPublished). Daemon logic never reads or sets it.
+	PausedChildren int `json:"paused_children,omitempty"`
 }
 
 // AgentNode is the immutable state/wire projection of one provider node. The

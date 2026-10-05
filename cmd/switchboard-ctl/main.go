@@ -22,6 +22,7 @@ import (
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/sessionview"
 	"github.com/tjmisko/switchboard/internal/state"
+	"github.com/tjmisko/switchboard/internal/usagelimit"
 )
 
 func main() {
@@ -140,6 +141,11 @@ func main() {
 			fail("codex-hook requires an event name")
 		}
 		cmdHook(c, args[1], state.AgentKindCodex)
+	case "pi-hook":
+		if len(args) < 2 {
+			fail("pi-hook requires an event name")
+		}
+		cmdHook(c, args[1], state.AgentKindPi)
 	case "activity":
 		if len(args) < 2 {
 			fail("activity requires a value: idle|active")
@@ -580,9 +586,10 @@ func sessionStatus(s state.Session) string {
 // so a broken hook can never block the agent.
 func cmdHook(c *rpc.Client, event, agent string) {
 	body, _ := io.ReadAll(os.Stdin)
-	req := parseHookPayload(body, event, agent)
+	observedAt := time.Now().UTC()
+	req := parseHookPayloadAt(body, event, agent, observedAt)
 	req.PID = os.Getppid()
-	req.ObservedAt = time.Now().UTC()
+	req.ObservedAt = observedAt
 	if agent == state.AgentKindCodex {
 		req.HookClientHints = hookClientHints()
 	}
@@ -609,6 +616,11 @@ type hookPayload struct {
 	TurnID               string          `json:"turn_id"`
 	ToolUseID            string          `json:"tool_use_id"`
 	PermissionMode       string          `json:"permission_mode"`
+	// Error is Claude StopFailure's error type. Raw, because another agent's
+	// payload may carry a non-string error, which must not fail the decode.
+	Error json.RawMessage `json:"error"`
+	// ErrorMessage is the Pi extension's errorMessage of a failed run.
+	ErrorMessage string `json:"error_message"`
 }
 
 // parseHookPayload is the hook privacy boundary. It always returns a sendable
@@ -616,6 +628,12 @@ type hookPayload struct {
 // naming content is admitted only on the two matching lifecycle edges and is
 // bounded by Unicode code points before it can reach RPC.
 func parseHookPayload(body []byte, event, agent string) rpc.Request {
+	return parseHookPayloadAt(body, event, agent, time.Now())
+}
+
+// parseHookPayloadAt is parseHookPayload with the hook's observation instant,
+// which anchors a usage-limit reset named as a bare clock time.
+func parseHookPayloadAt(body []byte, event, agent string, observedAt time.Time) rpc.Request {
 	req := rpc.Request{Cmd: "hook", Event: event, Agent: agent}
 	if len(body) == 0 {
 		return req
@@ -643,7 +661,35 @@ func parseHookPayload(body []byte, event, agent string) rpc.Request {
 	if agent == state.AgentKindCodex && event == "Stop" {
 		req.LastAssistantMessage = truncatePrompt(payload.LastAssistantMessage, 1000)
 	}
+	if event == "StopFailure" {
+		classifyUsageLimit(&req, payload, agent, observedAt)
+	}
 	return req
+}
+
+// classifyUsageLimit reads a failed turn's error text on this side of the
+// privacy boundary and forwards only the verdict and its reset time.
+func classifyUsageLimit(req *rpc.Request, payload hookPayload, agent string, at time.Time) {
+	var verdict usagelimit.Verdict
+	var limited bool
+	switch agent {
+	case state.AgentKindClaude:
+		var errorType string
+		if json.Unmarshal(payload.Error, &errorType) != nil {
+			return
+		}
+		verdict, limited = usagelimit.FromClaudeStopFailure(errorType, payload.LastAssistantMessage, at)
+	case state.AgentKindPi:
+		verdict, limited = usagelimit.FromPiError(payload.ErrorMessage, at)
+	}
+	if !limited {
+		return
+	}
+	req.UsageLimit = true
+	if verdict.ResetsAt != nil {
+		resetsAt := verdict.ResetsAt.UTC()
+		req.UsageLimitResetsAt = &resetsAt
+	}
 }
 func truncatePrompt(prompt string, limit int) string {
 	prompt = strings.TrimSpace(prompt)
@@ -882,6 +928,8 @@ commands:
                             set-full --cwd --name <full> (pretty display name)
   hook <event>            forward Claude Code hook enrichment (stdin = JSON)
   codex-hook <event>      forward Codex hook enrichment (stdin = JSON)
+  pi-hook <event>         forward Pi extension lifecycle (stdin = JSON); see
+                            integrations/pi/switchboard.ts
   activity idle|active    report a global user-activity edge for the delegation
                             metrics (idle daemon, e.g. hypridle); session-less
   display mode chips|circles|toggle  choose a presentation (navigation is unchanged)

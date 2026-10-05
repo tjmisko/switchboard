@@ -213,3 +213,13 @@ func TestValidColor(t *testing.T) {
 		}
 	}
 }
+
+func TestRenderSnapshotShouldMuteALimitedChip(t *testing.T) {
+	snap := state.Snapshot{Sessions: []state.Session{
+		{PID: 9, Codex: &state.AgentInfo{Status: state.StatusLimited}, Agent: state.AgentKindCodex},
+	}}
+	got := renderSnapshot(snap, []string{"capped"}, testOptions)
+	if !strings.Contains(got, "%{F#707880}● capped") {
+		t.Fatalf("limited render = %q, want the unknown colour", got)
+	}
+}
