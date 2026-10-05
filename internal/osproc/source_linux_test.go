@@ -4,8 +4,11 @@ package osproc
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/tjmisko/switchboard/internal/testsupport"
 )
@@ -154,5 +157,93 @@ func TestWatchAlreadyDeadFiresImmediately(t *testing.T) {
 	}
 	if watching(s, testsupport.DeadPID()) {
 		t.Error("ESRCH pid must not be in the watched set")
+	}
+}
+
+// requirePidfd skips when the kernel has no pidfd_open(2) (pre-5.3, or blocked
+// by a seccomp profile): there is no watcher to exercise.
+func requirePidfd(t *testing.T) {
+	t.Helper()
+	fd, err := unix.PidfdOpen(os.Getpid(), 0)
+	if err != nil {
+		t.Skipf("pidfd_open unavailable: %v", err)
+	}
+	unix.Close(fd)
+}
+
+// A pid that is watched again while its previous watcher's onDeath is still
+// running must get a watcher of its own. The daemon's death callback waits on
+// the store lock, and the scanner can re-appear the same pid in that window;
+// if the dying watcher still held the slot, the re-registration was swallowed
+// as a duplicate and the new lifetime was never watched.
+func TestWatchAgainDuringDeathCallback(t *testing.T) {
+	rows := []struct {
+		name string
+		// rewatchInside re-registers from inside onDeath; otherwise the test
+		// goroutine re-registers while onDeath is blocked.
+		rewatchInside bool
+	}{
+		{name: "should register a new watcher when the same pid is watched again from within its death callback", rewatchInside: true},
+		{name: "should register a new watcher when the same pid is watched again while its death callback is still running", rewatchInside: false},
+	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			requirePidfd(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			child := testsupport.SpawnSleep(t, 60*time.Second)
+			s := newLinuxSource()
+
+			second := make(chan struct{}, 4)
+			rewatchErr := make(chan error, 1)
+			firstEntered := make(chan struct{})
+			releaseFirst := make(chan struct{})
+			onFirstDeath := func() {
+				if row.rewatchInside {
+					rewatchErr <- s.Watch(ctx, child.PID, func() { second <- struct{}{} })
+					return
+				}
+				close(firstEntered)
+				<-releaseFirst
+			}
+			if err := s.Watch(ctx, child.PID, onFirstDeath); err != nil {
+				t.Fatalf("Watch: %v", err)
+			}
+
+			child.Kill(t)
+
+			if !row.rewatchInside {
+				select {
+				case <-firstEntered:
+				case <-time.After(3 * time.Second):
+					t.Fatal("first onDeath did not fire within 3s of kill")
+				}
+				rewatchErr <- s.Watch(ctx, child.PID, func() { second <- struct{}{} })
+				close(releaseFirst)
+			}
+
+			select {
+			case err := <-rewatchErr:
+				if err != nil {
+					t.Fatalf("re-Watch: %v", err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("first onDeath did not fire within 3s of kill")
+			}
+			// The pid is dead (a zombie or reaped), so a registered watcher reports
+			// it at once; a swallowed one never does.
+			select {
+			case <-second:
+			case <-time.After(3 * time.Second):
+				t.Fatal("re-Watch registered nothing: the dying watcher swallowed it as a duplicate")
+			}
+			select {
+			case <-second:
+				t.Fatal("re-Watch's onDeath fired more than once")
+			case <-time.After(300 * time.Millisecond):
+			}
+			waitWatchedEmpty(t, s)
+		})
 	}
 }

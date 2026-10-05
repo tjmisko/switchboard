@@ -60,7 +60,8 @@ type Source interface {
 	// Read returns one process by pid, or ErrGone if it has disappeared.
 	Read(pid int) (Info, error)
 	// Watch calls onDeath exactly once, from a background goroutine, when pid
-	// dies. A duplicate Watch for a pid already watched is a no-op.
+	// dies. A duplicate Watch for a pid already watched is a no-op; a pid whose
+	// onDeath has begun is no longer watched, so watching it again registers anew.
 	Watch(ctx context.Context, pid int, onDeath func()) error
 	// Stop cancels the watcher for pid (if any) without firing onDeath.
 	Stop(pid int)

@@ -65,6 +65,13 @@ func (s *linuxSource) AllPIDs() ([]int, error) { return proc.AllPIDs() }
 // Watch starts polling pid's pidfd. onDeath is called exactly once, from a
 // background goroutine, when the kernel marks the process dead. A duplicate
 // Watch for the same pid returns nil without scheduling a second watcher.
+//
+// The watcher leaves the watched set BEFORE it calls onDeath, so a Watch made
+// from inside the callback, or while it is still running, registers a fresh
+// watcher instead of being swallowed as a duplicate of the dying one. That is
+// the window a re-discovered pid races into: the old callback is still waiting
+// on the store lock when the scanner re-appears the pid, and a no-op there would
+// leave the new lifetime unwatched.
 func (s *linuxSource) Watch(parent context.Context, pid int, onDeath func()) error {
 	s.mu.Lock()
 	if _, dup := s.watched[pid]; dup {
@@ -86,39 +93,47 @@ func (s *linuxSource) Watch(parent context.Context, pid int, onDeath func()) err
 
 	go func() {
 		defer unix.Close(pidfd)
-		defer func() {
-			s.mu.Lock()
-			delete(s.watched, pid)
-			s.mu.Unlock()
-		}()
-		const tick = 1000 // ms — keeps Stop responsive without busy-looping
-		// pidfd readability (POLLIN) signals exit. POLLERR/POLLHUP/POLLNVAL are
-		// output-only conditions the kernel reports unconditionally; treating
-		// them as death too closes the Phase-0 ⚠ gap (decisions.md #11) where a
-		// POLLERR without POLLIN would otherwise spin the loop forever.
-		const deathRevents = unix.POLLIN | unix.POLLERR | unix.POLLHUP | unix.POLLNVAL
-		for {
-			if ctx.Err() != nil {
-				return
-			}
-			pfd := []unix.PollFd{{Fd: int32(pidfd), Events: unix.POLLIN}}
-			n, err := unix.Poll(pfd, tick)
-			if errors.Is(err, unix.EINTR) {
-				continue
-			}
-			if err != nil {
-				return
-			}
-			if n == 0 {
-				continue // timeout — re-check ctx and loop
-			}
-			if pfd[0].Revents&deathRevents != 0 {
-				onDeath()
-				return
-			}
+		died := pollUntilDeath(ctx, pidfd)
+		// Only this goroutine removes its own entry, and Watch adds one only when
+		// the slot is empty, so the slot is still ours to clear here.
+		s.mu.Lock()
+		delete(s.watched, pid)
+		s.mu.Unlock()
+		if died {
+			onDeath()
 		}
 	}()
 	return nil
+}
+
+// pollUntilDeath blocks until the kernel marks pidfd's process dead (true) or
+// ctx is cancelled or poll fails outright (false).
+func pollUntilDeath(ctx context.Context, pidfd int) bool {
+	const tick = 1000 // ms — keeps Stop responsive without busy-looping
+	// pidfd readability (POLLIN) signals exit. POLLERR/POLLHUP/POLLNVAL are
+	// output-only conditions the kernel reports unconditionally; treating
+	// them as death too closes the Phase-0 ⚠ gap (decisions.md #11) where a
+	// POLLERR without POLLIN would otherwise spin the loop forever.
+	const deathRevents = unix.POLLIN | unix.POLLERR | unix.POLLHUP | unix.POLLNVAL
+	for {
+		if ctx.Err() != nil {
+			return false
+		}
+		pfd := []unix.PollFd{{Fd: int32(pidfd), Events: unix.POLLIN}}
+		n, err := unix.Poll(pfd, tick)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if err != nil {
+			return false
+		}
+		if n == 0 {
+			continue // timeout — re-check ctx and loop
+		}
+		if pfd[0].Revents&deathRevents != 0 {
+			return true
+		}
+	}
 }
 
 func (s *linuxSource) Stop(pid int) {
