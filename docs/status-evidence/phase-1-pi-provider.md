@@ -286,4 +286,35 @@ a Pi in herdr both show working, red at a confirm dialog, idle, and limited.
 
 ## Spike results
 
-_Record the four verify-first answers here before 1.2._
+Recorded 2026-10-05 against pi-coding-agent 0.85.1, with a throwaway logging
+extension (since deleted) and a probe spawned exactly as `switchboard.ts`
+spawns `switchboard-ctl`.
+
+1. **Interactive gate: confirmed.** A TUI Pi has fd 0 and fd 1 on its pty and
+   a nonzero `tty_nr`. A json-mode child started from Pi's bash has fd 0 on
+   `/dev/null`, a pipe on fd 1, and `tty_nr` 0, because Pi's bash runs
+   commands in their own session with no controlling tty. Either "fd 0 is a
+   tty" or "`tty_nr` ≠ 0" separates them; the second needs no readlink. comm
+   (`pi`), exe (`node-22`) and cmdline (`pi` plus padding) cannot.
+2. **Built-in dialogs: they do not fire `ui_prompt_*`.** The project-trust
+   prompt, the `/model` selector and the `/resume` picker emit nothing; an
+   extension `ctx.ui.select` emits `ui_prompt_start {kind}` and
+   `ui_prompt_end`. An idle Pi at a built-in picker therefore does not go red,
+   and is not seen as waiting on the user. The owner accepted this: no red at
+   Pi's own pickers.
+3. **Hook ancestry: confirmed.** In a plain WezTerm pane, after `/reload`, and
+   in herdr, the process the extension spawns has the Pi process as its
+   direct parent.
+4. **herdr pane PID: confirmed.** The pane's foreground process-group leader
+   is the Pi process itself, with no wrapper, and herdr's
+   `pane process-info` reports the same PID.
+
+Additions to the plan:
+
+- `project_trust` fires before `session_start` and reaches user extensions,
+  so a trust prompt blocks startup before the extension's TUI gate is set.
+- A json-mode child runs the full extension set (`session_start` through
+  `session_shutdown`) with `mode=json`; the `ctx.mode === "tui"` gate drops
+  it correctly.
+- argv is overwritten (cmdline is `pi` plus padding), so the scanner cannot
+  read `--mode json` from it.
