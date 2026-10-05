@@ -231,6 +231,7 @@ func main() {
 		sess := resolver.Resolve(ctx, info)
 		sess.Agent = kind
 		sess.Headless = headless
+		var lifetime sessionLifetime
 		store.Apply(func(m map[int]*state.Session) {
 			// A surviving hydrated root keeps its discovery-lifetime timestamp and
 			// last-known provider projection while discovery refreshes only live
@@ -247,6 +248,7 @@ func main() {
 				applyHerdrPane(m[sess.PID], herdrPane, herdrWatcher, sink, time.Now())
 				sess = *m[sess.PID]
 			}
+			lifetime = lifetimeOf(m[sess.PID])
 		})
 		federated.AnnounceSession(ctx, sess)
 		agentRuntime.Request(providerRootKey(sess))
@@ -260,12 +262,7 @@ func main() {
 		// would have reported is never observed. The reconciler's liveness sweep
 		// backstops that loss (L1) and a registration failure below (L3); both funnel
 		// through endSession, so whichever notices first closes the lane exactly once.
-		if err := procSrc.Watch(ctx, info.PID, func() {
-			log.Printf("%s pid=%d died", kind, info.PID)
-			store.Apply(func(m map[int]*state.Session) {
-				endSession(m, info.PID, sink, forgetRoot, time.Now())
-			})
-		}); err != nil {
+		if err := watchSessionDeath(ctx, procSrc, store, lifetime, sink, forgetRoot, time.Now); err != nil {
 			log.Printf("watch pid=%d: %v (liveness sweep will close its lane)", info.PID, err)
 		}
 	}
@@ -382,6 +379,50 @@ func endSession(m map[int]*state.Session, pid int, sink *history.Sink, forget fu
 		forget(pid)
 	}
 	return true
+}
+
+// sessionLifetime names one tracked lifetime of a pid, as captured when its
+// death-watch was registered. A death callback carries it so that it can only
+// close the lifetime it was registered for: by the time a pidfd callback runs,
+// the sweep may already have closed that session and the scanner re-discovered
+// the recycled pid as a new one, which a bare endSession(pid) would end.
+//
+// This is a stopgap fence. StartedAt is not a kernel birth token: appear copies
+// it onto a re-discovered pid of the same agent while the old session is still
+// in the map, so a same-agent pid reuse in that window is not fenced. #97
+// (Phase 4, the OS process birth token) fixes that properly.
+type sessionLifetime struct {
+	PID       int
+	Agent     string
+	StartedAt time.Time
+}
+
+func lifetimeOf(s *state.Session) sessionLifetime {
+	return sessionLifetime{PID: s.PID, Agent: s.Agent, StartedAt: s.StartedAt}
+}
+
+// endSessionIf closes the lane of lifetime.PID only while the store still holds
+// that lifetime there; a pid since taken by another session is left alone. It
+// is endSession behind a guard, so the once-only contract (L5) is endSession's.
+// The caller MUST hold the store lock.
+func endSessionIf(m map[int]*state.Session, lifetime sessionLifetime, sink *history.Sink, forget func(int), now time.Time) bool {
+	s := m[lifetime.PID]
+	if s == nil || s.Agent != lifetime.Agent || !s.StartedAt.Equal(lifetime.StartedAt) {
+		return false
+	}
+	return endSession(m, lifetime.PID, sink, forget, now)
+}
+
+// watchSessionDeath registers the pidfd death-watch for one session lifetime.
+// The callback closes that lifetime's lane through endSessionIf, stamped with
+// now() at the moment the death is reported.
+func watchSessionDeath(ctx context.Context, src osproc.Source, store *state.Store, lifetime sessionLifetime, sink *history.Sink, forget func(int), now func() time.Time) error {
+	return src.Watch(ctx, lifetime.PID, func() {
+		log.Printf("%s pid=%d died", lifetime.Agent, lifetime.PID)
+		store.Apply(func(m map[int]*state.Session) {
+			endSessionIf(m, lifetime, sink, forget, now())
+		})
+	})
 }
 
 // sessionDead reports whether pid is DEFINITIVELY no longer this session's
