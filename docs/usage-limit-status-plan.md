@@ -64,15 +64,17 @@ RPC, which keeps the hook privacy boundary.
 ## Queue
 
 1. [x] Evidence survey (this doc).
-2. [ ] `state`: `StatusLimited`, `UsageLimit`, snapshot projection, `Load`
+2. [x] `state`: `StatusLimited`, `UsageLimit`, snapshot projection, `Load`
    normalization.
-3. [ ] ctl/rpc: limit classification at the edge, record and clear in
+3. [x] ctl/rpc: limit classification at the edge, record and clear in
    `dispatchAgentHook`. Claude observer treats `StopFailure` as `Stop`.
-4. [ ] Codex: the rollout reader reports the limit on its terminal marker, and
-   `pollCodexStoppedRoot` records it.
-5. [ ] Pi: `switchboard-ctl pi-hook`, `integrations/pi/switchboard.ts`.
-6. [ ] Renderers: tooltip "usage limit · resets 5:15 PM", grey class in
-   waybar/polybar/circles/claude-tui, ctl timeline.
+4. [x] Codex: the rollout reader reports the limit on its terminal marker, and
+   `pollCodexStoppedRoot` records it. Latency is the 90 s quiet window that
+   read already waits for; the app-server path (item 9) would cut it.
+5. [x] Pi: `switchboard-ctl pi-hook`, `integrations/pi/switchboard.ts`.
+6. [x] Renderers: tooltip "usage limit · resets 5:15 PM"; `limited` maps to
+   the `unknown` colour class plus a `limited` secondary class, so every
+   existing stylesheet (chips, circles, polybar, claude-tui) greys it.
 7. [ ] Wire config: Claude `StopFailure` → `switchboard-ctl hook StopFailure`;
    install the Pi extension; deploy.
 8. [ ] **Pi full hook lifecycle.** Pi becomes a provider agent with its own

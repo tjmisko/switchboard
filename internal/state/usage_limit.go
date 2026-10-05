@@ -91,6 +91,12 @@ func projectUsageLimit(sess *Session, now time.Time) {
 		sess.UsageLimit = nil
 		return
 	}
+	// A live red is a decision the user can act on, and a capped turn raises
+	// none, so a permission status means the limit no longer holds: the clear
+	// that should have said so was lost. Never hide it behind grey.
+	if publishedPermission(sess) {
+		return
+	}
 	sess.UsageLimit = cloneUsageLimit(sess.UsageLimit)
 	since := sess.UsageLimit.ObservedAt
 	for _, info := range []*AgentInfo{sess.Claude, sess.Codex} {
@@ -104,6 +110,13 @@ func projectUsageLimit(sess *Session, now time.Time) {
 		sess.AgentGraph.Summary.Status = StatusLimited
 		sess.AgentGraph.Summary.Since = since
 	}
+}
+
+func publishedPermission(sess *Session) bool {
+	if info := sess.Enrichment(); info != nil {
+		return info.Status == StatusPermission
+	}
+	return sess.AgentGraph != nil && sess.AgentGraph.Summary.Status == StatusPermission
 }
 
 // hydrateUsageLimit undoes the projection on a session read back from

@@ -214,3 +214,13 @@ func TestRecordUsageLimitShouldRefuseEvidenceTheSessionHasAlreadyOutrun(t *testi
 		t.Fatal("a limit newer than the activity was refused")
 	}
 }
+
+func TestProjectPublishedShouldNeverHideALivePermissionBehindALimit(t *testing.T) {
+	sess := limitedSession(timePtr(limitT0.Add(time.Hour)))
+	sess.Claude.Status = StatusPermission
+	sess.AgentGraph.Summary.Status = StatusPermission
+	got := ProjectPublished(Snapshot{Sessions: []Session{*sess}}, limitT0).Sessions[0]
+	if got.Claude.Status != StatusPermission || got.AgentGraph.Summary.Status != StatusPermission {
+		t.Fatalf("published %q/%q, want the red to win", got.Claude.Status, got.AgentGraph.Summary.Status)
+	}
+}
