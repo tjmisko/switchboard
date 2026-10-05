@@ -16,6 +16,9 @@ import (
 // 99% of the 5h window used, then the "premium" snapshot with null windows,
 // then task_complete with usage_limit_exceeded and "try again at 5:15 PM".
 func TestReadRolloutStateShouldReportAUsageLimitWhenTheRealCappedTurnEnds(t *testing.T) {
+	// The message's "5:15 PM" is the capturing machine's wall clock; the epoch
+	// wins only when the two agree, so read it in the zone it was written in.
+	pinLocalZone(t, "America/Los_Angeles")
 	state, err := ReadRolloutState(filepath.Join("testdata", "rollout-usage-limit.jsonl"))
 	if err != nil {
 		t.Fatal(err)
@@ -137,4 +140,17 @@ func TestReadRolloutStateShouldKeepAMarkerWhoseErrorIsNotAnObject(t *testing.T) 
 	if state.Runtime != agentgraph.RuntimeIdle || !state.At.Equal(time.Date(2026, 10, 5, 19, 30, 0, 0, time.UTC)) || state.UsageLimit != nil {
 		t.Fatalf("state = %+v, want the later idle marker with no limit", state)
 	}
+}
+
+// pinLocalZone sets time.Local for one test. The package runs no parallel
+// tests, so the swap cannot leak into another.
+func pinLocalZone(t *testing.T, name string) {
+	t.Helper()
+	zone, err := time.LoadLocation(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prior := time.Local
+	time.Local = zone
+	t.Cleanup(func() { time.Local = prior })
 }
