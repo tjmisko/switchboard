@@ -107,6 +107,9 @@ type Session struct {
 const (
 	AgentKindClaude = "claude"
 	AgentKindCodex  = "codex"
+	// AgentKindPi is discovered through herdr and has no provider adapter; its
+	// hooks (switchboard-ctl pi-hook) carry only usage-limit evidence today.
+	AgentKindPi = "pi"
 )
 
 // Status values stored in AgentInfo.Status. The first three are hook-driven and
