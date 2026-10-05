@@ -1408,6 +1408,7 @@ func (c *agentCoordinator) forgetCodexHookState(key provider.RootKey) {
 	c.clearCodexApprovalsLocked(c.codexHookRoots[key])
 	delete(c.codexHookRoots, key)
 	c.codexHookMu.Unlock()
+	c.forgetCodexLimitScan(key)
 	c.cancelCodexNaming(key, true)
 }
 

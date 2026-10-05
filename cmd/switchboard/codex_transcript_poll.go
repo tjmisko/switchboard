@@ -28,13 +28,9 @@ func (c *agentCoordinator) pollCodexStoppedRoot(ref provider.RootRef, now time.T
 	if err != nil {
 		return
 	}
+	// A usage-limit turn end is recorded by scanCodexUsageLimit, which also
+	// reads the subagents' rollouts; this read only corrects the root to idle.
 	runtime, at := rollout.Runtime, rollout.At
-	// Codex fires no hook when the usage limit ends a turn, so this read is the
-	// only witness. Record it before the graph guards below: whether or not the
-	// app-server owns the runtime, the limit is still why the session is stuck.
-	if rollout.UsageLimit != nil && at.After(hookAt) {
-		c.recordCodexUsageLimit(ref, sessionID, at, rollout.UsageLimit)
-	}
 
 	c.codexHookMu.Lock()
 	if c.codexHookRoots[ref.Key()] != root || root.sessionID != sessionID || !root.latestAt.Equal(hookAt) || root.transcript != path {
@@ -78,17 +74,22 @@ func (c *agentCoordinator) pollCodexStoppedRoot(ref provider.RootRef, now time.T
 	c.applyObservationWithHookOwnership(ref, generation, observation, claudeprovider.Compatibility{}, now, true)
 }
 
-// recordCodexUsageLimit records a rollout's usage-limit turn end on the session
-// still bound to the rollout's thread. Session.RecordUsageLimit refuses it if a
-// newer activity hook has already arrived.
-func (c *agentCoordinator) recordCodexUsageLimit(ref provider.RootRef, sessionID string, at time.Time, limit *codexprovider.RolloutUsageLimit) {
+// recordCodexUsageLimit records a usage-limit turn end, the root's or a
+// subagent's, on the session still bound to rootID. Session.RecordUsageLimit
+// refuses it if a newer activity hook has already arrived.
+func (c *agentCoordinator) recordCodexUsageLimit(ref provider.RootRef, rootID string, at time.Time, limit *codexprovider.RolloutUsageLimit) {
 	sess, ok := sessionForKey(c.store.Snapshot(), ref.Key())
-	if !ok || sess.AgentGraph == nil || sess.AgentGraph.RootID != sessionID {
+	if !ok || sess.AgentGraph == nil || sess.AgentGraph.RootID != rootID {
+		return
+	}
+	// The scan re-reads the same evidence until the rollout moves; only new
+	// evidence is worth a store write and a log line.
+	if sess.UsageLimit != nil && sess.UsageLimit.ObservedAt.Equal(at) {
 		return
 	}
 	c.store.Apply(func(sessions map[int]*state.Session) {
 		live := sessions[sess.PID]
-		if live == nil || live.AgentGraph == nil || live.AgentGraph.RootID != sessionID {
+		if live == nil || live.AgentGraph == nil || live.AgentGraph.RootID != rootID {
 			return
 		}
 		if live.RecordUsageLimit(state.UsageLimit{ObservedAt: at, ResetsAt: limit.ResetsAt, Source: state.UsageLimitSourceCodexRollout}) {
