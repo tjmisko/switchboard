@@ -47,6 +47,10 @@ type Session struct {
 	// usage limit. Publication reads its status as limited while the record is
 	// active (ProjectPublished); omitted otherwise.
 	UsageLimit *UsageLimit `json:"usage_limit,omitempty"`
+	// usageLimitActivityAt is the newest activity ClearUsageLimit has seen, so
+	// RecordUsageLimit can refuse evidence that the session has already outrun.
+	// In-memory only; a restart forgets it, which costs at most one stale read.
+	usageLimitActivityAt time.Time
 	// Navigable is populated only on detached aggregate copies. It says an
 	// exact local route candidate exists now; every action still revalidates the
 	// pane, window, liveness, and StartedAt before acting. Host-local snapshots

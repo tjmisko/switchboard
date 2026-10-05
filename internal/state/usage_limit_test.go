@@ -203,3 +203,14 @@ func TestLoadShouldDropALimitThatLapsedWhileTheDaemonWasDown(t *testing.T) {
 		t.Fatalf("lapsed limit survived Load: %+v status=%q", got.UsageLimit, got.Claude.Status)
 	}
 }
+
+func TestRecordUsageLimitShouldRefuseEvidenceTheSessionHasAlreadyOutrun(t *testing.T) {
+	var sess Session
+	sess.ClearUsageLimit(limitT0.Add(time.Second)) // the next prompt, with no record to clear
+	if sess.RecordUsageLimit(UsageLimit{ObservedAt: limitT0}) || sess.UsageLimit != nil {
+		t.Fatal("a limit read after newer activity greyed the session")
+	}
+	if !sess.RecordUsageLimit(UsageLimit{ObservedAt: limitT0.Add(2 * time.Second)}) {
+		t.Fatal("a limit newer than the activity was refused")
+	}
+}

@@ -1,12 +1,14 @@
 package main
 
 import (
+	"log"
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/agentgraph"
 	"github.com/tjmisko/switchboard/internal/provider"
 	claudeprovider "github.com/tjmisko/switchboard/internal/provider/claude"
 	codexprovider "github.com/tjmisko/switchboard/internal/provider/codex"
+	"github.com/tjmisko/switchboard/internal/state"
 )
 
 const codexTranscriptQuietWindow = 90 * time.Second
@@ -22,9 +24,16 @@ func (c *agentCoordinator) pollCodexStoppedRoot(ref provider.RootRef, now time.T
 	}
 	path, sessionID, hookAt := root.transcript, root.sessionID, root.latestAt
 	c.codexHookMu.Unlock()
-	runtime, at, err := codexprovider.ReadRolloutRuntime(path)
+	rollout, err := codexprovider.ReadRolloutState(path)
 	if err != nil {
 		return
+	}
+	runtime, at := rollout.Runtime, rollout.At
+	// Codex fires no hook when the usage limit ends a turn, so this read is the
+	// only witness. Record it before the graph guards below: whether or not the
+	// app-server owns the runtime, the limit is still why the session is stuck.
+	if rollout.UsageLimit != nil && at.After(hookAt) {
+		c.recordCodexUsageLimit(ref, sessionID, at, rollout.UsageLimit)
 	}
 
 	c.codexHookMu.Lock()
@@ -67,4 +76,30 @@ func (c *agentCoordinator) pollCodexStoppedRoot(ref provider.RootRef, now time.T
 	generation := c.begin(ref.Key())
 	c.codexHookMu.Unlock()
 	c.applyObservationWithHookOwnership(ref, generation, observation, claudeprovider.Compatibility{}, now, true)
+}
+
+// recordCodexUsageLimit records a rollout's usage-limit turn end on the session
+// still bound to the rollout's thread. Session.RecordUsageLimit refuses it if a
+// newer activity hook has already arrived.
+func (c *agentCoordinator) recordCodexUsageLimit(ref provider.RootRef, sessionID string, at time.Time, limit *codexprovider.RolloutUsageLimit) {
+	sess, ok := sessionForKey(c.store.Snapshot(), ref.Key())
+	if !ok || sess.AgentGraph == nil || sess.AgentGraph.RootID != sessionID {
+		return
+	}
+	c.store.Apply(func(sessions map[int]*state.Session) {
+		live := sessions[sess.PID]
+		if live == nil || live.AgentGraph == nil || live.AgentGraph.RootID != sessionID {
+			return
+		}
+		if live.RecordUsageLimit(state.UsageLimit{ObservedAt: at, ResetsAt: limit.ResetsAt, Source: state.UsageLimitSourceCodexRollout}) {
+			log.Printf("usage-limit: pid=%d agent=codex resets_at=%s", sess.PID, formatUsageLimitReset(limit.ResetsAt))
+		}
+	})
+}
+
+func formatUsageLimitReset(resetsAt *time.Time) string {
+	if resetsAt == nil {
+		return "unknown"
+	}
+	return resetsAt.Format(time.RFC3339)
 }

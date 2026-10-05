@@ -45,19 +45,26 @@ func (u *UsageLimit) ActiveAt(now time.Time) bool {
 
 // RecordUsageLimit stores limit evidence on the session. Evidence older than the
 // record already held is ignored, so a late rollout read cannot rewind a newer
-// hook's reset time.
+// hook's reset time; so is evidence older than the newest activity, so a read
+// that loses a race with the next prompt cannot grey a working session.
 func (s *Session) RecordUsageLimit(limit UsageLimit) bool {
 	if s.UsageLimit != nil && limit.ObservedAt.Before(s.UsageLimit.ObservedAt) {
+		return false
+	}
+	if limit.ObservedAt.Before(s.usageLimitActivityAt) {
 		return false
 	}
 	s.UsageLimit = cloneUsageLimit(&limit)
 	return true
 }
 
-// ClearUsageLimit drops the record when activity observed at `at` postdates the
-// limit evidence. Activity from before the limit (a reordered or delayed hook)
-// cannot clear it.
+// ClearUsageLimit notes activity observed at `at` and drops the record when the
+// activity postdates its evidence. Activity from before the limit (a reordered
+// or delayed hook) cannot clear it. It reports whether a record was dropped.
 func (s *Session) ClearUsageLimit(at time.Time) bool {
+	if at.After(s.usageLimitActivityAt) {
+		s.usageLimitActivityAt = at
+	}
 	if s.UsageLimit == nil {
 		return false
 	}
