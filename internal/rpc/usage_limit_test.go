@@ -1,9 +1,11 @@
 package rpc
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/proc"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/terminal"
 	"github.com/tjmisko/switchboard/internal/wm"
@@ -89,7 +91,12 @@ func TestHookShouldKeepTheLimitWhenTheEventIsNotActivity(t *testing.T) {
 }
 
 func TestPiHookShouldLimitAHerdrOnlySession(t *testing.T) {
-	server, store, _ := usageLimitServer(t, state.AgentKindPi)
+	server, store, forwarded := usageLimitServer(t, state.AgentKindPi)
+	defer func() {
+		if len(*forwarded) != 0 {
+			t.Fatalf("pi hooks reached the provider handler: %+v", *forwarded)
+		}
+	}()
 	at := time.Now().UTC()
 	server.handleHook(Request{PID: 42, Agent: state.AgentKindPi, Event: "StopFailure", ObservedAt: at, UsageLimit: true})
 	status, limit := publishedStatus(store)
@@ -111,5 +118,45 @@ func TestLegacyPiHookShouldNotCreateAProviderBlock(t *testing.T) {
 	server.handleHook(Request{PID: 42, Agent: state.AgentKindPi, Event: "UserPromptSubmit", ObservedAt: time.Now()})
 	if sess := store.Snapshot().Sessions[0]; sess.Claude != nil || sess.Codex != nil {
 		t.Fatalf("pi hook wrote a provider block: claude=%+v codex=%+v", sess.Claude, sess.Codex)
+	}
+}
+
+// A shared Codex app-server is a child of whichever TUI launched it, so process
+// ancestry names that TUI for every client's hooks. Dispatch attributes by the
+// hook's live directory instead; the limit must follow that attribution.
+func TestHookShouldClearTheLimitOfTheSessionDispatchAttributedOnASharedDaemon(t *testing.T) {
+	store := state.New("")
+	limitedAt := time.Now().Add(-time.Minute)
+	store.Apply(func(m map[int]*state.Session) {
+		m[100] = &state.Session{PID: 100, Agent: state.AgentKindCodex, CWD: "/functionary",
+			UsageLimit: &state.UsageLimit{ObservedAt: limitedAt}}
+		m[200] = &state.Session{PID: 200, Agent: state.AgentKindCodex, CWD: "/switchboard",
+			UsageLimit: &state.UsageLimit{ObservedAt: limitedAt}}
+	})
+	s := New(store, "", terminal.NewNone(), wm.NewNone())
+	processes := map[int]proc.Info{
+		101: {PID: 101, PPID: 100, Comm: "codex", Args: []string{"codex", "app-server", "--managed-daemon"}},
+		100: {PID: 100, Comm: "codex", Args: []string{"codex"}, CWD: "/functionary"},
+		200: {PID: 200, Comm: "codex", Args: []string{"codex"}, CWD: "/switchboard"},
+	}
+	s.readProc = func(pid int) (proc.Info, error) {
+		p, ok := processes[pid]
+		if !ok {
+			return p, fmt.Errorf("gone")
+		}
+		return p, nil
+	}
+	s.SetAgentHookHandler(func(Request, state.Session) {})
+	s.handleHook(Request{PID: 101, Agent: state.AgentKindCodex, HookCWD: "/switchboard", SessionID: "switchboard-thread", Event: "UserPromptSubmit", ObservedAt: time.Now()})
+
+	byPID := map[int]state.Session{}
+	for _, sess := range store.Snapshot().Sessions {
+		byPID[sess.PID] = sess
+	}
+	if byPID[200].UsageLimit != nil {
+		t.Fatal("the session that resumed is still limited")
+	}
+	if byPID[100].UsageLimit == nil {
+		t.Fatal("the launching TUI's limit was cleared by another session's prompt")
 	}
 }

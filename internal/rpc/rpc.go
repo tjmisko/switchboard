@@ -743,7 +743,7 @@ func (s *Server) handleHook(req Request) {
 		s.dispatchAgentHook(req)
 		return
 	}
-	s.applyUsageLimitHook(req)
+	s.applyUsageLimitHook(req, 0)
 	if req.Agent == state.AgentKindPi {
 		return // no provider adapter: the hook carried only usage-limit evidence
 	}
@@ -1055,7 +1055,11 @@ func (s *Server) handleHook(req Request) {
 // came from, or drops the session's record when the hook is new activity. It
 // runs ahead of provider dispatch for every agent, including those with no
 // provider adapter (Pi), and decides nothing about the provider status.
-func (s *Server) applyUsageLimitHook(req Request) {
+//
+// pid is the session dispatch already attributed the hook to, so a Codex hook
+// matched only by its unique live directory clears the same session the
+// rollout read recorded on. Zero resolves by process ancestry (legacy path).
+func (s *Server) applyUsageLimitHook(req Request, pid int) {
 	if !req.UsageLimit && !usageLimitActivity(req.Event) {
 		return
 	}
@@ -1064,11 +1068,13 @@ func (s *Server) applyUsageLimitHook(req Request) {
 		at = time.Now()
 	}
 	s.store.Apply(func(m map[int]*state.Session) {
-		pid := findTrackedAncestor(m, req.PID, s.readProc)
 		if pid == 0 {
-			return
+			pid = findTrackedAncestor(m, req.PID, s.readProc)
 		}
 		sess := m[pid]
+		if sess == nil {
+			return
+		}
 		if !req.UsageLimit {
 			if sess.ClearUsageLimit(at) {
 				log.Printf("usage-limit: pid=%d cleared by %s", pid, req.Event)
@@ -1112,7 +1118,6 @@ func formatResetsAt(resetsAt *time.Time) string {
 // process reads before invoking the provider-aware handler. In particular, no
 // /proc read, transcript read, or provider callback runs under Store.Apply.
 func (s *Server) dispatchAgentHook(req Request) {
-	s.applyUsageLimitHook(req)
 	snap := s.store.Snapshot()
 	tracked := make(map[int]*state.Session, len(snap.Sessions))
 	for i := range snap.Sessions {
@@ -1125,7 +1130,7 @@ func (s *Server) dispatchAgentHook(req Request) {
 			s.hookAttributionDiagnostic(HookAttributionDiagnostic{Category: category, MatchedPID: pid})
 		}
 		if pid != 0 {
-			s.agentHook(req, *tracked[pid])
+			s.forwardAgentHook(req, pid, *tracked[pid])
 			return
 		}
 	}
@@ -1133,7 +1138,17 @@ func (s *Server) dispatchAgentHook(req Request) {
 		s.reportHookAttributionProbe(req, snap.Sessions)
 		return
 	}
-	s.agentHook(req, *tracked[pid])
+	s.forwardAgentHook(req, pid, *tracked[pid])
+}
+
+// forwardAgentHook applies the hook's usage-limit evidence to the attributed
+// session, then hands the hook to its provider. Pi has no provider adapter.
+func (s *Server) forwardAgentHook(req Request, pid int, sess state.Session) {
+	s.applyUsageLimitHook(req, pid)
+	if req.Agent == state.AgentKindPi {
+		return
+	}
+	s.agentHook(req, sess)
 }
 
 func (s *Server) reportHookAttributionProbe(req Request, sessions []state.Session) {
