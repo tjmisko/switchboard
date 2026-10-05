@@ -77,13 +77,9 @@ RPC, which keeps the hook privacy boundary.
    existing stylesheet (chips, circles, polybar, claude-tui) greys it.
 7. [ ] Wire config: Claude `StopFailure` → `switchboard-ctl hook StopFailure`;
    install the Pi extension; deploy.
-8. [ ] **Pi full hook lifecycle.** Pi becomes a provider agent with its own
-   enrichment block, like Claude and Codex, instead of a herdr-only graph.
-   The extension forwards `session_start`, `agent_start`, `tool_call`/
-   `tool_result`, approval prompts, `agent_end`/`agent_settled` and
-   `session_shutdown` through `switchboard-ctl pi-hook`. The daemon adds a Pi
-   observer (status FSM, transcript path from `ctx.sessionManager`, session
-   rotation) and herdr drops back to a fallback. It needs its own design doc.
+8. [ ] **Pi full hook lifecycle.** Superseded by
+   `docs/status-evidence/phase-1-pi-provider.md` (including installing the
+   Pi extension as a symlink, the open half of item 7).
 9. [ ] Follow-ups: Codex app-server path (`turn/completed` with
    `turn.error.codexErrorInfo == "usageLimitExceeded"`, and
    `account/rateLimits/updated`); Claude transcript fallback (`isApiErrorMessage`
