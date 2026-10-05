@@ -54,7 +54,7 @@ Clearing on activity: `UserPromptSubmit`, `PreToolUse`, `PostToolUse` and
 | Agent  | Evidence                                    | Reset time                                      |
 |--------|---------------------------------------------|-------------------------------------------------|
 | Claude | `StopFailure` hook, `error=rate_limit` + "hit your … limit" text | "resets 1:20pm (Area/City)" parsed in that zone |
-| Codex  | rollout terminal `task_complete` with `usage_limit_exceeded` | latest `rate_limits` window with max `used_percent`; else "try again at 5:15 PM" |
+| Codex  | rollout terminal `task_complete` with `usage_limit_exceeded`, in the root's rollout or a subagent's | latest `rate_limits` window with max `used_percent`; else "try again at 5:15 PM" |
 | Pi     | `pi-hook StopFailure` from `integrations/pi/switchboard.ts` | "Try again in ~N min" / "try again at H:MM PM"  |
 
 A bare `rate_limit` (transient 429, overload) never sets `limited`. Message
@@ -89,3 +89,12 @@ RPC, which keeps the hook privacy boundary.
    `account/rateLimits/updated`); Claude transcript fallback (`isApiErrorMessage`
    + `error: "rate_limit"`) for sessions without the hook; Claude statusline
    `rate_limits.*.used_percentage` as a proactive tooltip warning.
+10. [x] **Subagents pause too.** A capped subagent leaves its root parked in
+    a wait the app-server reports as live work, and the root's rollout has no
+    turn end. `scanCodexUsageLimit` reads every subagent's rollout tail too; a
+    child's cap counts when it is newer than the root's newest turn marker.
+    Child hooks carry the child's `transcript_path`, which used to overwrite
+    the root's; they are now filed per `agent_id`. Rollout paths also come
+    from the app-server's `thread.path`, so a cap on disk is found after a
+    daemon restart with no hook. While limited, publication moves the live
+    children into `paused_children` ("1 agent · 1 paused").

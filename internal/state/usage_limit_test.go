@@ -224,3 +224,42 @@ func TestProjectPublishedShouldNeverHideALivePermissionBehindALimit(t *testing.T
 		t.Fatalf("published %q/%q, want the red to win", got.Claude.Status, got.AgentGraph.Summary.Status)
 	}
 }
+
+func TestProjectPublishedShouldReportLiveSubagentsAsPausedWhenTheSessionIsLimited(t *testing.T) {
+	sess := limitedSession(timePtr(limitT0.Add(3 * time.Hour)))
+	sess.Claude.InFlightSubagents = 2
+	sess.AgentGraph.Summary.Status = StatusDelegating
+	sess.AgentGraph.Summary.LiveChildren = 2
+
+	got := ProjectPublished(Snapshot{Sessions: []Session{*sess}}, limitT0.Add(time.Hour)).Sessions[0]
+
+	if got.AgentGraph.Summary.LiveChildren != 0 || got.AgentGraph.Summary.PausedChildren != 2 {
+		t.Fatalf("live/paused = %d/%d, want 0/2", got.AgentGraph.Summary.LiveChildren, got.AgentGraph.Summary.PausedChildren)
+	}
+	if got.Claude.InFlightSubagents != 0 {
+		t.Fatalf("in_flight_subagents = %d, want 0 under the limit", got.Claude.InFlightSubagents)
+	}
+}
+
+func TestProjectPublishedShouldKeepSubagentsLiveWhenTheLimitHasLapsed(t *testing.T) {
+	resetsAt := limitT0.Add(time.Hour)
+	sess := limitedSession(&resetsAt)
+	sess.AgentGraph.Summary.LiveChildren = 2
+
+	got := ProjectPublished(Snapshot{Sessions: []Session{*sess}}, resetsAt).Sessions[0]
+
+	if got.AgentGraph.Summary.LiveChildren != 2 || got.AgentGraph.Summary.PausedChildren != 0 {
+		t.Fatalf("live/paused = %d/%d, want 2/0", got.AgentGraph.Summary.LiveChildren, got.AgentGraph.Summary.PausedChildren)
+	}
+}
+
+func TestHydrateUsageLimitShouldReturnPausedSubagentsToLive(t *testing.T) {
+	sess := limitedSession(timePtr(limitT0.Add(3 * time.Hour)))
+	sess.AgentGraph.Summary = AgentGraphSummary{Status: StatusLimited, PausedChildren: 2}
+
+	hydrateUsageLimit(sess, limitT0.Add(time.Hour))
+
+	if s := sess.AgentGraph.Summary; s.Status != StatusIdle || s.LiveChildren != 2 || s.PausedChildren != 0 {
+		t.Fatalf("hydrated summary = %+v, want idle with 2 live and none paused", s)
+	}
+}

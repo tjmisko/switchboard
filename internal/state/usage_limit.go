@@ -99,16 +99,22 @@ func projectUsageLimit(sess *Session, now time.Time) {
 	}
 	sess.UsageLimit = cloneUsageLimit(sess.UsageLimit)
 	since := sess.UsageLimit.ObservedAt
+	// The cap is the account's, so a subagent stops with its root: a child
+	// the graph still counts live, or a root wait on one, is paused, not work.
 	for _, info := range []*AgentInfo{sess.Claude, sess.Codex} {
 		if info == nil {
 			continue
 		}
 		info.Status, info.StatusSince = StatusLimited, since
 		info.StatusSinceWire = &since
+		info.InFlightSubagents = 0
 	}
 	if sess.AgentGraph != nil {
-		sess.AgentGraph.Summary.Status = StatusLimited
-		sess.AgentGraph.Summary.Since = since
+		summary := &sess.AgentGraph.Summary
+		summary.Status = StatusLimited
+		summary.Since = since
+		summary.PausedChildren += summary.LiveChildren
+		summary.LiveChildren = 0
 	}
 }
 
@@ -128,8 +134,13 @@ func hydrateUsageLimit(sess *Session, now time.Time) {
 			info.Status = StatusIdle
 		}
 	}
-	if sess.AgentGraph != nil && sess.AgentGraph.Summary.Status == StatusLimited {
-		sess.AgentGraph.Summary.Status = StatusIdle
+	if sess.AgentGraph != nil {
+		summary := &sess.AgentGraph.Summary
+		if summary.Status == StatusLimited {
+			summary.Status = StatusIdle
+		}
+		summary.LiveChildren += summary.PausedChildren
+		summary.PausedChildren = 0
 	}
 	if !sess.UsageLimit.ActiveAt(now) {
 		sess.UsageLimit = nil

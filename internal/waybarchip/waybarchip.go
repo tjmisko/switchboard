@@ -630,6 +630,8 @@ func identityLine(full string, s state.Session) string {
 //
 //	12 agents · 5 live · 2 waiting · 9h40m done
 //
+// A usage-limited session reads "paused" where it would read "live".
+//
 // It replaces the per-agent tree the card used to draw. The tree cost six lines
 // and a "+6 more" elision to say less than this does, and every row carried its
 // own live age — which is what made the hover flicker (see durfmt.Coarse).
@@ -666,6 +668,9 @@ func agentFanout(g *state.AgentGraph) string {
 	parts := []string{fmt.Sprintf("%d agent%s", fanned, plural(fanned))}
 	if n := g.Summary.LiveChildren; n > 0 {
 		parts = append(parts, fmt.Sprintf("%d live", n))
+	}
+	if n := g.Summary.PausedChildren; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d paused", n))
 	}
 	if n := g.Summary.WaitingNodes; n > 0 {
 		parts = append(parts, fmt.Sprintf("%d waiting", n))

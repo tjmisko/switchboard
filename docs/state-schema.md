@@ -455,6 +455,7 @@ intentional in the wire-only design.
 | `attention` | string | yes | Folded wait reason: `none`, `approval`, or `user_input`. If both wait kinds exist, `approval` wins only in this compact field; the two counts below preserve both. |
 | `status` | string | yes | Legacy root-chip value: `working`, `idle`, `permission`, `delegating`, `limited` (see `usage_limit`), or `""` when no fresh rule produces a confident status. |
 | `live_children` | integer | yes | Descendants with positive liveness: pending/running lifecycle, active/idle runtime, or actionable approval/user-input attention. Terminal lifecycle always excludes a child. `runtime=unknown|not_loaded` plus `lifecycle=unknown` is visible topology but contributes zero. |
+| `paused_children` | integer | omitted when zero | Publication-only. While `usage_limit` is active, the children `live_children` would count are reported here instead and `live_children` reads 0: the cap is the account's, so subagents stop with their root. `in_flight_subagents` likewise reads 0. |
 | `waiting_nodes` | integer | yes | Live root/descendant nodes waiting for either approval or user input. Equals `approval_nodes + user_input_nodes`. |
 | `approval_nodes` | integer | yes | Live nodes whose attention is `approval`. |
 | `user_input_nodes` | integer | yes | Live nodes whose attention is `user_input`. |

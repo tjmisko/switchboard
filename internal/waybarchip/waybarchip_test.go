@@ -1354,3 +1354,17 @@ func TestNameConfigShouldPickUpARenameWrittenBySetAbbrev(t *testing.T) {
 		t.Errorf("hover should keep the full display name, not the abbreviation: %q", got.Tooltip)
 	}
 }
+
+func TestAgentFanoutShouldNamePausedAgentsWhenTheSessionIsLimited(t *testing.T) {
+	graph := &state.AgentGraph{
+		RootID:  "root",
+		Summary: state.AgentGraphSummary{Status: state.StatusLimited, PausedChildren: 1},
+		Nodes: []state.AgentNode{
+			{ID: "root"},
+			{ID: "child", ParentID: "root", Lifecycle: agentgraph.LifecycleRunning},
+		},
+	}
+	if got, want := agentFanout(graph), "1 agent · 1 paused"; got != want {
+		t.Fatalf("agentFanout = %q, want %q", got, want)
+	}
+}
