@@ -401,7 +401,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		}
 		switch req.Cmd {
 		case "list":
-			snap := s.store.Snapshot()
+			snap := s.store.PublishedSnapshot()
 			_ = enc.Encode(Response{Snapshot: &snap})
 		case "list-all":
 			snap := s.aggregateSnapshot()
@@ -493,7 +493,7 @@ func (s *Server) aggregateSnapshot() state.Snapshot {
 	if s.view != nil {
 		return s.view.Snapshot()
 	}
-	return s.store.Snapshot()
+	return s.store.PublishedSnapshot()
 }
 
 func (s *Server) subscribeAll(ctx context.Context, conn net.Conn, enc *json.Encoder) {
