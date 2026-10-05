@@ -37,6 +37,9 @@ func Prepare(snapshot state.Snapshot, limit int) []Item {
 		if status == state.StatusDelegating {
 			classes = append(classes, "delegating")
 		}
+		if status == state.StatusLimited {
+			classes = append(classes, "limited")
+		}
 		if session.Focused {
 			classes = append(classes, "focused")
 		}
@@ -74,13 +77,32 @@ func Status(session state.Session) string {
 	return "unknown"
 }
 
-// ColorClass maps delegating onto working while retaining delegating as a
-// secondary class in Prepare. This keeps the existing green/no-attention rule.
+// ColorClass maps delegating onto working and limited onto unknown, retaining
+// each as a secondary class in Prepare. Delegating keeps the green/no-attention
+// rule; limited paints grey in every stylesheet that already greys unknown.
 func ColorClass(status string) string {
-	if status == state.StatusDelegating {
+	switch status {
+	case state.StatusDelegating:
 		return state.StatusWorking
+	case state.StatusLimited:
+		return "unknown"
 	}
 	return status
+}
+
+// LimitDetail spells out a limited session's status for a tooltip: "usage
+// limit · resets 5:15 PM", with the weekday when the reset is not today, and
+// plain "usage limit" when the provider named no reset.
+func LimitDetail(session state.Session, now time.Time) string {
+	if session.UsageLimit == nil || session.UsageLimit.ResetsAt == nil {
+		return "usage limit"
+	}
+	resetsAt := session.UsageLimit.ResetsAt.In(now.Location())
+	layout := "3:04 PM"
+	if y, m, d := resetsAt.Date(); y != now.Year() || m != now.Month() || d != now.Day() {
+		layout = "Mon 3:04 PM"
+	}
+	return "usage limit · resets " + resetsAt.Format(layout)
 }
 
 // FocusSelector returns the stable switchboard-ctl selector for a session, or an
