@@ -103,9 +103,11 @@ type agentCoordinator struct {
 	codexLimitScans map[provider.RootKey]*codexLimitScan
 
 	// piMu serializes the Pi hook reducer (pi_hooks.go) per daemon; it is
-	// taken before the store lock, never under it.
+	// taken before the store lock, never under it. piTails caches the session
+	// file reads that stand in for hooks after a restart (pi_session_file.go).
 	piMu    sync.Mutex
 	piRoots map[provider.RootKey]*piHookRoot
+	piTails map[provider.RootKey]*piSessionTail
 }
 
 type codexNamingState struct {
@@ -140,7 +142,7 @@ func newAgentCoordinator(store *state.Store, sink *history.Sink, claude claudeOb
 		namingModel: codexprovider.DefaultDisplayNameModel, namingTimeout: 45 * time.Second,
 		codexHookRoots: make(map[provider.RootKey]*codexHookRootState), codexStarts: make(map[provider.RootKey]*pendingCodexStart),
 		codexStartSettle: codexHookStartSettle, codexApprovalGrace: codexHookApprovalGrace,
-		piRoots: make(map[provider.RootKey]*piHookRoot),
+		piRoots: make(map[provider.RootKey]*piHookRoot), piTails: make(map[provider.RootKey]*piSessionTail),
 	}
 }
 

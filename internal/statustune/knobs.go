@@ -214,6 +214,10 @@ const (
 	// RulePiHookLapsed — the last hook's lease ran out with no newer hook, so
 	// the status fell back to herdr's reading, or to unknown without one.
 	RulePiHookLapsed = "pi_hook_lapsed"
+	// RulePiSessionFileRead — after a daemon restart, before any hook reached
+	// the root, the tail of Pi's session file set the status: working when the
+	// last assistant message stopped for a tool, else idle.
+	RulePiSessionFileRead = "pi_session_file_read"
 )
 
 // KnobHint names the Tuning field that governs a rule's outcome, with a one-line
@@ -286,6 +290,7 @@ var ruleKnobs = map[string]KnobHint{
 	RulePiDialogClosed:          {"", "the extension's dialog count fell to zero; the chip returns to working inside a run, else idle. A count rather than an edge, so a lost hook self-corrects on the next one. Nothing to tune"},
 	RulePiRunSettled:            {"", "Pi's agent_settled is the real end of a run (agent_end can still be followed by a retry); nothing to tune"},
 	RulePiRunFailed:             {"", "the run settled after an error stop. The status is idle; a usage-limit verdict on it publishes limited separately. Nothing to tune"},
+	RulePiSessionFileRead:       {"", "a restarted daemon read the tail of Pi's session file because no hook had reached it yet; the next hook or a live herdr reading takes over. Nothing to tune"},
 	RulePiHookLapsed:            {"", "the Pi hook lease (the hook-only windows Codex uses: 10m working, 24h red, 7d idle) ran out without a newer hook, so herdr's reading decides, or nothing does. Nothing in Tuning governs it"},
 	RuleGraphStaleBackstop:      {"PendingWriterStaleCap", "how long one writer's transcript may sit quiescent before its prompt is dropped as unanswerable (default 30m). Applies ONLY to a writer whose tail carries no unanswered tool — one that still does is demonstrably blocked and is held red regardless. Raise it to let an abandoned teammate's red nag longer"},
 }

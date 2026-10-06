@@ -264,11 +264,13 @@ func (c *agentCoordinator) recordPiRotation(req rpc.Request, pid int, cwd, prevI
 	c.recordDiagnostic(agentgraph.ProviderPi, "conversation_rotated", now)
 }
 
-// reconcilePiRoots runs on the coordinator's periodic pass. It re-projects
-// each bound Pi session at now, so a hook lease that ran out with nothing
-// newer hands the status to herdr or to unknown, and it drops the reducer
-// state of Pi processes no longer tracked.
+// reconcilePiRoots runs on the coordinator's periodic pass. It reads the
+// session file of each restored root no hook has reached yet, re-projects each
+// bound Pi session at now, so a lease that ran out with nothing newer hands the
+// status to herdr or to unknown, and it drops the reducer state of Pi
+// processes no longer tracked.
 func (c *agentCoordinator) reconcilePiRoots(now time.Time) {
+	c.seedPiFromSessionFiles(now)
 	type lapse struct {
 		pid            int
 		sessionID, cwd string
@@ -291,6 +293,11 @@ func (c *agentCoordinator) reconcilePiRoots(now time.Time) {
 
 	c.piMu.Lock()
 	defer c.piMu.Unlock()
+	for key := range c.piTails {
+		if !live[key] {
+			delete(c.piTails, key)
+		}
+	}
 	for key, root := range c.piRoots {
 		if live[key] {
 			continue
