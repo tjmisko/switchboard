@@ -231,6 +231,36 @@ func TestStreamLocalAnnouncesBeforeSubscribingAndEmitsCanonicalFrames(t *testing
 	}
 }
 
+// #97: a session's birth token is host-local. The local stream never sends it
+// to a peer, and a frame from a peer that carries one anyway is stripped.
+func TestBirthTokenShouldNeverCrossFederationWhenASessionCarriesOne(t *testing.T) {
+	withBirth := func() state.Snapshot {
+		snapshot := testSnapshot(1)
+		snapshot.Sessions[0].Birth = "boot:12345"
+		return snapshot
+	}
+
+	t.Run("should not send the token when streaming the local snapshot", func(t *testing.T) {
+		local := withBirth()
+		client := &fakeSubscriptionClient{responses: []rpc.Response{{Snapshot: &local}}}
+		var output bytes.Buffer
+		_ = StreamLocal(context.Background(), client, &output, StreamOptions{Hostname: func() (string, error) { return "buildbox", nil }})
+		if output.Len() == 0 || bytes.Contains(output.Bytes(), []byte("boot:12345")) || bytes.Contains(output.Bytes(), []byte(`"birth"`)) {
+			t.Fatalf("stream output = %s, want a frame without the birth token", output.Bytes())
+		}
+	})
+	t.Run("should drop the token when a peer's frame carries one", func(t *testing.T) {
+		body := encodedFrame(t, "buildbox", withBirth())
+		frame, err := DecodeFrame(bytes.TrimSuffix(body, []byte("\n")))
+		if err != nil {
+			t.Fatalf("DecodeFrame: %v", err)
+		}
+		if got := frame.Snapshot.Sessions[0].Birth; got != "" {
+			t.Fatalf("decoded Birth = %q, want it cleared", got)
+		}
+	})
+}
+
 func TestStreamLocalStopsBeforeSubscribeWhenAttachFails(t *testing.T) {
 	client := &fakeSubscriptionClient{}
 	want := errors.New("announce failed")
