@@ -253,6 +253,7 @@ switchboard-ctl cycle next|prev     # focus next/prev session, wrapping
 switchboard-ctl attention           # move right to the most urgent color, wrapping; only toggle one layer up when already there
 switchboard-ctl pick                # exact-token<TAB>label<TAB>ws<TAB>cwd (for fzf)
 switchboard-ctl diagnose --observer # content-free binding/freshness/graph health
+switchboard-ctl explain --pid <n>   # why one root shows its status now; --json for the record
 ```
 
 On an Observe-only stack, `focus` returns a clean "navigate unsupported"
@@ -489,6 +490,20 @@ Use `switchboard-ctl diagnose --observer` to inspect content-free binding,
 snapshot freshness, completeness, node counts, observer mode, display-name
 origin, and finite error categories. It never prints cwd, transcripts, thread
 labels, prompts, assistant content, commands, or raw provider payloads.
+
+`diagnose` is the history; `switchboard-ctl explain --pid <pid> [--json]` is
+the present. It asks the daemon why one local root shows the status it does
+now: the source that decided (provider graph, hook, herdr, usage limit), a
+reason code (`graph_authority`, `hook_owned`, `herdr_override`,
+`herdr_yield_attention`, `pi_hook_authority`, `herdr_fallback`, `herdr_only`,
+`usage_limit_overlay`, or why the status is unknown: `binding_missing`,
+`observation_pending`, `observation_expired`, `coverage_unsupported`,
+`unrecorded`), the evidence's observation time and freshness deadline, when
+the decision was last made, and up to eight readings that lost with the rule
+that rejected each (`source_outranked`, `stale_vs_fresh`,
+`older_than_current`, or the deciding reason). Under a usage limit it shows
+`limited` with the decision beneath it. The record is in memory, bound to the
+process lifetime and provider session, and carries ids, enums and times only.
 
 ## Requirements
 
