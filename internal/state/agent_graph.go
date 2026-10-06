@@ -328,6 +328,13 @@ func hydrateAgentGraph(sess *Session, now time.Time) {
 			}
 		}
 	}
+	// A Pi graph was live authority only for the daemon that observed it.
+	// Restored, it is last-known presentation: it keeps the deadline it was
+	// persisted with and yields to any live reading (piStatusAuthority).
+	if provider == agentgraph.ProviderPi &&
+		(observation.Source == agentgraph.SourceHook || observation.Source == agentgraph.SourcePiSessionFile) {
+		observation.Source = agentgraph.SourceRestoredLastKnown
+	}
 	projection, err := ProjectAgentGraph(observation, sess.AgentGraph, now)
 	if err != nil {
 		sess.AgentGraph = nil

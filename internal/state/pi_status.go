@@ -9,19 +9,37 @@ import (
 // piHookGraphFresh reports whether the session's graph is Pi hook evidence for
 // its bound root that is still within its lease at now.
 func (s *Session) piHookGraphFresh(now time.Time) bool {
-	g := s.AgentGraph
-	return s.Agent == AgentKindPi && s.Pi != nil && s.Pi.SessionID != "" &&
-		g != nil && g.Source == agentgraph.SourceHook && g.RootID == s.Pi.SessionID && g.Fresh(now)
+	return s.piGraphFresh(now, agentgraph.SourceHook)
 }
 
-// piStatusAuthority is the interim precedence between a bound Pi session's two
-// status sources (phase-1 plan, 1.5):
+// piGraphFresh reports whether the session's graph comes from one of sources,
+// is rooted at the bound Pi session, and is still within its lease at now.
+func (s *Session) piGraphFresh(now time.Time, sources ...agentgraph.SourceKind) bool {
+	g := s.AgentGraph
+	if s.Agent != AgentKindPi || s.Pi == nil || s.Pi.SessionID == "" ||
+		g == nil || g.RootID != s.Pi.SessionID || !g.Fresh(now) {
+		return false
+	}
+	for _, source := range sources {
+		if g.Source == source {
+			return true
+		}
+	}
+	return false
+}
+
+// piStatusAuthority is the interim precedence between a bound Pi session's
+// status sources (phase-1 plan, 1.5 and 1.7):
 //
 //  1. Pi hook evidence within its lease wins. It is exact: the extension
 //     reports Pi's own lifecycle and dialog count.
 //  2. Otherwise a live herdr reading decides, mapped as HerdrLegacyStatus
 //     maps it for every other agent.
-//  3. Otherwise the status is unknown ("").
+//  3. Otherwise the tail of Pi's session file, read while no hook has reached
+//     this daemon, or the graph a restart restored, within its lease. Neither
+//     is live authority, so herdr outranks both; a restored graph keeps only
+//     the deadline it was persisted with.
+//  4. Otherwise the status is unknown ("").
 //
 // herdr's blocked state and the hook's dialog count both mean red, so they
 // cannot disagree on red; and because fresh hook evidence outranks herdr
@@ -37,6 +55,9 @@ func (s *Session) piStatusAuthority(now time.Time) (status string, since time.Ti
 		if status, ok := HerdrLegacyStatus(s.Herdr.Status, ""); ok {
 			return status, s.Herdr.StatusSince
 		}
+	}
+	if s.piGraphFresh(now, agentgraph.SourcePiSessionFile, agentgraph.SourceRestoredLastKnown) {
+		return s.AgentGraph.Summary.Status, s.AgentGraph.Summary.Since
 	}
 	return "", time.Time{}
 }
@@ -55,9 +76,10 @@ func (s *Session) projectPiStatus(info *AgentInfo, fallback, now time.Time) {
 	info.Status, info.StatusSince = status, since
 }
 
-// SetPiHookGraph lands the projection of one Pi hook observation: it binds the
-// Pi block to the graph's root (Pi's session id) and re-projects the published
-// status, returning it before and after so the caller can record the edge.
+// SetPiHookGraph lands the projection of one Pi observation, a hook's or the
+// session file's: it binds the Pi block to the graph's root (Pi's session id)
+// and re-projects the published status, returning it before and after so the
+// caller can record the edge.
 func (s *Session) SetPiHookGraph(graph *AgentGraph, now time.Time) (before, after string) {
 	before = s.publishedStatus(now)
 	s.AgentGraph = graph.Clone()

@@ -746,7 +746,7 @@ func sourceRank(source agentgraph.SourceKind) int {
 		return 4
 	case agentgraph.SourceHook:
 		return 3
-	case agentgraph.SourceCodexRollout:
+	case agentgraph.SourceCodexRollout, agentgraph.SourcePiSessionFile:
 		return 2
 	case agentgraph.SourceRestoredLastKnown:
 		return 1

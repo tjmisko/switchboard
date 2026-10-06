@@ -106,6 +106,10 @@ const (
 	SourceClaudeTranscript  SourceKind = "claude_transcript"
 	SourceCodexRollout      SourceKind = "codex_rollout"
 	SourceRestoredLastKnown SourceKind = "restored_last_known"
+	// SourcePiSessionFile is the tail of Pi's own session file, read while no
+	// hook has reached a restarted daemon. It is transcript evidence of the
+	// same class as SourceCodexRollout.
+	SourcePiSessionFile SourceKind = "pi_session_file"
 	// SourceHerdr is herdr's own per-pane agent status, the only source for an
 	// agent Switchboard has no provider adapter for.
 	SourceHerdr SourceKind = "herdr"
