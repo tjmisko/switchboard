@@ -559,7 +559,7 @@ func (c *agentCoordinator) applyObservationWithRule(ref provider.RootRef, genera
 		if ref.Provider == agentgraph.ProviderClaude {
 			applyClaudeCompatibility(sess.AgentBlock(state.AgentKindClaude), compat)
 		}
-		sess.SetAgentGraph(graph)
+		sess.SetAgentGraph(graph, now)
 		if info := sess.Enrichment(); info != nil {
 			afterStatus = info.Status
 			afterPending = info.PendingSummary()

@@ -37,10 +37,16 @@ func (u *UsageLimit) ActiveAt(now time.Time) bool {
 	if u == nil {
 		return false
 	}
+	return now.Before(u.deadline())
+}
+
+// deadline is when the limit stops holding: its reset time, else
+// usageLimitUnknownResetHold past its evidence.
+func (u *UsageLimit) deadline() time.Time {
 	if u.ResetsAt != nil {
-		return now.Before(*u.ResetsAt)
+		return *u.ResetsAt
 	}
-	return now.Before(u.ObservedAt.Add(usageLimitUnknownResetHold))
+	return u.ObservedAt.Add(usageLimitUnknownResetHold)
 }
 
 // RecordUsageLimit stores limit evidence on the session. Evidence older than the
@@ -91,10 +97,7 @@ func projectUsageLimit(sess *Session, now time.Time) {
 		sess.UsageLimit = nil
 		return
 	}
-	// A live red is a decision the user can act on, and a capped turn raises
-	// none, so a permission status means the limit no longer holds: the clear
-	// that should have said so was lost. Never hide it behind grey.
-	if publishedPermission(sess) {
+	if !usageLimitOverlays(sess, now) {
 		return
 	}
 	sess.UsageLimit = cloneUsageLimit(sess.UsageLimit)
@@ -116,6 +119,16 @@ func projectUsageLimit(sess *Session, now time.Time) {
 		summary.PausedChildren += summary.LiveChildren
 		summary.LiveChildren = 0
 	}
+}
+
+// usageLimitOverlays reports whether publication reads limited over the
+// session's status at now. It is the one rule both ProjectPublished and
+// ExplainStatus apply.
+func usageLimitOverlays(sess *Session, now time.Time) bool {
+	// A live red is a decision the user can act on, and a capped turn raises
+	// none, so a permission status means the limit no longer holds: the clear
+	// that should have said so was lost. Never hide it behind grey.
+	return sess.UsageLimit.ActiveAt(now) && !publishedPermission(sess)
 }
 
 func publishedPermission(sess *Session) bool {

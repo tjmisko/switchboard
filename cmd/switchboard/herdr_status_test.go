@@ -113,7 +113,7 @@ var (
 // says idle.
 func graphClaudeSession() *state.Session {
 	sess := &state.Session{PID: 700, Agent: state.AgentKindClaude, TTY: "/dev/pts/7", CWD: "/repo"}
-	sess.SetAgentGraph(&state.AgentGraph{RootID: "sess-1", Summary: state.AgentGraphSummary{Status: state.StatusIdle, Since: herdrT0}})
+	sess.SetAgentGraph(&state.AgentGraph{RootID: "sess-1", Summary: state.AgentGraphSummary{Status: state.StatusIdle, Since: herdrT0}}, herdrT0)
 	return sess
 }
 

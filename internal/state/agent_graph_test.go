@@ -237,7 +237,7 @@ func TestSetAgentGraphProjectsLegacyWithoutDiscardingClaudeCompatibilityFields(t
 			}},
 		},
 	}
-	sess.SetAgentGraph(first)
+	sess.SetAgentGraph(first, graphObserved)
 	if sess.AgentGraph == first {
 		t.Fatal("SetAgentGraph retained caller-owned graph pointer")
 	}
@@ -275,7 +275,7 @@ func TestSetAgentGraphProjectsLegacyWithoutDiscardingClaudeCompatibilityFields(t
 	if second.Summary.Since.Equal(first.Summary.Since) {
 		t.Fatal("structured graph summary transition did not reset graph summary since")
 	}
-	sess.SetAgentGraph(second)
+	sess.SetAgentGraph(second, graphObserved)
 	if !sess.Codex.StatusSince.Equal(priorLegacySince) {
 		t.Fatalf("same legacy status moved status_since: got %v want %v", sess.Codex.StatusSince, priorLegacySince)
 	}
@@ -293,7 +293,7 @@ func TestSetAgentGraphProjectsLegacyWithoutDiscardingClaudeCompatibilityFields(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	sess.SetAgentGraph(third)
+	sess.SetAgentGraph(third, graphObserved)
 	if sess.Codex.Status != state.StatusIdle || !sess.Codex.StatusSince.Equal(obs.ObservedAt) {
 		t.Fatalf("real legacy transition = %+v, want idle since %v", sess.Codex, obs.ObservedAt)
 	}
@@ -307,7 +307,7 @@ func TestStoreSnapshotDeepCopiesAgentGraph(t *testing.T) {
 	store := state.New("")
 	store.Apply(func(m map[int]*state.Session) {
 		sess := &state.Session{PID: 1, Agent: state.AgentKindCodex, Codex: &state.AgentInfo{}}
-		sess.SetAgentGraph(graph)
+		sess.SetAgentGraph(graph, graphObserved)
 		m[1] = sess
 	})
 

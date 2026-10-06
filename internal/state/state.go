@@ -12,6 +12,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/tjmisko/switchboard/internal/statusexplain"
 )
 
 type Session struct {
@@ -51,6 +53,11 @@ type Session struct {
 	// RecordUsageLimit can refuse evidence that the session has already outrun.
 	// In-memory only; a restart forgets it, which costs at most one stale read.
 	usageLimitActivityAt time.Time
+	// statusDecision is the content-free record of the projection that last
+	// set the published status: which source decided, under which rule, and
+	// which reading lost (#95). In-memory only, like usageLimitActivityAt;
+	// ExplainStatus reads it and nothing decides from it.
+	statusDecision statusexplain.Projection
 	// Navigable is populated only on detached aggregate copies. It says an
 	// exact local route candidate exists now; every action still revalidates the
 	// pane, window, liveness, and StartedAt before acting. Host-local snapshots
