@@ -18,6 +18,7 @@ import (
 	codexprovider "github.com/tjmisko/switchboard/internal/provider/codex"
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
+	"github.com/tjmisko/switchboard/internal/statusexplain"
 	"github.com/tjmisko/switchboard/internal/statustune"
 )
 
@@ -79,6 +80,9 @@ type agentCoordinator struct {
 	tracked     map[provider.RootKey]trackedProviderRoot
 	diagnostics map[string]rpc.AgentDiagnostic
 	lastLog     map[string]time.Time
+	// admissions is graph admission's part of each root's decision record,
+	// read by Explain (status_explain.go).
+	admissions map[provider.RootKey]*admissionRecord
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -297,6 +301,7 @@ func (c *agentCoordinator) refreshTrackedRoots() []provider.RootRef {
 			c.generation[key]++
 			gone = append(gone, forgotten{key: key, root: root})
 			delete(c.tracked, key)
+			delete(c.admissions, key)
 		}
 	}
 	for key, ref := range live {
@@ -395,10 +400,12 @@ func (c *agentCoordinator) observeAt(ctx context.Context, ref provider.RootRef, 
 	}
 	observer := c.observer(ref.Provider)
 	if observer == nil {
+		c.recordObserveOutcome(ref, statusexplain.ReasonCoverageUnsupported)
 		return
 	}
 	if ref.Provider == agentgraph.ProviderClaude {
 		if ref.ProviderSessionID == "" {
+			c.recordObserveOutcome(ref, statusexplain.ReasonBindingMissing)
 			return // exact Claude identity has not arrived; never bind by cwd
 		}
 		c.restoreClaude(ref)
@@ -415,6 +422,7 @@ func (c *agentCoordinator) observeAt(ctx context.Context, ref provider.RootRef, 
 		category := "snapshot_pending"
 		if ref.Provider == agentgraph.ProviderCodex && observation.RootID == "" {
 			category = "exact_binding_unavailable"
+			c.recordObserveOutcome(ref, statusexplain.ReasonBindingMissing)
 		}
 		c.recordDiagnostic(ref.Provider, category, now)
 		c.expireCurrent(ref, generation, now)
@@ -518,8 +526,13 @@ func (c *agentCoordinator) applyObservationWithRule(ref provider.RootRef, genera
 	if !ok || agentgraph.ProviderKind(priorSession.Agent) != ref.Provider {
 		return false
 	}
-	if !hookOwnsTransition && !shouldApplyObservation(observation, priorSession.AgentGraph, now) {
-		return false
+	if !hookOwnsTransition {
+		if admitted, reason := admitObservation(observation, priorSession.AgentGraph, now); !admitted {
+			if reason != "" {
+				c.recordRejectionLocked(ref.Key(), observation, reason, now)
+			}
+			return false
+		}
 	}
 	graph, err := state.ProjectAgentGraph(observation, priorSession.AgentGraph, now)
 	if err != nil {
@@ -595,6 +608,7 @@ func (c *agentCoordinator) applyObservationWithRule(ref provider.RootRef, genera
 	}
 	root.provider, root.kind, root.rootID = c.observer(ref.Provider), ref.Provider, observation.RootID
 	c.tracked[ref.Key()] = root
+	c.recordAdmissionLocked(ref.Key(), graph, hookOwnsTransition)
 	for _, event := range canonical {
 		c.sink.Record(event)
 	}
@@ -662,11 +676,19 @@ func observationRootName(observation agentgraph.Observation) (string, bool) {
 }
 
 func shouldApplyObservation(observation agentgraph.Observation, current *state.AgentGraph, now time.Time) bool {
+	admitted, _ := admitObservation(observation, current, now)
+	return admitted
+}
+
+// admitObservation is graph admission: whether observation may replace
+// current, and, when it may not, the rule that refused it (#95). An empty
+// observation is refused with no reason; there is nothing to explain.
+func admitObservation(observation agentgraph.Observation, current *state.AgentGraph, now time.Time) (bool, statusexplain.Reason) {
 	if observation.RootID == "" || len(observation.Nodes) == 0 {
-		return false
+		return false, ""
 	}
 	if current == nil || current.RootID != observation.RootID {
-		return true
+		return true, ""
 	}
 	currentFresh := current.Fresh(now)
 	candidateFresh := observation.Fresh(now)
@@ -676,27 +698,30 @@ func shouldApplyObservation(observation agentgraph.Observation, current *state.A
 		// app-server sample corrects it, and a delayed sample can never repaint
 		// over a newer hook. Claude retains its established hook/transcript policy.
 		if observation.ObservedAt.Before(current.ObservedAt) {
-			return false
+			return false, statusexplain.ReasonOlderThanCurrent
 		}
 		if observation.ObservedAt.After(current.ObservedAt) {
 			if currentFresh && !candidateFresh && current.Source != observation.Source {
-				return false
+				return false, statusexplain.ReasonStaleVsFresh
 			}
-			return true
+			return true, ""
 		}
 	}
 	currentRank := sourceRank(current.Source)
 	candidateRank := sourceRank(observation.Source)
 	if currentFresh && currentRank > candidateRank {
-		return false
+		return false, statusexplain.ReasonSourceOutranked
 	}
 	if candidateFresh && candidateRank > currentRank {
-		return true
+		return true, ""
 	}
 	if currentFresh && !candidateFresh && current.Source != observation.Source {
-		return false
+		return false, statusexplain.ReasonStaleVsFresh
 	}
-	return !observation.ObservedAt.Before(current.ObservedAt)
+	if observation.ObservedAt.Before(current.ObservedAt) {
+		return false, statusexplain.ReasonOlderThanCurrent
+	}
+	return true, ""
 }
 
 // overlayCodexHookObservation keeps the app-server's structural detail and

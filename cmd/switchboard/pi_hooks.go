@@ -11,6 +11,7 @@ import (
 	"github.com/tjmisko/switchboard/internal/provider"
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
+	"github.com/tjmisko/switchboard/internal/statusexplain"
 	"github.com/tjmisko/switchboard/internal/statustune"
 )
 
@@ -323,6 +324,15 @@ func (c *agentCoordinator) recordPiRotation(req rpc.Request, pid int, cwd, prevI
 	c.recordDiagnostic(agentgraph.ProviderPi, "conversation_rotated", now)
 }
 
+// piDecisionMoved reports whether a re-projection changed which source decides
+// a Pi status or why, even with the status itself unchanged: a hook lease that
+// lapses onto a herdr reading of the same colour. Such a move is applied to the
+// store so explain does not keep attributing the status to the lapsed hook; it
+// publishes nothing, since no published field changes.
+func piDecisionMoved(before, after statusexplain.Projection) bool {
+	return before.Reason != after.Reason || before.Source != after.Source
+}
+
 // reconcilePiRoots runs on the coordinator's periodic pass. It reads the
 // session file of each restored root no hook has reached yet, re-projects each
 // bound Pi session at now, so a lease that ran out with nothing newer hands the
@@ -345,7 +355,8 @@ func (c *agentCoordinator) reconcilePiRoots(now time.Time) {
 			continue
 		}
 		live[providerRootKey(sess)] = true
-		if before, after := sess.ReprojectPi(now); before != after {
+		prior := sess.StatusDecision()
+		if before, after := sess.ReprojectPi(now); before != after || piDecisionMoved(prior, sess.StatusDecision()) {
 			pending = true
 		}
 	}
