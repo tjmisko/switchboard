@@ -47,6 +47,11 @@ const (
 	ReasonObservationExpired Reason = "observation_expired"
 	// The source in hand cannot classify this root's status.
 	ReasonCoverageUnsupported Reason = "coverage_unsupported"
+	// The observer authoritatively ended its earlier evidence for this root
+	// (the provider session it was bound to was replaced), so that evidence was
+	// dropped rather than held to its deadline, and nothing about the new
+	// binding has landed yet (#98).
+	ReasonObservationReset Reason = "observation_reset"
 	// The published status was set by a path that records no decision (a
 	// legacy hook transition, or state hydrated across a restart). Explain says
 	// so rather than attributing it to evidence that did not decide it.
@@ -84,7 +89,7 @@ var knownReasons = map[Reason]bool{
 	ReasonHerdrYieldAttention: true, ReasonHerdrOnly: true, ReasonHerdrFallback: true,
 	ReasonPiHookAuthority: true, ReasonUsageLimitOverlay: true, ReasonBindingMissing: true,
 	ReasonObservationPending: true, ReasonObservationExpired: true,
-	ReasonCoverageUnsupported: true, ReasonUnrecorded: true, ReasonSourceOutranked: true,
+	ReasonCoverageUnsupported: true, ReasonObservationReset: true, ReasonUnrecorded: true, ReasonSourceOutranked: true,
 	ReasonStaleVsFresh: true, ReasonOlderThanCurrent: true,
 	ReasonEventAuthority: true, ReasonTranscriptAuthority: true, ReasonTerminalAuthority: true,
 	ReasonLastKnown: true, ReasonAttentionHeld: true, ReasonDescendantsLive: true,
