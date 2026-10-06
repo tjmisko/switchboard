@@ -128,3 +128,33 @@ func (s *Session) SetPiNativeName(sessionID, name string) {
 	}
 	s.DisplayName = &DisplayName{Value: name, Origin: DisplayNameNative, ConversationID: sessionID}
 }
+
+// SetPiUsage sets the bound Pi root node's cumulative usage and billing
+// identity on a graph Pi owns (its hooks', its session file's, or a restored
+// one). Status, summary and lease are untouched: usage is no status evidence.
+// A herdr graph is left alone, since herdr rebuilds its node on every reading;
+// the reducer's own total lands with the next Pi observation instead. It
+// reports whether the graph took the usage.
+func (s *Session) SetPiUsage(sessionID string, usage agentgraph.Usage, billing agentgraph.BillingIdentity) bool {
+	g := s.AgentGraph
+	if s.Agent != AgentKindPi || s.Pi == nil || s.Pi.SessionID != sessionID ||
+		g == nil || g.RootID != sessionID || g.Source == agentgraph.SourceHerdr {
+		return false
+	}
+	clone := g.Clone()
+	for i := range clone.Nodes {
+		if clone.Nodes[i].ID != sessionID {
+			continue
+		}
+		clone.Nodes[i].Usage = AgentUsage{
+			InputTokens: usage.InputTokens, CachedInputTokens: usage.CachedInputTokens,
+			CacheWriteInputTokens: usage.CacheWriteInputTokens, OutputTokens: usage.OutputTokens,
+			ReasoningOutputTokens: usage.ReasoningOutputTokens, TotalTokens: usage.TotalTokens,
+			ModelContextWindow: usage.ModelContextWindow,
+		}
+		clone.Nodes[i].Billing = billing
+		s.AgentGraph = clone
+		return true
+	}
+	return false
+}

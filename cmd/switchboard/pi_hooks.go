@@ -31,12 +31,16 @@ const (
 // dialogs. lastAt is the newest hook instant applied, which orders the
 // spawn-and-forget hooks: one older than it is dropped. nameAt orders Pi's
 // /name the same way, apart from status, because a rename carries none.
+// usage and billing are the bound session's running totals (pi_usage.go).
 type piHookRoot struct {
 	sessionID   string
 	runOpen     bool
 	openDialogs int
 	lastAt      time.Time
 	nameAt      time.Time
+	usage       agentgraph.Usage
+	billing     agentgraph.BillingIdentity
+	usageSeen   piUsageSeen
 }
 
 // seedPiHookRoot rebuilds a root's reducer state from the session's published
@@ -52,6 +56,11 @@ func seedPiHookRoot(sess state.Session) *piHookRoot {
 		if g.Source == agentgraph.SourceHook {
 			root.lastAt = g.ObservedAt
 		}
+		// A restart keeps the totals a Pi-owned graph carried; herdr's node
+		// never holds any.
+		seed := agentgraph.Observation{Nodes: []agentgraph.Node{{ID: root.sessionID}}, RootID: root.sessionID}
+		carryPiRootDetail(&seed, g)
+		root.usage, root.billing = seed.Nodes[0].Usage, seed.Nodes[0].Billing
 	}
 	return root
 }
@@ -112,7 +121,10 @@ func piRootObservation(root *piHookRoot, at time.Time) agentgraph.Observation {
 	return agentgraph.Observation{
 		Provider: agentgraph.ProviderPi, RootID: root.sessionID, Source: agentgraph.SourceHook,
 		ObservedAt: at, FreshUntil: at.Add(lease),
-		Nodes: []agentgraph.Node{{ID: root.sessionID, Runtime: runtime, Attention: attention, UpdatedAt: at}},
+		Nodes: []agentgraph.Node{{
+			ID: root.sessionID, Runtime: runtime, Attention: attention, UpdatedAt: at,
+			Usage: root.usage, Billing: root.billing,
+		}},
 	}
 }
 
@@ -163,8 +175,11 @@ func (c *agentCoordinator) handlePiHook(req rpc.Request, sess state.Session) {
 		c.piRoots[key] = root
 	}
 	switch req.Event {
-	case "SessionEnd", "Usage":
-		return // no status evidence; Usage is accounted elsewhere
+	case "SessionEnd":
+		return // no status evidence
+	case "Usage":
+		c.applyPiUsage(key, root, req, sess, now)
+		return
 	case "SessionName":
 		c.applyPiSessionName(key, root, req, now)
 		return
@@ -189,7 +204,9 @@ func (c *agentCoordinator) handlePiHook(req rpc.Request, sess state.Session) {
 	next := *root
 	next.sessionID = sessionID
 	if rotated {
+		// Name and usage belong to the conversation left, not the new one.
 		next.runOpen, next.openDialogs, next.nameAt = false, 0, time.Time{}
+		next.usage, next.billing, next.usageSeen = agentgraph.Usage{}, agentgraph.BillingIdentity{}, piUsageSeen{}
 	}
 	// SessionStart carries Pi's current /name for the session it binds.
 	naming := req.Event == "SessionStart" && !now.Before(next.nameAt)
