@@ -132,7 +132,12 @@ func graphClaudeSession(t *testing.T) *state.Session {
 func newTestSink(t *testing.T) (*history.Sink, string) {
 	t.Helper()
 	dir := t.TempDir()
-	return history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: dir}), dir
+	sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: dir})
+	// Cleanups run last-in first-out, so the sink drains its writer before
+	// TempDir's RemoveAll runs; otherwise a test that never reads its events
+	// races the writer and RemoveAll fails with "directory not empty".
+	t.Cleanup(sink.Close)
+	return sink, dir
 }
 
 func transitionsIn(t *testing.T, sink *history.Sink, dir string) []history.Event {
