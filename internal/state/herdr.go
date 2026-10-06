@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/agentgraph"
+	"github.com/tjmisko/switchboard/internal/statusexplain"
 )
 
 // HerdrInfo is the herdr (herdr.dev) pane hosting a session and herdr's own
@@ -75,17 +76,23 @@ func HerdrLegacyStatus(herdr, provider string) (string, bool) {
 }
 
 // herdrAuthority returns the status herdr decides for this session given the
-// provider's own, or false when herdr is not the authority right now.
-func (s *Session) herdrAuthority(provider string) (string, time.Time, bool) {
+// provider's own, or false when herdr is not the authority right now. reason
+// says why: herdr_override when it decides, herdr_yield_attention when it
+// yields to Codex attention, coverage_unsupported when its live reading
+// classifies nothing, and "" when herdr is not followed.
+func (s *Session) herdrAuthority(provider string) (status string, since time.Time, reason statusexplain.Reason, ok bool) {
 	if s.Herdr == nil || !s.Herdr.Live {
-		return "", time.Time{}, false
+		return "", time.Time{}, "", false
 	}
 	if s.Agent == AgentKindCodex && s.AgentGraph != nil && s.AgentGraph.Fresh(time.Now()) &&
 		(s.AgentGraph.Summary.Attention == agentgraph.AttentionUserInput || s.AgentGraph.Summary.Attention == agentgraph.AttentionApproval) {
-		return "", time.Time{}, false
+		return "", time.Time{}, statusexplain.ReasonHerdrYieldAttention, false
 	}
-	status, ok := HerdrLegacyStatus(s.Herdr.Status, provider)
-	return status, s.Herdr.StatusSince, ok
+	status, ok = HerdrLegacyStatus(s.Herdr.Status, provider)
+	if !ok {
+		return "", time.Time{}, statusexplain.ReasonCoverageUnsupported, false
+	}
+	return status, s.Herdr.StatusSince, statusexplain.ReasonHerdrOverride, true
 }
 
 // HerdrReading is one reading of a session's herdr pane.
@@ -149,6 +156,8 @@ func (s *Session) SetHerdr(r HerdrReading, now time.Time) (before, after string)
 		// then it has none and publishes its herdr graph.
 		if s.Agent == AgentKindPi && s.Pi != nil {
 			s.projectPiStatus(s.Pi, r.Since, now)
+		} else {
+			s.recordHerdrOnly(now)
 		}
 		return before, s.publishedStatus(now)
 	}
@@ -157,7 +166,7 @@ func (s *Session) SetHerdr(r HerdrReading, now time.Time) (before, after string)
 		return "", ""
 	}
 	before = info.Status
-	s.projectStatus(info, r.Since)
+	s.projectStatus(info, r.Since, now)
 	return before, info.Status
 }
 
@@ -280,12 +289,15 @@ func (s *Session) graphEnrichment() *AgentInfo {
 // projectStatus sets the published status from the provider graph's summary,
 // overridden by herdr while it is the authority. StatusSince moves only when
 // the published status changes. fallback dates a provider-decided edge whose
-// summary carries no Since.
-func (s *Session) projectStatus(info *AgentInfo, fallback time.Time) {
+// summary carries no Since. now dates the decision record, changed or not; it
+// decides nothing.
+func (s *Session) projectStatus(info *AgentInfo, fallback, now time.Time) {
 	status, since := s.AgentGraph.Summary.Status, s.AgentGraph.Summary.Since
-	if herdrStatus, herdrSince, ok := s.herdrAuthority(status); ok {
+	herdrStatus, herdrSince, herdrReason, herdrDecides := s.herdrAuthority(status)
+	if herdrDecides {
 		status, since = herdrStatus, herdrSince
 	}
+	s.recordGraphProjection(status, herdrReason, now)
 	if info.Status == status {
 		return
 	}

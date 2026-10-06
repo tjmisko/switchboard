@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/agentgraph"
+	"github.com/tjmisko/switchboard/internal/statusexplain"
 )
 
 // piHookGraphFresh reports whether the session's graph is Pi hook evidence for
@@ -42,32 +43,62 @@ func (s *Session) piGraphFresh(now time.Time, sources ...agentgraph.SourceKind) 
 //     the deadline it was persisted with.
 //  4. Otherwise the status is unknown ("").
 //
+// reason names the step that decided, or for step 4 why nothing could:
+// pi_hook_authority, herdr_fallback, graph_authority, then binding_missing,
+// observation_expired or coverage_unsupported.
+//
 // herdr's blocked state and the hook's dialog count both mean red, so they
 // cannot disagree on red; and because fresh hook evidence outranks herdr
 // outright, a herdr working reading cannot clear a hook-held red.
 //
 // #96 replaces this function with the one pure status resolver; keep Pi's
 // precedence here and nowhere else so that it can.
-func (s *Session) piStatusAuthority(now time.Time) (status string, since time.Time) {
+func (s *Session) piStatusAuthority(now time.Time) (status string, since time.Time, reason statusexplain.Reason) {
 	if s.piHookGraphFresh(now) {
-		return s.AgentGraph.Summary.Status, s.AgentGraph.Summary.Since
+		return s.AgentGraph.Summary.Status, s.AgentGraph.Summary.Since, statusexplain.ReasonPiHookAuthority
 	}
 	if s.Herdr != nil && s.Herdr.Live {
 		if status, ok := HerdrLegacyStatus(s.Herdr.Status, ""); ok {
-			return status, s.Herdr.StatusSince
+			return status, s.Herdr.StatusSince, statusexplain.ReasonHerdrFallback
 		}
 	}
 	if s.piGraphFresh(now, agentgraph.SourcePiSessionFile, agentgraph.SourceRestoredLastKnown) {
-		return s.AgentGraph.Summary.Status, s.AgentGraph.Summary.Since
+		return s.AgentGraph.Summary.Status, s.AgentGraph.Summary.Since, statusexplain.ReasonGraphAuthority
 	}
-	return "", time.Time{}
+	return "", time.Time{}, s.piUnknownReason()
+}
+
+// piUnknownReason says why piStatusAuthority found nothing to decide.
+func (s *Session) piUnknownReason() statusexplain.Reason {
+	switch {
+	case s.Pi == nil || s.Pi.SessionID == "":
+		return statusexplain.ReasonBindingMissing
+	case s.piBoundGraph() != nil:
+		return statusexplain.ReasonObservationExpired
+	case s.Herdr != nil && s.Herdr.Live:
+		return statusexplain.ReasonCoverageUnsupported
+	default:
+		return statusexplain.ReasonObservationExpired
+	}
+}
+
+// piBoundGraph is the session's graph when Pi's own evidence (a hook, the
+// session file, or a restore) produced it for the bound session, fresh or
+// not; nil otherwise, including for a herdr graph.
+func (s *Session) piBoundGraph() *AgentGraph {
+	g := s.AgentGraph
+	if s.Pi == nil || s.Pi.SessionID == "" || g == nil || g.RootID != s.Pi.SessionID || g.Source == agentgraph.SourceHerdr {
+		return nil
+	}
+	return g
 }
 
 // projectPiStatus sets a bound Pi block's published status from
 // piStatusAuthority. StatusSince moves only when the status changes; fallback
 // dates an edge whose source carries no start.
 func (s *Session) projectPiStatus(info *AgentInfo, fallback, now time.Time) {
-	status, since := s.piStatusAuthority(now)
+	status, since, reason := s.piStatusAuthority(now)
+	s.recordPiProjection(status, reason, now)
 	if info.Status == status {
 		return
 	}

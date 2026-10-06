@@ -35,6 +35,7 @@ import (
 	codexprovider "github.com/tjmisko/switchboard/internal/provider/codex"
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
+	"github.com/tjmisko/switchboard/internal/statusexplain"
 	"github.com/tjmisko/switchboard/internal/statustune"
 	"github.com/tjmisko/switchboard/internal/terminal"
 	"github.com/tjmisko/switchboard/internal/transcript"
@@ -291,6 +292,9 @@ func main() {
 	})
 	server.SetAgentHookHandler(agentRuntime.HandleHook)
 	server.SetAgentDiagnosticSource(agentRuntime.Diagnostics)
+	server.SetStatusExplainer(func(hostname string, pid int) (statusexplain.Decision, error) {
+		return agentRuntime.ExplainLocal(federated.hostname, hostname, pid)
+	})
 	server.SetHookAttributionDiagnostic(func(diagnostic rpc.HookAttributionDiagnostic) {
 		agentRuntime.recordDiagnostic(agentgraph.ProviderCodex, diagnostic.Category, time.Now())
 		if diagnostic.MatchedPID != 0 {

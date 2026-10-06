@@ -115,3 +115,31 @@ The four criteria above each become a test. In addition:
 ## Out of scope
 
 Changing any status outcome. That is Phase 3.
+
+## As built
+
+Where the implementation departs from the work units above:
+
+- **Two halves, one record.** Projection runs outside the coordinator (the
+  herdr watcher, the reconciler, Pi hooks), so its half of the record lives
+  on the session as an unexported, in-memory `statusexplain.Projection`,
+  stamped with the process lifetime. `projectStatus`, `projectPiStatus` and
+  `SetHerdr`'s herdr-only path write it. Graph admission's half (rejected
+  candidates, hook ownership, why observe stopped short) lives in the
+  coordinator, keyed by `RootKey` and bound to the provider session id.
+  `agentCoordinator.Explain` merges the two.
+- **Expiry** is recorded by the projection that `expireCurrent` already
+  triggers, rather than at `expireCurrent` itself.
+- **Reasons added** to the closed enum: `graph_authority`, `herdr_only`,
+  `herdr_fallback`, `observation_pending`, `older_than_current` and
+  `unrecorded`. The last is what explain says when a path that records
+  nothing (the legacy hook FSM, hydration) has moved the status since the
+  last recorded decision, rather than attribute the status to evidence that
+  did not decide it.
+- **`SetAgentGraph` takes `now`**, to date the record. `herdrAuthority` keeps
+  its own `time.Now()` for the Codex attention exception, unchanged; #96
+  removes it.
+- **The Pi reconcile tick** also applies a re-projection that moves which
+  source decides without changing the status, so explain follows a hook
+  lease lapsing onto a herdr reading of the same colour. It publishes
+  nothing.

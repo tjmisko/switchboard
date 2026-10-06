@@ -131,6 +131,8 @@ func main() {
 		cmdAttention(c)
 	case "agent-diagnostics":
 		cmdAgentDiagnostics(c, *jsonOut)
+	case "explain":
+		cmdExplain(c, args[1:], *jsonOut)
 	case "hook":
 		if len(args) < 2 {
 			fail("hook requires an event name")
@@ -1034,6 +1036,9 @@ commands:
                             unrestricted.
   agent-diagnostics       show bounded provider diagnostic counters; --json
                             emits the raw content-free array
+  explain --pid <pid>     why one root shows the status it does now: the
+                            deciding source, reason code, freshness, and the
+                            readings that lost; --json for the record
   name <sub>              project names: resolve --cwd --name, abbrev --cwd,
                             full --cwd, set <dir> <abbrev>, or
                             set-full --cwd --name <full> (pretty display name)
@@ -1068,7 +1073,7 @@ commands:
 
 flags:
   --socket <path>         daemon socket (default: $XDG_RUNTIME_DIR/switchboard.sock)
-  --json                  json output for list or agent-diagnostics
+  --json                  json output for list, agent-diagnostics or explain
 `))
 }
 
