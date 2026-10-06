@@ -439,15 +439,32 @@ func (c *agentCoordinator) observeAt(ctx context.Context, ref provider.RootRef, 
 	if err != nil {
 		c.recordDiagnostic(ref.Provider, "observe_error", now)
 	}
-	if observation.RootID == "" || len(observation.Nodes) == 0 {
-		category := "snapshot_pending"
-		if ref.Provider == agentgraph.ProviderCodex && observation.RootID == "" {
-			category = "exact_binding_unavailable"
-			c.recordObserveOutcome(ref, statusexplain.ReasonBindingMissing)
-		}
-		c.recordDiagnostic(ref.Provider, category, now)
+	// The outcome, not the error or the graph's shape, decides what the answer
+	// is (#98). Only a usable graph, or the prior graph an unavailable answer
+	// carries to its original deadline, reaches the landing path.
+	switch agentgraph.OutcomeOf(observation, err) {
+	case agentgraph.OutcomeUnsupported:
+		// The prior graph is held to its own deadline, as for unavailable; the
+		// outcome is filed after the lapse re-lands it, so it explains it.
+		c.recordDiagnostic(ref.Provider, "coverage_unsupported", now)
 		c.expireCurrent(ref, generation, now)
+		c.recordObserveOutcome(ref, statusexplain.ReasonCoverageUnsupported)
 		return
+	case agentgraph.OutcomeReset:
+		c.recordDiagnostic(ref.Provider, "observation_reset", now)
+		c.resetObservation(ref, generation, observation.RootID, now)
+		return
+	case agentgraph.OutcomeUnavailable:
+		if !c.carriesHeldEvidence(ref, observation) {
+			category := "snapshot_pending"
+			if ref.Provider == agentgraph.ProviderCodex && observation.RootID == "" {
+				category = "exact_binding_unavailable"
+				c.recordObserveOutcome(ref, statusexplain.ReasonBindingMissing)
+			}
+			c.recordDiagnostic(ref.Provider, category, now)
+			c.expireCurrent(ref, generation, now)
+			return
+		}
 	}
 	compat, rule := claudeprovider.Compatibility{}, ""
 	if ref.Provider == agentgraph.ProviderClaude {
@@ -468,6 +485,72 @@ func (c *agentCoordinator) observeAt(ctx context.Context, ref provider.RootRef, 
 			c.sink.Record(event)
 		}
 	}
+}
+
+// carriesHeldEvidence reports whether an unavailable answer carries a graph
+// the root already holds: the observer's prior observation, with the window it
+// landed with. Landing it re-applies what the held graph already says (a
+// failed Claude scan still lands its tick's prompt resolutions) without
+// renewing its authority. An unavailable answer whose graph is newer, or
+// longer-lived, than anything held is not evidence and never lands (#98).
+func (c *agentCoordinator) carriesHeldEvidence(ref provider.RootRef, observation agentgraph.Observation) bool {
+	if observation.RootID == "" || len(observation.Nodes) == 0 {
+		return false
+	}
+	sess, ok := sessionForKey(c.store.Snapshot(), ref.Key())
+	if !ok {
+		return false
+	}
+	observedAt, freshUntil, ok := sess.HeldEvidence(observation.RootID, observedKind(observation))
+	return ok && !observation.ObservedAt.After(observedAt) && !observation.FreshUntil.After(freshUntil)
+}
+
+// resetObservation applies an observer's authoritative reset: the root's
+// binding moved to rootID, so the graph about the previous conversation is
+// dropped now, through the resolver, rather than held to its deadline. The
+// explanation says observation_reset until evidence about rootID lands.
+func (c *agentCoordinator) resetObservation(ref provider.RootRef, generation uint64, rootID string, now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.generation[ref.Key()] != generation {
+		return
+	}
+	var before, after, previous string
+	var beforeSince time.Time
+	dropped := false
+	c.store.Apply(func(sessions map[int]*state.Session) {
+		sess := sessions[ref.PID]
+		if !sessionHoldsRoot(sess, ref.Key()) || agentgraph.ProviderKind(sess.Agent) != ref.Provider {
+			return
+		}
+		if info := sess.Enrichment(); info != nil {
+			beforeSince, previous = info.StatusSince, info.SessionID
+		}
+		before, after, dropped = sess.ResetAgentEvidence(rootID, now)
+	})
+	c.admissionLocked(ref.Key(), rootID).outcome = statusexplain.ReasonObservationReset
+	if !dropped {
+		return
+	}
+	root := c.tracked[ref.Key()]
+	if root.rootID != "" && root.rootID != rootID {
+		c.history.Forget(root.kind, root.rootID)
+	}
+	root.rootID = rootID
+	c.tracked[ref.Key()] = root
+	if before == after {
+		return
+	}
+	sessionID := rootID
+	if sessionID == "" {
+		sessionID = previous
+	}
+	c.sink.Record(history.Event{
+		Ts: now, Type: history.EventTransition, SessionID: sessionID,
+		PID: ref.PID, Agent: string(ref.Provider), CWD: ref.CWD,
+		From: before, To: after,
+		Rule: statustune.RuleGraphObservationReset, DurPrevMs: history.HeldMs(beforeSince, now),
+	})
 }
 
 // observedKind is what an observer's answer is as evidence: a provider
