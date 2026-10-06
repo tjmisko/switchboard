@@ -184,7 +184,7 @@ func TestObservedKindShouldKeepAHeldObservationsProvenanceWhenAnObserverReturnsI
 
 func TestAdmitRootShouldKeepTheResolversEvidenceWhenDiscoveryReannouncesASession(t *testing.T) {
 	m := map[int]*state.Session{}
-	prior := &state.Session{PID: 77, StartedAt: landingLifetime, Agent: state.AgentKindClaude, TTY: "/dev/pts/7"}
+	prior := &state.Session{PID: 77, StartedAt: landingLifetime, Agent: state.AgentKindClaude, TTY: "/dev/pts/7", Birth: testBirth(77)}
 	o := admissionCandidate(agentgraph.ProviderClaude, "root", agentgraph.SourceHook, explainT0, time.Hour)
 	o.Nodes[0].Attention = agentgraph.AttentionApproval
 	graph, err := state.ProjectAgentGraph(o, nil, explainT0)
@@ -194,7 +194,7 @@ func TestAdmitRootShouldKeepTheResolversEvidenceWhenDiscoveryReannouncesASession
 	prior.LandAgentGraph(graph, state.GraphLanding{Kind: state.GraphHookEvent}, explainT0)
 	m[prior.PID] = prior
 
-	admitted := admitRoot(m, state.Session{PID: 77, StartedAt: explainT0, Agent: state.AgentKindClaude, TTY: "/dev/pts/7"}, nil, newFakeHerdrSource(), nil, explainT0)
+	admitted := admitRoot(m, state.Session{PID: 77, StartedAt: explainT0, Agent: state.AgentKindClaude, TTY: "/dev/pts/7", Birth: testBirth(77)}, nil, newFakeHerdrSource(), nil, nil, explainT0)
 	at := explainT0.Add(time.Second)
 	admitted.SetHerdr(state.HerdrReading{PaneID: "w1:p1", Socket: "/h.sock", TerminalID: "t1", Agent: "claude",
 		Status: state.HerdrWorking, Live: true, Since: at}, at)

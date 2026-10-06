@@ -392,7 +392,7 @@ func TestScannerFiresOnceAndForgetReFires(t *testing.T) {
 		t.Fatalf("fired %d times across two scans, want 1", count)
 	}
 
-	s.Forget(100)
+	s.Forget(osproc.Lifetime{PID: 100})
 	s.scanOnce(fire)
 	if count != 2 {
 		t.Fatalf("after Forget, fired total %d, want 2", count)
@@ -494,6 +494,44 @@ func TestScannerRecycledPIDShadowedWithoutForget(t *testing.T) {
 	}
 }
 
+// #97: the seen set is keyed by lifetime. A pid reused by a second agent is
+// reported once its first lifetime is forgotten, and a Forget for the first
+// lifetime that arrives after that (a late death callback) must not clear the
+// replacement's entry, or the replacement would be reported, and admitted, a
+// second time.
+func TestScannerForgetIsFencedByLifetime(t *testing.T) {
+	first, second := claudeInfo(100), claudeInfo(100)
+	first.Birth, second.Birth = "boot:1000", "boot:2000"
+	src := &fakeProcSource{pids: []int{100}, infos: map[int]osproc.Info{100: first}}
+	s := newWithSource(src)
+
+	var fired []string
+	fire := func(info osproc.Info) { fired = append(fired, info.Birth) }
+
+	s.scanOnce(fire)
+	src.infos[100] = second // the kernel reuses pid 100
+	s.Forget(first.Lifetime())
+	s.scanOnce(fire)
+	if len(fired) != 2 || fired[1] != second.Birth {
+		t.Fatalf("fired %v, want the replacement lifetime reported after the first is forgotten", fired)
+	}
+
+	t.Run("should keep the replacement's entry when a late Forget for the dead lifetime arrives", func(t *testing.T) {
+		s.Forget(first.Lifetime())
+		s.scanOnce(fire)
+		if len(fired) != 2 {
+			t.Fatalf("fired %v, want no second report of the replacement", fired)
+		}
+	})
+	t.Run("should clear the entry when the lifetime it holds is forgotten", func(t *testing.T) {
+		s.Forget(second.Lifetime())
+		s.scanOnce(fire)
+		if len(fired) != 3 {
+			t.Fatalf("fired %v, want the pid re-read after its own lifetime is forgotten", fired)
+		}
+	})
+}
+
 // §2.2 Scanner — onAppeared runs WITHOUT the scanner lock held, so a callback
 // that calls back into the scanner (e.g. Forget) cannot deadlock.
 func TestScannerCallbackIsLockFree(t *testing.T) {
@@ -502,7 +540,7 @@ func TestScannerCallbackIsLockFree(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		s.scanOnce(func(i osproc.Info) { s.Forget(i.PID) })
+		s.scanOnce(func(i osproc.Info) { s.Forget(i.Lifetime()) })
 		close(done)
 	}()
 	select {
@@ -538,8 +576,8 @@ func (s fakeOSSource) Read(pid int) (osproc.Info, error) {
 	return info, nil
 }
 
-func (fakeOSSource) Watch(context.Context, int, func()) error { return nil }
-func (fakeOSSource) Stop(int)                                 {}
+func (fakeOSSource) Watch(context.Context, osproc.Lifetime, func()) error { return nil }
+func (fakeOSSource) Stop(osproc.Lifetime)                                 {}
 
 // fakeOSSourceWithPIDs adds the optional AllPIDs fast-path, so the adapter uses
 // the cheap pid-lister upgrade (the Linux source's hot path) instead of deriving

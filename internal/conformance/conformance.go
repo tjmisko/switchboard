@@ -34,21 +34,25 @@ func liveConformance() bool { return os.Getenv("SWITCHBOARD_LIVE_CONFORMANCE") !
 
 // ProcInfo is the neutral process record. Fields mirror what every OS backend
 // can supply; TTY is an opaque join key (its literal form is OS-specific).
+// Birth is the opaque process-birth token (#97): (PID, Birth) names one
+// process lifetime, and a backend that cannot supply it leaves it empty.
 type ProcInfo struct {
-	PID  int
-	PPID int
-	Comm string
-	Exe  string
-	CWD  string
-	TTY  string
+	PID   int
+	PPID  int
+	Comm  string
+	Exe   string
+	CWD   string
+	TTY   string
+	Birth string
 }
 
-// Source enumerates processes and signals once when a watched pid dies.
+// Source enumerates processes and signals once when a watched lifetime dies.
+// Watch and Stop name the lifetime by pid and birth token.
 type Source interface {
 	Enumerate() ([]ProcInfo, error)
 	Read(pid int) (ProcInfo, error)
-	Watch(ctx context.Context, pid int, onDeath func()) error
-	Stop(pid int)
+	Watch(ctx context.Context, pid int, birth string, onDeath func()) error
+	Stop(pid int, birth string)
 }
 
 // SourceFixture bundles the implementation with the host-specific helpers the
@@ -135,13 +139,59 @@ func RunSourceContract(t *testing.T, fx SourceFixture) {
 		}
 	})
 
+	t.Run("a live process carries a birth token that is stable across reads", func(t *testing.T) {
+		pid := fx.SpawnBareChild(t)
+		first, err := fx.Source.Read(pid)
+		if err != nil {
+			t.Fatalf("Read: %v", err)
+		}
+		if first.Birth == "" {
+			t.Fatal("birth token is empty for a live process, want an opaque token")
+		}
+		second, err := fx.Source.Read(pid)
+		if err != nil || second.Birth != first.Birth {
+			t.Fatalf("second Read birth = %q, %v; want %q", second.Birth, err, first.Birth)
+		}
+		infos, err := fx.Source.Enumerate()
+		if err != nil {
+			t.Fatalf("Enumerate: %v", err)
+		}
+		for _, info := range infos {
+			if info.PID == pid && info.Birth != first.Birth {
+				t.Errorf("Enumerate birth = %q, Read birth = %q; want agreement", info.Birth, first.Birth)
+			}
+		}
+	})
+
+	t.Run("watch of a lifetime its pid no longer holds reports that death at once", func(t *testing.T) {
+		pid := fx.SpawnBareChild(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// The live child stands in for a replacement that took the pid after an
+		// earlier lifetime was read: no timing race is needed to stage reuse.
+		fired := make(chan struct{}, 4)
+		if err := fx.Source.Watch(ctx, pid, "an-earlier-lifetime", func() { fired <- struct{}{} }); err != nil {
+			t.Fatalf("Watch: %v", err)
+		}
+		select {
+		case <-fired:
+		case <-time.After(3 * time.Second):
+			t.Fatal("onDeath did not fire: the watcher adopted the replacement lifetime")
+		}
+	})
+
 	t.Run("watch fires onDeath exactly once on death", func(t *testing.T) {
 		pid := fx.SpawnBareChild(t)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
+		info, err := fx.Source.Read(pid)
+		if err != nil {
+			t.Fatalf("Read: %v", err)
+		}
 		fired := make(chan struct{}, 4)
-		if err := fx.Source.Watch(ctx, pid, func() { fired <- struct{}{} }); err != nil {
+		if err := fx.Source.Watch(ctx, pid, info.Birth, func() { fired <- struct{}{} }); err != nil {
 			t.Fatalf("Watch: %v", err)
 		}
 		fx.KillChild(t, pid)

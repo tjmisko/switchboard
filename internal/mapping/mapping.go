@@ -66,6 +66,7 @@ func (r *Resolver) Resolve(ctx context.Context, info osproc.Info) state.Session 
 		CWD:       info.CWD,
 		TTY:       info.TTY,
 		StartedAt: time.Now(),
+		Birth:     info.Birth,
 	}
 	if info.TTY == "" {
 		return sess

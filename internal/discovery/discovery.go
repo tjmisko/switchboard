@@ -396,22 +396,25 @@ func (a osprocSource) AllPIDs() ([]int, error) {
 
 func (a osprocSource) Read(pid int) (osproc.Info, error) { return a.src.Read(pid) }
 
+// Scanner reports each agent process lifetime once. seen maps a pid to the
+// birth token of the lifetime last reported under it, so a Forget for an old
+// lifetime cannot clear the entry of its replacement.
 type Scanner struct {
 	mu   sync.Mutex
-	seen map[int]struct{}
+	seen map[int]string
 	src  procSource
 }
 
 // New builds a Scanner over the given OS process source. The darwin backend
 // drops in here unchanged — discovery only ever touches osproc.Source.
 func New(src osproc.Source) *Scanner {
-	return &Scanner{seen: make(map[int]struct{}), src: osprocSource{src: src}}
+	return &Scanner{seen: make(map[int]string), src: osprocSource{src: src}}
 }
 
 // newWithSource builds a Scanner over an injected procSource. Test-only seam;
 // runtime callers use New, which wires the osproc-backed adapter.
 func newWithSource(src procSource) *Scanner {
-	return &Scanner{seen: make(map[int]struct{}), src: src}
+	return &Scanner{seen: make(map[int]string), src: src}
 }
 
 // Run polls the process source every interval and invokes onAppeared for any
@@ -431,13 +434,20 @@ func (s *Scanner) Run(ctx context.Context, interval time.Duration, onAppeared fu
 	}
 }
 
-// Forget drops a PID from the seen set so the next scan can re-fire if the
-// kernel ever recycled the same PID for a fresh claude process. Call this
-// from procwatch's death callback.
-func (s *Scanner) Forget(pid int) {
+// Forget drops a lifetime from the seen set so the next scan re-reads its pid
+// and can report the lifetime that holds it next. Call it when a session
+// ends. It leaves the entry alone when the seen set provably holds another
+// lifetime of the pid: a late Forget for a dead lifetime must not make the
+// scanner report its replacement a second time. An unverified token on either
+// side clears the entry, since a redundant re-read is harmless.
+func (s *Scanner) Forget(lifetime osproc.Lifetime) {
 	s.mu.Lock()
-	delete(s.seen, pid)
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	seen, ok := s.seen[lifetime.PID]
+	if !ok || osproc.CompareBirth(seen, lifetime.Birth) == osproc.BirthDifferent {
+		return
+	}
+	delete(s.seen, lifetime.PID)
 }
 
 func (s *Scanner) scanOnce(onAppeared func(osproc.Info)) {
@@ -460,7 +470,7 @@ func (s *Scanner) scanOnce(onAppeared func(osproc.Info)) {
 			continue
 		}
 		s.mu.Lock()
-		s.seen[pid] = struct{}{}
+		s.seen[pid] = info.Birth
 		s.mu.Unlock()
 		onAppeared(info)
 	}

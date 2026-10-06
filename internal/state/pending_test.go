@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -342,6 +343,43 @@ func TestPendingPromptRecordsProjectAndRoundTrip(t *testing.T) {
 		}
 		if bytes.Contains(body, []byte("pending_prompts")) {
 			t.Errorf("pending_prompts reached the wire on a block with no prompts: %s", body)
+		}
+	})
+}
+
+// #97: the birth token persists additively. It survives a restart beside the
+// display start time, and a session without one writes no field at all, so a
+// mirror without tokens is byte-for-byte the schema v3 shape it was.
+func TestBirthShouldRoundTripThroughTheMirrorWhenPersisted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	started := time.Unix(1000, 0).UTC()
+	src := New(path)
+	src.Apply(func(m map[int]*Session) {
+		m[42] = &Session{PID: 42, StartedAt: started, Agent: AgentKindClaude, Birth: "boot:5000"}
+		m[43] = &Session{PID: 43, StartedAt: started, Agent: AgentKindClaude}
+	})
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(raw), `"birth"`); n != 1 {
+		t.Fatalf("mirror carries %d birth fields, want 1 (omitted when empty):\n%s", n, raw)
+	}
+	if !strings.Contains(string(raw), `"schema_version": 3`) {
+		t.Fatalf("mirror is not schema v3:\n%s", raw)
+	}
+
+	dst := New(path)
+	if err := dst.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	dst.Apply(func(m map[int]*Session) {
+		if m[42].Birth != "boot:5000" || !m[42].StartedAt.Equal(started) {
+			t.Errorf("restored = birth %q started %v, want boot:5000 and %v", m[42].Birth, m[42].StartedAt, started)
+		}
+		if m[43].Birth != "" {
+			t.Errorf("restored unverified birth = %q, want empty", m[43].Birth)
 		}
 	})
 }

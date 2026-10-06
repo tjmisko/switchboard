@@ -17,7 +17,7 @@ func newSource() Source { return newLinuxSource() }
 // newLinuxSource builds the concrete Linux source. Tests use it directly to
 // reach Watched(), which is introspection the Source interface does not expose.
 func newLinuxSource() *linuxSource {
-	return &linuxSource{watched: make(map[int]context.CancelFunc)}
+	return &linuxSource{watched: make(map[Lifetime]context.CancelFunc), readBirth: proc.Birth}
 }
 
 // linuxSource reads process metadata from /proc and watches deaths with
@@ -27,7 +27,10 @@ func newLinuxSource() *linuxSource {
 // is the former internal/procwatch, absorbed into the seam in Phase 1.1.
 type linuxSource struct {
 	mu      sync.Mutex
-	watched map[int]context.CancelFunc
+	watched map[Lifetime]context.CancelFunc
+	// readBirth re-reads a pid's birth token after its pidfd is open. Tests
+	// swap it to stage a pid that another lifetime took before the open.
+	readBirth func(pid int) (string, error)
 }
 
 func (s *linuxSource) Enumerate() ([]Info, error) {
@@ -62,23 +65,32 @@ func (s *linuxSource) Read(pid int) (Info, error) {
 // Enumerate instead.
 func (s *linuxSource) AllPIDs() ([]int, error) { return proc.AllPIDs() }
 
-// Watch starts polling pid's pidfd. onDeath is called exactly once, from a
-// background goroutine, when the kernel marks the process dead. A duplicate
-// Watch for the same pid returns nil without scheduling a second watcher.
+// Watch starts polling the pidfd of one process lifetime. onDeath is called
+// exactly once, from a background goroutine, when the kernel marks that
+// lifetime dead. A duplicate Watch for the same lifetime returns nil without
+// scheduling a second watcher.
+//
+// pidfd_open(2) opens whichever process holds the pid at that instant, which
+// may be a replacement if the watched lifetime died after the scanner read
+// it. So the birth token is re-read AFTER the open. A pid cannot leave a
+// process and come back to it, so if the pid still carries the watched birth
+// now, it carried it at the open too: the pidfd refers to the watched
+// lifetime. Gone or another birth means the watched lifetime is already over,
+// and onDeath fires at once; an unreadable token is refused as unverified.
 //
 // The watcher leaves the watched set BEFORE it calls onDeath, so a Watch made
 // from inside the callback, or while it is still running, registers a fresh
-// watcher instead of being swallowed as a duplicate of the dying one. That is
-// the window a re-discovered pid races into: the old callback is still waiting
-// on the store lock when the scanner re-appears the pid, and a no-op there would
-// leave the new lifetime unwatched.
-func (s *linuxSource) Watch(parent context.Context, pid int, onDeath func()) error {
+// watcher instead of being swallowed as a duplicate of the dying one.
+func (s *linuxSource) Watch(parent context.Context, lifetime Lifetime, onDeath func()) error {
+	if !lifetime.Verified() {
+		return ErrUnverifiedLifetime
+	}
 	s.mu.Lock()
-	if _, dup := s.watched[pid]; dup {
+	if _, dup := s.watched[lifetime]; dup {
 		s.mu.Unlock()
 		return nil
 	}
-	pidfd, err := unix.PidfdOpen(pid, 0)
+	pidfd, err := unix.PidfdOpen(lifetime.PID, 0)
 	if err != nil {
 		s.mu.Unlock()
 		if errors.Is(err, unix.ESRCH) {
@@ -87,8 +99,30 @@ func (s *linuxSource) Watch(parent context.Context, pid int, onDeath func()) err
 		}
 		return err
 	}
+	birth, err := s.readBirth(lifetime.PID)
+	if err != nil && !errors.Is(err, proc.ErrGone) {
+		s.mu.Unlock()
+		unix.Close(pidfd)
+		return err
+	}
+	if err == nil && CompareBirth(birth, lifetime.Birth) == BirthUnverified {
+		// The pid is live but its token unreadable now: which process the pidfd
+		// holds is unproven, and reporting a death here could end a live
+		// session. Refuse, and leave the lifetime to the liveness sweep.
+		s.mu.Unlock()
+		unix.Close(pidfd)
+		return ErrUnverifiedLifetime
+	}
+	if err != nil || CompareBirth(birth, lifetime.Birth) == BirthDifferent {
+		// Gone, or the pid now belongs to another lifetime: the watched one is
+		// already dead.
+		s.mu.Unlock()
+		unix.Close(pidfd)
+		go onDeath()
+		return nil
+	}
 	ctx, cancel := context.WithCancel(parent)
-	s.watched[pid] = cancel
+	s.watched[lifetime] = cancel
 	s.mu.Unlock()
 
 	go func() {
@@ -97,7 +131,7 @@ func (s *linuxSource) Watch(parent context.Context, pid int, onDeath func()) err
 		// Only this goroutine removes its own entry, and Watch adds one only when
 		// the slot is empty, so the slot is still ours to clear here.
 		s.mu.Lock()
-		delete(s.watched, pid)
+		delete(s.watched, lifetime)
 		s.mu.Unlock()
 		if died {
 			onDeath()
@@ -136,9 +170,9 @@ func pollUntilDeath(ctx context.Context, pidfd int) bool {
 	}
 }
 
-func (s *linuxSource) Stop(pid int) {
+func (s *linuxSource) Stop(lifetime Lifetime) {
 	s.mu.Lock()
-	cancel, ok := s.watched[pid]
+	cancel, ok := s.watched[lifetime]
 	s.mu.Unlock()
 	if ok {
 		cancel()
@@ -150,8 +184,8 @@ func (s *linuxSource) Watched() []int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]int, 0, len(s.watched))
-	for pid := range s.watched {
-		out = append(out, pid)
+	for lifetime := range s.watched {
+		out = append(out, lifetime.PID)
 	}
 	return out
 }
