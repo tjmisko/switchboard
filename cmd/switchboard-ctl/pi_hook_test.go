@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tjmisko/switchboard/internal/state"
 )
@@ -178,5 +180,52 @@ func TestPiHookShouldKeepItsSessionIdentityWhenAPiFieldIsMalformed(t *testing.T)
 	req := parseHookPayloadAt(body, "PermissionRequest", state.AgentKindPi, hookAt)
 	if req.SessionID != "pi-1" || req.Transcript != "/t.jsonl" || req.OpenDialogs != nil {
 		t.Fatalf("malformed open_dialogs = %+v, want identity kept and no count", req)
+	}
+}
+
+func piBodyAt(eventAt string) []byte {
+	return []byte(`{"session_id":"pi-1","open_dialogs":1,"event_at":` + eventAt + `}`)
+}
+
+func TestPiHookShouldStampTheEventInstantWhenEventAtIsSane(t *testing.T) {
+	fired := hookAt.Add(-300 * time.Millisecond)
+	req := parseHookPayloadAt(piBodyAt(strconv.FormatInt(fired.UnixMilli(), 10)), "PermissionRequest", state.AgentKindPi, hookAt)
+	if !req.ObservedAt.Equal(time.UnixMilli(fired.UnixMilli())) {
+		t.Fatalf("observed_at = %v, want the Pi event's own instant %v", req.ObservedAt, fired)
+	}
+}
+
+func TestPiHookShouldUseTheCtlClockWhenEventAtIsOutOfBounds(t *testing.T) {
+	cases := map[string]string{
+		"far future": strconv.FormatInt(hookAt.Add(piEventAtMaxFuture+time.Second).UnixMilli(), 10),
+		"too old":    strconv.FormatInt(hookAt.Add(-piEventAtMaxAge-time.Second).UnixMilli(), 10),
+		"malformed":  `"soon"`,
+		"zero":       "0",
+	}
+	for name, eventAt := range cases {
+		req := parseHookPayloadAt(piBodyAt(eventAt), "PermissionRequest", state.AgentKindPi, hookAt)
+		if !req.ObservedAt.Equal(hookAt) {
+			t.Errorf("%s: observed_at = %v, want the ctl clock %v", name, req.ObservedAt, hookAt)
+		}
+		if req.OpenDialogs == nil || *req.OpenDialogs != 1 {
+			t.Errorf("%s: a bad event_at cost the dialog count: %v", name, req.OpenDialogs)
+		}
+	}
+}
+
+func TestPiHookShouldClampEventAtToTheCtlClockWhenItLeadsWithinTheSkew(t *testing.T) {
+	ahead := strconv.FormatInt(hookAt.Add(500*time.Millisecond).UnixMilli(), 10)
+	req := parseHookPayloadAt(piBodyAt(ahead), "PermissionRequest", state.AgentKindPi, hookAt)
+	if !req.ObservedAt.Equal(hookAt) {
+		t.Fatalf("observed_at = %v, want it clamped to %v", req.ObservedAt, hookAt)
+	}
+}
+
+func TestEventAtShouldNotStampClaudeOrCodexHooks(t *testing.T) {
+	for _, agent := range []string{state.AgentKindClaude, state.AgentKindCodex} {
+		req := parseHookPayloadAt(piBodyAt(strconv.FormatInt(hookAt.Add(-time.Second).UnixMilli(), 10)), "Stop", agent, hookAt)
+		if !req.ObservedAt.IsZero() {
+			t.Errorf("%s took event_at: %v", agent, req.ObservedAt)
+		}
 	}
 }
