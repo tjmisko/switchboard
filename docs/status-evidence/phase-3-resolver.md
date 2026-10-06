@@ -149,7 +149,11 @@ the decision is the published status and the record explain reads.
 - **Codex event-time order across kinds.** A fresh landing supersedes older
   event-time evidence of the other kinds (`Candidate.Superseded`): it may
   still hold its own open request, but never decides again, so a SessionStart
-  hook does not come back when a newer app-server sample lapses.
+  hook does not come back when a newer app-server sample lapses. Superseded
+  evidence reports no descendants either; the Codex rollout tail's idle
+  correction, built from the published graph with its children kept, reports
+  that graph's working descendants instead, so an idle root with running
+  subagents stays delegating when the correction lands.
 - **Hook-latched attention.** A Codex sample whose root request was put
   there by the hooks' pending-input or approval latch carries it as the
   hook's (`statusresolve.HookLatched`), so the hook that answers it resolves
