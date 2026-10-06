@@ -48,24 +48,22 @@ func onlyRejected(t *testing.T, d statusexplain.Decision) statusexplain.Candidat
 // Acceptance criterion 1, Codex: an open input request held while herdr reads
 // the screen as working.
 func TestExplainStatusShouldExplainPermissionAndTheRejectedTerminalReadingWhenACodexInputRequestIsUnresolved(t *testing.T) {
-	// herdrAuthority still reads the wall clock for the attention exception, so
-	// the graph must be fresh against it.
-	now := time.Now()
+	now := herdrT0.Add(time.Minute)
 	s := &Session{PID: 30, StartedAt: herdrT0, Agent: AgentKindCodex, Codex: &AgentInfo{}}
-	s.SetHerdr(reading(HerdrWorking, true, now.Add(-time.Minute)), now)
+	s.SetHerdr(codexReading(HerdrWorking, true, now.Add(-time.Minute)), now)
 	s.SetAgentGraph(codexGraph(t, agentgraph.RuntimeActive, agentgraph.AttentionUserInput, now, time.Hour), now)
 
 	d := s.ExplainStatus(now)
-	if d.Status != StatusPermission || d.Reason != statusexplain.ReasonHerdrYieldAttention {
-		t.Fatalf("decision = %+v, want permission for herdr_yield_attention", d.Choice)
+	if d.Status != StatusPermission || d.Reason != statusexplain.ReasonAttentionHeld {
+		t.Fatalf("decision = %+v, want permission for attention_held", d.Choice)
 	}
 	if d.Source != string(agentgraph.SourceCodexAppServer) || d.EvidenceKind != statusexplain.EvidenceProviderSnapshot {
 		t.Fatalf("selected source = %q/%q, want the app-server graph", d.Source, d.EvidenceKind)
 	}
 	rejected := onlyRejected(t, d)
 	if rejected.Source != string(agentgraph.SourceHerdr) || rejected.Status != StatusWorking ||
-		rejected.RejectReason != statusexplain.ReasonHerdrYieldAttention {
-		t.Fatalf("rejected = %+v, want herdr's working reading rejected for herdr_yield_attention", rejected)
+		rejected.RejectReason != statusexplain.ReasonAttentionHeld {
+		t.Fatalf("rejected = %+v, want herdr's working reading rejected for attention_held", rejected)
 	}
 }
 
@@ -79,7 +77,7 @@ func TestExplainStatusShouldExplainPermissionAndTheRejectedTerminalReadingWhenAP
 	s.SetHerdr(piReading(HerdrWorking, later), later)
 
 	d := s.ExplainStatus(later)
-	if d.Status != StatusPermission || d.Reason != statusexplain.ReasonPiHookAuthority || d.Source != string(agentgraph.SourceHook) {
+	if d.Status != StatusPermission || d.Reason != statusexplain.ReasonEventAuthority || d.Source != string(agentgraph.SourceHook) {
 		t.Fatalf("decision = %+v, want permission from the Pi hook", d.Choice)
 	}
 	if !d.DecidedAt.Equal(later) || !d.FreshUntil.Equal(at.Add(time.Minute)) {
@@ -87,8 +85,8 @@ func TestExplainStatusShouldExplainPermissionAndTheRejectedTerminalReadingWhenAP
 	}
 	rejected := onlyRejected(t, d)
 	if rejected.Source != string(agentgraph.SourceHerdr) || rejected.Status != StatusWorking ||
-		rejected.RejectReason != statusexplain.ReasonPiHookAuthority {
-		t.Fatalf("rejected = %+v, want herdr's working reading rejected for pi_hook_authority", rejected)
+		rejected.RejectReason != statusexplain.ReasonSourceOutranked {
+		t.Fatalf("rejected = %+v, want herdr's working reading outranked by the Pi hook", rejected)
 	}
 }
 
@@ -130,22 +128,30 @@ func TestExplainStatusShouldGiveDistinctReasonsWhenBindingIsMissingObservationEx
 	if len(got) != 3 {
 		t.Fatalf("reasons collapsed: %v", got)
 	}
+	// The expired evidence is the rejected candidate that explains the unknown.
 	d := expired.ExplainStatus(later)
-	if !d.FreshUntil.Equal(at.Add(time.Minute)) || d.Source != string(agentgraph.SourceClaudeTranscript) {
-		t.Fatalf("expired decision lost its evidence: %+v", d.Choice)
+	if r := onlyRejected(t, d); !r.FreshUntil.Equal(at.Add(time.Minute)) || r.Source != string(agentgraph.SourceClaudeTranscript) ||
+		r.RejectReason != statusexplain.ReasonObservationExpired {
+		t.Fatalf("expired decision lost its evidence: %+v", d)
 	}
 }
 
 func TestExplainStatusShouldReportCoverageUnsupportedWhenALiveHerdrReadingClassifiesNothing(t *testing.T) {
 	s := &Session{PID: 4, StartedAt: herdrT0, Agent: "gemini"}
-	s.SetHerdr(reading(HerdrUnknown, true, herdrT0), herdrT0)
+	r := reading(HerdrUnknown, true, herdrT0)
+	r.Agent = "gemini"
+	s.SetHerdr(r, herdrT0)
 	d := s.ExplainStatus(herdrT0)
-	if d.Status != "" || d.Reason != statusexplain.ReasonCoverageUnsupported || d.Source != string(agentgraph.SourceHerdr) {
-		t.Fatalf("decision = %+v, want unknown for coverage_unsupported from herdr", d.Choice)
+	if d.Status != "" || d.Reason != statusexplain.ReasonCoverageUnsupported {
+		t.Fatalf("decision = %+v, want unknown for coverage_unsupported", d.Choice)
 	}
-	s.SetHerdr(reading(HerdrWorking, true, herdrT0.Add(time.Second)), herdrT0.Add(time.Second))
-	if d := s.ExplainStatus(herdrT0.Add(time.Second)); d.Status != StatusWorking || d.Reason != statusexplain.ReasonHerdrOnly {
-		t.Fatalf("decision = %+v, want working for herdr_only", d.Choice)
+	if c := onlyRejected(t, d); c.Source != string(agentgraph.SourceHerdr) || c.RejectReason != statusexplain.ReasonCoverageUnsupported {
+		t.Fatalf("rejected = %+v, want herdr's reading as the evidence that classifies nothing", c)
+	}
+	r.Status, r.Since = HerdrWorking, herdrT0.Add(time.Second)
+	s.SetHerdr(r, herdrT0.Add(time.Second))
+	if d := s.ExplainStatus(herdrT0.Add(time.Second)); d.Status != StatusWorking || d.Reason != statusexplain.ReasonTerminalAuthority {
+		t.Fatalf("decision = %+v, want working for terminal_authority", d.Choice)
 	}
 }
 
@@ -162,8 +168,8 @@ func TestExplainStatusShouldNotExposeThePreviousLifetimesDecisionWhenTheProcessI
 	s := &Session{PID: 6, StartedAt: herdrT0, Agent: AgentKindClaude, Claude: &AgentInfo{}}
 	s.SetHerdr(reading(HerdrWorking, true, herdrT0), herdrT0)
 	s.SetAgentGraph(claudeGraph(t, agentgraph.RuntimeIdle, herdrT0, time.Hour), herdrT0)
-	if d := s.ExplainStatus(herdrT0); d.Reason != statusexplain.ReasonHerdrOverride {
-		t.Fatalf("first lifetime = %+v, want herdr_override", d.Choice)
+	if d := s.ExplainStatus(herdrT0); d.Reason != statusexplain.ReasonTerminalAuthority {
+		t.Fatalf("first lifetime = %+v, want terminal_authority", d.Choice)
 	}
 
 	// The same PID, a new process: the record and the provider state are left
@@ -174,7 +180,7 @@ func TestExplainStatusShouldNotExposeThePreviousLifetimesDecisionWhenTheProcessI
 	replaced.AgentGraph = nil
 	replaced.Herdr = nil
 	d := replaced.ExplainStatus(herdrT0.Add(time.Hour))
-	if d.Reason == statusexplain.ReasonHerdrOverride || len(d.Rejected) != 0 {
+	if d.Reason == statusexplain.ReasonTerminalAuthority || len(d.Rejected) != 0 {
 		t.Fatalf("replaced process explained by the previous lifetime: %+v", d)
 	}
 	if !d.Root.StartedAt.Equal(herdrT0.Add(time.Hour)) {
@@ -214,14 +220,14 @@ func TestExplainStatusShouldExplainHerdrOverridingAGraphWhenHerdrIsLive(t *testi
 	s.SetHerdr(reading(HerdrWorking, true, at), at)
 
 	d := s.ExplainStatus(at)
-	if d.Status != StatusWorking || d.Reason != statusexplain.ReasonHerdrOverride ||
+	if d.Status != StatusWorking || d.Reason != statusexplain.ReasonTerminalAuthority ||
 		d.EvidenceKind != statusexplain.EvidenceTerminal || !d.ObservedAt.Equal(at) || !d.FreshUntil.IsZero() {
-		t.Fatalf("decision = %+v, want herdr's working as herdr_override", d.Choice)
+		t.Fatalf("decision = %+v, want herdr's working as terminal_authority", d.Choice)
 	}
 	rejected := onlyRejected(t, d)
 	if rejected.Status != StatusIdle || rejected.Source != string(agentgraph.SourceClaudeTranscript) ||
-		rejected.RejectReason != statusexplain.ReasonHerdrOverride {
-		t.Fatalf("rejected = %+v, want the graph's idle rejected for herdr_override", rejected)
+		rejected.RejectReason != statusexplain.ReasonSourceOutranked {
+		t.Fatalf("rejected = %+v, want the graph's idle outranked by herdr", rejected)
 	}
 }
 
@@ -233,8 +239,8 @@ func TestExplainStatusShouldExplainHerdrFallingBackWhenThePiHookLeaseLapses(t *t
 	s.ReprojectPi(lapsed)
 
 	d := s.ExplainStatus(lapsed)
-	if d.Status != StatusIdle || d.Reason != statusexplain.ReasonHerdrFallback {
-		t.Fatalf("decision = %+v, want herdr's idle as herdr_fallback", d.Choice)
+	if d.Status != StatusIdle || d.Reason != statusexplain.ReasonTerminalAuthority {
+		t.Fatalf("decision = %+v, want herdr's idle as terminal_authority", d.Choice)
 	}
 	rejected := onlyRejected(t, d)
 	if rejected.Source != string(agentgraph.SourceHook) || rejected.RejectReason != statusexplain.ReasonObservationExpired {
@@ -279,7 +285,7 @@ func TestExplainStatusShouldNotOverlayLimitedWhenTheStatusIsPermission(t *testin
 	s.SetHerdr(reading(HerdrBlocked, true, herdrT0), herdrT0)
 	s.RecordUsageLimit(UsageLimit{ObservedAt: herdrT0, Source: UsageLimitSourceClaudeHook})
 	d := s.ExplainStatus(herdrT0.Add(time.Minute))
-	if d.Status != StatusPermission || d.Underlying != nil || d.Reason != statusexplain.ReasonHerdrOverride {
+	if d.Status != StatusPermission || d.Underlying != nil || d.Reason != statusexplain.ReasonTerminalAuthority {
 		t.Fatalf("decision = %+v underlying = %+v, want herdr's permission and no overlay", d.Choice, d.Underlying)
 	}
 }

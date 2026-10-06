@@ -28,7 +28,7 @@ func piHookGraph(t *testing.T, runtime agentgraph.RuntimeState, attention agentg
 // boundPi is a Pi session in a followed herdr pane that a hook has bound.
 func boundPi(t *testing.T, herdrStatus string) *Session {
 	t.Helper()
-	s := &Session{PID: 20, Agent: AgentKindPi}
+	s := &Session{PID: 20, StartedAt: statusLifetime, Agent: AgentKindPi}
 	s.SetHerdr(piReading(herdrStatus, herdrT0), herdrT0)
 	s.AgentBlock(AgentKindPi).SessionID = piSessionID
 	s.ReprojectPi(herdrT0)
@@ -61,7 +61,7 @@ func TestPiStatusAuthorityShouldFallBackToHerdrWhenNoHookHasArrived(t *testing.T
 		t.Fatalf("bound block with no hook evidence published %q, want herdr's working", after)
 	}
 
-	unbound := &Session{PID: 21, Agent: AgentKindPi}
+	unbound := &Session{PID: 21, StartedAt: statusLifetime, Agent: AgentKindPi}
 	if _, after := unbound.SetHerdr(piReading(HerdrBlocked, at), at); after != StatusPermission || unbound.Pi != nil {
 		t.Fatalf("unbound pi published %q (block %+v), want herdr's permission through its graph", after, unbound.Pi)
 	}
@@ -122,7 +122,7 @@ func restoredPi(t *testing.T, observedAt, freshUntil time.Time) *Session {
 	t.Helper()
 	graph := piHookGraph(t, agentgraph.RuntimeActive, agentgraph.AttentionNone, observedAt, freshUntil.Sub(observedAt))
 	persisted := Snapshot{SchemaVersion: CurrentSchemaVersion, Sessions: []Session{{
-		PID: 20, Agent: AgentKindPi, AgentGraph: graph,
+		PID: 20, StartedAt: observedAt.Add(-time.Hour), Agent: AgentKindPi, AgentGraph: graph,
 		Pi: &AgentInfo{SessionID: piSessionID, Transcript: "/home/u/.pi/agent/sessions/--p--/s.jsonl", Status: StatusWorking},
 	}}}
 	body, err := json.Marshal(persisted)
@@ -176,10 +176,10 @@ func TestPiStatusAuthorityShouldLetALiveHerdrReadingOutrankARestoredGraph(t *tes
 }
 
 func TestPiStatusAuthorityShouldTakeTheSessionFileStatusWhenNoHookOrHerdrIsLive(t *testing.T) {
-	s := &Session{PID: 20, Agent: AgentKindPi, Pi: &AgentInfo{SessionID: piSessionID}}
+	s := &Session{PID: 20, StartedAt: statusLifetime, Agent: AgentKindPi, Pi: &AgentInfo{SessionID: piSessionID}}
 	at := herdrT0.Add(time.Second)
 	graph := piSourceGraph(t, agentgraph.SourcePiSessionFile, agentgraph.RuntimeActive, at, 90*time.Second)
-	if _, after := s.SetPiHookGraph(graph, at); after != StatusWorking {
+	if _, after := s.SetPiSessionFileGraph(graph, at); after != StatusWorking {
 		t.Fatalf("session-file working published %q", after)
 	}
 	if _, after := s.ReprojectPi(at.Add(90 * time.Second)); after != "" {
@@ -191,7 +191,7 @@ func TestPiStatusAuthorityShouldPreferALiveHerdrReadingOverTheSessionFile(t *tes
 	s := boundPi(t, HerdrIdle)
 	at := herdrT0.Add(time.Second)
 	graph := piSourceGraph(t, agentgraph.SourcePiSessionFile, agentgraph.RuntimeActive, at, 90*time.Second)
-	if _, after := s.SetPiHookGraph(graph, at); after != StatusIdle {
+	if _, after := s.SetPiSessionFileGraph(graph, at); after != StatusIdle {
 		t.Fatalf("session-file working over live herdr idle published %q, want herdr's idle", after)
 	}
 }

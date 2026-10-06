@@ -8,8 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/agentgraph"
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
+	"github.com/tjmisko/switchboard/internal/statusexplain"
 )
 
 func TestCodexTranscriptPollingWithoutProvider(t *testing.T) {
@@ -120,5 +122,31 @@ func TestCodexTranscriptPollShouldNotLimitWhenActivityOutranTheRead(t *testing.T
 	c.observeAt(context.Background(), ref, now.Add(95*time.Second))
 	if published := store.PublishedSnapshot().Sessions[0]; published.UsageLimit != nil {
 		t.Fatalf("a stale rollout read greyed a resumed session: %+v", published.UsageLimit)
+	}
+}
+
+// The poll's idle correction is the rollout tail's own evidence kind (#96),
+// no longer a copy of the graph it was read against under the graph's source.
+func TestCodexTranscriptPollShouldLandItsIdleCorrectionAsTranscriptEvidenceWhenTheRolloutCompletes(t *testing.T) {
+	c, store := newStandardCodexHookTestCoordinator(t, "thread-1")
+	now := time.Now()
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	text := fmt.Sprintf("{\"timestamp\":%q,\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n", now.Add(time.Second).Format(time.RFC3339Nano))
+	if err := os.WriteFile(path, []byte(text), 0600); err != nil {
+		t.Fatal(err)
+	}
+	sendCodexHook(c, store, rpc.Request{Event: "PreToolUse", SessionID: "thread-1", ToolName: "exec_command", Transcript: path, ObservedAt: now})
+	ref, ok := providerRootRef(store.Snapshot().Sessions[0])
+	if !ok {
+		t.Fatal("missing provider root")
+	}
+	at := now.Add(95 * time.Second)
+	c.observeAt(context.Background(), ref, at)
+	if graph := codexGraph(t, store); graph.Source != agentgraph.SourceCodexRollout || graph.Summary.Status != state.StatusIdle {
+		t.Fatalf("correction landed from %s as %s, want codex_rollout idle", graph.Source, graph.Summary.Status)
+	}
+	d := explainAt(t, c, ref.PID, at)
+	if d.Status != state.StatusIdle || d.Reason != statusexplain.ReasonTranscriptAuthority || d.EvidenceKind != statusexplain.EvidenceTranscript {
+		t.Fatalf("decision = %+v, want idle from the rollout tail as transcript_authority", d.Choice)
 	}
 }

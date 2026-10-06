@@ -11,11 +11,12 @@ import (
 	"github.com/tjmisko/switchboard/internal/statusexplain"
 )
 
-// admissionRecord is graph admission's part of one root's decision record
-// (#95). The projection's part lives on the session (state.ExplainStatus);
-// this holds what only the coordinator sees: the graph it last admitted and
-// whether a hook owned that transition, the candidates rejected against that
-// graph, and, while nothing has been admitted, why observation stopped short.
+// admissionRecord is the landing path's part of one root's decision record
+// (#95). The resolver's decision lives on the session (state.ExplainStatus);
+// this holds what only the coordinator sees: the graph it last landed, the
+// observations refused before they could become evidence (older than their
+// kind's latest), and, while nothing has landed, why observation stopped
+// short.
 //
 // It is in memory only, guarded by agentCoordinator.mu, keyed by the process
 // lifetime (RootKey), and bound to one provider session id: a record for any
@@ -25,7 +26,6 @@ type admissionRecord struct {
 
 	admittedSource agentgraph.SourceKind
 	admittedAt     time.Time
-	hookOwned      bool
 
 	rejected statusexplain.Rejections
 	outcome  statusexplain.Reason
@@ -57,12 +57,12 @@ func (c *agentCoordinator) recordRejectionLocked(key provider.RootKey, observati
 // recordAdmissionLocked files the graph that landed. A different graph than
 // the one held starts a fresh rejected list, since those candidates lost to a
 // graph that no longer decides; the same graph re-landing keeps it.
-func (c *agentCoordinator) recordAdmissionLocked(key provider.RootKey, graph *state.AgentGraph, hookOwned bool) {
+func (c *agentCoordinator) recordAdmissionLocked(key provider.RootKey, graph *state.AgentGraph) {
 	rec := c.admissionLocked(key, graph.RootID)
 	if rec.admittedSource != graph.Source || !rec.admittedAt.Equal(graph.ObservedAt) {
 		rec.rejected.Reset()
 	}
-	rec.admittedSource, rec.admittedAt, rec.hookOwned = graph.Source, graph.ObservedAt, hookOwned
+	rec.admittedSource, rec.admittedAt = graph.Source, graph.ObservedAt
 	rec.outcome = ""
 }
 
@@ -99,19 +99,15 @@ func (c *agentCoordinator) Explain(snap state.Snapshot, pid int) (statusexplain.
 	return d.Sanitize(), nil
 }
 
-// mergeInto adds admission's part to a projection's decision: hook ownership
-// of the graph that decides, the reason observation stopped short of one, and
-// the candidates rejected against it.
+// mergeInto adds the landing path's part to the resolver's decision: the
+// reason observation stopped short of one, and the observations refused
+// before they became evidence.
 func (rec *admissionRecord) mergeInto(d *statusexplain.Decision) {
 	decided := &d.Choice
 	if d.Underlying != nil {
 		decided = d.Underlying
 	}
 	switch decided.Reason {
-	case statusexplain.ReasonGraphAuthority:
-		if rec.hookOwned && decided.Source == string(rec.admittedSource) && decided.ObservedAt.Equal(rec.admittedAt) {
-			decided.Reason = statusexplain.ReasonHookOwned
-		}
 	case statusexplain.ReasonBindingMissing, statusexplain.ReasonObservationPending:
 		if rec.outcome != "" {
 			decided.Reason = rec.outcome

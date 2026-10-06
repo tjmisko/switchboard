@@ -109,11 +109,23 @@ var (
 	herdrT0  = time.Date(2026, 9, 28, 12, 0, 0, 0, time.UTC)
 )
 
-// graphClaudeSession is a Claude session in a herdr pane whose provider graph
-// says idle.
-func graphClaudeSession() *state.Session {
-	sess := &state.Session{PID: 700, Agent: state.AgentKindClaude, TTY: "/dev/pts/7", CWD: "/repo"}
-	sess.SetAgentGraph(&state.AgentGraph{RootID: "sess-1", Summary: state.AgentGraphSummary{Status: state.StatusIdle, Since: herdrT0}}, herdrT0)
+// graphClaudeSession is a Claude session in a herdr pane whose provider graph,
+// observed at herdrT0 and fresh for a day, says idle.
+func graphClaudeSession(t *testing.T) *state.Session {
+	t.Helper()
+	sess := &state.Session{PID: 700, StartedAt: herdrT0.Add(-time.Hour), Agent: state.AgentKindClaude, TTY: "/dev/pts/7", CWD: "/repo"}
+	graph, err := state.ProjectAgentGraph(agentgraph.Observation{
+		Provider: agentgraph.ProviderClaude, RootID: "sess-1", Source: agentgraph.SourceClaudeTranscript,
+		ObservedAt: herdrT0, FreshUntil: herdrT0.Add(24 * time.Hour),
+		Nodes: []agentgraph.Node{{ID: "sess-1", Runtime: agentgraph.RuntimeIdle, UpdatedAt: herdrT0}},
+	}, nil, herdrT0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess.SetAgentGraph(graph, herdrT0)
+	if sess.Claude.Status != state.StatusIdle {
+		t.Fatalf("graph session published %q, want idle", sess.Claude.Status)
+	}
 	return sess
 }
 
@@ -136,7 +148,7 @@ func transitionsIn(t *testing.T, sink *history.Sink, dir string) []history.Event
 }
 
 func TestApplyHerdrPaneShouldPublishHerdrsStatusWhenItsPaneReportsOne(t *testing.T) {
-	sess := graphClaudeSession()
+	sess := graphClaudeSession(t)
 	source := newFakeHerdrSource()
 	source.set(herdrKey, "claude", herdr.StatusBlocked, herdrT0.Add(time.Minute))
 	sink, dir := newTestSink(t)
@@ -159,7 +171,7 @@ func TestApplyHerdrPaneShouldPublishHerdrsStatusWhenItsPaneReportsOne(t *testing
 }
 
 func TestApplyHerdrPaneShouldRecordNothingWhenHerdrAgreesWithTheProvider(t *testing.T) {
-	sess := graphClaudeSession()
+	sess := graphClaudeSession(t)
 	source := newFakeHerdrSource()
 	source.set(herdrKey, "claude", herdr.StatusIdle, herdrT0)
 	sink, dir := newTestSink(t)
@@ -173,7 +185,7 @@ func TestApplyHerdrPaneShouldRecordNothingWhenHerdrAgreesWithTheProvider(t *test
 }
 
 func TestApplyHerdrPaneShouldReturnTheStatusToTheProviderWhenTheServerStopsCounting(t *testing.T) {
-	sess := graphClaudeSession()
+	sess := graphClaudeSession(t)
 	source := newFakeHerdrSource()
 	source.set(herdrKey, "claude", herdr.StatusWorking, herdrT0)
 	sink, dir := newTestSink(t)
@@ -194,7 +206,7 @@ func TestApplyHerdrPaneShouldReturnTheStatusToTheProviderWhenTheServerStopsCount
 // herdr gives a pane a new id when it moves to another workspace; the tick's
 // enumeration carries the new one.
 func TestApplyHerdrPaneShouldFollowThePaneWhenTheEnumerationGivesItANewID(t *testing.T) {
-	sess := graphClaudeSession()
+	sess := graphClaudeSession(t)
 	source := newFakeHerdrSource()
 	source.set(herdrKey, "claude", herdr.StatusIdle, herdrT0)
 	moved := herdr.PaneKey{Socket: testHerdrSock, PaneID: "w2:p4"}
@@ -210,7 +222,7 @@ func TestApplyHerdrPaneShouldFollowThePaneWhenTheEnumerationGivesItANewID(t *tes
 }
 
 func TestApplyHerdrPaneShouldKeepTheLastPaneWhenTheTTYIsMissingFromAnEnumeration(t *testing.T) {
-	sess := graphClaudeSession()
+	sess := graphClaudeSession(t)
 	source := newFakeHerdrSource()
 	source.set(herdrKey, "claude", herdr.StatusWorking, herdrT0)
 	ref := herdrRef
@@ -223,7 +235,7 @@ func TestApplyHerdrPaneShouldKeepTheLastPaneWhenTheTTYIsMissingFromAnEnumeration
 }
 
 func TestApplyHerdrPaneShouldIgnoreASessionOutsideHerdr(t *testing.T) {
-	sess := graphClaudeSession()
+	sess := graphClaudeSession(t)
 	wez := terminal.PaneRef{Backend: "wezterm", Mux: 9, PaneID: 3, TTY: "/dev/pts/7"}
 	applyHerdrPane(sess, &wez, newFakeHerdrSource(), nil, herdrT0)
 	applyHerdrPane(sess, nil, newFakeHerdrSource(), nil, herdrT0)
@@ -248,7 +260,7 @@ func TestHerdrSocketsShouldListEachHerdrServerOnceWhenPanesShareIt(t *testing.T)
 func TestRunHerdrStatusShouldApplyASignalledPaneToItsSession(t *testing.T) {
 	store := state.New("")
 	store.Apply(func(m map[int]*state.Session) {
-		sess := graphClaudeSession()
+		sess := graphClaudeSession(t)
 		sess.Herdr = &state.HerdrInfo{PaneID: "w1:p1", Socket: testHerdrSock}
 		m[sess.PID] = sess
 	})

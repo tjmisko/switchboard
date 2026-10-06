@@ -27,6 +27,13 @@ type codexPendingInput struct {
 	turnID, toolUseID, writer, toolName, inputHash string
 }
 
+// The landing kinds of this file's observations, named here because several
+// of its functions call their root state "state".
+const (
+	codexHookLanding      = state.GraphHookEvent
+	codexChildEdgeLanding = state.GraphHookEdge
+)
+
 func (s *codexHookRootState) hasBlockingInput() bool {
 	for _, pending := range s.pending {
 		if !isCodexAsyncUserInputTool(pending.toolName) {
@@ -280,10 +287,9 @@ func (c *agentCoordinator) handleCodexHookNow(ref provider.RootRef, req rpc.Requ
 	commitCodexHookSession(rootState, rootID, now)
 	rootState.transcriptStoppedAt = time.Time{}
 	rootState.rememberTranscript(req.AgentID, req.Transcript)
-	pendingAttention, hookOwnsTransition := reduceCodexPendingInput(rootState, req)
+	pendingAttention := reduceCodexPendingInput(rootState, req)
 	inputBlocking := rootState.hasBlockingInput()
-	approvalDeferred, approvalOwnsTransition := c.reduceCodexPendingApprovalLocked(rootState, ref, rootID, req, now)
-	hookOwnsTransition = hookOwnsTransition || approvalOwnsTransition
+	approvalDeferred := c.reduceCodexPendingApprovalLocked(rootState, ref, rootID, req, now)
 	c.codexHookMu.Unlock()
 	if req.Event == "UserPromptSubmit" {
 		if observer, ok := c.codex.(interface {
@@ -309,14 +315,13 @@ func (c *agentCoordinator) handleCodexHookNow(ref provider.RootRef, req rpc.Requ
 				// cannot clear an independently proven human-owned request.
 				mapped = false
 			}
-			hookOwnsTransition = hookOwnsTransition || codexAppServerRootUnavailable(current.AgentGraph)
 			observation = overlayCodexHookObservation(observation, current.AgentGraph)
 		}
 	}
 	if mapped {
 		c.rememberCodexHookRootObservation(ref.Key(), hookFallback)
 		generation := c.begin(ref.Key())
-		c.applyObservationWithHookOwnership(ref, generation, observation, claudeprovider.Compatibility{}, now, hookOwnsTransition)
+		c.applyObservationAs(ref, generation, observation, claudeprovider.Compatibility{}, now, "", state.GraphHookEvent)
 	}
 	if approvalDeferred {
 		c.recordDiagnostic(agentgraph.ProviderCodex, "hook_approval_grace_started", now)
@@ -578,7 +583,7 @@ func (c *agentCoordinator) applyCodexChildHookEdge(ref provider.RootRef, rootID 
 		return
 	}
 	generation := c.begin(ref.Key())
-	if !c.applyObservationWithHookOwnership(ref, generation, observation, claudeprovider.Compatibility{}, now, true) {
+	if !c.applyObservationAs(ref, generation, observation, claudeprovider.Compatibility{}, now, "", state.GraphHookEdge) {
 		c.rollbackCodexChildHook(ref.Key(), rootID, edge, previousOverlay, hadOverlay, previousLast, hadLast)
 		return
 	}
@@ -792,7 +797,7 @@ func (c *agentCoordinator) expireCodexChildHookState(ref provider.RootRef, now t
 		}
 	}
 	if changed {
-		c.applyObservationWithHookOwnership(ref, c.begin(ref.Key()), observation, claudeprovider.Compatibility{}, now, true)
+		c.applyObservationAs(ref, c.begin(ref.Key()), observation, claudeprovider.Compatibility{}, now, "", codexChildEdgeLanding)
 	}
 }
 
@@ -940,21 +945,18 @@ func codexRootStateUnavailable(runtime agentgraph.RuntimeState, attention agentg
 // to correlate on, and a blocking record is released by the turn Stop; that is
 // the honest bound, and it is the stale-red side of the trade. Async questions
 // instead survive the Stop and are dismissed by the next user submission.
-func reduceCodexPendingInput(state *codexHookRootState, req rpc.Request) (agentgraph.AttentionState, bool) {
-	ownedTransition := false
+func reduceCodexPendingInput(state *codexHookRootState, req rpc.Request) agentgraph.AttentionState {
 	if (req.Event == "PreToolUse" || req.Event == "PermissionRequest") && isCodexHumanInputPermission(req.ToolName) {
 		pending := codexPendingInput{
 			turnID: req.TurnID, toolUseID: req.ToolUseID, writer: req.AgentID,
 			toolName: req.ToolName, inputHash: req.ToolInputHash,
 		}
 		codexPendingInputFold(state, pending, req)
-		ownedTransition = true
 	}
 	if req.Event == "PostToolUse" && isCodexHumanInputPermission(req.ToolName) && !isCodexAsyncUserInputTool(req.ToolName) {
 		for key, pending := range state.pending {
 			if codexPendingInputMatches(pending, req) {
 				delete(state.pending, key)
-				ownedTransition = true
 			}
 		}
 	}
@@ -977,7 +979,6 @@ func reduceCodexPendingInput(state *codexHookRootState, req rpc.Request) (agentg
 		for key, pending := range state.pending {
 			if !isCodexAsyncUserInputTool(pending.toolName) && (req.TurnID == "" || pending.turnID == "" || pending.turnID == req.TurnID) {
 				delete(state.pending, key)
-				ownedTransition = true
 			}
 		}
 	}
@@ -987,14 +988,13 @@ func reduceCodexPendingInput(state *codexHookRootState, req rpc.Request) (agentg
 		for key, pending := range state.pending {
 			if isCodexAsyncUserInputTool(pending.toolName) {
 				delete(state.pending, key)
-				ownedTransition = true
 			}
 		}
 	}
 	if len(state.pending) > 0 {
-		return agentgraph.AttentionUserInput, ownedTransition
+		return agentgraph.AttentionUserInput
 	}
-	return agentgraph.AttentionNone, ownedTransition
+	return agentgraph.AttentionNone
 }
 
 // reduceCodexPendingApprovalLocked gives a generic PermissionRequest the same
@@ -1009,7 +1009,7 @@ func (c *agentCoordinator) reduceCodexPendingApprovalLocked(
 	rootID string,
 	req rpc.Request,
 	now time.Time,
-) (deferred, ownsTransition bool) {
+) (deferred bool) {
 	if state.approvals == nil {
 		state.approvals = make(map[string]*codexPendingApproval)
 	}
@@ -1027,7 +1027,7 @@ func (c *agentCoordinator) reduceCodexPendingApprovalLocked(
 		state.approvals[key] = pending
 		c.startCodexApprovalTimerLocked(state, key, pending)
 		logCodexHookWait("started", pending, "hook_permission", now)
-		return true, true
+		return true
 	}
 
 	resolved := make([]string, 0, 1)
@@ -1064,13 +1064,11 @@ func (c *agentCoordinator) reduceCodexPendingApprovalLocked(
 		if pending == nil {
 			continue
 		}
-		published := !pending.redPublishedAt.IsZero()
 		c.stopCodexApprovalLocked(pending)
 		delete(state.approvals, key)
 		logCodexHookWait("resolved", pending, "hook_progress", now)
-		ownsTransition = ownsTransition || published
 	}
-	return false, ownsTransition
+	return false
 }
 
 // startCodexApprovalTimerLocked schedules the Phase-1 timeout-to-human fallback.
@@ -1098,7 +1096,7 @@ func (c *agentCoordinator) startCodexApprovalTimerLocked(state *codexHookRootSta
 			c.codexHookMu.Unlock()
 			return
 		}
-		now := time.Now()
+		now := c.now()
 		if existingAttention {
 			// The chip is already red for something else, so publishing this gate
 			// would say nothing new — but forgetting it is a missed RED. The other
@@ -1145,8 +1143,8 @@ func (c *agentCoordinator) startCodexApprovalTimerLocked(state *codexHookRootSta
 		if currentSession, ok := sessionForKey(c.store.Snapshot(), pending.ref.Key()); ok {
 			observation = overlayCodexHookObservation(observation, currentSession.AgentGraph)
 		}
-		c.applyObservationWithHookOwnership(
-			pending.ref, generation, observation, claudeprovider.Compatibility{}, now, true,
+		c.applyObservationAs(
+			pending.ref, generation, observation, claudeprovider.Compatibility{}, now, "", codexHookLanding,
 		)
 	})
 }

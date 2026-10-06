@@ -412,6 +412,7 @@ func admitRoot(m map[int]*state.Session, sess state.Session, herdrPane *terminal
 		sess.StartedAt = prior.StartedAt
 		sess.DisplayName = prior.DisplayName
 		sess.Claude, sess.Codex, sess.Pi, sess.AgentGraph = prior.Claude, prior.Codex, prior.Pi, prior.AgentGraph
+		sess.InheritStatusEvidence(prior)
 		if !state.IsProviderAgent(sess.Agent) {
 			sess.Herdr = prior.Herdr
 		}

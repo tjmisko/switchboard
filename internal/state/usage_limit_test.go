@@ -10,8 +10,13 @@ import (
 
 var limitT0 = time.Date(2026, 10, 5, 19, 28, 5, 0, time.UTC)
 
+// limitedSession is a Claude session published working, as projection left
+// it, with a usage-limit record. Publication reads the published fields; it
+// does not re-resolve them.
 func limitedSession(resetsAt *time.Time) *Session {
-	s := graphSession(StatusWorking, limitT0.Add(-time.Minute))
+	since := limitT0.Add(-time.Minute)
+	s := &Session{PID: 10, Agent: AgentKindClaude, Claude: &AgentInfo{Status: StatusWorking, StatusSince: since}}
+	s.AgentGraph = &AgentGraph{RootID: "sess-1", Summary: AgentGraphSummary{Status: StatusWorking, Since: since}}
 	s.UsageLimit = &UsageLimit{ObservedAt: limitT0, ResetsAt: resetsAt, Source: UsageLimitSourceClaudeHook}
 	return s
 }

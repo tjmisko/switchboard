@@ -305,7 +305,7 @@ func TestShowsInWindowShouldRequireEveryLayerThatHasSpokenToAgree(t *testing.T) 
 }
 
 func TestApplyHerdrPaneShouldRecordHerdrsFocusedPaneWhenItsServerIsFollowed(t *testing.T) {
-	sess := graphClaudeSession()
+	sess := graphClaudeSession(t)
 	source := newFakeHerdrSource()
 	source.set(herdrKey, "claude", herdr.StatusIdle, herdrT0)
 	source.active[testHerdrSock] = "w1:p2"
@@ -334,7 +334,7 @@ func TestApplyHerdrPaneShouldRecordHerdrsFocusedPaneWhenItsServerIsFollowed(t *t
 func TestRunHerdrStatusShouldNotRefocusWhenOnlyAStatusChanged(t *testing.T) {
 	store := state.New("")
 	store.Apply(func(m map[int]*state.Session) {
-		sess := graphClaudeSession()
+		sess := graphClaudeSession(t)
 		sess.Herdr = &state.HerdrInfo{PaneID: "w1:p1", Socket: testHerdrSock}
 		m[sess.PID] = sess
 	})

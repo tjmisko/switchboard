@@ -8,35 +8,51 @@ import (
 	"github.com/tjmisko/switchboard/internal/statusexplain"
 )
 
-// Characterization of today's projection precedence (#95, work unit 6). Each
-// test is named for the rule it pins and asserts both the published status and
-// the reason explain gives for it. These are #96's regression suite: the pure
-// resolver must reproduce every row, or change it on purpose.
+// Characterization of projection precedence (#95, work unit 6), now decided by
+// the one status resolver (#96). Each test is named for the rule it pins and
+// asserts both the published status and the reason explain gives for it.
+//
+// Rows the resolver changed on purpose say so with "#96:" and the acceptance
+// criterion that changes them. Reason codes are the resolver's: herdr_override,
+// herdr_fallback and herdr_only became terminal_authority; pi_hook_authority
+// became event_authority; herdr_yield_attention became attention_held; a Pi
+// session file deciding is transcript_authority; delegation kept over herdr's
+// idle is descendants_live.
 
-// Rule herdr_override: a live herdr reading decides a Claude session's status
-// over its provider graph, whatever the graph says, including a Claude red.
+// Rule terminal authority: a live herdr reading of the tracked agent decides a
+// Claude session's status over its provider graph, except an open request for
+// the user, which it cannot resolve, and background work it cannot see.
 func TestPrecedenceHerdrOverrideShouldPublishHerdrsReadingWhenItIsLiveOverAClaudeGraph(t *testing.T) {
 	for _, tc := range []struct {
-		herdr string
-		graph string
-		want  string
+		herdr, agent string
+		graph        string
+		want         string
+		wantReason   statusexplain.Reason
 	}{
-		{HerdrWorking, StatusIdle, StatusWorking},
-		{HerdrWorking, StatusPermission, StatusWorking},
-		{HerdrBlocked, StatusWorking, StatusPermission},
-		{HerdrIdle, StatusWorking, StatusIdle},
-		{HerdrDone, StatusPermission, StatusIdle},
-		{HerdrIdle, StatusDelegating, StatusDelegating},
-		{HerdrDone, StatusDelegating, StatusDelegating},
+		{HerdrWorking, "claude", StatusIdle, StatusWorking, statusexplain.ReasonTerminalAuthority},
+		// #96: fresh unresolved provider attention survives terminal working
+		// or idle readings (was herdr's working, herdr_override).
+		{HerdrWorking, "claude", StatusPermission, StatusPermission, statusexplain.ReasonAttentionHeld},
+		{HerdrBlocked, "claude", StatusWorking, StatusPermission, statusexplain.ReasonTerminalAuthority},
+		{HerdrIdle, "claude", StatusWorking, StatusIdle, statusexplain.ReasonTerminalAuthority},
+		// #96: as above (was herdr's idle, herdr_override).
+		{HerdrDone, "claude", StatusPermission, StatusPermission, statusexplain.ReasonAttentionHeld},
+		{HerdrIdle, "claude", StatusDelegating, StatusDelegating, statusexplain.ReasonDescendantsLive},
+		{HerdrDone, "claude", StatusDelegating, StatusDelegating, statusexplain.ReasonDescendantsLive},
+		// #96: terminal readings must match the tracked agent and terminal
+		// association (was herdr's working, herdr_override).
+		{HerdrWorking, "codex", StatusIdle, StatusIdle, statusexplain.ReasonGraphAuthority},
+		{HerdrWorking, "", StatusIdle, StatusIdle, statusexplain.ReasonGraphAuthority},
 	} {
-		s := graphSession(tc.graph, herdrT0)
-		s.StartedAt = herdrT0
-		s.SetHerdr(reading(tc.herdr, true, herdrT0), herdrT0)
+		s := graphSession(t, tc.graph, herdrT0)
+		r := reading(tc.herdr, true, herdrT0)
+		r.Agent = tc.agent
+		s.SetHerdr(r, herdrT0)
 		if s.Claude.Status != tc.want {
-			t.Errorf("herdr %s over graph %s published %q, want %q", tc.herdr, tc.graph, s.Claude.Status, tc.want)
+			t.Errorf("herdr %s (%q) over graph %s published %q, want %q", tc.herdr, tc.agent, tc.graph, s.Claude.Status, tc.want)
 		}
-		if got := s.ExplainStatus(herdrT0).Reason; got != statusexplain.ReasonHerdrOverride {
-			t.Errorf("herdr %s over graph %s explained as %q", tc.herdr, tc.graph, got)
+		if got := s.ExplainStatus(herdrT0).Reason; got != tc.wantReason {
+			t.Errorf("herdr %s (%q) over graph %s explained as %q, want %q", tc.herdr, tc.agent, tc.graph, got, tc.wantReason)
 		}
 	}
 }
@@ -70,11 +86,10 @@ func TestPrecedenceHerdrShouldDecideNothingWhenItsReadingIsUnknownOrNotLive(t *t
 	}
 }
 
-// Rule herdr_yield_attention: fresh Codex input or approval attention holds
-// against any live herdr reading; expired attention does not, and Claude's
-// attention never does.
+// Rule attention held: fresh Codex input or approval attention holds against
+// any live herdr reading; expired attention does not.
 func TestPrecedenceHerdrShouldYieldOnlyToFreshCodexAttentionWhenBothAreLive(t *testing.T) {
-	now := time.Now() // herdrAuthority reads the wall clock for this rule
+	now := herdrT0
 	for _, tc := range []struct {
 		name       string
 		attention  agentgraph.AttentionState
@@ -82,12 +97,12 @@ func TestPrecedenceHerdrShouldYieldOnlyToFreshCodexAttentionWhenBothAreLive(t *t
 		want       string
 		wantReason statusexplain.Reason
 	}{
-		{"user input", agentgraph.AttentionUserInput, time.Hour, StatusPermission, statusexplain.ReasonHerdrYieldAttention},
-		{"approval", agentgraph.AttentionApproval, time.Hour, StatusPermission, statusexplain.ReasonHerdrYieldAttention},
-		{"no attention", agentgraph.AttentionNone, time.Hour, StatusWorking, statusexplain.ReasonHerdrOverride},
+		{"user input", agentgraph.AttentionUserInput, time.Hour, StatusPermission, statusexplain.ReasonAttentionHeld},
+		{"approval", agentgraph.AttentionApproval, time.Hour, StatusPermission, statusexplain.ReasonAttentionHeld},
+		{"no attention", agentgraph.AttentionNone, time.Hour, StatusWorking, statusexplain.ReasonTerminalAuthority},
 	} {
-		s := &Session{PID: 41, StartedAt: herdrT0, Agent: AgentKindCodex, Codex: &AgentInfo{}}
-		s.SetHerdr(reading(HerdrWorking, true, now), now)
+		s := &Session{PID: 41, StartedAt: statusLifetime, Agent: AgentKindCodex, Codex: &AgentInfo{}}
+		s.SetHerdr(codexReading(HerdrWorking, true, now), now)
 		s.SetAgentGraph(codexGraph(t, agentgraph.RuntimeActive, tc.attention, now, tc.lease), now)
 		if s.Codex.Status != tc.want {
 			t.Errorf("%s: published %q, want %q", tc.name, s.Codex.Status, tc.want)
@@ -97,13 +112,14 @@ func TestPrecedenceHerdrShouldYieldOnlyToFreshCodexAttentionWhenBothAreLive(t *t
 		}
 	}
 
-	claude := &Session{PID: 42, StartedAt: herdrT0, Agent: AgentKindClaude, Claude: &AgentInfo{}}
+	// #96: fresh unresolved provider attention survives terminal working or
+	// idle readings, Claude's included (was herdr's working: before the
+	// resolver only Codex attention held).
+	claude := &Session{PID: 42, StartedAt: statusLifetime, Agent: AgentKindClaude, Claude: &AgentInfo{}}
 	claude.SetHerdr(reading(HerdrWorking, true, now), now)
-	claude.AgentGraph = &AgentGraph{RootID: "sess-1", ObservedAt: now, FreshUntil: now.Add(time.Hour),
-		Summary: AgentGraphSummary{Status: StatusPermission, Attention: agentgraph.AttentionApproval, Since: now}}
-	claude.SetAgentGraph(claude.AgentGraph, now)
-	if claude.Claude.Status != StatusWorking {
-		t.Errorf("claude approval graph under live herdr working published %q, want herdr's working", claude.Claude.Status)
+	claude.SetAgentGraph(claudeStatusGraph(t, agentgraph.SourceClaudeTranscript, StatusPermission, now, time.Hour), now)
+	if claude.Claude.Status != StatusPermission {
+		t.Errorf("claude approval graph under live herdr working published %q, want the request held", claude.Claude.Status)
 	}
 }
 
@@ -119,14 +135,14 @@ func TestPrecedencePiShouldPreferHookThenHerdrThenSessionFileWhenEachIsAvailable
 		want       string
 		wantReason statusexplain.Reason
 	}{
-		{"hook over herdr", HerdrIdle, agentgraph.SourceHook, time.Minute, StatusWorking, statusexplain.ReasonPiHookAuthority},
-		{"herdr over session file", HerdrIdle, agentgraph.SourcePiSessionFile, time.Minute, StatusIdle, statusexplain.ReasonHerdrFallback},
-		{"herdr over lapsed hook", HerdrIdle, agentgraph.SourceHook, 0, StatusIdle, statusexplain.ReasonHerdrFallback},
-		{"session file alone", "", agentgraph.SourcePiSessionFile, time.Minute, StatusWorking, statusexplain.ReasonGraphAuthority},
+		{"hook over herdr", HerdrIdle, agentgraph.SourceHook, time.Minute, StatusWorking, statusexplain.ReasonEventAuthority},
+		{"herdr over session file", HerdrIdle, agentgraph.SourcePiSessionFile, time.Minute, StatusIdle, statusexplain.ReasonTerminalAuthority},
+		{"herdr over lapsed hook", HerdrIdle, agentgraph.SourceHook, 0, StatusIdle, statusexplain.ReasonTerminalAuthority},
+		{"session file alone", "", agentgraph.SourcePiSessionFile, time.Minute, StatusWorking, statusexplain.ReasonTranscriptAuthority},
 		{"lapsed hook alone", "", agentgraph.SourceHook, 0, "", statusexplain.ReasonObservationExpired},
 		{"herdr unknown alone", HerdrUnknown, "", 0, "", statusexplain.ReasonCoverageUnsupported},
 	} {
-		s := &Session{PID: 43, StartedAt: herdrT0, Agent: AgentKindPi, Pi: &AgentInfo{SessionID: piSessionID}}
+		s := &Session{PID: 43, StartedAt: statusLifetime, Agent: AgentKindPi, Pi: &AgentInfo{SessionID: piSessionID}}
 		if tc.herdr != "" {
 			s.SetHerdr(piReading(tc.herdr, herdrT0), herdrT0)
 		}
@@ -135,7 +151,12 @@ func TestPrecedencePiShouldPreferHookThenHerdrThenSessionFileWhenEachIsAvailable
 			if lease == 0 {
 				lease = time.Nanosecond
 			}
-			s.SetPiHookGraph(piSourceGraph(t, tc.graph, agentgraph.RuntimeActive, at, lease), at)
+			graph := piSourceGraph(t, tc.graph, agentgraph.RuntimeActive, at, lease)
+			if tc.graph == agentgraph.SourcePiSessionFile {
+				s.SetPiSessionFileGraph(graph, at)
+			} else {
+				s.SetPiHookGraph(graph, at)
+			}
 		}
 		later := at.Add(time.Millisecond)
 		s.ReprojectPi(later)
@@ -177,19 +198,22 @@ func TestPrecedenceUsageLimitShouldOverlayEveryStatusButPermissionWhenActive(t *
 	}
 }
 
-// Rule herdr_only: an agent with no provider adapter publishes its herdr graph,
+// Rule herdr only: an agent with no provider adapter publishes its herdr graph,
 // and a reading that is no longer followed reduces to unknown.
 func TestPrecedenceHerdrOnlyShouldPublishTheHerdrGraphWhenTheAgentHasNoProvider(t *testing.T) {
-	s := &Session{PID: 45, StartedAt: herdrT0, Agent: "gemini"}
-	s.SetHerdr(reading(HerdrBlocked, true, herdrT0), herdrT0)
+	s := &Session{PID: 45, StartedAt: statusLifetime, Agent: "gemini"}
+	r := reading(HerdrBlocked, true, herdrT0)
+	r.Agent = "gemini"
+	s.SetHerdr(r, herdrT0)
 	if got := s.publishedStatus(herdrT0); got != StatusPermission {
 		t.Fatalf("herdr blocked published %q", got)
 	}
-	if got := s.ExplainStatus(herdrT0).Reason; got != statusexplain.ReasonHerdrOnly {
+	if got := s.ExplainStatus(herdrT0).Reason; got != statusexplain.ReasonTerminalAuthority {
 		t.Fatalf("explained as %q", got)
 	}
 	later := herdrT0.Add(time.Second)
-	s.SetHerdr(reading(HerdrBlocked, false, later), later)
+	r.Live, r.Since = false, later
+	s.SetHerdr(r, later)
 	if got := s.publishedStatus(later); got != "" {
 		t.Fatalf("unfollowed herdr published %q, want unknown", got)
 	}

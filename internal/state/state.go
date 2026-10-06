@@ -53,11 +53,19 @@ type Session struct {
 	// RecordUsageLimit can refuse evidence that the session has already outrun.
 	// In-memory only; a restart forgets it, which costs at most one stale read.
 	usageLimitActivityAt time.Time
-	// statusDecision is the content-free record of the projection that last
-	// set the published status: which source decided, under which rule, and
-	// which reading lost (#95). In-memory only, like usageLimitActivityAt;
-	// ExplainStatus reads it and nothing decides from it.
-	statusDecision statusexplain.Projection
+	// statusDecision is the status resolver's last decision for the session
+	// (#96): the status it published, the evidence that decided, and every
+	// candidate that lost and why. In-memory only, like usageLimitActivityAt.
+	// ExplainStatus reads it, and the next resolution weighs it as its prior
+	// (open attention holds through its own deadline).
+	statusDecision statusexplain.Decision
+	// evidence is the latest graph each kind of provider evidence landed for
+	// the bound conversation; the resolver weighs them together. In-memory
+	// only and replaced, never mutated, so a snapshot's copy stays detached.
+	evidence graphEvidence
+	// displayKind is the kind of evidence AgentGraph, the published graph,
+	// came from.
+	displayKind GraphKind
 	// Navigable is populated only on detached aggregate copies. It says an
 	// exact local route candidate exists now; every action still revalidates the
 	// pane, window, liveness, and StartedAt before acting. Host-local snapshots

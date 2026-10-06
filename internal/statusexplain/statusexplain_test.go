@@ -195,8 +195,8 @@ func TestEvidenceKindOfShouldClassifyEveryGraphSourceWhenOneIsGiven(t *testing.T
 	cases := map[agentgraph.SourceKind]EvidenceKind{
 		agentgraph.SourceCodexAppServer:    EvidenceProviderSnapshot,
 		agentgraph.SourceClaudeTranscript:  EvidenceProviderSnapshot,
-		agentgraph.SourceCodexRollout:      EvidenceProviderSnapshot,
-		agentgraph.SourcePiSessionFile:     EvidenceProviderSnapshot,
+		agentgraph.SourceCodexRollout:      EvidenceTranscript,
+		agentgraph.SourcePiSessionFile:     EvidenceTranscript,
 		agentgraph.SourceHook:              EvidenceHook,
 		agentgraph.SourceHerdr:             EvidenceTerminal,
 		agentgraph.SourceRestoredLastKnown: EvidenceRestored,

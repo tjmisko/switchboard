@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/agentgraph"
+	"github.com/tjmisko/switchboard/internal/statusexplain"
 )
 
 // FreshnessBucket is the quantum a published freshness horizon is rounded up
@@ -171,21 +172,31 @@ func ProjectAgentGraph(observation agentgraph.Observation, prior *AgentGraph, no
 	return projection, nil
 }
 
-// SetAgentGraph attaches a detached projection and updates the existing legacy
-// enrichment view. Root ID and summary status are the only compatibility fields
-// it changes: Claude in-flight/workflow/pending-writer data remains owned by the
-// Claude adapter. Legacy StatusSince moves only when the legacy status changes,
-// independently of structured count-only summary transitions. While herdr is
-// the session's status authority (see HerdrInfo), its status wins. now dates
-// the decision record explain reads; it decides nothing.
+// SetAgentGraph lands graph as a provider snapshot. It is LandAgentGraph for
+// callers that have nothing more specific to say about the evidence.
 func (s *Session) SetAgentGraph(graph *AgentGraph, now time.Time) {
-	s.AgentGraph = graph.Clone()
-	if s.AgentGraph == nil {
-		return
+	s.LandAgentGraph(graph, GraphLanding{Kind: GraphSnapshot}, now)
+}
+
+// LandAgentGraph keeps a detached projection as the latest evidence of the
+// kind landing names, chooses the published graph among the session's landed
+// ones, and re-resolves the published status at now (see resolveStatus). Root
+// ID and status are the only legacy enrichment fields it changes: Claude
+// in-flight/workflow/pending-writer data remains owned by the Claude adapter.
+// Legacy StatusSince moves only when the legacy status changes. It returns
+// why the graph was not kept, "" when it was (LandingRefusal).
+//
+// A session that is neither Claude nor Codex only attaches the graph: Pi lands
+// through SetPiHookGraph and SetPiSessionFileGraph.
+func (s *Session) LandAgentGraph(graph *AgentGraph, landing GraphLanding, now time.Time) statusexplain.Reason {
+	graph = graph.Clone()
+	if graph == nil {
+		s.AgentGraph = nil
+		return ""
 	}
 	kind := s.Agent
 	if kind == "" {
-		switch s.AgentGraph.provider {
+		switch graph.provider {
 		case agentgraph.ProviderClaude:
 			kind = AgentKindClaude
 		case agentgraph.ProviderCodex:
@@ -200,11 +211,18 @@ func (s *Session) SetAgentGraph(graph *AgentGraph, now time.Time) {
 		}
 	}
 	if kind != AgentKindClaude && kind != AgentKindCodex {
-		return
+		s.AgentGraph = graph
+		return ""
+	}
+	if reason := s.LandingRefusal(graph.RootID, graph.ObservedAt, landing.Kind); reason != "" {
+		return reason
 	}
 	info := s.AgentBlock(kind)
-	info.SessionID = s.AgentGraph.RootID
-	s.projectStatus(info, s.AgentGraph.Summary.Since, now)
+	info.SessionID = graph.RootID
+	s.landEvidence(graph, landing, now)
+	s.selectDisplay(graph, landing.Kind, now)
+	s.project(info, graph.Summary.Since, now)
+	return ""
 }
 
 func (g *AgentGraph) domainSummary() agentgraph.Summary {
@@ -329,9 +347,10 @@ func hydrateAgentGraph(sess *Session, now time.Time) {
 			}
 		}
 	}
-	// A Pi graph was live authority only for the daemon that observed it.
-	// Restored, it is last-known presentation: it keeps the deadline it was
-	// persisted with and yields to any live reading (piStatusAuthority).
+	// A graph was live authority only for the daemon that observed it.
+	// Restored, it is last-known presentation (GraphRestored): it keeps the
+	// deadline it was persisted with and yields to any live reading. A Pi graph
+	// also says so in its source, which Pi's own paths read.
 	if provider == agentgraph.ProviderPi &&
 		(observation.Source == agentgraph.SourceHook || observation.Source == agentgraph.SourcePiSessionFile) {
 		observation.Source = agentgraph.SourceRestoredLastKnown
@@ -342,6 +361,8 @@ func hydrateAgentGraph(sess *Session, now time.Time) {
 		return
 	}
 	sess.AgentGraph = projection
+	sess.evidence = graphEvidence{GraphRestored: {graph: projection}}
+	sess.displayKind = GraphRestored
 	var info *AgentInfo
 	switch sess.Agent {
 	case AgentKindClaude:

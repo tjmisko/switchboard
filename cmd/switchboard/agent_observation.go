@@ -84,6 +84,11 @@ type agentCoordinator struct {
 	// read by Explain (status_explain.go).
 	admissions map[provider.RootKey]*admissionRecord
 
+	// clock is the coordinator's time source for the decisions it starts on
+	// its own (a tick, a timer, a hook with no stamp); nil means the wall
+	// clock. Every status decision below takes the instant as a parameter.
+	clock func() time.Time
+
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 	start  sync.Once
@@ -148,6 +153,14 @@ func newAgentCoordinator(store *state.Store, sink *history.Sink, claude claudeOb
 		codexStartSettle: codexHookStartSettle, codexApprovalGrace: codexHookApprovalGrace,
 		piRoots: make(map[provider.RootKey]*piHookRoot), piTails: make(map[provider.RootKey]*piSessionTail),
 	}
+}
+
+// now is the coordinator's clock.
+func (c *agentCoordinator) now() time.Time {
+	if c.clock == nil {
+		return time.Now()
+	}
+	return c.clock()
 }
 
 func (c *agentCoordinator) Start(parent context.Context, interval time.Duration) {
@@ -247,7 +260,7 @@ func (c *agentCoordinator) run(ctx context.Context, interval time.Duration) {
 }
 
 func (c *agentCoordinator) reconcileAll(ctx context.Context) {
-	c.reconcilePiRoots(time.Now())
+	c.reconcilePiRoots(c.now())
 	refs := c.refreshTrackedRoots()
 	for _, ref := range refs {
 		if ctx.Err() != nil {
@@ -385,7 +398,7 @@ func (c *agentCoordinator) observer(kind agentgraph.ProviderKind) provider.Obser
 }
 
 func (c *agentCoordinator) observe(ctx context.Context, ref provider.RootRef) {
-	c.observeAt(ctx, ref, time.Now())
+	c.observeAt(ctx, ref, c.now())
 }
 
 // observeAt is observe with the tick's instant supplied. The clock is a
@@ -408,11 +421,11 @@ func (c *agentCoordinator) observeAt(ctx context.Context, ref provider.RootRef, 
 			c.recordObserveOutcome(ref, statusexplain.ReasonBindingMissing)
 			return // exact Claude identity has not arrived; never bind by cwd
 		}
-		c.restoreClaude(ref)
+		c.restoreClaude(ref, now)
 	}
 	generation := c.begin(ref.Key())
 	if ref.Provider == agentgraph.ProviderCodex {
-		defer func() { c.reconcileCodexChildHooks(ref, time.Now()) }()
+		defer func() { c.reconcileCodexChildHooks(ref, now) }()
 	}
 	observation, err := observer.Observe(ctx, ref, now)
 	if err != nil {
@@ -442,14 +455,31 @@ func (c *agentCoordinator) observeAt(ctx context.Context, ref provider.RootRef, 
 			c.recordDiagnostic(ref.Provider, category, now)
 		}
 	}
-	if c.applyObservationWithRule(ref, generation, observation, compat, now, rule, false) && ref.Provider == agentgraph.ProviderClaude {
+	if c.applyObservationAs(ref, generation, observation, compat, now, rule, observedKind(observation)) && ref.Provider == agentgraph.ProviderClaude {
 		for _, event := range c.claude.DrainLegacyEvents(ref.Key()) {
 			c.sink.Record(event)
 		}
 	}
 }
 
-func (c *agentCoordinator) restoreClaude(ref provider.RootRef) {
+// observedKind is what an observer's answer is as evidence: a provider
+// snapshot, unless the observer held its previous observation over a failed
+// read, which keeps the provenance it had (a restore, a hook edge) and so must
+// not be promoted to a snapshot by being returned from Observe.
+func observedKind(observation agentgraph.Observation) state.GraphKind {
+	switch observation.Source {
+	case agentgraph.SourceRestoredLastKnown:
+		return state.GraphRestored
+	case agentgraph.SourceHook:
+		return state.GraphHookEvent
+	default:
+		return state.GraphSnapshot
+	}
+}
+
+// restoreClaude lands, once per tracked root, the Claude adapter's rebuild of
+// the persisted compatibility block: restored last-known evidence, at now.
+func (c *agentCoordinator) restoreClaude(ref provider.RootRef, now time.Time) {
 	key := ref.Key()
 	c.mu.Lock()
 	tracked := c.tracked[key]
@@ -466,13 +496,13 @@ func (c *agentCoordinator) restoreClaude(ref provider.RootRef) {
 		return
 	}
 	restored := compatibilityFromState(sess.Claude)
-	observation, err := c.claude.Restore(ref, restored, time.Now())
+	observation, err := c.claude.Restore(ref, restored, now)
 	if err != nil {
-		c.recordDiagnostic(agentgraph.ProviderClaude, "restore_error", time.Now())
+		c.recordDiagnostic(agentgraph.ProviderClaude, "restore_error", now)
 		return
 	}
 	generation := c.begin(key)
-	c.applyObservation(ref, generation, observation, c.claude.Projection(key), time.Now())
+	c.applyObservationAs(ref, generation, observation, c.claude.Projection(key), now, "", state.GraphRestored)
 }
 
 func (c *agentCoordinator) begin(key provider.RootKey) uint64 {
@@ -489,32 +519,43 @@ func (c *agentCoordinator) current(key provider.RootKey, generation uint64) bool
 	return c.generation[key] == generation
 }
 
+// applyObservation lands an observer's sample: a provider snapshot.
 func (c *agentCoordinator) applyObservation(ref provider.RootRef, generation uint64, observation agentgraph.Observation, compat claudeprovider.Compatibility, now time.Time) bool {
-	return c.applyObservationWithRule(ref, generation, observation, compat, now, "", false)
+	return c.applyObservationAs(ref, generation, observation, compat, now, "", state.GraphSnapshot)
 }
 
-func (c *agentCoordinator) applyObservationWithHookOwnership(ref provider.RootRef, generation uint64, observation agentgraph.Observation, compat claudeprovider.Compatibility, now time.Time, hookOwnsTransition bool) bool {
-	return c.applyObservationWithRule(ref, generation, observation, compat, now, "", hookOwnsTransition)
-}
-
-// applyObservationWithRule is the landing path. rule is the content-free id of
-// the decision that produced this observation — a hook edge's HookResult.Rule or
-// an Observe tick's drained resolution reason — and is recorded on the
-// transition, if any, that the observation causes. An empty rule falls back to
-// RuleGraphAuthority: the provider attributed nothing, which is the honest
-// record for a Codex edge, a restore, or a Claude observation whose transition
-// came from fanout topology rather than from a prompt.
+// applyObservationAs is the landing path. kind is what the observation is as
+// evidence (a snapshot, a hook's event, a partial child edge, a transcript
+// tail, a restore), stated by the caller that produced it; the status resolver
+// weighs it with the root's other evidence (state.Session.LandAgentGraph). A
+// graph only displaces the latest graph of its own kind, never another kind's:
+// selection happens in the resolver, not here.
+//
+// rule is the content-free id of the decision that produced this observation —
+// a hook edge's HookResult.Rule or an Observe tick's drained resolution reason —
+// and is recorded on the transition, if any, that the observation causes. An
+// empty rule falls back to RuleGraphAuthority: the provider attributed nothing,
+// which is the honest record for a Codex edge, a restore, or a Claude
+// observation whose transition came from fanout topology rather than from a
+// prompt.
 //
 // The rule EXPLAINS the transition; it never decides one. Nothing below reads it
 // except the history event.
-func (c *agentCoordinator) applyObservationWithRule(ref provider.RootRef, generation uint64, observation agentgraph.Observation, compat claudeprovider.Compatibility, now time.Time, rule string, hookOwnsTransition bool) bool {
+func (c *agentCoordinator) applyObservationAs(ref provider.RootRef, generation uint64, observation agentgraph.Observation, compat claudeprovider.Compatibility, now time.Time, rule string, kind state.GraphKind) bool {
+	landing := state.GraphLanding{Kind: kind}
 	if ref.Provider == agentgraph.ProviderCodex {
+		own := codexObservationRootAttention(observation)
 		observation = c.overlayCodexHookRootObservation(ref.Key(), observation, now)
 		observation = c.overlayCodexPendingObservation(ref.Key(), observation, now)
 		// Order is load-bearing: the pending overlay claims the root first, so the
 		// approval overlay only ever fills a chip no more specific human reason owns.
 		observation = c.overlayCodexApprovalObservation(ref.Key(), observation, now)
 		observation = c.overlayCodexChildObservation(ref.Key(), observation, now)
+		// A request the overlays put on the root is the hooks' own (their
+		// pending-input and approval latches, or a hook root carried over an
+		// app-server gap), so the hook that closes it may resolve it.
+		landing.HookLatched = kind != state.GraphHookEvent && own == agentgraph.AttentionNone &&
+			codexObservationRootAttention(observation) != agentgraph.AttentionNone
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -526,23 +567,17 @@ func (c *agentCoordinator) applyObservationWithRule(ref provider.RootRef, genera
 	if !ok || agentgraph.ProviderKind(priorSession.Agent) != ref.Provider {
 		return false
 	}
-	if !hookOwnsTransition {
-		if admitted, reason := admitObservation(observation, priorSession.AgentGraph, now); !admitted {
-			if reason != "" {
-				c.recordRejectionLocked(ref.Key(), observation, reason, now)
-			}
-			return false
-		}
+	if observation.RootID == "" || len(observation.Nodes) == 0 {
+		return false
+	}
+	if reason := priorSession.LandingRefusal(observation.RootID, observation.ObservedAt, kind); reason != "" {
+		c.recordRejectionLocked(ref.Key(), observation, reason, now)
+		return false
 	}
 	graph, err := state.ProjectAgentGraph(observation, priorSession.AgentGraph, now)
 	if err != nil {
 		c.recordDiagnosticLocked(ref.Provider, "invalid_observation", now)
 		return false
-	}
-	canonical, err := c.history.Project(history.AgentStateContext{PID: ref.PID, CWD: ref.CWD}, observation, now)
-	if err != nil {
-		c.recordDiagnosticLocked(ref.Provider, "history_projection_error", now)
-		canonical = nil
 	}
 	beforeStatus, beforePending, beforeSession := "", "", observation.RootID
 	beforeSince := time.Time{}
@@ -553,7 +588,8 @@ func (c *agentCoordinator) applyObservationWithRule(ref provider.RootRef, genera
 			beforeSession = info.SessionID
 		}
 	}
-	applied, nativeOverride := false, false
+	applied, displayed, nativeOverride := false, false, false
+	var refused statusexplain.Reason
 	afterStatus, afterPending, afterSession := "", "", beforeSession
 	nativeName, hasNativeName := observationRootName(observation)
 	authoritativeNativeName := ref.Provider == agentgraph.ProviderCodex &&
@@ -572,7 +608,10 @@ func (c *agentCoordinator) applyObservationWithRule(ref provider.RootRef, genera
 		if ref.Provider == agentgraph.ProviderClaude {
 			applyClaudeCompatibility(sess.AgentBlock(state.AgentKindClaude), compat)
 		}
-		sess.SetAgentGraph(graph, now)
+		if refused = sess.LandAgentGraph(graph, landing, now); refused != "" {
+			return
+		}
+		displayed = sess.AgentGraph != nil && sess.AgentGraph.Source == graph.Source && sess.AgentGraph.ObservedAt.Equal(graph.ObservedAt)
 		if info := sess.Enrichment(); info != nil {
 			afterStatus = info.Status
 			afterPending = info.PendingSummary()
@@ -595,9 +634,23 @@ func (c *agentCoordinator) applyObservationWithRule(ref provider.RootRef, genera
 		}
 		applied = true
 	})
+	if refused != "" {
+		c.recordRejectionLocked(ref.Key(), observation, refused, now)
+		return false
+	}
 	if !applied {
 		c.history.Forget(observation.Provider, observation.RootID)
 		return false
+	}
+	// History follows the published graph: evidence the resolver keeps but
+	// does not show (a hook under a held request) projects nothing.
+	var canonical []history.Event
+	if displayed {
+		canonical, err = c.history.Project(history.AgentStateContext{PID: ref.PID, CWD: ref.CWD}, observation, now)
+		if err != nil {
+			c.recordDiagnosticLocked(ref.Provider, "history_projection_error", now)
+			canonical = nil
+		}
 	}
 	if nativeOverride {
 		c.recordDiagnosticLocked(agentgraph.ProviderCodex, "native-override", now)
@@ -608,7 +661,7 @@ func (c *agentCoordinator) applyObservationWithRule(ref provider.RootRef, genera
 	}
 	root.provider, root.kind, root.rootID = c.observer(ref.Provider), ref.Provider, observation.RootID
 	c.tracked[ref.Key()] = root
-	c.recordAdmissionLocked(ref.Key(), graph, hookOwnsTransition)
+	c.recordAdmissionLocked(ref.Key(), graph)
 	for _, event := range canonical {
 		c.sink.Record(event)
 	}
@@ -675,55 +728,6 @@ func observationRootName(observation agentgraph.Observation) (string, bool) {
 	return "", false
 }
 
-func shouldApplyObservation(observation agentgraph.Observation, current *state.AgentGraph, now time.Time) bool {
-	admitted, _ := admitObservation(observation, current, now)
-	return admitted
-}
-
-// admitObservation is graph admission: whether observation may replace
-// current, and, when it may not, the rule that refused it (#95). An empty
-// observation is refused with no reason; there is nothing to explain.
-func admitObservation(observation agentgraph.Observation, current *state.AgentGraph, now time.Time) (bool, statusexplain.Reason) {
-	if observation.RootID == "" || len(observation.Nodes) == 0 {
-		return false, ""
-	}
-	if current == nil || current.RootID != observation.RootID {
-		return true, ""
-	}
-	currentFresh := current.Fresh(now)
-	candidateFresh := observation.Fresh(now)
-	if observation.Provider == agentgraph.ProviderCodex {
-		// Exact event time is the first authority within one Codex conversation.
-		// Hooks can therefore provide the immediate edge while a subsequent
-		// app-server sample corrects it, and a delayed sample can never repaint
-		// over a newer hook. Claude retains its established hook/transcript policy.
-		if observation.ObservedAt.Before(current.ObservedAt) {
-			return false, statusexplain.ReasonOlderThanCurrent
-		}
-		if observation.ObservedAt.After(current.ObservedAt) {
-			if currentFresh && !candidateFresh && current.Source != observation.Source {
-				return false, statusexplain.ReasonStaleVsFresh
-			}
-			return true, ""
-		}
-	}
-	currentRank := sourceRank(current.Source)
-	candidateRank := sourceRank(observation.Source)
-	if currentFresh && currentRank > candidateRank {
-		return false, statusexplain.ReasonSourceOutranked
-	}
-	if candidateFresh && candidateRank > currentRank {
-		return true, ""
-	}
-	if currentFresh && !candidateFresh && current.Source != observation.Source {
-		return false, statusexplain.ReasonStaleVsFresh
-	}
-	if observation.ObservedAt.Before(current.ObservedAt) {
-		return false, statusexplain.ReasonOlderThanCurrent
-	}
-	return true, ""
-}
-
 // overlayCodexHookObservation keeps the app-server's structural detail and
 // provenance while applying a newer hook's immediate root status. A hook is
 // intentionally partial: it must not erase the authoritative thread name,
@@ -767,21 +771,6 @@ func codexAppServerGraphOwnsHookHorizon(current *state.AgentGraph, hookAt time.T
 		current.Fresh(hookAt) && !codexAppServerRootUnavailable(current)
 }
 
-func sourceRank(source agentgraph.SourceKind) int {
-	switch source {
-	case agentgraph.SourceCodexAppServer, agentgraph.SourceClaudeTranscript:
-		return 4
-	case agentgraph.SourceHook:
-		return 3
-	case agentgraph.SourceCodexRollout, agentgraph.SourcePiSessionFile:
-		return 2
-	case agentgraph.SourceRestoredLastKnown:
-		return 1
-	default:
-		return 0
-	}
-}
-
 func (c *agentCoordinator) expireCurrent(ref provider.RootRef, generation uint64, now time.Time) {
 	if !c.current(ref.Key(), generation) {
 		return
@@ -795,7 +784,9 @@ func (c *agentCoordinator) expireCurrent(ref provider.RootRef, generation uint64
 	if ref.Provider == agentgraph.ProviderClaude {
 		compat = compatibilityFromState(sess.Claude)
 	}
-	c.applyObservation(ref, generation, observation, compat, now)
+	// The published graph lapsing is not new evidence: it re-lands as the kind
+	// it already was, so the resolver weighs whatever else is still fresh.
+	c.applyObservationAs(ref, generation, observation, compat, now, "", sess.DisplayGraphKind())
 }
 
 func observationFromState(kind agentgraph.ProviderKind, graph *state.AgentGraph) agentgraph.Observation {
@@ -963,7 +954,7 @@ func pendingSetsFromRecords(records []state.PendingPromptRecord) map[string][]cl
 func (c *agentCoordinator) HandleHook(req rpc.Request, sess state.Session) {
 	if req.Agent == state.AgentKindPi {
 		if sess.Agent != state.AgentKindPi {
-			c.recordDiagnostic(agentgraph.ProviderPi, "hook_provider_mismatch", time.Now())
+			c.recordDiagnostic(agentgraph.ProviderPi, "hook_provider_mismatch", c.now())
 			return
 		}
 		c.handlePiHook(req, sess)
@@ -989,7 +980,7 @@ func (c *agentCoordinator) HandleHook(req rpc.Request, sess state.Session) {
 	}
 	now := req.ObservedAt
 	if now.IsZero() {
-		now = time.Now()
+		now = c.now()
 	}
 	switch ref.Provider {
 	case agentgraph.ProviderClaude:
@@ -1000,7 +991,7 @@ func (c *agentCoordinator) HandleHook(req rpc.Request, sess state.Session) {
 			c.recordDiagnostic(ref.Provider, "exact_binding_unavailable", now)
 			return
 		}
-		c.restoreClaude(ref)
+		c.restoreClaude(ref, now)
 		generation := c.begin(ref.Key())
 		result := c.claude.ApplyHook(claudeprovider.HookSignal{
 			Root: ref, Event: req.Event, AgentID: req.AgentID, AgentType: req.AgentType,
@@ -1036,7 +1027,7 @@ func (c *agentCoordinator) HandleHook(req rpc.Request, sess state.Session) {
 		// result.Rule names the edge the adapter just decided by — the red opening,
 		// one call's clear, a hold that left it red — and is the whole point of
 		// Phase 3: a transition recorded without it says only that the graph spoke.
-		c.applyObservationWithRule(ref, generation, result.Observation, result.Projection, now, result.Rule, false)
+		c.applyObservationAs(ref, generation, result.Observation, result.Projection, now, result.Rule, state.GraphHookEvent)
 	case agentgraph.ProviderCodex:
 		rootID := req.SessionID
 		if rootID == "" {
