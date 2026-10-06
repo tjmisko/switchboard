@@ -101,6 +101,11 @@ type agentCoordinator struct {
 
 	codexLimitMu    sync.Mutex
 	codexLimitScans map[provider.RootKey]*codexLimitScan
+
+	// piMu serializes the Pi hook reducer (pi_hooks.go) per daemon; it is
+	// taken before the store lock, never under it.
+	piMu    sync.Mutex
+	piRoots map[provider.RootKey]*piHookRoot
 }
 
 type codexNamingState struct {
@@ -135,6 +140,7 @@ func newAgentCoordinator(store *state.Store, sink *history.Sink, claude claudeOb
 		namingModel: codexprovider.DefaultDisplayNameModel, namingTimeout: 45 * time.Second,
 		codexHookRoots: make(map[provider.RootKey]*codexHookRootState), codexStarts: make(map[provider.RootKey]*pendingCodexStart),
 		codexStartSettle: codexHookStartSettle, codexApprovalGrace: codexHookApprovalGrace,
+		piRoots: make(map[provider.RootKey]*piHookRoot),
 	}
 }
 
@@ -235,6 +241,7 @@ func (c *agentCoordinator) run(ctx context.Context, interval time.Duration) {
 }
 
 func (c *agentCoordinator) reconcileAll(ctx context.Context) {
+	c.reconcilePiRoots(time.Now())
 	refs := c.refreshTrackedRoots()
 	for _, ref := range refs {
 		if ctx.Err() != nil {
@@ -925,8 +932,16 @@ func pendingSetsFromRecords(records []state.PendingPromptRecord) map[string][]cl
 // HandleHook is the RPC graph-aware hook callback. The incoming Claude
 // AgentID is intentionally passed raw exactly once; the adapter performs its
 // own canonicalization. Codex hook status is only a fallback beneath a fresh
-// app-server observation.
+// app-server observation. Pi has no adapter: its hooks go to the Pi reducer.
 func (c *agentCoordinator) HandleHook(req rpc.Request, sess state.Session) {
+	if req.Agent == state.AgentKindPi {
+		if sess.Agent != state.AgentKindPi {
+			c.recordDiagnostic(agentgraph.ProviderPi, "hook_provider_mismatch", time.Now())
+			return
+		}
+		c.handlePiHook(req, sess)
+		return
+	}
 	ref, ok := providerRootRef(sess)
 	if !ok {
 		return
