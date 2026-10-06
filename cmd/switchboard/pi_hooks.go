@@ -226,7 +226,7 @@ func (c *agentCoordinator) handlePiHook(req rpc.Request, sess state.Session) {
 	var beforeSince time.Time
 	c.store.Apply(func(sessions map[int]*state.Session) {
 		s := sessions[key.PID]
-		if s == nil || !s.StartedAt.Equal(key.StartedAt) || s.Agent != state.AgentKindPi {
+		if !sessionHoldsRoot(s, key) || s.Agent != state.AgentKindPi {
 			return
 		}
 		projected, err := state.ProjectAgentGraph(observation, s.AgentGraph, now)
@@ -298,7 +298,7 @@ func (c *agentCoordinator) applyPiSessionName(key provider.RootKey, root *piHook
 	applied := false
 	c.store.Apply(func(sessions map[int]*state.Session) {
 		s := sessions[key.PID]
-		if s == nil || !s.StartedAt.Equal(key.StartedAt) || s.Agent != state.AgentKindPi {
+		if !sessionHoldsRoot(s, key) || s.Agent != state.AgentKindPi {
 			return
 		}
 		s.SetPiNativeName(sessionID, req.SessionName)

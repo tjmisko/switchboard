@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 	"time"
@@ -8,6 +9,7 @@ import (
 	"github.com/tjmisko/switchboard/internal/agentgraph"
 	"github.com/tjmisko/switchboard/internal/history"
 	"github.com/tjmisko/switchboard/internal/osproc"
+	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/terminal"
 	"github.com/tjmisko/switchboard/internal/transcript"
@@ -128,6 +130,97 @@ func TestAdmitRootShouldInheritOnlyTheSameProcessLifetime(t *testing.T) {
 			t.Fatalf("herdr block = %+v, want none: the pane belonged to the previous pi", got.Herdr)
 		}
 	})
+}
+
+// A Codex hook binding is held per lifetime. When a pid is reused by another
+// Codex, even one carrying the very same StartedAt, the old lifetime's binding
+// is forgotten and the replacement starts unbound.
+func TestCodexBindingShouldNotCarryOverWhenAPIDIsReusedByTheSameAgent(t *testing.T) {
+	const pid = 4402
+	store := state.New("")
+	oldRef := seedCoordinatorSession(store, pid, identityT0, state.AgentKindCodex, "thread-old", "/repo")
+	fake := newFakeCodexCoordinatorObserver()
+	coordinator := newAgentCoordinator(store, nil, nil, fake)
+	defer coordinator.Close()
+	coordinator.refreshTrackedRoots()
+	if got := fake.binding(oldRef.Key()); got != "thread-old" {
+		t.Fatalf("setup: binding = %q, want thread-old", got)
+	}
+
+	store.Apply(func(m map[int]*state.Session) {
+		admitRoot(m, state.Session{PID: pid, Agent: state.AgentKindCodex, CWD: "/repo", StartedAt: identityT0, Birth: "boot-test:reused"},
+			nil, newFakeHerdrSource(), nil, nil, identityT0)
+	})
+	coordinator.refreshTrackedRoots()
+
+	replacement := providerRootKey(store.Snapshot().Sessions[0])
+	if replacement == oldRef.Key() {
+		t.Fatal("the replacement has the old lifetime's root key")
+	}
+	if got := fake.binding(replacement); got != "" {
+		t.Errorf("replacement binding = %q, want none", got)
+	}
+	fake.mu.Lock()
+	forgets := fake.forgets[oldRef.Key()]
+	fake.mu.Unlock()
+	if forgets != 1 {
+		t.Errorf("old lifetime forgotten %d times, want once", forgets)
+	}
+	if _, ok := sessionForKey(store.Snapshot(), oldRef.Key()); ok {
+		t.Error("the old lifetime's key still resolves to a session")
+	}
+}
+
+// A provider observation gathered for the old lifetime, still in flight when
+// the pid is reused, must not land on the replacement, even when the
+// replacement carries the same StartedAt, the case only the birth token fences.
+func TestLateObservationShouldNotLandOnAReplacementWhenThePIDWasReused(t *testing.T) {
+	const pid = 4403
+	store := state.New("")
+	oldRef := seedCoordinatorSession(store, pid, identityT0, state.AgentKindCodex, "root", "/repo")
+	fake := newFakeCodexCoordinatorObserver()
+	fake.started, fake.release = make(chan struct{}), make(chan struct{})
+	fake.observations[oldRef.Key()] = testCodexObservation(oldRef, "root", time.Now(), agentgraph.RuntimeActive, agentgraph.AttentionApproval)
+	coordinator := newAgentCoordinator(store, nil, nil, fake)
+	defer coordinator.Close()
+	coordinator.refreshTrackedRoots()
+
+	done := make(chan struct{})
+	go func() {
+		coordinator.observe(context.Background(), oldRef)
+		close(done)
+	}()
+	<-fake.started
+	replacement := &state.Session{PID: pid, Agent: state.AgentKindCodex, CWD: "/repo", StartedAt: identityT0, Birth: "boot-test:reused",
+		Codex: &state.AgentInfo{SessionID: "root"}}
+	store.Apply(func(m map[int]*state.Session) { m[pid] = replacement })
+	close(fake.release)
+	<-done
+
+	got := store.Snapshot().Sessions[0]
+	if got.AgentGraph != nil {
+		t.Fatalf("replacement graph = %+v, want the old lifetime's observation dropped", got.AgentGraph)
+	}
+}
+
+// A settle timer armed for the old lifetime fires after the pid was reused. It
+// must not modify the replacement. The test waits on the coordinator's own
+// timer group, not on a sleep.
+func TestLateTimerShouldNotModifyAReplacementWhenThePIDWasReused(t *testing.T) {
+	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-old")
+	old := store.Snapshot().Sessions[0]
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "SessionStart", SessionID: "thread-old", HookSource: "startup", ObservedAt: time.Now(),
+	})
+	store.Apply(func(m map[int]*state.Session) {
+		m[old.PID] = &state.Session{PID: old.PID, Agent: state.AgentKindCodex, CWD: old.CWD, StartedAt: old.StartedAt, Birth: "boot-test:reused"}
+	})
+	coordinator.codexTimerWG.Wait()
+
+	got := store.Snapshot().Sessions[0]
+	if got.Birth != "boot-test:reused" || got.AgentGraph != nil || got.Codex != nil {
+		t.Fatalf("replacement = %+v, want it untouched by the old lifetime's timer", got)
+	}
 }
 
 // A daemon restart restores display state and authority only once the live

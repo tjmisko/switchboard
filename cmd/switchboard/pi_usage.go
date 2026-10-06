@@ -128,7 +128,7 @@ func (c *agentCoordinator) applyPiUsage(key provider.RootKey, root *piHookRoot, 
 		total, billing := root.usage, root.billing
 		c.store.Apply(func(sessions map[int]*state.Session) {
 			s := sessions[key.PID]
-			if s == nil || !s.StartedAt.Equal(key.StartedAt) || s.Agent != state.AgentKindPi {
+			if !sessionHoldsRoot(s, key) || s.Agent != state.AgentKindPi {
 				return
 			}
 			s.SetPiUsage(sessionID, total, billing)

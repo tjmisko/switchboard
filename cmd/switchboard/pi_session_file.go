@@ -136,7 +136,7 @@ func (c *agentCoordinator) seedPiFromSessionFile(candidate piSessionFileCandidat
 	var beforeSince time.Time
 	c.store.Apply(func(sessions map[int]*state.Session) {
 		s := sessions[candidate.key.PID]
-		if s == nil || !s.StartedAt.Equal(candidate.key.StartedAt) || s.Agent != state.AgentKindPi ||
+		if !sessionHoldsRoot(s, candidate.key) || s.Agent != state.AgentKindPi ||
 			s.Pi == nil || s.Pi.SessionID != candidate.sessionID {
 			return
 		}
