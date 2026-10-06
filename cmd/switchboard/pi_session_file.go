@@ -39,8 +39,9 @@ type piSessionFileCandidate struct {
 // 1.7). A restored Pi block has no live authority, and its hooks rebuild the
 // reducer only when Pi next fires one, which for an idle Pi may be hours away.
 // Until then the tail of Pi's own session file decides, read through the
-// shared bounded tail reader: the newest assistant message on the active
-// branch stopped for a tool → working, for anything else → idle.
+// shared bounded tail reader. The newest message on the active branch decides:
+// the user's (Pi appends it as a run starts) or an assistant message stopped
+// for a tool → working; an assistant message stopped for anything else → idle.
 //
 // The read lands as a pi_session_file graph with piSessionFileLease and is
 // renewed while the file stays readable. It yields to herdr outright

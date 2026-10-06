@@ -216,7 +216,8 @@ const (
 	RulePiHookLapsed = "pi_hook_lapsed"
 	// RulePiSessionFileRead — after a daemon restart, before any hook reached
 	// the root, the tail of Pi's session file set the status: working when the
-	// last assistant message stopped for a tool, else idle.
+	// newest message is the user's (a run just started) or an assistant
+	// message that stopped for a tool, else idle.
 	RulePiSessionFileRead = "pi_session_file_read"
 )
 

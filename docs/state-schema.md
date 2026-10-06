@@ -218,9 +218,10 @@ After a daemon restart a persisted Pi graph comes back as
 is never renewed, and yields to any live herdr reading. Until a hook reaches
 the restarted daemon, each reconcile tick reads the tail of the session file
 named by `pi.transcript` (at most 256 KiB, re-read only when its size or mtime
-moves). The newest assistant message on the active branch, the parent chain
-from the file's last entry, reads `working` when it stopped for a tool and
-`idle` otherwise. It lands as `source: "pi_session_file"` with a 90-second
+moves). The newest user or assistant message on the active branch, the parent
+chain from the file's last entry, decides: a user message (Pi appends it as a
+run starts) or an assistant message that stopped for a tool reads `working`,
+any other assistant stop `idle`. It lands as `source: "pi_session_file"` with a 90-second
 lease, renewed while the file stays readable, and history records the edge as
 `pi_session_file_read`. A live herdr reading suspends the read, and the first
 hook ends it. The file records no dialog, so the read never replaces a

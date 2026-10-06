@@ -351,7 +351,10 @@ Additions to the plan:
   It never replaces a restored red, since the file records no dialog; the
   Codex rollout read leaves hook-owned waits alone for the same reason.
   The active branch is the parent chain from the file's last entry, which is
-  the leaf Pi itself loads.
+  the leaf Pi itself loads. The newest message on it decides, and a user
+  message there reads working (coordinator decision): Pi appends it as a run
+  starts, so the plan's "last assistant stopReason" alone would read idle
+  through a run's first model call.
 - **Naming.** The extension forwards `session_info_changed` as a new
   `SessionName` hook (content: the user-set name only, `""` when cleared).
   The name is stored as `display_name` with origin `native`, bound to the Pi

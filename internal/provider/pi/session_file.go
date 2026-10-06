@@ -18,9 +18,10 @@ import (
 const sessionTailBytes = 256 * 1024
 
 // SessionTail is what a Pi session file's tail says about the run: Runtime is
-// active when the newest assistant message on the active branch stopped to
-// call a tool, idle when it stopped for any other reason, and unknown when the
-// tail holds no assistant message on that branch. At is that message's
+// active when the newest message on the active branch is the user's (Pi
+// appends it as a run starts) or an assistant message that stopped to call a
+// tool, idle when that assistant message stopped for any other reason, and
+// unknown when the tail holds neither on that branch. At is that message's
 // timestamp.
 type SessionTail struct {
 	Runtime agentgraph.RuntimeState
@@ -47,8 +48,8 @@ type sessionEntry struct {
 // the leaf when it loads a session, so the active branch is the parent chain
 // from the last entry. A later line can belong to an abandoned branch only
 // until the next append, which always extends the leaf. The walk stops at the
-// first assistant message; when the chain leaves the window first, or the
-// newest row is still being written, the tail is no evidence.
+// first user or assistant message; when the chain leaves the window first, or
+// the newest row is still being written, the tail is no evidence.
 func ReadSessionTail(path string) (SessionTail, error) {
 	unknown := SessionTail{Runtime: agentgraph.RuntimeUnknown}
 	data, complete, err := tailread.Lines(path, sessionTailBytes)
@@ -70,6 +71,9 @@ func ReadSessionTail(path string) (SessionTail, error) {
 		entry, ok := entries[id]
 		if !ok {
 			break
+		}
+		if entry.Type == "message" && entry.Message.Role == "user" {
+			return SessionTail{Runtime: agentgraph.RuntimeActive, At: entry.Timestamp}, nil
 		}
 		if entry.Type == "message" && entry.Message.Role == "assistant" {
 			if entry.Message.StopReason == "toolUse" {
