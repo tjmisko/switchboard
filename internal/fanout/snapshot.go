@@ -113,7 +113,7 @@ func (o *Observer) Observe(root Root, now time.Time) (Result, error) {
 	}
 	sess := &state.Session{PID: root.PID, Agent: root.Agent, CWD: root.CWD}
 	info := &state.AgentInfo{SessionID: root.SessionID, Transcript: root.Transcript}
-	events := o.Reconcile(sess, info, now)
+	events, scan := o.reconcile(sess, info, now)
 
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -121,16 +121,19 @@ func (o *Observer) Observe(root Root, now time.Time) (Result, error) {
 	if ss == nil {
 		return Result{}, errors.New("fanout: session was not initialized")
 	}
-	snapshot, err := o.snapshotLocked(root, ss, now)
+	snapshot, err := o.snapshotLocked(root, ss, now, scan)
 	if err != nil {
 		return Result{Snapshot: snapshot, Events: append([]history.Event(nil), events...)}, err
 	}
 	return Result{Snapshot: snapshot.Clone(), Events: append([]history.Event(nil), events...)}, nil
 }
 
-func (o *Observer) snapshotLocked(root Root, ss *sessionState, now time.Time) (Snapshot, error) {
+func (o *Observer) snapshotLocked(root Root, ss *sessionState, now time.Time, scan subagentScan) (Snapshot, error) {
 	snapshot := Snapshot{SessionID: root.SessionID, ObservedAt: now, Complete: true}
-	subs, err := transcript.SubagentsForTranscript(root.Transcript)
+	subs, err := scan.subs, scan.err
+	if !scan.done {
+		subs, err = transcript.SubagentsForTranscript(root.Transcript)
+	}
 	if err != nil {
 		snapshot.Complete = false
 		return snapshot, err
