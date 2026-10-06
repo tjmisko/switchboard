@@ -248,9 +248,10 @@ func TestRestartShouldRevalidateTheProcessLifetimeBeforeRestoringAuthority(t *te
 			wantSessionEnds: 1,
 		},
 		{
-			name:           "should restore nothing and close no lane when the mirror predates birth tokens",
+			name:           "should keep the display start and provider state when the mirror predates birth tokens and the process still classifies as the session",
 			persistedBirth: "",
 			live:           osproc.Info{PID: pid, Comm: "claude", TTY: "/dev/pts/4", Birth: "boot:1"},
+			wantRestored:   true,
 		},
 		{
 			name:           "should restore nothing and close no lane when the live token is unavailable",
@@ -299,6 +300,124 @@ func TestRestartShouldRevalidateTheProcessLifetimeBeforeRestoringAuthority(t *te
 			}
 		})
 	}
+}
+
+// A state.json written before #97 carries no birth tokens. The first restart
+// after the upgrade trusts such a session on first use: while the process
+// still classifies as the session and a token is readable now, the session is
+// restored and adopts that token, and from then on every restart and death is
+// fenced by it.
+func TestRestartShouldTrustAPreBirthTokenSessionOnFirstUse(t *testing.T) {
+	const pid = 4406
+	rediscovered := identityT0.Add(2 * time.Hour)
+	claudeLive := func(birth string) osproc.Info {
+		return osproc.Info{PID: pid, Comm: "claude", TTY: "/dev/pts/4", Birth: birth}
+	}
+	// restart loads the mirror at path into a fresh store and runs the startup
+	// stale drop against one live process, as the daemon does on start.
+	restart := func(t *testing.T, path string, live osproc.Info, sink *history.Sink) *state.Store {
+		t.Helper()
+		store := state.New(path)
+		if err := store.Load(); err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		dropStaleSessions(store, &infoProcs{infos: map[int]osproc.Info{pid: live}}, sink, nil, transcript.DefaultTailBytes)
+		return store
+	}
+	preBirthMirror := func(t *testing.T) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "state.json")
+		state.New(path).Apply(func(m map[int]*state.Session) { m[pid] = identityClaude(t, pid, "", identityT0) })
+		return path
+	}
+
+	t.Run("should restore a pre-#97 session and adopt its live token when the process still classifies as the session", func(t *testing.T) {
+		path := preBirthMirror(t)
+		sink, dir := newTestSink(t)
+		store := restart(t, path, claudeLive("boot:1"), sink)
+		sessions := store.Snapshot().Sessions
+		if len(sessions) != 1 || sessions[0].Birth != "boot:1" {
+			t.Fatalf("sessions = %+v, want the session restored with the live token adopted", sessions)
+		}
+		// The scanner re-announces the live process: the same lifetime now.
+		store.Apply(func(m map[int]*state.Session) {
+			admitRoot(m, discoveredClaude(pid, "boot:1", rediscovered), nil, newFakeHerdrSource(), sink, nil, rediscovered)
+		})
+		got := store.Snapshot().Sessions[0]
+		if !got.StartedAt.Equal(identityT0) || got.Claude == nil || got.Claude.SessionID != "sid-old" || got.DisplayName == nil || got.AgentGraph == nil {
+			t.Fatalf("session = %+v, want the persisted start time, binding, graph and name inherited", got)
+		}
+		// The death watch registered at rediscovery is keyed by the adopted
+		// lifetime, so its callback closes this session's lane.
+		procs := &deathCapturingProcSource{}
+		if err := watchSessionDeath(context.Background(), procs, store, lifetimeOf(&got), got.Agent, sink, nil, func() time.Time { return rediscovered }); err != nil {
+			t.Fatalf("watchSessionDeath: %v", err)
+		}
+		if len(procs.lifetimes) != 1 || procs.lifetimes[0] != (osproc.Lifetime{PID: pid, Birth: "boot:1"}) {
+			t.Fatalf("watched %v, want the adopted lifetime", procs.lifetimes)
+		}
+		procs.deaths[0]()
+		if n := len(store.Snapshot().Sessions); n != 0 {
+			t.Errorf("sessions after the death = %d, want the adopted lifetime ended", n)
+		}
+		sink.Close()
+		if ends := eventsOfType(readEvents(t, dir), history.EventSessionEnd); len(ends) != 1 || ends[0].SessionID != "sid-old" {
+			t.Errorf("session_end events = %+v, want only the death's, none from the restart", ends)
+		}
+	})
+
+	t.Run("should persist the adopted token so the next restart verifies it", func(t *testing.T) {
+		path := preBirthMirror(t)
+		first := restart(t, path, claudeLive("boot:1"), nil)
+		if sessions := first.Snapshot().Sessions; len(sessions) != 1 || sessions[0].Birth != "boot:1" {
+			t.Fatalf("setup: sessions = %+v, want the token adopted", sessions)
+		}
+		sink, dir := newTestSink(t)
+		second := restart(t, path, claudeLive("boot:2"), sink)
+		if sessions := second.Snapshot().Sessions; len(sessions) != 0 {
+			t.Errorf("sessions = %+v, want the reused pid's session dropped", sessions)
+		}
+		sink.Close()
+		if ends := eventsOfType(readEvents(t, dir), history.EventSessionEnd); len(ends) != 1 || ends[0].SessionID != "sid-old" {
+			t.Errorf("session_end events = %+v, want a definitive death against the adopted token", ends)
+		}
+	})
+
+	t.Run("should not adopt a token when the process no longer classifies as the session", func(t *testing.T) {
+		live := osproc.Info{PID: pid, Comm: "bash", TTY: "/dev/pts/4", Birth: "boot:1"}
+		sess := identityClaude(t, pid, "", identityT0)
+		if verdict := restoreVerdict(live, nil, sess); verdict != (processVerdict{definitive: true}) {
+			t.Errorf("verdict = %+v, want a definitive death and no adopted token", verdict)
+		}
+		sink, dir := newTestSink(t)
+		store := restart(t, preBirthMirror(t), live, sink)
+		if sessions := store.Snapshot().Sessions; len(sessions) != 0 {
+			t.Errorf("sessions = %+v, want the session dropped", sessions)
+		}
+		sink.Close()
+		if ends := eventsOfType(readEvents(t, dir), history.EventSessionEnd); len(ends) != 1 {
+			t.Errorf("session_end events = %d, want the lane closed once", len(ends))
+		}
+	})
+
+	t.Run("should keep the existing unverified behaviour when no token is readable now", func(t *testing.T) {
+		sink, dir := newTestSink(t)
+		store := restart(t, preBirthMirror(t), claudeLive(""), sink)
+		if sessions := store.Snapshot().Sessions; len(sessions) != 0 {
+			t.Fatalf("sessions = %+v, want the unverified session dropped for rediscovery", sessions)
+		}
+		store.Apply(func(m map[int]*state.Session) {
+			admitRoot(m, discoveredClaude(pid, "", rediscovered), nil, newFakeHerdrSource(), sink, nil, rediscovered)
+		})
+		got := store.Snapshot().Sessions[0]
+		if got.Birth != "" || !got.StartedAt.Equal(rediscovered) || got.Claude != nil || got.AgentGraph != nil || got.DisplayName != nil {
+			t.Errorf("session = %+v, want a fresh unverified lifetime with nothing inherited", got)
+		}
+		sink.Close()
+		if ends := eventsOfType(readEvents(t, dir), history.EventSessionEnd); len(ends) != 0 {
+			t.Errorf("session_end events = %d, want none: no token proves no death", len(ends))
+		}
+	})
 }
 
 // The liveness sweep is the only death check an unverified session gets, so it

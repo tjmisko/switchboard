@@ -572,6 +572,9 @@ func dropStaleSessions(store *state.Store, procSrc osproc.Source, sink *history.
 				if info := m[pid].Enrichment(); info != nil {
 					info.StatusSince = now
 				}
+				if process.adoptBirth != "" {
+					m[pid].Birth = process.adoptBirth
+				}
 				hydratePending(m[pid], verdicts[pid], now)
 				continue
 			}
@@ -590,21 +593,31 @@ func dropStaleSessions(store *state.Store, procSrc osproc.Source, sink *history.
 // processVerdict is the startup judgement of one hydrated session's process.
 // alive restores the session, display and authority. A session not alive is
 // dropped, and definitive says its process is provably not the session, so
-// its lane is closed too.
+// its lane is closed too. adoptBirth, when set, is the live token an alive
+// session that persisted none takes as its own.
 type processVerdict struct {
 	alive      bool
 	definitive bool
+	adoptBirth string
 }
 
 // restoreVerdict revalidates a hydrated session's process lifetime before any
-// authority is restored (#97). Only the same birth token, read live, restores
-// the session: its display timestamps and its last-known provider state. A
+// authority is restored (#97). The same birth token, read live, restores the
+// session: its display timestamps and its last-known provider state. A
 // different token is a reused pid, whose session died while the daemon was
-// down. An unverified token (none persisted, as in a state.json written before
-// #97, or none readable now) proves neither: if the process still classifies
-// as the session, it is dropped WITHOUT a session_end and rediscovered as a
-// new lifetime with nothing inherited; if it does not, it is a definite death,
-// as before.
+// down.
+//
+// A session persisted with no token (a state.json written before #97) is
+// trusted on first use: if a token is readable now and the process still
+// classifies as the session, the pre-#97 identity check, it is restored and
+// adopts the live token, so every later restart is fully fenced. This is the
+// one restart judged as weakly as before #97; without it, the first restart
+// after the upgrade would drop every session's start time and status.
+//
+// No token readable now proves nothing: if the process still classifies as
+// the session, it is dropped WITHOUT a session_end and rediscovered as a new
+// lifetime with nothing inherited; if it does not, it is a definite death, as
+// before.
 func restoreVerdict(info osproc.Info, err error, sess *state.Session) processVerdict {
 	if errors.Is(err, osproc.ErrGone) {
 		return processVerdict{definitive: true}
@@ -617,6 +630,9 @@ func restoreVerdict(info osproc.Info, err error, sess *state.Session) processVer
 	}
 	if osproc.CompareBirth(sess.Birth, info.Birth) == osproc.BirthSame {
 		return processVerdict{alive: true}
+	}
+	if sess.Birth == "" && info.Birth != "" {
+		return processVerdict{alive: true, adoptBirth: info.Birth}
 	}
 	return processVerdict{}
 }

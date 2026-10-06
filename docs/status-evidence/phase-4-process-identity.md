@@ -111,9 +111,14 @@ One PR, `feat/process-birth-token`.
   `session_end` and rediscovers it fresh, and `explain` reports
   `lifetime_unverified`. Hook attribution keeps its old behaviour for it.
 - **Persistence.** `birth` on each session, `omitempty`, cleared from
-  federation frames in both directions. A `state.json` written before this
-  phase carries no token, so the first restart after the upgrade rediscovers
-  every running session fresh (start time, names and restored status are not
-  carried over once).
+  federation frames in both directions.
+- **Upgrade.** A `state.json` written before this phase carries no token. The
+  first restart after the upgrade trusts such a session on first use: when a
+  token is readable now and the process still classifies as the session (the
+  pre-#97 check), it is restored, start time, name and status included, and
+  adopts the live token, which is persisted. From then on every restart and
+  death is fenced by that token. A pid reused while the daemon was down by
+  the same agent passes that one restart, as it did before #97. With no token
+  readable now, the session is dropped and rediscovered fresh, as above.
 - **Hook attribution.** A ppid walk that reaches a tracked pid now held by
   another lifetime drops the hook.
