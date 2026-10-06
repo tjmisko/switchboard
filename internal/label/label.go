@@ -37,8 +37,9 @@ import (
 // It deliberately never uses the Codex terminal title, whose configurable
 // branch/model fields and activity spinner do not belong in a session label.
 // Claude prefers its authoritative ~/.claude/sessions/<pid>.json name, then a
-// spinner-stripped terminal title. Both providers fall back to cwd and finally
-// pid.
+// spinner-stripped terminal title. Pi prefers its own /name, carried as a
+// native display name bound to the Pi session, then follows Claude's chain.
+// Every provider falls back to cwd and finally pid.
 func RawName(s state.Session) string {
 	return rawName(s, claudeSessionName)
 }
@@ -62,6 +63,11 @@ func rawName(s state.Session, claudeName func(pid int) string) string {
 	// continues through codexRawName below.
 	if s.Remote && s.Agent != state.AgentKindCodex {
 		if name := strings.TrimSpace(s.ResolvedName); name != "" {
+			return name
+		}
+	}
+	if s.Agent == state.AgentKindPi {
+		if name := piNativeName(s); name != "" {
 			return name
 		}
 	}
@@ -128,6 +134,15 @@ func codexRawName(s state.Session) string {
 		return codexDisplaySlug(shortCodexSessionID(info.SessionID))
 	}
 	return ""
+}
+
+// piNativeName is Pi's own /name for the session's bound Pi session, or ""
+// when Pi has none. It travels on the snapshot, so it is federation-safe.
+func piNativeName(s state.Session) string {
+	if s.Pi == nil || !s.DisplayName.NativeFor(s.Pi.SessionID) {
+		return ""
+	}
+	return strings.TrimSpace(s.DisplayName.Value)
 }
 
 const maxCodexDisplayWords = 3

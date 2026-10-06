@@ -1,6 +1,7 @@
 package state
 
 import (
+	"strings"
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/agentgraph"
@@ -109,4 +110,21 @@ func (s *Session) RotatePiSession(sessionID, transcript string) {
 	info := s.AgentBlock(AgentKindPi)
 	*info = AgentInfo{SessionID: sessionID, Transcript: transcript, Status: info.Status, StatusSince: info.StatusSince}
 	s.DisplayName = nil
+}
+
+// SetPiNativeName records Pi's /name for the bound Pi session as its display
+// name, origin native. An empty name, which is how Pi reports a cleared one,
+// drops it, and the label falls back to the ordinary chain. A name for any
+// session other than the bound one is ignored: it belongs to a conversation
+// this block no longer shows.
+func (s *Session) SetPiNativeName(sessionID, name string) {
+	if s.Pi == nil || s.Pi.SessionID == "" || s.Pi.SessionID != sessionID {
+		return
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		s.DisplayName = nil
+		return
+	}
+	s.DisplayName = &DisplayName{Value: name, Origin: DisplayNameNative, ConversationID: sessionID}
 }

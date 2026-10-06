@@ -157,7 +157,9 @@ type Request struct {
 	// PreviousSessionFile is SessionStart's previousSessionFile on /new,
 	// /resume and /fork, which pairs a rotated session with its predecessor.
 	PreviousSessionFile string `json:"previous_session_file,omitempty"`
-	// SessionName is Pi's /name, bounded at the ctl edge.
+	// SessionName is Pi's /name, bounded at the ctl edge. SessionStart carries
+	// the name the session has; a SessionName hook carries a rename, "" when
+	// the name was cleared.
 	SessionName string `json:"session_name,omitempty"`
 	// Usage is one assistant message's token counts and Pi's own cost for it,
 	// on the Usage event.

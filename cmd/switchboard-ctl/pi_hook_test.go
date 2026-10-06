@@ -13,7 +13,7 @@ import (
 // The events integrations/pi/switchboard.ts sends, in Claude's vocabulary.
 var piHookEvents = []string{
 	"SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PostToolUse",
-	"PermissionRequest", "PermissionResolved", "Usage", "Stop", "StopFailure",
+	"PermissionRequest", "PermissionResolved", "Usage", "Stop", "StopFailure", "SessionName",
 }
 
 func TestPiHookShouldCarryItsSessionIDTranscriptAndDialogCountIntoTheDaemon(t *testing.T) {
@@ -227,5 +227,21 @@ func TestEventAtShouldNotStampClaudeOrCodexHooks(t *testing.T) {
 		if !req.ObservedAt.IsZero() {
 			t.Errorf("%s took event_at: %v", agent, req.ObservedAt)
 		}
+	}
+}
+
+func TestPiHookShouldCarryOnlyTheBoundedNameWhenPiIsRenamedMidSession(t *testing.T) {
+	name := strings.Repeat("界", maxPiSessionName+10)
+	body := `{"session_id":"pi-1","session_name":"` + name + `","busy":true,"open_dialogs":1,"input_tokens":1}`
+	req := parseHookPayloadAt([]byte(body), "SessionName", state.AgentKindPi, hookAt)
+	if got := len([]rune(req.SessionName)); got != maxPiSessionName || req.SessionID != "pi-1" {
+		t.Fatalf("rename = %+v (name runes %d), want the session id and a %d-rune name", req, got, maxPiSessionName)
+	}
+	if req.Busy || req.OpenDialogs != nil || req.Usage != nil {
+		t.Fatalf("rename carried another event's field: %+v", req)
+	}
+	cleared := parseHookPayloadAt([]byte(`{"session_id":"pi-1","session_name":""}`), "SessionName", state.AgentKindPi, hookAt)
+	if cleared.SessionName != "" || cleared.SessionID != "pi-1" {
+		t.Fatalf("cleared name = %+v", cleared)
 	}
 }

@@ -709,6 +709,9 @@ func carryPiLifecycle(req *rpc.Request, body []byte, event string) {
 		req.Busy = payload.Busy
 		req.PreviousSessionFile = boundedHookPath(payload.PreviousSessionFile)
 		req.SessionName = truncatePrompt(payload.SessionName, maxPiSessionName)
+	case "SessionName":
+		// Pi's /name mid-session (session_info_changed); empty when cleared.
+		req.SessionName = truncatePrompt(payload.SessionName, maxPiSessionName)
 	case "PermissionRequest", "PermissionResolved":
 		if payload.OpenDialogs != nil {
 			count := max(*payload.OpenDialogs, 0)

@@ -106,3 +106,35 @@ func TestDisplayNameWireContainsNoTransientNamingContext(t *testing.T) {
 		}
 	}
 }
+
+func TestDisplayNameNativeForShouldAcceptOnlyANativeRecordBoundToTheSession(t *testing.T) {
+	native := &DisplayName{Value: "Refactor auth", Origin: DisplayNameNative, ConversationID: "pi-1"}
+	if !native.NativeFor("pi-1") || native.NativeFor("pi-2") {
+		t.Fatalf("NativeFor = %t/%t, want true for its own session only", native.NativeFor("pi-1"), native.NativeFor("pi-2"))
+	}
+	if native.ValidFor("pi-1") {
+		t.Fatal("ValidFor accepted a native record; Codex must keep refusing it")
+	}
+	generated := &DisplayName{Value: "fix-hook", Origin: DisplayNameGenerated, ConversationID: "pi-1"}
+	blank := &DisplayName{Value: " ", Origin: DisplayNameNative, ConversationID: "pi-1"}
+	var none *DisplayName
+	if generated.NativeFor("pi-1") || blank.NativeFor("pi-1") || none.NativeFor("pi-1") {
+		t.Fatal("NativeFor accepted a generated, blank or absent record")
+	}
+}
+
+func TestSetPiNativeNameShouldBindTheNameToTheBoundSessionAndClearItWhenEmpty(t *testing.T) {
+	s := &Session{PID: 20, Agent: AgentKindPi, Pi: &AgentInfo{SessionID: "pi-1"}}
+	s.SetPiNativeName("pi-1", "  Refactor auth  ")
+	if !s.DisplayName.NativeFor("pi-1") || s.DisplayName.Value != "Refactor auth" {
+		t.Fatalf("named = %+v", s.DisplayName)
+	}
+	s.SetPiNativeName("pi-2", "Other session")
+	if s.DisplayName.Value != "Refactor auth" {
+		t.Fatalf("a name for another session replaced the bound one: %+v", s.DisplayName)
+	}
+	s.SetPiNativeName("pi-1", "")
+	if s.DisplayName != nil {
+		t.Fatalf("cleared = %+v, want none", s.DisplayName)
+	}
+}
