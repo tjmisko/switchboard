@@ -623,3 +623,24 @@ func TestResolveIndexShouldNameTheCandidateTheDecisionRestsOnWhenOneDoes(t *test
 		}
 	}
 }
+
+func TestResolveShouldNotLetSupersededEvidenceDecideWhenTheNewerObservationLapses(t *testing.T) {
+	// A Codex SessionStart hook (long lease) superseded by an app-server sample
+	// that has since lapsed: the hook does not decide again.
+	hook := codexHook(t0, 24*time.Hour, idle, none)
+	hook.Superseded = true
+	sample := codexSnap(t0.Add(time.Second), time.Second, idle, none, workingChild)
+	at := t0.Add(5 * time.Second)
+	d := Resolve(codex, []Candidate{hook, sample}, statusexplain.Decision{}, at)
+	want(t, "lapsed sample over superseded hook", d, "", statusexplain.ReasonObservationExpired)
+	if got := rejected(d, agentgraph.SourceHook, agentgraph.LegacyIdle); got != statusexplain.ReasonOlderThanCurrent {
+		t.Errorf("superseded hook rejected for %q, want older_than_current", got)
+	}
+
+	// A superseded snapshot still holds its own request open (decision 1).
+	asked := codexSnap(t0, time.Minute, active, input)
+	asked.Superseded = true
+	newer := codexHook(t0.Add(time.Second), time.Hour, active, none)
+	d = Resolve(codex, []Candidate{asked, newer}, statusexplain.Decision{}, t0.Add(2*time.Second))
+	want(t, "superseded request", d, agentgraph.LegacyPermission, statusexplain.ReasonAttentionHeld)
+}

@@ -154,7 +154,8 @@ func resolves(r Candidate, c claim) bool {
 // The rules, in order:
 //
 //  1. A candidate that is not about the target, or not fresh at now, cannot
-//     select; one that cannot classify the root contributes nothing.
+//     select; one that cannot classify the root contributes nothing; one a
+//     newer observation superseded may only hold its own request open.
 //  2. The best remaining candidate by Rank is the base.
 //  3. Open provider attention (a current exact event's or snapshot's, or the
 //     prior decision's until its deadline) holds the root at permission
@@ -192,7 +193,10 @@ func ResolveIndex(target Target, candidates []Candidate, prior statusexplain.Dec
 
 	base, restored := -1, -1
 	for i, c := range candidates {
-		if !admitted[i] || c.Status == "" {
+		if admitted[i] && c.Superseded {
+			reasons[i] = statusexplain.ReasonOlderThanCurrent
+		}
+		if !admitted[i] || c.Status == "" || c.Superseded {
 			continue
 		}
 		switch Rank(c) {
@@ -212,7 +216,7 @@ func ResolveIndex(target Target, candidates []Candidate, prior statusexplain.Dec
 		}
 	}
 	for i, c := range candidates {
-		if !admitted[i] || c.Status == "" || Rank(c) == rankNone || i == base {
+		if !admitted[i] || c.Status == "" || c.Superseded || Rank(c) == rankNone || i == base {
 			continue
 		}
 		reasons[i] = statusexplain.ReasonOlderThanCurrent
@@ -337,7 +341,7 @@ func openAttention(candidates []Candidate, admitted []bool, held bool, prior sta
 func newestDescendants(candidates []Candidate, admitted []bool) int {
 	newest := -1
 	for i, c := range candidates {
-		if !admitted[i] || !reportsDescendants(c.Kind) {
+		if !admitted[i] || c.Superseded || !reportsDescendants(c.Kind) {
 			continue
 		}
 		if newest < 0 || c.ObservedAt.After(candidates[newest].ObservedAt) ||

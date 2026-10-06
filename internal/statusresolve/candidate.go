@@ -39,6 +39,12 @@ type Candidate struct {
 	// before kind (Codex): a newer hook beats an older snapshot of the same
 	// conversation, and an older snapshot never repaints a newer hook.
 	EventTimeOrder bool
+	// Superseded marks event-time-ordered provider evidence that a newer
+	// observation of the same conversation replaced while fresh: it may still
+	// hold its own open request, but it never selects a status again, even
+	// once the newer observation lapses. The caller that keeps the landing
+	// history sets it; the zero value is current evidence.
+	Superseded bool
 	// AttentionWriter is the writer that raised Attention when it is not this
 	// evidence's own: a Codex app-server sample composed with a request the
 	// hooks hold open carries the hook's request, not one the app-server saw.
