@@ -271,3 +271,42 @@ func TestObserverRolloutCategoriesSetModeWithoutClaimingConnection(t *testing.T)
 		t.Fatalf("rollout category implied health: %+v", diagnostics[0])
 	}
 }
+
+func TestBuildObserverDiagnosticsShouldNamePisBindingSourceWhenHookHerdrOrNone(t *testing.T) {
+	now := time.Date(2026, 10, 5, 18, 0, 0, 0, time.UTC)
+	herdr := &state.HerdrInfo{PaneID: "w1:p1", Socket: "/s", Status: state.HerdrIdle}
+	herdrGraph := &state.AgentGraph{RootID: "herdr:term_1", Source: agentgraph.SourceHerdr,
+		ObservedAt: now.Add(-time.Second), FreshUntil: now.Add(time.Hour),
+		Nodes: []state.AgentNode{{ID: "herdr:term_1", Runtime: agentgraph.RuntimeIdle}}}
+	snap := state.Snapshot{SchemaVersion: state.CurrentSchemaVersion, Sessions: []state.Session{
+		{
+			PID: 30, Agent: state.AgentKindPi, Herdr: herdr,
+			Pi:          &state.AgentInfo{SessionID: "pi-root", Status: state.StatusIdle},
+			DisplayName: &state.DisplayName{Value: "private pi name", Origin: state.DisplayNameNative, ConversationID: "pi-root"},
+		},
+		{PID: 31, Agent: state.AgentKindPi, Herdr: herdr, AgentGraph: herdrGraph},
+		{PID: 32, Agent: state.AgentKindPi},
+	}}
+	got := buildObserverDiagnostics(snap, now)
+	if len(got) != 3 {
+		t.Fatalf("diagnostics = %+v, want every Pi session", got)
+	}
+	for i, want := range []struct {
+		source string
+		bound  bool
+	}{{"hook", true}, {"herdr", true}, {"none", false}} {
+		if got[i].BindingSource != want.source || got[i].Bound != want.bound {
+			t.Errorf("pid %d binding = %s bound=%t, want %s bound=%t", got[i].PID, got[i].BindingSource, got[i].Bound, want.source, want.bound)
+		}
+	}
+	if got[0].DisplayNameOrigin != string(state.DisplayNameNative) {
+		t.Errorf("pi display name origin = %q, want native", got[0].DisplayNameOrigin)
+	}
+	b, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "private pi name") {
+		t.Fatalf("diagnostics leaked Pi's name: %s", b)
+	}
+}
