@@ -364,6 +364,8 @@ func TestClassify(t *testing.T) {
 		{"claude daemon is neither", osproc.Info{Comm: "claude", Exe: "/x/claude/claude", Args: []string{"claude", "daemon", "run"}}, AgentNone},
 		{"codex session", osproc.Info{Comm: "codex", Args: []string{"codex"}}, AgentCodex},
 		{"codex exec is neither", osproc.Info{Comm: "codex", Args: []string{"codex", "exec"}}, AgentNone},
+		{"pi session", tuiPi(1), AgentPi},
+		{"json-mode pi child is neither", jsonPiChild(1), AgentNone},
 		{"bash is neither", osproc.Info{Comm: "bash"}, AgentNone},
 	}
 	for _, tt := range tests {
@@ -608,5 +610,89 @@ func TestIsHeadless(t *testing.T) {
 				t.Fatalf("IsHeadless(%v) = %t, want %t", tt.args, got, tt.want)
 			}
 		})
+	}
+}
+
+// tuiPi is an interactive Pi as the spike observed it: comm "pi", node as exe,
+// argv overwritten to "pi" plus padding, and its pty on fd 0.
+func tuiPi(pid int) osproc.Info {
+	return osproc.Info{PID: pid, Comm: "pi", Exe: "/usr/bin/node-22", TTY: "/dev/pts/4", StdinTTY: true,
+		Args: []string{"pi", "", ""}}
+}
+
+// jsonPiChild is a json-mode Pi started through Pi's bash tool: same comm, exe
+// and argv, but /dev/null on fd 0. Its stderr may still reach the terminal, so
+// TTY can be set.
+func jsonPiChild(pid int) osproc.Info {
+	info := tuiPi(pid)
+	info.StdinTTY = false
+	return info
+}
+
+func TestIsPiShouldClassifyAnInteractivePi(t *testing.T) {
+	for _, exe := range []string{"/usr/bin/node-22", "/usr/bin/node", "/home/u/.nvm/versions/node/v22.3.0/bin/node",
+		"/opt/node22", "/usr/bin/node-22 (deleted)", ""} {
+		info := tuiPi(10)
+		info.Exe = exe
+		if !IsPi(info) {
+			t.Errorf("IsPi rejected an interactive pi with exe %q", exe)
+		}
+		if Classify(info) != AgentPi {
+			t.Errorf("Classify(exe %q) = %q, want pi", exe, Classify(info))
+		}
+	}
+}
+
+func TestIsPiShouldNotClassifyWhenNotAnInteractivePi(t *testing.T) {
+	rpc := tuiPi(10)
+	rpc.Comm = "pi-rpc"
+	noTerminal := jsonPiChild(10)
+	noTerminal.TTY = ""
+	bun := tuiPi(10)
+	bun.Exe = "/usr/bin/bun"
+	impostor := tuiPi(10)
+	impostor.Exe = "/usr/local/bin/pi"
+	nodeish := tuiPi(10)
+	nodeish.Exe = "/usr/bin/nodemon"
+	dashOnly := tuiPi(10)
+	dashOnly.Exe = "/usr/bin/node-"
+	nodeOtherComm := tuiPi(10)
+	nodeOtherComm.Comm = "node"
+	for name, info := range map[string]osproc.Info{
+		"json-mode child with stderr on the pty": jsonPiChild(10),
+		"json-mode child with no terminal":       noTerminal,
+		"pi-rpc":                                 rpc,
+		"non-node runtime":                       bun,
+		"native pi impostor":                     impostor,
+		"nodemon":                                nodeish,
+		"node- with no version":                  dashOnly,
+		"plain node":                             nodeOtherComm,
+	} {
+		if IsPi(info) {
+			t.Errorf("IsPi accepted %s: %+v", name, info)
+		}
+		if Classify(info) != AgentNone {
+			t.Errorf("Classify(%s) = %q, want none", name, Classify(info))
+		}
+	}
+}
+
+// A Pi is a hook boundary: the rpc ancestry walk must not carry a hook from
+// inside an untracked Pi up to an enclosing agent.
+func TestIsHookBoundaryShouldHoldWhenTheProcessIsAnInteractivePi(t *testing.T) {
+	if !IsHookBoundary(tuiPi(10)) {
+		t.Fatal("an interactive pi is not a hook boundary")
+	}
+}
+
+func TestScannerShouldAnnounceAPiOnceWhenItIsInteractive(t *testing.T) {
+	src := &fakeProcSource{pids: []int{200, 201}, infos: map[int]osproc.Info{200: tuiPi(200), 201: jsonPiChild(201)}}
+	s := newWithSource(src)
+	var got []int
+	fire := func(info osproc.Info) { got = append(got, info.PID) }
+	s.scanOnce(fire)
+	s.scanOnce(fire)
+	if len(got) != 1 || got[0] != 200 {
+		t.Fatalf("announced %v, want only the interactive pi 200, once", got)
 	}
 }

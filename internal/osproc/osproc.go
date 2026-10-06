@@ -31,6 +31,10 @@ type Info struct {
 	CWD  string
 	TTY  string
 	Args []string
+	// StdinTTY is true when fd 0 is the terminal (Linux: a /dev/pts link). It is
+	// the interactive gate for agents whose comm, exe and argv cannot tell a TUI
+	// from a non-interactive child (discovery.IsPi).
+	StdinTTY bool
 }
 
 // FromProc projects a proc.Info onto the neutral record. It lives here rather
@@ -39,7 +43,7 @@ type Info struct {
 // proc.Read and must ask discovery what it is looking at — and internal/proc
 // carries no build tags, so this compiles on every platform.
 func FromProc(p proc.Info) Info {
-	return Info{PID: p.PID, PPID: p.PPID, Comm: p.Comm, Exe: p.Exe, CWD: p.CWD, TTY: p.TTY, Args: p.Args}
+	return Info{PID: p.PID, PPID: p.PPID, Comm: p.Comm, Exe: p.Exe, CWD: p.CWD, TTY: p.TTY, Args: p.Args, StdinTTY: p.StdinTTY}
 }
 
 // ErrGone means the process disappeared between enumeration and read (the most

@@ -219,9 +219,9 @@ func main() {
 	herdrWatcher := herdr.NewWatcher()
 	defer herdrWatcher.Close()
 
-	// appear starts tracking one agent root: the process scanner's Claude and
-	// Codex finds, and herdr discovery's agents in herdr panes (herdrPane set),
-	// whose status herdr alone supplies.
+	// appear starts tracking one agent root: the process scanner's Claude, Codex
+	// and Pi finds, and herdr discovery's agents in herdr panes (herdrPane set).
+	// A Pi in herdr is found by both; see admitRoot.
 	appear := func(info osproc.Info, kind string, headless bool, herdrPane *terminal.PaneRef) {
 		suffix := ""
 		if headless {
@@ -233,22 +233,9 @@ func main() {
 		sess.Headless = headless
 		var lifetime sessionLifetime
 		store.Apply(func(m map[int]*state.Session) {
-			// A surviving hydrated root keeps its discovery-lifetime timestamp and
-			// last-known provider projection while discovery refreshes only live
-			// process/window fields. This is what lets restored graphs remain
-			// authoritative until their explicit freshness deadline instead of being
-			// erased on scan one. StartedAt is therefore not a kernel birth token.
-			if prior := m[sess.PID]; prior != nil && prior.Agent == sess.Agent {
-				sess.StartedAt = prior.StartedAt
-				sess.DisplayName = prior.DisplayName
-				sess.Claude, sess.Codex, sess.Pi, sess.AgentGraph = prior.Claude, prior.Codex, prior.Pi, prior.AgentGraph
-			}
-			m[sess.PID] = &sess
-			if herdrPane != nil {
-				applyHerdrPane(m[sess.PID], herdrPane, herdrWatcher, sink, time.Now())
-				sess = *m[sess.PID]
-			}
-			lifetime = lifetimeOf(m[sess.PID])
+			admitted := admitRoot(m, sess, herdrPane, herdrWatcher, sink, time.Now())
+			sess = *admitted
+			lifetime = lifetimeOf(admitted)
 		})
 		federated.AnnounceSession(ctx, sess)
 		agentRuntime.Request(providerRootKey(sess))
@@ -401,6 +388,37 @@ func lifetimeOf(s *state.Session) sessionLifetime {
 	return sessionLifetime{PID: s.PID, Agent: s.Agent, StartedAt: s.StartedAt}
 }
 
+// admitRoot stores a discovered root under its pid and returns the stored
+// session. Runs inside store.Apply.
+//
+// A surviving root of the same agent keeps its discovery-lifetime timestamp and
+// last-known provider projection while discovery refreshes only live
+// process/window fields. This is what lets restored graphs remain authoritative
+// until their explicit freshness deadline instead of being erased on scan one.
+// StartedAt is therefore not a kernel birth token.
+//
+// A herdr-observed agent also keeps its herdr block (Claude and Codex panes are
+// the reconciler's to attach, as before). A Pi in a herdr pane is found by both
+// the scanner and herdr discovery, in either order, and must stay one session:
+// when herdr arrives second it attaches its pane to the scanner's root, and when
+// the scanner arrives second (herdrPane nil) it must not strip the pane herdr
+// attached, since herdr discovery announces a pid only once per daemon run.
+func admitRoot(m map[int]*state.Session, sess state.Session, herdrPane *terminal.PaneRef, herdrSource herdrStatusSource, sink *history.Sink, now time.Time) *state.Session {
+	if prior := m[sess.PID]; prior != nil && prior.Agent == sess.Agent {
+		sess.StartedAt = prior.StartedAt
+		sess.DisplayName = prior.DisplayName
+		sess.Claude, sess.Codex, sess.Pi, sess.AgentGraph = prior.Claude, prior.Codex, prior.Pi, prior.AgentGraph
+		if !state.IsProviderAgent(sess.Agent) {
+			sess.Herdr = prior.Herdr
+		}
+	}
+	m[sess.PID] = &sess
+	if herdrPane != nil {
+		applyHerdrPane(&sess, herdrPane, herdrSource, sink, now)
+	}
+	return &sess
+}
+
 // endSessionIf closes the lane of lifetime.PID only while the store still holds
 // that lifetime there; a pid since taken by another session is left alone. It
 // is endSession behind a guard, so the once-only contract (L5) is endSession's.
@@ -447,13 +465,23 @@ func sessionDead(src osproc.Source, sess *state.Session) bool {
 }
 
 // processIsSession reports whether a live process is still the agent session
-// tracked under its pid. A Claude or Codex root must still classify as one. An
-// agent herdr alone observes has no classifier here, so its pid counts as its
-// own while it still runs on the session's terminal: a reused pid lands on some
-// other tty, or none.
+// tracked under its pid. A Claude or Codex root must still classify as one, and
+// a Pi is the session while it is still an interactive Pi. An agent herdr alone
+// observes has no classifier here, so its pid counts as its own while it still
+// runs on the session's terminal: a reused pid lands on some other tty, or none.
+// A Pi without a herdr pane was found by the scanner alone, so only the
+// classifier vouches for it.
 func processIsSession(info osproc.Info, sess *state.Session) bool {
 	if sess.Agent == "" || state.IsProviderAgent(sess.Agent) {
 		return discovery.Classify(info) != discovery.AgentNone
+	}
+	if sess.Agent == state.AgentKindPi {
+		if discovery.IsPi(info) {
+			return true
+		}
+		if sess.Herdr == nil {
+			return false
+		}
 	}
 	return sess.TTY != "" && info.TTY == sess.TTY
 }

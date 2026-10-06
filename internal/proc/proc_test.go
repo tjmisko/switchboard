@@ -3,6 +3,8 @@ package proc
 import (
 	"errors"
 	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/tjmisko/switchboard/internal/testsupport"
@@ -165,5 +167,53 @@ func TestVmHWMKBReadsThisProcess(t *testing.T) {
 	}
 	if kb := VmHWMKB(); kb <= 0 {
 		t.Errorf("VmHWMKB() = %d, want a positive peak RSS for a live process", kb)
+	}
+}
+
+// writeProcFixture builds /proc/<pid> under root with comm, status and the
+// given fd symlinks (fd number → link target). Targets need not exist:
+// readlink only reads the link.
+func writeProcFixture(t *testing.T, root string, pid int, fds map[int]string) {
+	t.Helper()
+	dir := filepath.Join(root, strconv.Itoa(pid))
+	testsupport.WriteFile(t, filepath.Join(dir, "comm"), "pi\n")
+	testsupport.WriteFile(t, filepath.Join(dir, "status"), testsupport.ProcStatus(1))
+	if err := os.MkdirAll(filepath.Join(dir, "fd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for fd, target := range fds {
+		if err := os.Symlink(target, filepath.Join(dir, "fd", strconv.Itoa(fd))); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// The Pi spike (phase-1-pi-provider.md, "Spike results") found that a TUI Pi
+// has its pty on fd 0, while a json-mode child Pi runs with /dev/null on fd 0.
+// TTY takes the first pts among fd 0..2, so only StdinTTY separates them when
+// the child's stderr still reaches the terminal.
+func TestReadShouldReportStdinTTYOnlyWhenFDZeroIsAPTS(t *testing.T) {
+	root := t.TempDir()
+	writeProcFixture(t, root, 100, map[int]string{0: "/dev/pts/3", 1: "/dev/pts/3", 2: "/dev/pts/3"})
+	writeProcFixture(t, root, 200, map[int]string{0: "/dev/null", 1: "pipe:[123]", 2: "/dev/pts/3"})
+	writeProcFixture(t, root, 300, map[int]string{0: "/dev/null", 1: "pipe:[123]", 2: "pipe:[124]"})
+	r := NewReader(root)
+
+	for _, tc := range []struct {
+		pid       int
+		wantTTY   string
+		wantStdin bool
+	}{
+		{100, "/dev/pts/3", true},
+		{200, "/dev/pts/3", false},
+		{300, "", false},
+	} {
+		info, err := r.Read(tc.pid)
+		if err != nil {
+			t.Fatalf("Read(%d): %v", tc.pid, err)
+		}
+		if info.TTY != tc.wantTTY || info.StdinTTY != tc.wantStdin {
+			t.Errorf("Read(%d) TTY=%q StdinTTY=%v, want %q, %v", tc.pid, info.TTY, info.StdinTTY, tc.wantTTY, tc.wantStdin)
+		}
 	}
 }
