@@ -184,8 +184,22 @@ func (o *Observer) SetWorkflowQuietGrace(d time.Duration) {
 // session's direct children (spawnDepth<2). A nil/empty/idless session, or a
 // transcript that cannot be scanned, is a no-op that leaves the last-known count.
 func (o *Observer) Reconcile(sess *state.Session, c *state.AgentInfo, now time.Time) []history.Event {
+	events, _ := o.reconcile(sess, c, now)
+	return events
+}
+
+// subagentScan is one tick's subagent directory scan. Observe hands the one
+// Reconcile made to the snapshot, so each child file is stat'ed once per tick
+// rather than once per consumer (#98). done is false when no scan ran.
+type subagentScan struct {
+	subs []transcript.Subagent
+	err  error
+	done bool
+}
+
+func (o *Observer) reconcile(sess *state.Session, c *state.AgentInfo, now time.Time) ([]history.Event, subagentScan) {
 	if sess == nil || c == nil || c.Transcript == "" || c.SessionID == "" {
-		return nil
+		return nil, subagentScan{}
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -252,8 +266,9 @@ func (o *Observer) Reconcile(sess *state.Session, c *state.AgentInfo, now time.T
 	// 2) Authoritative dir scan: every subagent of this session, keyed by the
 	// universal agent-id, immune to transcript scroll-out.
 	subs, err := transcript.SubagentsForTranscript(c.Transcript)
+	scan := subagentScan{subs: subs, err: err, done: true}
 	if err != nil {
-		return nil // leave the last-known count rather than guess
+		return nil, scan // leave the last-known count rather than guess
 	}
 
 	var events []history.Event
@@ -337,7 +352,7 @@ func (o *Observer) Reconcile(sess *state.Session, c *state.AgentInfo, now time.T
 	// running reads delegating (green) exactly like a hand-launched fanout.
 	events = append(events, o.reconcileWorkflowsLocked(sess, c, ss, now, &inflight)...)
 	c.InFlightSubagents = inflight
-	return events
+	return events, scan
 }
 
 // reconcileWorkflowsLocked brings the per-run workflow cursors up to date,
