@@ -325,7 +325,7 @@ func (s *Session) ResetAgentEvidence(rootID string, now time.Time) (before, afte
 	}
 	s.evidence = kept
 	if s.AgentGraph.RootID != rootID {
-		s.AgentGraph, s.displayKind = nil, graphKindNone
+		s.AgentGraph, s.displayKind = unobservedAgentGraph(rootID, s.providerOf()), graphKindNone
 	}
 	if rootID != "" {
 		info.SessionID = rootID
@@ -335,6 +335,20 @@ func (s *Session) ResetAgentEvidence(rootID string, now time.Time) (before, afte
 	}
 	s.project(info, now, now)
 	return before, info.Status, true
+}
+
+// unobservedAgentGraph is the graph a reset root publishes until evidence
+// about rootID lands: bound to rootID, never observed and so never fresh, with
+// no nodes and an unknown summary. It keeps the session graph-owned, so herdr's
+// later readings are still weighed by the resolver (SetHerdr) instead of the
+// reading at the reset staying published.
+func unobservedAgentGraph(rootID string, provider agentgraph.ProviderKind) *AgentGraph {
+	return &AgentGraph{
+		RootID:   rootID,
+		Summary:  AgentGraphSummary{Runtime: agentgraph.RuntimeUnknown, Attention: agentgraph.AttentionNone},
+		Nodes:    []AgentNode{},
+		provider: provider,
+	}
 }
 
 // ReprojectStatus re-resolves a Claude or Codex session's published status at
