@@ -168,7 +168,7 @@ func TestObserveAtShouldExplainAndTreatUnsupportedAndResetDifferentlyWhenAPriorG
 		at := outcomeT0.Add(10 * time.Second)
 		c.observeAt(t.Context(), ref, at)
 		sess := publishedSession(t, c, ref)
-		if got := publishedStatus(t, c, ref); got != "" || sess.AgentGraph != nil {
+		if got := publishedStatus(t, c, ref); got != "" || sess.AgentGraph == nil || sess.AgentGraph.RootID != "thread-2" || len(sess.AgentGraph.Nodes) != 0 {
 			t.Fatalf("reset kept the old conversation's graph: published %q graph=%v", got, sess.AgentGraph)
 		}
 		d := explainAt(t, c, ref.PID, at)

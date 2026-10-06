@@ -16,8 +16,9 @@ func TestResetAgentEvidenceShouldDropTheOldConversationsGraphBeforeItsDeadlineWh
 	if !dropped || before != StatusWorking || after != "" {
 		t.Fatalf("reset = %q -> %q dropped=%t, want working -> unknown with the old graph dropped", before, after, dropped)
 	}
-	if s.AgentGraph != nil || len(s.evidence) != 0 || s.Codex.SessionID != "thread-2" {
-		t.Fatalf("after reset graph=%v evidence=%d session=%q, want nothing held and the new binding", s.AgentGraph, len(s.evidence), s.Codex.SessionID)
+	if s.AgentGraph == nil || s.AgentGraph.RootID != "thread-2" || len(s.AgentGraph.Nodes) != 0 || s.graphStatus(at) != "" ||
+		len(s.evidence) != 0 || s.Codex.SessionID != "thread-2" {
+		t.Fatalf("after reset graph=%+v evidence=%d session=%q, want nothing held, an unobserved graph and the new binding", s.AgentGraph, len(s.evidence), s.Codex.SessionID)
 	}
 	d := s.ExplainStatus(at)
 	if d.Root.SessionID != "thread-2" || d.Status != "" || d.Reason != statusexplain.ReasonObservationPending {
@@ -60,5 +61,22 @@ func TestHeldEvidenceShouldReportTheLandedWindowOnlyForTheSameConversationAndKin
 	}
 	if _, _, ok := s.HeldEvidence("sess-2", GraphSnapshot); ok {
 		t.Fatal("another conversation reported held evidence")
+	}
+}
+
+func TestResetAgentEvidenceShouldKeepFollowingHerdrWhenNoEvidenceAboutTheNewBindingHasLanded(t *testing.T) {
+	s := codexSession()
+	s.SetHerdr(codexReading(HerdrWorking, true, herdrT0), herdrT0)
+	s.LandAgentGraph(codexStatusGraph(t, agentgraph.SourceCodexAppServer, StatusPermission, herdrT0, time.Hour), GraphLanding{Kind: GraphSnapshot}, herdrT0)
+	if _, after, _ := s.ResetAgentEvidence("thread-2", herdrT0.Add(time.Second)); after != StatusWorking {
+		t.Fatalf("after reset = %q, want herdr's working", after)
+	}
+	later := herdrT0.Add(time.Minute)
+	before, after := s.SetHerdr(codexReading(HerdrIdle, true, later), later)
+	if before != StatusWorking || after != StatusIdle || s.Codex.Status != StatusIdle {
+		t.Fatalf("herdr idle after reset = %q -> %q published %q, want working -> idle", before, after, s.Codex.Status)
+	}
+	if s.AgentGraph == nil || s.AgentGraph.RootID != "thread-2" || s.AgentGraph.Fresh(later) {
+		t.Fatalf("graph after reset = %+v, want an unobserved placeholder bound to the new conversation", s.AgentGraph)
 	}
 }
