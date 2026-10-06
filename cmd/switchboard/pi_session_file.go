@@ -60,8 +60,16 @@ func (c *agentCoordinator) seedPiFromSessionFiles(now time.Time) {
 			delete(c.piTails, key)
 			continue
 		}
+		g := sess.AgentGraph
+		bound := g != nil && g.RootID == sess.Pi.SessionID
+		// The file records no dialog, so it cannot clear a red: a restored
+		// one keeps its deadline unless a hook or herdr says otherwise, as a
+		// Codex rollout read leaves a hook-owned wait alone.
+		if bound && g.Fresh(now) && g.Summary.Attention != agentgraph.AttentionNone {
+			continue
+		}
 		candidate := piSessionFileCandidate{key: key, sessionID: sess.Pi.SessionID, path: sess.Pi.Transcript}
-		if g := sess.AgentGraph; g != nil && g.Source == agentgraph.SourcePiSessionFile && g.RootID == sess.Pi.SessionID {
+		if bound && g.Source == agentgraph.SourcePiSessionFile {
 			candidate.freshUntil = g.FreshUntil
 		}
 		candidates = append(candidates, candidate)

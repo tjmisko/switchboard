@@ -223,7 +223,8 @@ from the file's last entry, reads `working` when it stopped for a tool and
 `idle` otherwise. It lands as `source: "pi_session_file"` with a 90-second
 lease, renewed while the file stays readable, and history records the edge as
 `pi_session_file_read`. A live herdr reading suspends the read, and the first
-hook ends it.
+hook ends it. The file records no dialog, so the read never replaces a
+restored `permission`; that keeps its deadline unless a hook or herdr answers.
 
 The authority itself is not on the wire. A block read back from `state.json`
 after a restart decides nothing until the daemon hears from that herdr server

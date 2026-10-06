@@ -348,6 +348,8 @@ Additions to the plan:
   and mtime. The result is a `pi_session_file` graph with the rollout read's
   90 s window, renewed once half of it has run while the file is readable.
   The read is skipped under a live herdr reading and stops at the first hook.
+  It never replaces a restored red, since the file records no dialog; the
+  Codex rollout read leaves hook-owned waits alone for the same reason.
   The active branch is the parent chain from the file's last entry, which is
   the leaf Pi itself loads.
 - **Naming.** The extension forwards `session_info_changed` as a new

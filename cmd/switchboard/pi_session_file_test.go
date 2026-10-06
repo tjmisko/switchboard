@@ -139,3 +139,25 @@ func TestPiRestartShouldLeaveTheRestoredStatusWhenTheTailHoldsNoEvidence(t *test
 		t.Fatalf("a tail with no assistant message landed a graph: %+v", graph)
 	}
 }
+
+func TestPiRestartShouldNotClearARestoredRedFromTheSessionFileTail(t *testing.T) {
+	h, _ := restoredPiHarness(t, "toolUse")
+	restored, err := state.ProjectAgentGraph(agentgraph.Observation{
+		Provider: agentgraph.ProviderPi, RootID: piTestSession, Source: agentgraph.SourceRestoredLastKnown,
+		ObservedAt: h.base.Add(-time.Minute), FreshUntil: h.base.Add(time.Hour),
+		Nodes: []agentgraph.Node{{ID: piTestSession, Runtime: agentgraph.RuntimeActive, Attention: agentgraph.AttentionUserInput}},
+	}, nil, h.base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.store.Apply(func(sessions map[int]*state.Session) {
+		sessions[piTestPID].SetPiHookGraph(restored, h.base)
+	})
+	h.wantStatus("restored", state.StatusPermission)
+
+	h.c.reconcilePiRoots(h.base.Add(time.Second))
+	h.wantStatus("tail read under a restored red", state.StatusPermission)
+	if source := h.session().AgentGraph.Source; source != agentgraph.SourceRestoredLastKnown {
+		t.Fatalf("the tail replaced a restored red: graph source %q", source)
+	}
+}
