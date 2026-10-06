@@ -892,3 +892,34 @@ func TestNameCache_BlockedWriters_servesConcurrentCallersTheSameName(t *testing.
 		}
 	}
 }
+
+func TestRawNameShouldShowPisNameWhenPiNamedTheBoundSession(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := state.Session{PID: 4300, Agent: state.AgentKindPi, CWD: "/home/u/Projects/Arachne",
+		Pi:          &state.AgentInfo{SessionID: "pi-1"},
+		DisplayName: &state.DisplayName{Value: "Refactor auth module", Origin: state.DisplayNameNative, ConversationID: "pi-1"},
+		Wezterm:     &state.WeztermInfo{WindowTitle: "π - Arachne"},
+	}
+	if got := RawName(s); got != "Refactor auth module" {
+		t.Errorf("RawName = %q, want Pi's /name verbatim", got)
+	}
+	s.Remote = true
+	if got := RawName(s); got != "Refactor auth module" {
+		t.Errorf("remote RawName = %q, want Pi's /name from the snapshot", got)
+	}
+}
+
+func TestRawNameShouldFallBackForPiWhenTheNameBelongsToAnotherSession(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := state.Session{PID: 4301, Agent: state.AgentKindPi, CWD: "/home/u/Projects/Arachne",
+		Pi:          &state.AgentInfo{SessionID: "pi-2"},
+		DisplayName: &state.DisplayName{Value: "Old name", Origin: state.DisplayNameNative, ConversationID: "pi-1"},
+	}
+	if got := RawName(s); got != "Arachne" {
+		t.Errorf("RawName = %q, want the cwd fallback", got)
+	}
+	s.DisplayName = nil
+	if got := RawName(s); got != "Arachne" {
+		t.Errorf("unnamed RawName = %q, want the cwd fallback", got)
+	}
+}

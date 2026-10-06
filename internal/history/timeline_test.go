@@ -1395,3 +1395,42 @@ func TestActivityTimelineKeepsAPlausibleActiveHoldWhole(t *testing.T) {
 		t.Fatalf("a 90m active hold must survive whole, got %+v", got)
 	}
 }
+
+// piUsageEv is a Pi usage_sample carrying Pi's own cost for one message.
+func piUsageEv(sec int, id string, in int64, cost float64) Event {
+	usd := pricing.USDFromMicros(int64(cost * 1_000_000))
+	return Event{
+		Ts: ts(sec), Type: EventUsageSample, PID: 1, SessionID: "pi-1", Agent: "pi",
+		ExecutionProvider: pricing.ProviderAnthropic, Model: "claude-opus-4-8",
+		UsageEventID: id, UsageSnapshot: true, UsageRevision: 1,
+		Usage: &UsageDelta{InputTokens: in},
+		Cost: &CostEstimate{
+			APIEquivalentUSD: &usd, Status: pricing.CostEstimated, Coverage: 1, PricedTokens: in,
+			PricingKind: pricing.PricingKindClientReported, PricingProvider: "pi",
+		},
+	}
+}
+
+func TestEstimateEventShouldAddPisOwnPerMessageCostWithoutRepricing(t *testing.T) {
+	pricingNow := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	// The catalog prices claude-opus-4-8 input at $5/MTok, so a reprice of
+	// these 2M tokens would read $10.00; Pi said $0.42 + $0.08.
+	events := []Event{piUsageEv(5, "pi:m1", 1_000_000, 0.42), piUsageEv(6, "pi:m2", 1_000_000, 0.08)}
+	totals := AggregateTotalsWithCatalogs(events, pricing.BootstrapCatalogs(), pricingNow)
+	if !approxUSD(totals.CostUSD, 0.50) {
+		t.Fatalf("totals cost = %v, want Pi's own $0.50", totals.CostUSD)
+	}
+	if totals.Cost == nil || totals.Cost.Status != pricing.CostEstimated || totals.Cost.PricingKind != pricing.PricingKindClientReported {
+		t.Fatalf("totals cost = %+v, want an estimated client-reported cost", totals.Cost)
+	}
+	if totals.TokIn != 2_000_000 {
+		t.Fatalf("totals input = %d, want 2M", totals.TokIn)
+	}
+	lane := BuildSwimlanesWithCatalogs(events, ts(10), pricing.BootstrapCatalogs(), pricingNow)[0]
+	if !approxUSD(lane.CostUSD, 0.50) {
+		t.Fatalf("lane cost = %v, want Pi's own $0.50", lane.CostUSD)
+	}
+	if *events[0].Cost.APIEquivalentUSD != pricing.USDFromMicros(420_000) {
+		t.Fatalf("folding the cost wrote through to the event: %v", *events[0].Cost.APIEquivalentUSD)
+	}
+}

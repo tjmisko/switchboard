@@ -16,6 +16,7 @@
 // payload also carries session_id, transcript_path, cwd and event_at.
 //   session_start                       → SessionStart {source, previous_session_file, session_name, busy}
 //   session_shutdown                    → SessionEnd {source}
+//   session_info_changed (/name)        → SessionName {session_name}, "" when cleared
 //   agent_start                         → UserPromptSubmit
 //   tool_execution_start / _end         → PreToolUse / PostToolUse {tool_name, tool_use_id}
 //   ui_prompt_start, herdr:blocked      → PermissionRequest {open_dialogs}
@@ -122,6 +123,14 @@ export default function (pi) {
   pi.on("session_shutdown", (event, ctx) => {
     if (!interactive) return;
     send("SessionEnd", { ...sessionFields(ctx), source: event?.reason });
+  });
+
+  // /name mid-session. The daemon shows it as the session's name, so a rename
+  // is forwarded as it happens rather than at the next session_start.
+  pi.on("session_info_changed", (event, ctx) => {
+    if (!interactive) return;
+    const name = typeof event?.name === "string" ? event.name : "";
+    send("SessionName", { ...sessionFields(ctx), session_name: name });
   });
 
   pi.on("agent_start", (_event, ctx) => {

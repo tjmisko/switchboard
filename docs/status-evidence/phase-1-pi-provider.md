@@ -334,3 +334,41 @@ Additions to the plan:
 - **Rotation in history.** A rotation writes a `session_start` carrying the
   new `session_id` and `prev_session_id`; as for a Claude `/clear`, the new id
   on the live pid ends the old lane and no `session_end` is written.
+
+## PR 1D notes (1.7–1.10)
+
+- **Restart.** A persisted Pi hook or session-file graph is hydrated as
+  `restored_last_known` with its original deadline. `piStatusAuthority` ranks
+  it, and the session-file read, below a live herdr reading (tier 3 of 4), so
+  "no live authority" is enforced in the precedence function rather than by
+  dropping the graph.
+- **Session-file read.** While no hook has reached a restarted daemon, each
+  reconcile tick reads the tail of `pi.transcript` through `internal/tailread`
+  (the bounded reader extracted from the Codex rollout read), cached by size
+  and mtime. The result is a `pi_session_file` graph with the rollout read's
+  90 s window, renewed once half of it has run while the file is readable.
+  The read is skipped under a live herdr reading and stops at the first hook.
+  It never replaces a restored red, since the file records no dialog; the
+  Codex rollout read leaves hook-owned waits alone for the same reason.
+  The active branch is the parent chain from the file's last entry, which is
+  the leaf Pi itself loads. The newest message on it decides, and a user
+  message there reads working (coordinator decision): Pi appends it as a run
+  starts, so the plan's "last assistant stopReason" alone would read idle
+  through a run's first model call.
+- **Naming.** The extension forwards `session_info_changed` as a new
+  `SessionName` hook (content: the user-set name only, `""` when cleared).
+  The name is stored as `display_name` with origin `native`, bound to the Pi
+  session id. Codex's `ValidFor` still refuses a native record; Pi reads it
+  through `NativeFor`. A graph-root nickname, the Codex native path, was not
+  used because herdr replaces the Pi graph whenever hook evidence lapses.
+- **Usage and cost.** Each `Usage` hook is a history `usage_sample` with
+  `cost.pricing_kind = client_reported`, which `history.EstimateEvent` returns
+  as supplied. A cost Pi did not report stays unknown; it is not repriced.
+  Dedupe is by `usage_event_id`, a hash of the session id with Pi's message
+  id, or with the hook instant and counts when there is no id. The running
+  total also sits on the graph root node (`usage`, `billing`).
+- **diagnose** lists every Pi session with `binding_source` hook, herdr or
+  none.
+
+Follow-ups, out of scope: Pi under bun or as a compiled binary (discovery
+expects a node exe); Pi on a `/dev/ttyN` virtual console.

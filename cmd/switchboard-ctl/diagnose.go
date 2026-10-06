@@ -175,7 +175,7 @@ func defaultObserverStatePath() string {
 func buildObserverDiagnostics(snap state.Snapshot, now time.Time) []observerDiagnostic {
 	out := make([]observerDiagnostic, 0, len(snap.Sessions))
 	for _, session := range snap.Sessions {
-		if session.Agent != state.AgentKindCodex && session.Agent != state.AgentKindClaude && session.AgentGraph == nil {
+		if !state.IsProviderAgent(session.Agent) && session.Agent != state.AgentKindPi && session.AgentGraph == nil {
 			continue
 		}
 		d := observerDiagnostic{
@@ -244,6 +244,10 @@ func buildObserverDiagnostics(snap state.Snapshot, now time.Time) []observerDiag
 				d.ShadowMismatch = &mismatch
 			}
 		}
+		if session.Agent == state.AgentKindPi {
+			d.BindingSource = piBindingSource(session)
+			d.Bound = d.BindingSource != "none"
+		}
 		out = append(out, d)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
@@ -253,6 +257,19 @@ func buildObserverDiagnostics(snap state.Snapshot, now time.Time) []observerDiag
 		return out[i].Provider < out[j].Provider
 	})
 	return out
+}
+
+// piBindingSource names what a Pi session's root is bound by: "hook" once a
+// Pi extension hook has bound Pi's own session id, else "herdr" while herdr's
+// pane is all that identifies it, else "none".
+func piBindingSource(session state.Session) string {
+	switch {
+	case session.Pi != nil && session.Pi.SessionID != "":
+		return "hook"
+	case session.Herdr != nil:
+		return "herdr"
+	}
+	return "none"
 }
 
 type observerLogRecord struct {

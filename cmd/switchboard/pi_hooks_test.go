@@ -238,13 +238,10 @@ func TestPiReducerShouldTreatAReloadMidRunAsWorkingWhenPiReportsBusy(t *testing.
 
 func TestPiReducerShouldRebindTheRootOnNewAndResumeAndNotOnReload(t *testing.T) {
 	h := newPiHarness(t)
-	h.hook("SessionStart", 0, source("startup"))
+	h.hook("SessionStart", 0, source("startup"), named("work"))
 	h.hook("UserPromptSubmit", time.Second)
-	h.store.Apply(func(sessions map[int]*state.Session) {
-		sessions[piTestPID].DisplayName = &state.DisplayName{}
-	})
 
-	h.hook("SessionStart", 2*time.Second, source("reload"), busy)
+	h.hook("SessionStart", 2*time.Second, source("reload"), busy, named("work"))
 	if sess := h.session(); sess.Pi.SessionID != piTestSession || sess.AgentGraph.RootID != piTestSession || sess.DisplayName == nil {
 		t.Fatalf("reload rebound the root: pi=%+v root=%q", sess.Pi, sess.AgentGraph.RootID)
 	}

@@ -29,12 +29,18 @@ const (
 // from UserPromptSubmit (agent_start) until Stop or StopFailure
 // (agent_settled); openDialogs is the extension's latest count of open
 // dialogs. lastAt is the newest hook instant applied, which orders the
-// spawn-and-forget hooks: one older than it is dropped.
+// spawn-and-forget hooks: one older than it is dropped. nameAt orders Pi's
+// /name the same way, apart from status, because a rename carries none.
+// usage and billing are the bound session's running totals (pi_usage.go).
 type piHookRoot struct {
 	sessionID   string
 	runOpen     bool
 	openDialogs int
 	lastAt      time.Time
+	nameAt      time.Time
+	usage       agentgraph.Usage
+	billing     agentgraph.BillingIdentity
+	usageSeen   piUsageSeen
 }
 
 // seedPiHookRoot rebuilds a root's reducer state from the session's published
@@ -50,6 +56,11 @@ func seedPiHookRoot(sess state.Session) *piHookRoot {
 		if g.Source == agentgraph.SourceHook {
 			root.lastAt = g.ObservedAt
 		}
+		// A restart keeps the totals a Pi-owned graph carried; herdr's node
+		// never holds any.
+		seed := agentgraph.Observation{Nodes: []agentgraph.Node{{ID: root.sessionID}}, RootID: root.sessionID}
+		carryPiRootDetail(&seed, g)
+		root.usage, root.billing = seed.Nodes[0].Usage, seed.Nodes[0].Billing
 	}
 	return root
 }
@@ -110,7 +121,10 @@ func piRootObservation(root *piHookRoot, at time.Time) agentgraph.Observation {
 	return agentgraph.Observation{
 		Provider: agentgraph.ProviderPi, RootID: root.sessionID, Source: agentgraph.SourceHook,
 		ObservedAt: at, FreshUntil: at.Add(lease),
-		Nodes: []agentgraph.Node{{ID: root.sessionID, Runtime: runtime, Attention: attention, UpdatedAt: at}},
+		Nodes: []agentgraph.Node{{
+			ID: root.sessionID, Runtime: runtime, Attention: attention, UpdatedAt: at,
+			Usage: root.usage, Billing: root.billing,
+		}},
 	}
 }
 
@@ -160,8 +174,15 @@ func (c *agentCoordinator) handlePiHook(req rpc.Request, sess state.Session) {
 		root = seedPiHookRoot(sess)
 		c.piRoots[key] = root
 	}
-	if req.Event == "SessionEnd" || req.Event == "Usage" {
-		return // no status evidence; Usage is accounted elsewhere
+	switch req.Event {
+	case "SessionEnd":
+		return // no status evidence
+	case "Usage":
+		c.applyPiUsage(key, root, req, sess, now)
+		return
+	case "SessionName":
+		c.applyPiSessionName(key, root, req, now)
+		return
 	}
 	if now.Before(root.lastAt) {
 		// Hooks are sent spawn-and-forget. An older one arriving late, a
@@ -183,8 +204,12 @@ func (c *agentCoordinator) handlePiHook(req rpc.Request, sess state.Session) {
 	next := *root
 	next.sessionID = sessionID
 	if rotated {
-		next.runOpen, next.openDialogs = false, 0
+		// Name and usage belong to the conversation left, not the new one.
+		next.runOpen, next.openDialogs, next.nameAt = false, 0, time.Time{}
+		next.usage, next.billing, next.usageSeen = agentgraph.Usage{}, agentgraph.BillingIdentity{}, piUsageSeen{}
 	}
+	// SessionStart carries Pi's current /name for the session it binds.
+	naming := req.Event == "SessionStart" && !now.Before(next.nameAt)
 	rule := reducePiHook(&next, req, rotated)
 	if rule == "" {
 		return
@@ -216,12 +241,18 @@ func (c *agentCoordinator) handlePiHook(req rpc.Request, sess state.Session) {
 		if req.Transcript != "" {
 			s.Pi.Transcript = req.Transcript
 		}
+		if naming {
+			s.SetPiNativeName(sessionID, req.SessionName)
+		}
 		cwd, applied = s.CWD, true
 	})
 	if !applied {
 		return
 	}
 	next.lastAt = now
+	if naming {
+		next.nameAt = now
+	}
 	*root = next
 
 	if rotated {
@@ -248,6 +279,34 @@ func (c *agentCoordinator) handlePiHook(req rpc.Request, sess state.Session) {
 	}
 }
 
+// applyPiSessionName lands Pi's /name, set or cleared mid-session
+// (session_info_changed), as the bound session's native display name. It is
+// ordered by nameAt rather than lastAt: a rename is no status evidence, so it
+// neither renews the hook lease nor fences a status hook. A rename for a
+// session the root is not bound to is dropped; the SessionStart that binds
+// that session carries its name.
+func (c *agentCoordinator) applyPiSessionName(key provider.RootKey, root *piHookRoot, req rpc.Request, now time.Time) {
+	sessionID := req.SessionID
+	if sessionID == "" {
+		sessionID = root.sessionID
+	}
+	if sessionID == "" || sessionID != root.sessionID || now.Before(root.nameAt) {
+		return
+	}
+	applied := false
+	c.store.Apply(func(sessions map[int]*state.Session) {
+		s := sessions[key.PID]
+		if s == nil || !s.StartedAt.Equal(key.StartedAt) || s.Agent != state.AgentKindPi {
+			return
+		}
+		s.SetPiNativeName(sessionID, req.SessionName)
+		applied = true
+	})
+	if applied {
+		root.nameAt = now
+	}
+}
+
 // recordPiRotation opens the new session's history lane, paired with the
 // session it replaced: by Pi's previous_session_file when that names the
 // session left, else by the session the daemon had bound. A new session id on
@@ -264,11 +323,13 @@ func (c *agentCoordinator) recordPiRotation(req rpc.Request, pid int, cwd, prevI
 	c.recordDiagnostic(agentgraph.ProviderPi, "conversation_rotated", now)
 }
 
-// reconcilePiRoots runs on the coordinator's periodic pass. It re-projects
-// each bound Pi session at now, so a hook lease that ran out with nothing
-// newer hands the status to herdr or to unknown, and it drops the reducer
-// state of Pi processes no longer tracked.
+// reconcilePiRoots runs on the coordinator's periodic pass. It reads the
+// session file of each restored root no hook has reached yet, re-projects each
+// bound Pi session at now, so a lease that ran out with nothing newer hands the
+// status to herdr or to unknown, and it drops the reducer state of Pi
+// processes no longer tracked.
 func (c *agentCoordinator) reconcilePiRoots(now time.Time) {
+	c.seedPiFromSessionFiles(now)
 	type lapse struct {
 		pid            int
 		sessionID, cwd string
@@ -291,6 +352,11 @@ func (c *agentCoordinator) reconcilePiRoots(now time.Time) {
 
 	c.piMu.Lock()
 	defer c.piMu.Unlock()
+	for key := range c.piTails {
+		if !live[key] {
+			delete(c.piTails, key)
+		}
+	}
 	for key, root := range c.piRoots {
 		if live[key] {
 			continue

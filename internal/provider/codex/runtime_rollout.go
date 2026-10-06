@@ -3,11 +3,10 @@ package codex
 import (
 	"bytes"
 	"encoding/json"
-	"io"
-	"os"
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/agentgraph"
+	"github.com/tjmisko/switchboard/internal/tailread"
 	"github.com/tjmisko/switchboard/internal/usagelimit"
 )
 
@@ -43,35 +42,12 @@ func ReadRolloutRuntime(path string) (agentgraph.RuntimeState, time.Time, error)
 func ReadRolloutState(path string) (RolloutState, error) {
 	const tailBytes = 256 * 1024
 	unknown := RolloutState{Runtime: agentgraph.RuntimeUnknown}
-	f, err := os.Open(path)
+	data, complete, err := tailread.Lines(path, tailBytes)
 	if err != nil {
 		return unknown, err
-	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return unknown, err
-	}
-	start := fi.Size() - tailBytes
-	if start < 0 {
-		start = 0
-	}
-	if _, err := f.Seek(start, io.SeekStart); err != nil {
-		return unknown, err
-	}
-	data, err := io.ReadAll(io.LimitReader(f, tailBytes))
-	if err != nil {
-		return unknown, err
-	}
-	if start > 0 {
-		if n := bytes.IndexByte(data, '\n'); n >= 0 {
-			data = data[n+1:]
-		} else {
-			data = nil
-		}
 	}
 	// A partially-written new row may be a start marker; defer until it flushes.
-	if len(data) != 0 && data[len(data)-1] != '\n' {
+	if !complete {
 		return unknown, nil
 	}
 	state := unknown

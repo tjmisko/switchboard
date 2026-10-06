@@ -462,6 +462,11 @@ const (
 	CostUnknown   CostStatus = "unknown"
 )
 
+// PricingKindClientReported marks an estimate the agent client computed for
+// its own request and supplied with the usage (Pi's per-message cost). It is
+// carried as reported and never repriced against a catalog.
+const PricingKindClientReported = "client_reported"
+
 // Estimate keeps each billing concept distinct. Pointer amounts preserve the
 // difference between an unknown value and a real zero.
 type Estimate struct {

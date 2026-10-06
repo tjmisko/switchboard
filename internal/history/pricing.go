@@ -15,9 +15,14 @@ func priceBook(now time.Time) pricing.CatalogSet {
 }
 
 // EstimateEvent derives explicit cost semantics for one usage_sample. Raw usage
-// is always repriced against the selected catalog; vendor-returned USD/credits
-// remain separate and are never overwritten by token arithmetic.
+// is repriced against the selected catalog; vendor-returned USD/credits remain
+// separate and are never overwritten by token arithmetic. A client-reported
+// cost (Pi's own per-message cost) bypasses the catalog entirely: it is the
+// event's cost as supplied, never repriced (status-evidence decision 5).
 func EstimateEvent(ev Event, catalogs pricing.CatalogSet, now time.Time) CostEstimate {
+	if ev.Cost != nil && ev.Cost.PricingKind == pricing.PricingKindClientReported {
+		return applyUsageCoverage(cloneCostEstimate(*ev.Cost), ev.UsageCoverage)
+	}
 	estimate := pricing.EstimateRequest(catalogs, ev.PricingIdentity(), ev.CanonicalUsage(), now)
 	if ev.Cost == nil {
 		return applyUsageCoverage(estimate, ev.UsageCoverage)
@@ -63,6 +68,34 @@ func EstimateEvent(ev Event, catalogs pricing.CatalogSet, now time.Time) CostEst
 		estimate.Status = pricing.CostIncluded
 	}
 	return applyUsageCoverage(estimate, ev.UsageCoverage)
+}
+
+// cloneCostEstimate detaches a reported estimate from the event it rides on,
+// so folding it into a lane or total cannot write through to the event.
+func cloneCostEstimate(estimate CostEstimate) CostEstimate {
+	clone := estimate
+	for _, field := range []**pricing.USD{&clone.APIEquivalentUSD, &clone.VendorEstimatedUSD, &clone.EstimatedBilledUSD} {
+		if *field != nil {
+			value := **field
+			*field = &value
+		}
+	}
+	if clone.PlanCredits != nil {
+		value := *clone.PlanCredits
+		clone.PlanCredits = &value
+	}
+	clone.UnpricedReasons = append([]string(nil), estimate.UnpricedReasons...)
+	clone.PricingSources = append([]string(nil), estimate.PricingSources...)
+	clone.PricingVersions = append([]string(nil), estimate.PricingVersions...)
+	if estimate.PricingRetrievedAt != nil {
+		at := *estimate.PricingRetrievedAt
+		clone.PricingRetrievedAt = &at
+	}
+	if estimate.PricingEffectiveAt != nil {
+		at := *estimate.PricingEffectiveAt
+		clone.PricingEffectiveAt = &at
+	}
+	return clone
 }
 
 // EstimateCoverageGap turns a durable collector cutover/gap marker into an

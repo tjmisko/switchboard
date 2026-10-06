@@ -75,8 +75,9 @@ type Session struct {
 	// selects which enrichment block (claude/codex) hooks write and how a
 	// renderer reads status. Omitted only when the kind is not yet known.
 	Agent string `json:"agent,omitempty"`
-	// DisplayName is Switchboard-owned Codex display metadata. It is valid only
-	// for its exact conversation_id and never changes Codex's native thread name.
+	// DisplayName is Switchboard-owned Codex display metadata, or Pi's own /name
+	// (origin native). It is valid only for its exact conversation_id and never
+	// changes Codex's native thread name.
 	DisplayName *DisplayName `json:"display_name,omitempty"`
 	// ResolvedName is the provider host's current display name before project
 	// prefixing. The host that owns the process is the only machine that can
@@ -115,10 +116,11 @@ type Session struct {
 const (
 	AgentKindClaude = "claude"
 	AgentKindCodex  = "codex"
-	// AgentKindPi is discovered through herdr. Its extension hooks
-	// (switchboard-ctl pi-hook) carry Pi's lifecycle into rpc, where today only
-	// their usage-limit evidence is applied; once a hook binds the session, its
-	// enrichment block is Pi and its graph root is Pi's session id (PiRootID).
+	// AgentKindPi is discovered by the process scanner (discovery.IsPi) and by
+	// herdr, which merge into one session. Its extension hooks (switchboard-ctl
+	// pi-hook) carry Pi's lifecycle to the daemon's Pi reducer; once a hook
+	// binds the session, its enrichment block is Pi and its graph root is Pi's
+	// session id (PiRootID).
 	AgentKindPi = "pi"
 )
 
