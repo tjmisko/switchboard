@@ -21,7 +21,7 @@ import (
 type osprocAdapter struct{ s osproc.Source }
 
 func toNeutral(p osproc.Info) conformance.ProcInfo {
-	return conformance.ProcInfo{PID: p.PID, PPID: p.PPID, Comm: p.Comm, Exe: p.Exe, CWD: p.CWD, TTY: p.TTY}
+	return conformance.ProcInfo{PID: p.PID, PPID: p.PPID, Comm: p.Comm, Exe: p.Exe, CWD: p.CWD, TTY: p.TTY, Birth: p.Birth}
 }
 
 func (a osprocAdapter) Enumerate() ([]conformance.ProcInfo, error) {
@@ -41,11 +41,11 @@ func (a osprocAdapter) Read(pid int) (conformance.ProcInfo, error) {
 	return toNeutral(info), err
 }
 
-func (a osprocAdapter) Watch(ctx context.Context, pid int, onDeath func()) error {
-	return a.s.Watch(ctx, pid, onDeath)
+func (a osprocAdapter) Watch(ctx context.Context, pid int, birth string, onDeath func()) error {
+	return a.s.Watch(ctx, osproc.Lifetime{PID: pid, Birth: birth}, onDeath)
 }
 
-func (a osprocAdapter) Stop(pid int) { a.s.Stop(pid) }
+func (a osprocAdapter) Stop(pid int, birth string) { a.s.Stop(osproc.Lifetime{PID: pid, Birth: birth}) }
 
 // childRegistry tracks spawned testsupport children by pid so the neutral
 // KillChild hook can kill AND reap (reaping is what makes a dead pid read as

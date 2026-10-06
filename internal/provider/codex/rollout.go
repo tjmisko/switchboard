@@ -118,7 +118,7 @@ func (c *rolloutCollector) forget(key provider.RootKey) {
 }
 
 func rolloutBindingKey(key provider.RootKey, fileKey string) string {
-	return strconv.Itoa(key.PID) + "\x00" + strconv.FormatInt(key.StartedAt.UnixNano(), 10) + "\x00" + fileKey
+	return strconv.Itoa(key.PID) + "\x00" + strconv.FormatInt(key.StartedAt.UnixNano(), 10) + "\x00" + key.Birth + "\x00" + fileKey
 }
 
 func (c *rolloutCollector) collectAll(ctx context.Context) {

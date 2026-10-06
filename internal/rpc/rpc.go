@@ -1612,7 +1612,13 @@ func findTrackedAncestor(m map[int]*state.Session, pid int, readProc func(int) (
 
 func findHookAncestor(m map[int]*state.Session, pid int, readProc func(int) (proc.Info, error)) (int, bool) {
 	for depth := 0; pid > 1 && depth < 20; depth++ {
-		if _, ok := m[pid]; ok {
+		if sess, ok := m[pid]; ok {
+			if heldByAnotherLifetime(sess, readProc) {
+				// The tracked session's pid now belongs to another process, an
+				// untracked agent this hook came from (#97). Its hook belongs to
+				// nobody the daemon knows about, as for any untracked agent.
+				return 0, false
+			}
 			return pid, false
 		}
 		info, err := readProc(pid)
@@ -1625,6 +1631,18 @@ func findHookAncestor(m map[int]*state.Session, pid int, readProc func(int) (pro
 		pid = info.PPID
 	}
 	return 0, false
+}
+
+// heldByAnotherLifetime reports whether a tracked session's pid is provably
+// held by a process other than the one the session tracks: both birth tokens
+// read and different. A session without a token (unverified) and a failed read
+// prove nothing, and attribution stays as it was before birth tokens existed.
+func heldByAnotherLifetime(sess *state.Session, readProc func(int) (proc.Info, error)) bool {
+	if sess.Birth == "" {
+		return false
+	}
+	info, err := readProc(sess.PID)
+	return err == nil && osproc.CompareBirth(sess.Birth, info.Birth) == osproc.BirthDifferent
 }
 
 // The directory fallback is heuristic, not an exact client identity. It is

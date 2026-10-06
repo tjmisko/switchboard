@@ -22,7 +22,7 @@ var provenanceBase = time.Date(2026, 8, 23, 16, 0, 0, 0, time.UTC)
 
 func provenanceRef() provider.RootRef {
 	return provider.RootRef{
-		PID: 8451, StartedAt: provenanceBase.Add(-time.Hour), Provider: agentgraph.ProviderCodex,
+		PID: 8451, StartedAt: provenanceBase.Add(-time.Hour), Birth: testBirth(8451), Provider: agentgraph.ProviderCodex,
 		ProviderSessionID: "root", CWD: "/project",
 	}
 }

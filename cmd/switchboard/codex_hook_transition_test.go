@@ -219,8 +219,8 @@ func TestStandardCodexQuestionsAreIsolatedByProcessLifetimeNotCWD(t *testing.T) 
 	started := time.Now().Add(-time.Hour)
 	seedCoordinatorSession(store, 8201, started, state.AgentKindCodex, "thread-1", "/same")
 	seedCoordinatorSession(store, 8202, started.Add(time.Second), state.AgentKindCodex, "thread-2", "/same")
-	first := provider.RootRef{PID: 8201, StartedAt: started, Provider: agentgraph.ProviderCodex}
-	second := provider.RootRef{PID: 8202, StartedAt: started.Add(time.Second), Provider: agentgraph.ProviderCodex}
+	first := provider.RootRef{PID: 8201, StartedAt: started, Birth: testBirth(8201), Provider: agentgraph.ProviderCodex}
+	second := provider.RootRef{PID: 8202, StartedAt: started.Add(time.Second), Birth: testBirth(8202), Provider: agentgraph.ProviderCodex}
 	coordinator := newAgentCoordinator(store, nil, nil, nil)
 	coordinator.refreshTrackedRoots()
 	defer coordinator.Close()

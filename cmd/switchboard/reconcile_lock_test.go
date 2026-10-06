@@ -12,6 +12,7 @@ import (
 	"github.com/tjmisko/switchboard/internal/detect"
 	"github.com/tjmisko/switchboard/internal/fanout"
 	"github.com/tjmisko/switchboard/internal/mapping"
+	"github.com/tjmisko/switchboard/internal/osproc"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/statustune"
 	"github.com/tjmisko/switchboard/internal/terminal"
@@ -90,7 +91,7 @@ func reconcileFixture(t *testing.T, sessionCount int) (*state.Store, *slowBatchL
 
 	tick := func() {
 		reconcileOnce(context.Background(), store, resolver, manager, stack,
-			statustune.Default(), nil, rstate, func(int) {})
+			statustune.Default(), nil, rstate, func(osproc.Lifetime) {})
 	}
 	return store, loc, resolver, tick
 }
@@ -206,7 +207,7 @@ func TestShouldFallBackToPerSessionResolveWhenTheBackendCannotBatch(t *testing.T
 	rstate := newReconcileState(fanout.NewObserver(t.TempDir()))
 
 	reconcileOnce(context.Background(), store, resolver, manager, stack,
-		statustune.Default(), nil, rstate, func(int) {})
+		statustune.Default(), nil, rstate, func(osproc.Lifetime) {})
 
 	// The session survives the tick with its identity intact; the none backend
 	// simply never resolves it past the Observe tier.
@@ -251,7 +252,7 @@ func TestReconcilePublishesClaudeManualNameForFederatedReaders(t *testing.T) {
 	rstate := newReconcileState(fanout.NewObserver(t.TempDir()))
 	tick := func() {
 		reconcileOnce(context.Background(), store, resolver, manager, stack,
-			statustune.Default(), nil, rstate, func(int) {})
+			statustune.Default(), nil, rstate, func(osproc.Lifetime) {})
 	}
 
 	tick()
@@ -333,7 +334,7 @@ func runConcurrentResolves(t *testing.T, turn *resolveTurn) bool {
 		defer wg.Done()
 		turn.Do(func() {
 			reconcileOnce(context.Background(), store, resolver, manager, stack,
-				statustune.Default(), nil, rstate, func(int) {})
+				statustune.Default(), nil, rstate, func(osproc.Lifetime) {})
 		})
 	}()
 	go func() {

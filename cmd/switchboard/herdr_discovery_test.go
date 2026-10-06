@@ -25,9 +25,12 @@ func (f *fakeHerdrPanes) Snapshot(context.Context) (map[string]terminal.PaneRef,
 }
 
 // ttyProcs is an osproc.Source that knows each pid's tty; unknown pids are gone.
+// A pid's birth token is testBirth(pid) until reuse hands the pid to a new
+// process lifetime.
 type ttyProcs struct {
-	mu   sync.Mutex
-	ttys map[int]string
+	mu     sync.Mutex
+	ttys   map[int]string
+	births map[int]string
 }
 
 func (p *ttyProcs) Read(pid int) (osproc.Info, error) {
@@ -37,11 +40,26 @@ func (p *ttyProcs) Read(pid int) (osproc.Info, error) {
 	if !ok {
 		return osproc.Info{PID: pid}, osproc.ErrGone
 	}
-	return osproc.Info{PID: pid, Comm: "node", TTY: tty, CWD: "/repo"}, nil
+	birth, reused := p.births[pid]
+	if !reused {
+		birth = testBirth(pid)
+	}
+	return osproc.Info{PID: pid, Comm: "node", TTY: tty, CWD: "/repo", Birth: birth}, nil
 }
-func (p *ttyProcs) Enumerate() ([]osproc.Info, error)        { return nil, nil }
-func (p *ttyProcs) Watch(context.Context, int, func()) error { return nil }
-func (p *ttyProcs) Stop(int)                                 {}
+
+// reuse hands pid to a new process lifetime that keeps its tty: the same
+// executable on the same terminal, distinguishable only by its birth token.
+func (p *ttyProcs) reuse(pid int, birth string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.births == nil {
+		p.births = map[int]string{}
+	}
+	p.births[pid] = birth
+}
+func (p *ttyProcs) Enumerate() ([]osproc.Info, error)                    { return nil, nil }
+func (p *ttyProcs) Watch(context.Context, osproc.Lifetime, func()) error { return nil }
+func (p *ttyProcs) Stop(osproc.Lifetime)                                 {}
 
 // processInfoCaller answers pane.process_info from a pane → (pgid, pids) table
 // and counts its calls.
@@ -178,6 +196,24 @@ func TestHerdrDiscoveryShouldLookAgainWhenTheCachedProcessExits(t *testing.T) {
 	}
 }
 
+// #97: the cached agent pid is revalidated by lifetime, not tty alone. A pid
+// reused on the same tty by the same executable is a new process, so the pane
+// is looked up afresh and the candidate carries the new lifetime.
+func TestHerdrDiscoveryShouldLookAgainWhenTheCachedPIDIsReusedOnTheSameTTY(t *testing.T) {
+	f := newDiscoveryFixture()
+	f.pane("w1:p1", "/dev/pts/7", "pi", 901)
+	f.d.tick(context.Background())
+
+	f.procs.reuse(901, "boot-test:reused")
+	got, _ := f.d.tick(context.Background())
+	if f.caller.calls != 2 {
+		t.Fatalf("process_info calls = %d, want 2: a reused pid must not be served from the cache", f.caller.calls)
+	}
+	if len(got) != 1 || got[0].info.Lifetime() != (osproc.Lifetime{PID: 901, Birth: "boot-test:reused"}) {
+		t.Fatalf("tick = %+v, want the new lifetime of pid 901", got)
+	}
+}
+
 // process_info can name a pid that exits, or is reused elsewhere, before it is
 // read.
 func TestHerdrDiscoveryShouldRejectAProcessNotOnThePanesTTY(t *testing.T) {
@@ -291,6 +327,23 @@ func TestRunHerdrDiscoveryShouldAnnounceAgainWhenAPIDReturnsAsANewAgent(t *testi
 	}
 }
 
+// #97: herdr announces lifetimes, not pids. A pid reused on the same pane by
+// the same agent is a new lifetime and is announced again, so appear sees it,
+// and admitRoot gives it nothing of the old session.
+func TestRunHerdrDiscoveryShouldAnnounceAgainWhenAPIDIsReusedByTheSameAgent(t *testing.T) {
+	f := newDiscoveryFixture()
+	f.pane("w1:p1", "/dev/pts/7", "pi", 901)
+	store := state.New("")
+	got := runDiscoveryTicks(t, f, store, 3, func(tick int) {
+		if tick == 1 {
+			f.procs.reuse(901, "boot-test:reused")
+		}
+	})
+	if len(got) != 2 || got[0] != 901 || got[1] != 901 {
+		t.Fatalf("appeared = %v, want pid 901 announced once per lifetime", got)
+	}
+}
+
 func TestProcessIsSessionShouldKeepAHerdrAgentWhileItRunsOnItsTTY(t *testing.T) {
 	sess := &state.Session{PID: 901, Agent: "pi", TTY: "/dev/pts/7", Herdr: &state.HerdrInfo{PaneID: "w1:p1", Socket: testHerdrSock}}
 	if !processIsSession(osproc.Info{PID: 901, Comm: "node", TTY: "/dev/pts/7"}, sess) {
@@ -318,7 +371,7 @@ func TestSweepShouldEndAHerdrAgentWhenItsPIDMovesToAnotherTTY(t *testing.T) {
 	sink, dir := newTestSink(t)
 	m := map[int]*state.Session{901: {PID: 901, Agent: "pi", TTY: "/dev/pts/7"}}
 	procs := &ttyProcs{ttys: map[int]string{901: "/dev/pts/12"}}
-	sweepDeadSessions(m, procs, sink, func(int) {}, herdrT0)
+	sweepDeadSessions(m, procs, sink, func(osproc.Lifetime) {}, herdrT0)
 	if _, ok := m[901]; ok {
 		t.Fatal("session kept for a pid now on another tty")
 	}

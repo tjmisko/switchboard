@@ -217,3 +217,126 @@ func TestReadShouldReportStdinTTYOnlyWhenFDZeroIsAPTS(t *testing.T) {
 		}
 	}
 }
+
+// statLine builds a /proc/<pid>/stat line whose field 22 (starttime) is start.
+// Fields 3..21 and 23.. carry distinct numbers so an off-by-one reads a
+// different value rather than the right one by accident.
+func statLine(pid int, comm, start string) string {
+	return strconv.Itoa(pid) + " (" + comm + ") S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 20 0 1 0 " + start + " 123456 789 18446744073709551615\n"
+}
+
+// #97: the birth token is field 22 of /proc/<pid>/stat, counted from the LAST
+// ')'. A process may name itself anything, and a comm holding ") " would shift
+// every field for a parser that splits on whitespace or stops at the first ')'.
+func TestParseStartTimeShouldReadFieldTwentyTwoWhenCommHoldsParenthesesAndSpaces(t *testing.T) {
+	tests := []struct {
+		name   string
+		stat   string
+		want   string
+		wantOK bool
+	}{
+		{"plain comm", statLine(42, "claude", "98765"), "98765", true},
+		{"comm with a space", statLine(42, "Web Content", "98765"), "98765", true},
+		{"comm that closes a paren early", statLine(42, "a) S 9 9 (b", "98765"), "98765", true},
+		{"comm that is only parens", statLine(42, ")()", "98765"), "98765", true},
+		{"line cut before starttime", "42 (claude) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 20 0 1 0\n", "", false},
+		{"no closing paren", "42 claude S 1 2 3\n", "", false},
+		{"non-numeric starttime", statLine(42, "claude", "soon"), "", false},
+		{"empty", "", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := parseStartTime(tt.stat)
+			if got != tt.want || ok != tt.wantOK {
+				t.Errorf("parseStartTime = %q, %v; want %q, %v", got, ok, tt.want, tt.wantOK)
+			}
+		})
+	}
+}
+
+func writeBootID(t *testing.T, root, id string) {
+	t.Helper()
+	testsupport.WriteFile(t, filepath.Join(root, "sys", "kernel", "random", "boot_id"), id+"\n")
+}
+
+// The token joins the boot id with starttime, so the same starttime after a
+// reboot is a different lifetime, and a reused pid (new starttime) is too.
+func TestReadShouldReportABirthTokenThatChangesWithStartTimeAndBoot(t *testing.T) {
+	root := t.TempDir()
+	writeBootID(t, root, "boot-a")
+	writeProcFixture(t, root, 100, nil)
+	testsupport.WriteFile(t, filepath.Join(root, "100", "stat"), statLine(100, "pi", "5000"))
+	info, err := NewReader(root).Read(100)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if info.Birth == "" {
+		t.Fatal("Birth is empty, want a token when stat and boot_id are readable")
+	}
+
+	t.Run("should report the same token when the same lifetime is read again", func(t *testing.T) {
+		again, err := NewReader(root).Read(100)
+		if err != nil || again.Birth != info.Birth {
+			t.Fatalf("second Read Birth = %q, %v; want %q", again.Birth, err, info.Birth)
+		}
+	})
+	t.Run("should report another token when the pid is reused", func(t *testing.T) {
+		testsupport.WriteFile(t, filepath.Join(root, "100", "stat"), statLine(100, "pi", "7000"))
+		reused, err := NewReader(root).Read(100)
+		if err != nil || reused.Birth == "" || reused.Birth == info.Birth {
+			t.Fatalf("reused Birth = %q, %v; want a token other than %q", reused.Birth, err, info.Birth)
+		}
+	})
+	t.Run("should report another token when the host rebooted", func(t *testing.T) {
+		testsupport.WriteFile(t, filepath.Join(root, "100", "stat"), statLine(100, "pi", "5000"))
+		writeBootID(t, root, "boot-b")
+		rebooted, err := NewReader(root).Read(100)
+		if err != nil || rebooted.Birth == "" || rebooted.Birth == info.Birth {
+			t.Fatalf("rebooted Birth = %q, %v; want a token other than %q", rebooted.Birth, err, info.Birth)
+		}
+	})
+}
+
+// An unavailable token is not an error: the process is still read, and its
+// lifetime is left unverified (empty), which the layers above never match.
+func TestReadShouldLeaveBirthEmptyWhenTheTokenIsUnavailable(t *testing.T) {
+	t.Run("should leave birth empty when stat is missing", func(t *testing.T) {
+		root := t.TempDir()
+		writeBootID(t, root, "boot-a")
+		writeProcFixture(t, root, 100, nil)
+		info, err := NewReader(root).Read(100)
+		if err != nil || info.Birth != "" {
+			t.Fatalf("Read = Birth %q, err %v; want an empty birth and no error", info.Birth, err)
+		}
+	})
+	t.Run("should leave birth empty when boot_id is unreadable", func(t *testing.T) {
+		root := t.TempDir()
+		writeProcFixture(t, root, 100, nil)
+		testsupport.WriteFile(t, filepath.Join(root, "100", "stat"), statLine(100, "pi", "5000"))
+		info, err := NewReader(root).Read(100)
+		if err != nil || info.Birth != "" {
+			t.Fatalf("Read = Birth %q, err %v; want an empty birth and no error", info.Birth, err)
+		}
+	})
+	t.Run("should report gone when the birth of a vanished pid is read", func(t *testing.T) {
+		if _, err := NewReader(t.TempDir()).Birth(100); !errors.Is(err, ErrGone) {
+			t.Fatalf("Birth(vanished) err = %v, want ErrGone", err)
+		}
+	})
+}
+
+// Observable contract against the real /proc: this process has a token, and
+// it is stable across reads.
+func TestBirthShouldBeStableForThisProcess(t *testing.T) {
+	if _, err := os.Stat("/proc/sys/kernel/random/boot_id"); err != nil {
+		t.Skip("no boot_id on this host")
+	}
+	a, err := Birth(os.Getpid())
+	if err != nil || a == "" {
+		t.Fatalf("Birth(self) = %q, %v; want a token", a, err)
+	}
+	info, err := Read(os.Getpid())
+	if err != nil || info.Birth != a {
+		t.Fatalf("Read(self).Birth = %q, %v; want %q", info.Birth, err, a)
+	}
+}

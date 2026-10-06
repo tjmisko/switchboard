@@ -210,8 +210,8 @@ func main() {
 	agentRuntime.SetCodexDisplayNamer(codexprovider.EphemeralNamer{}, *codexDisplayNameModel)
 	agentRuntime.Start(ctx, *reconcileInterval)
 	defer agentRuntime.Close()
-	forgetRoot := func(pid int) {
-		scanner.Forget(pid)
+	forgetRoot := func(lifetime osproc.Lifetime) {
+		scanner.Forget(lifetime)
 		// Forget/Close work is performed by the coordinator after this callback's
 		// Store.Apply has released its lock.
 		agentRuntime.RequestCleanup()
@@ -232,11 +232,9 @@ func main() {
 		sess := resolver.Resolve(ctx, info)
 		sess.Agent = kind
 		sess.Headless = headless
-		var lifetime sessionLifetime
 		store.Apply(func(m map[int]*state.Session) {
-			admitted := admitRoot(m, sess, herdrPane, herdrWatcher, sink, time.Now())
+			admitted := admitRoot(m, sess, herdrPane, herdrWatcher, sink, forgetRoot, time.Now())
 			sess = *admitted
-			lifetime = lifetimeOf(admitted)
 		})
 		federated.AnnounceSession(ctx, sess)
 		agentRuntime.Request(providerRootKey(sess))
@@ -250,7 +248,7 @@ func main() {
 		// would have reported is never observed. The reconciler's liveness sweep
 		// backstops that loss (L1) and a registration failure below (L3); both funnel
 		// through endSession, so whichever notices first closes the lane exactly once.
-		if err := watchSessionDeath(ctx, procSrc, store, lifetime, sink, forgetRoot, time.Now); err != nil {
+		if err := watchSessionDeath(ctx, procSrc, store, lifetimeOf(&sess), sess.Agent, sink, forgetRoot, time.Now); err != nil {
 			log.Printf("watch pid=%d: %v (liveness sweep will close its lane)", info.PID, err)
 		}
 	}
@@ -358,7 +356,7 @@ func configureCodexUsagePersistence(config codexprovider.Config, sink *history.S
 // session, so every later trigger finds nothing and records nothing — one death
 // can never produce two session_end events (L5). The caller MUST hold the store
 // lock (i.e. call this inside store.Apply). Reports whether it closed the lane.
-func endSession(m map[int]*state.Session, pid int, sink *history.Sink, forget func(int), now time.Time) bool {
+func endSession(m map[int]*state.Session, pid int, sink *history.Sink, forget func(osproc.Lifetime), now time.Time) bool {
 	s := m[pid]
 	if s == nil {
 		return false // already closed by another trigger
@@ -367,54 +365,59 @@ func endSession(m map[int]*state.Session, pid int, sink *history.Sink, forget fu
 		SessionID: enrichmentID(s), PID: s.PID, Agent: s.Agent, CWD: s.CWD})
 	delete(m, pid)
 	if forget != nil {
-		forget(pid)
+		forget(lifetimeOf(s))
 	}
 	return true
 }
 
-// sessionLifetime names one tracked lifetime of a pid, as captured when its
-// death-watch was registered. A death callback carries it so that it can only
-// close the lifetime it was registered for: by the time a pidfd callback runs,
-// the sweep may already have closed that session and the scanner re-discovered
-// the recycled pid as a new one, which a bare endSession(pid) would end.
-//
-// This is a stopgap fence. StartedAt is not a kernel birth token: appear copies
-// it onto a re-discovered pid of the same agent while the old session is still
-// in the map, so a same-agent pid reuse in that window is not fenced. #97
-// (Phase 4, the OS process birth token) fixes that properly.
-type sessionLifetime struct {
-	PID       int
-	Agent     string
-	StartedAt time.Time
-}
-
-func lifetimeOf(s *state.Session) sessionLifetime {
-	return sessionLifetime{PID: s.PID, Agent: s.Agent, StartedAt: s.StartedAt}
+// lifetimeOf names the process lifetime a tracked session belongs to: its pid
+// and the birth token read when it was discovered (#97). A session whose token
+// was unavailable has an unverified lifetime, which no fence ever matches.
+func lifetimeOf(s *state.Session) osproc.Lifetime {
+	return osproc.Lifetime{PID: s.PID, Birth: s.Birth}
 }
 
 // admitRoot stores a discovered root under its pid and returns the stored
 // session. Runs inside store.Apply.
 //
-// A surviving root of the same agent keeps its discovery-lifetime timestamp and
-// last-known provider projection while discovery refreshes only live
-// process/window fields. This is what lets restored graphs remain authoritative
-// until their explicit freshness deadline instead of being erased on scan one.
-// StartedAt is therefore not a kernel birth token.
+// The root inherits a prior session under its pid only when both are the same
+// agent AND the same process lifetime: both birth tokens present and equal.
+// Then it keeps its display start time and last-known provider projection
+// while discovery refreshes only live process/window fields. This is what
+// lets a daemon restart, or a second discoverer of the same process, keep its
+// display state and restored graph authoritative until its explicit freshness
+// deadline instead of erasing them on scan one.
+//
+// Any other prior is not this root. A reused pid (a different token) can
+// never inherit the previous session's status, binding or StartedAt, even on
+// the same tty with the same executable; its prior is definitively dead, so
+// its lane is closed here. An unverified token on either side inherits
+// nothing either, since it cannot be told from a reuse, but proves no death,
+// so it closes no lane. Because a new lifetime always gets a fresh StartedAt,
+// every StartedAt fence downstream also separates the two lifetimes.
 //
 // A herdr-observed agent also keeps its herdr block (Claude and Codex panes are
 // the reconciler's to attach, as before). A Pi in a herdr pane is found by both
 // the scanner and herdr discovery, in either order, and must stay one session:
 // when herdr arrives second it attaches its pane to the scanner's root, and when
 // the scanner arrives second (herdrPane nil) it must not strip the pane herdr
-// attached, since herdr discovery announces a pid only once per daemon run.
-func admitRoot(m map[int]*state.Session, sess state.Session, herdrPane *terminal.PaneRef, herdrSource herdrStatusSource, sink *history.Sink, now time.Time) *state.Session {
-	if prior := m[sess.PID]; prior != nil && prior.Agent == sess.Agent {
-		sess.StartedAt = prior.StartedAt
-		sess.DisplayName = prior.DisplayName
-		sess.Claude, sess.Codex, sess.Pi, sess.AgentGraph = prior.Claude, prior.Codex, prior.Pi, prior.AgentGraph
-		sess.InheritStatusEvidence(prior)
-		if !state.IsProviderAgent(sess.Agent) {
-			sess.Herdr = prior.Herdr
+// attached, since herdr discovery announces a lifetime only once per daemon run.
+func admitRoot(m map[int]*state.Session, sess state.Session, herdrPane *terminal.PaneRef, herdrSource herdrStatusSource, sink *history.Sink, forget func(osproc.Lifetime), now time.Time) *state.Session {
+	if prior := m[sess.PID]; prior != nil {
+		switch osproc.CompareBirth(prior.Birth, sess.Birth) {
+		case osproc.BirthSame:
+			if prior.Agent != sess.Agent {
+				break
+			}
+			sess.StartedAt = prior.StartedAt
+			sess.DisplayName = prior.DisplayName
+			sess.Claude, sess.Codex, sess.Pi, sess.AgentGraph = prior.Claude, prior.Codex, prior.Pi, prior.AgentGraph
+			sess.InheritStatusEvidence(prior)
+			if !state.IsProviderAgent(sess.Agent) {
+				sess.Herdr = prior.Herdr
+			}
+		case osproc.BirthDifferent:
+			endSession(m, sess.PID, sink, forget, now)
 		}
 	}
 	m[sess.PID] = &sess
@@ -425,23 +428,25 @@ func admitRoot(m map[int]*state.Session, sess state.Session, herdrPane *terminal
 }
 
 // endSessionIf closes the lane of lifetime.PID only while the store still holds
-// that lifetime there; a pid since taken by another session is left alone. It
-// is endSession behind a guard, so the once-only contract (L5) is endSession's.
-// The caller MUST hold the store lock.
-func endSessionIf(m map[int]*state.Session, lifetime sessionLifetime, sink *history.Sink, forget func(int), now time.Time) bool {
+// that lifetime there: the same verified birth token. A pid since taken by
+// another lifetime is left alone, and so is an unverified one, whose death the
+// liveness sweep judges instead. It is endSession behind a guard, so the
+// once-only contract (L5) is endSession's. The caller MUST hold the store lock.
+func endSessionIf(m map[int]*state.Session, lifetime osproc.Lifetime, sink *history.Sink, forget func(osproc.Lifetime), now time.Time) bool {
 	s := m[lifetime.PID]
-	if s == nil || s.Agent != lifetime.Agent || !s.StartedAt.Equal(lifetime.StartedAt) {
+	if s == nil || osproc.CompareBirth(s.Birth, lifetime.Birth) != osproc.BirthSame {
 		return false
 	}
 	return endSession(m, lifetime.PID, sink, forget, now)
 }
 
-// watchSessionDeath registers the pidfd death-watch for one session lifetime.
+// watchSessionDeath registers the kernel death watch for one session lifetime.
 // The callback closes that lifetime's lane through endSessionIf, stamped with
-// now() at the moment the death is reported.
-func watchSessionDeath(ctx context.Context, src osproc.Source, store *state.Store, lifetime sessionLifetime, sink *history.Sink, forget func(int), now func() time.Time) error {
-	return src.Watch(ctx, lifetime.PID, func() {
-		log.Printf("%s pid=%d died", lifetime.Agent, lifetime.PID)
+// now() at the moment the death is reported. An unverified lifetime is refused
+// by the source (osproc.ErrUnverifiedLifetime); the sweep covers it.
+func watchSessionDeath(ctx context.Context, src osproc.Source, store *state.Store, lifetime osproc.Lifetime, agent string, sink *history.Sink, forget func(osproc.Lifetime), now func() time.Time) error {
+	return src.Watch(ctx, lifetime, func() {
+		log.Printf("%s pid=%d died", agent, lifetime.PID)
 		store.Apply(func(m map[int]*state.Session) {
 			endSessionIf(m, lifetime, sink, forget, now())
 		})
@@ -470,13 +475,19 @@ func sessionDead(src osproc.Source, sess *state.Session) bool {
 }
 
 // processIsSession reports whether a live process is still the agent session
-// tracked under its pid. A Claude or Codex root must still classify as one, and
+// tracked under its pid. A process whose birth token differs from the session's
+// is another lifetime, whatever it runs and wherever (#97). Past that, a Claude
+// or Codex root must still classify as one (the same lifetime may have exec'd
+// into something else), and
 // a Pi is the session while it is still an interactive Pi. An agent herdr alone
 // observes has no classifier here, so its pid counts as its own while it still
 // runs on the session's terminal: a reused pid lands on some other tty, or none.
 // A Pi without a herdr pane was found by the scanner alone, so only the
 // classifier vouches for it.
 func processIsSession(info osproc.Info, sess *state.Session) bool {
+	if osproc.CompareBirth(sess.Birth, info.Birth) == osproc.BirthDifferent {
+		return false
+	}
 	if sess.Agent == "" || state.IsProviderAgent(sess.Agent) {
 		return discovery.Classify(info) != discovery.AgentNone
 	}
@@ -505,7 +516,7 @@ func processIsSession(info osproc.Info, sess *state.Session) bool {
 // a restart within a single reconcile interval.
 //
 // Deleting from a map while ranging it is safe in Go. Runs inside store.Apply.
-func sweepDeadSessions(m map[int]*state.Session, src osproc.Source, sink *history.Sink, forget func(int), now time.Time) {
+func sweepDeadSessions(m map[int]*state.Session, src osproc.Source, sink *history.Sink, forget func(osproc.Lifetime), now time.Time) {
 	for pid, sess := range m {
 		if !sessionDead(src, sess) {
 			continue
@@ -533,24 +544,17 @@ func sweepDeadSessions(m map[int]*state.Session, src osproc.Source, sink *histor
 // prompt, and the alternative — trusting the pre-restart clock — would make every
 // pre-restart transcript entry read as "resolved after" and demote a red that was
 // live across the restart. See hydratePending.
-func dropStaleSessions(store *state.Store, procSrc osproc.Source, sink *history.Sink, forget func(int), tailBytes int64) {
+func dropStaleSessions(store *state.Store, procSrc osproc.Source, sink *history.Sink, forget func(osproc.Lifetime), tailBytes int64) {
 	now := time.Now()
 	// Sampled BEFORE the lock, per the direction the recent perf work established
 	// (§9.4). Nothing is serving yet so there is no contention to create, but the
 	// rule that transcript I/O stays outside store.Apply is worth keeping absolute.
 	snapshot := store.Snapshot()
 	verdicts := hydratePendingVerdicts(snapshot, tailBytes, now)
-	type processVerdict struct {
-		alive      bool
-		definitive bool
-	}
 	processes := make(map[int]processVerdict, len(snapshot.Sessions))
 	for _, sess := range snapshot.Sessions {
 		info, err := procSrc.Read(sess.PID)
-		processes[sess.PID] = processVerdict{
-			alive:      err == nil && processIsSession(info, &sess),
-			definitive: errors.Is(err, osproc.ErrGone) || err == nil,
-		}
+		processes[sess.PID] = restoreVerdict(info, err, &sess)
 	}
 	store.Apply(func(m map[int]*state.Session) {
 		for pid := range m {
@@ -568,6 +572,9 @@ func dropStaleSessions(store *state.Store, procSrc osproc.Source, sink *history.
 				if info := m[pid].Enrichment(); info != nil {
 					info.StatusSince = now
 				}
+				if process.adoptBirth != "" {
+					m[pid].Birth = process.adoptBirth
+				}
 				hydratePending(m[pid], verdicts[pid], now)
 				continue
 			}
@@ -581,6 +588,53 @@ func dropStaleSessions(store *state.Store, procSrc osproc.Source, sink *history.
 			delete(m, pid)
 		}
 	})
+}
+
+// processVerdict is the startup judgement of one hydrated session's process.
+// alive restores the session, display and authority. A session not alive is
+// dropped, and definitive says its process is provably not the session, so
+// its lane is closed too. adoptBirth, when set, is the live token an alive
+// session that persisted none takes as its own.
+type processVerdict struct {
+	alive      bool
+	definitive bool
+	adoptBirth string
+}
+
+// restoreVerdict revalidates a hydrated session's process lifetime before any
+// authority is restored (#97). The same birth token, read live, restores the
+// session: its display timestamps and its last-known provider state. A
+// different token is a reused pid, whose session died while the daemon was
+// down.
+//
+// A session persisted with no token (a state.json written before #97) is
+// trusted on first use: if a token is readable now and the process still
+// classifies as the session, the pre-#97 identity check, it is restored and
+// adopts the live token, so every later restart is fully fenced. This is the
+// one restart judged as weakly as before #97; without it, the first restart
+// after the upgrade would drop every session's start time and status.
+//
+// No token readable now proves nothing: if the process still classifies as
+// the session, it is dropped WITHOUT a session_end and rediscovered as a new
+// lifetime with nothing inherited; if it does not, it is a definite death, as
+// before.
+func restoreVerdict(info osproc.Info, err error, sess *state.Session) processVerdict {
+	if errors.Is(err, osproc.ErrGone) {
+		return processVerdict{definitive: true}
+	}
+	if err != nil {
+		return processVerdict{}
+	}
+	if !processIsSession(info, sess) {
+		return processVerdict{definitive: true}
+	}
+	if osproc.CompareBirth(sess.Birth, info.Birth) == osproc.BirthSame {
+		return processVerdict{alive: true}
+	}
+	if sess.Birth == "" && info.Birth != "" {
+		return processVerdict{alive: true, adoptBirth: info.Birth}
+	}
+	return processVerdict{}
 }
 
 // hydratePendingVerdicts asks each hydrated session's transcripts whether the
@@ -776,7 +830,7 @@ func pendingWriterLabel(writer string) string {
 // the timer disarmed and arms it again.
 const layoutDebounce = 200 * time.Millisecond
 
-func runWMLoop(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, sink *history.Sink, src osproc.Source, forget func(int), turn *resolveTurn) {
+func runWMLoop(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, sink *history.Sink, src osproc.Source, forget func(osproc.Lifetime), turn *resolveTurn) {
 	for ctx.Err() == nil {
 		events, err := manager.Subscribe(ctx)
 		if err != nil {
@@ -803,7 +857,7 @@ func runWMLoop(ctx context.Context, store *state.Store, resolver *mapping.Resolv
 //
 // debounce is a parameter rather than the layoutDebounce constant so tests can
 // drive the coalescing without sleeping a real 200ms per case.
-func drainWMEvents(ctx context.Context, store *state.Store, resolver *mapping.Resolver, events <-chan wm.Event, sink *history.Sink, src osproc.Source, forget func(int), turn *resolveTurn, debounce time.Duration) {
+func drainWMEvents(ctx context.Context, store *state.Store, resolver *mapping.Resolver, events <-chan wm.Event, sink *history.Sink, src osproc.Source, forget func(osproc.Lifetime), turn *resolveTurn, debounce time.Duration) {
 	// Go 1.23+ timer semantics: Stop/Reset never leave a stale value on the
 	// channel, so the classic stop-and-drain dance is unnecessary. `pending`
 	// tracks whether the timer is armed — the channel itself cannot answer that.
@@ -877,7 +931,7 @@ func drainWMEvents(ctx context.Context, store *state.Store, resolver *mapping.Re
 // handleWMEvent reacts to a neutral window event. Addresses arrive already
 // normalized to Clients() form (the wm seam owns the Hyprland 0x quirk), so the
 // daemon compares them directly against sess.Hyprland.Address.
-func handleWMEvent(ctx context.Context, store *state.Store, resolver *mapping.Resolver, evt wm.Event, sink *history.Sink, src osproc.Source, forget func(int), turn *resolveTurn) {
+func handleWMEvent(ctx context.Context, store *state.Store, resolver *mapping.Resolver, evt wm.Event, sink *history.Sink, src osproc.Source, forget func(osproc.Lifetime), turn *resolveTurn) {
 	switch evt.Kind {
 	case wm.EventWindowClosed:
 		// A session's window went away — the "user closed the terminal while claude
@@ -1051,7 +1105,7 @@ func resolveSession(ctx context.Context, resolver *mapping.Resolver, sess *state
 // Catches anything missed by event-driven updates (e.g. a session whose
 // mapping was incomplete when first created, the initial focus state, or a
 // hyprctl race).
-func runReconciler(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, interval time.Duration, tun statustune.Tuning, sink *history.Sink, obs *fanout.Observer, forget func(int), turn *resolveTurn, herdrSrc herdrStatusSource) {
+func runReconciler(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, interval time.Duration, tun statustune.Tuning, sink *history.Sink, obs *fanout.Observer, forget func(osproc.Lifetime), turn *resolveTurn, herdrSrc herdrStatusSource) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	rstate := newReconcileState(obs)
@@ -1075,7 +1129,7 @@ func runReconciler(ctx context.Context, store *state.Store, resolver *mapping.Re
 	}
 }
 
-func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, tun statustune.Tuning, sink *history.Sink, rstate *reconcileState, forget func(int)) {
+func reconcileOnce(ctx context.Context, store *state.Store, resolver *mapping.Resolver, manager wm.Manager, stack detect.Stack, tun statustune.Tuning, sink *history.Sink, rstate *reconcileState, forget func(osproc.Lifetime)) {
 	// Re-publish capabilities every tick: the terminal locator is self-redetecting
 	// (detect.NewAuto), so a terminal that came up after the daemon flips
 	// terminal/navigate from their boot-race "none" values without a restart.

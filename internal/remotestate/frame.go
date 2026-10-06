@@ -146,7 +146,17 @@ func DecodeFrame(body []byte) (Frame, error) {
 	if err := validateSnapshot(snapshot); err != nil {
 		return Frame{}, err
 	}
+	clearHostLocalIdentity(&snapshot)
 	return Frame{Host: canonical, Snapshot: snapshot}, nil
+}
+
+// clearHostLocalIdentity drops what names a process on the sending host only:
+// each session's OS process-birth token (#97). A peer can neither verify nor
+// use it, so it never crosses federation in either direction.
+func clearHostLocalIdentity(snapshot *state.Snapshot) {
+	for i := range snapshot.Sessions {
+		snapshot.Sessions[i].Birth = ""
+	}
 }
 
 func validateSnapshot(snapshot state.Snapshot) error {
@@ -291,6 +301,7 @@ func StreamLocal(ctx context.Context, client SubscriptionClient, out io.Writer, 
 		if err := validateSnapshot(*response.Snapshot); err != nil {
 			return fmt.Errorf("local daemon snapshot: %w", err)
 		}
+		clearHostLocalIdentity(response.Snapshot)
 		if err := EncodeFrame(out, Frame{Host: host, Snapshot: *response.Snapshot}, options.MaxFrameBytes); err != nil {
 			return fmt.Errorf("write remote stream: %w", err)
 		}

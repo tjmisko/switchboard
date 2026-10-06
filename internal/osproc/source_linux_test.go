@@ -4,12 +4,14 @@ package osproc
 
 import (
 	"context"
+	"errors"
 	"os"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
 
+	"github.com/tjmisko/switchboard/internal/proc"
 	"github.com/tjmisko/switchboard/internal/testsupport"
 )
 
@@ -32,6 +34,20 @@ func watching(s *linuxSource, pid int) bool {
 		}
 	}
 	return false
+}
+
+// liveLifetime reads pid's current lifetime through s, failing the test when it
+// has no birth token: every Watch below needs a verified lifetime.
+func liveLifetime(t *testing.T, s *linuxSource, pid int) Lifetime {
+	t.Helper()
+	info, err := s.Read(pid)
+	if err != nil {
+		t.Fatalf("Read(%d): %v", pid, err)
+	}
+	if !info.Lifetime().Verified() {
+		t.Fatalf("Read(%d) has no birth token", pid)
+	}
+	return info.Lifetime()
 }
 
 // waitWatchedEmpty waits (briefly) for the watched set to drain — the proxy for
@@ -59,7 +75,7 @@ func TestWatchFiresOnDeathExactlyOnce(t *testing.T) {
 
 	fired := make(chan struct{}, 4)
 	s := newLinuxSource()
-	if err := s.Watch(ctx, child.PID, func() { fired <- struct{}{} }); err != nil {
+	if err := s.Watch(ctx, liveLifetime(t, s, child.PID), func() { fired <- struct{}{} }); err != nil {
 		t.Fatalf("Watch: %v", err)
 	}
 
@@ -90,10 +106,10 @@ func TestDuplicateWatchIsNoOp(t *testing.T) {
 
 	fired := make(chan struct{}, 8)
 	s := newLinuxSource()
-	if err := s.Watch(ctx, child.PID, func() { fired <- struct{}{} }); err != nil {
+	if err := s.Watch(ctx, liveLifetime(t, s, child.PID), func() { fired <- struct{}{} }); err != nil {
 		t.Fatalf("first Watch: %v", err)
 	}
-	if err := s.Watch(ctx, child.PID, func() { fired <- struct{}{} }); err != nil {
+	if err := s.Watch(ctx, liveLifetime(t, s, child.PID), func() { fired <- struct{}{} }); err != nil {
 		t.Fatalf("duplicate Watch returned error: %v", err)
 	}
 	if n := len(s.Watched()); n != 1 {
@@ -123,11 +139,11 @@ func TestStopCancelsWithoutFiringOnDeath(t *testing.T) {
 
 	fired := make(chan struct{}, 4)
 	s := newLinuxSource()
-	if err := s.Watch(ctx, child.PID, func() { fired <- struct{}{} }); err != nil {
+	if err := s.Watch(ctx, liveLifetime(t, s, child.PID), func() { fired <- struct{}{} }); err != nil {
 		t.Fatalf("Watch: %v", err)
 	}
 
-	s.Stop(child.PID)
+	s.Stop(liveLifetime(t, s, child.PID))
 
 	select {
 	case <-fired:
@@ -146,7 +162,7 @@ func TestWatchAlreadyDeadFiresImmediately(t *testing.T) {
 
 	fired := make(chan struct{}, 4)
 	s := newLinuxSource()
-	if err := s.Watch(ctx, testsupport.DeadPID(), func() { fired <- struct{}{} }); err != nil {
+	if err := s.Watch(ctx, Lifetime{PID: testsupport.DeadPID(), Birth: "boot:1"}, func() { fired <- struct{}{} }); err != nil {
 		t.Fatalf("Watch(dead): %v", err)
 	}
 
@@ -194,6 +210,7 @@ func TestWatchAgainDuringDeathCallback(t *testing.T) {
 
 			child := testsupport.SpawnSleep(t, 60*time.Second)
 			s := newLinuxSource()
+			lifetime := liveLifetime(t, s, child.PID)
 
 			second := make(chan struct{}, 4)
 			rewatchErr := make(chan error, 1)
@@ -201,13 +218,13 @@ func TestWatchAgainDuringDeathCallback(t *testing.T) {
 			releaseFirst := make(chan struct{})
 			onFirstDeath := func() {
 				if row.rewatchInside {
-					rewatchErr <- s.Watch(ctx, child.PID, func() { second <- struct{}{} })
+					rewatchErr <- s.Watch(ctx, lifetime, func() { second <- struct{}{} })
 					return
 				}
 				close(firstEntered)
 				<-releaseFirst
 			}
-			if err := s.Watch(ctx, child.PID, onFirstDeath); err != nil {
+			if err := s.Watch(ctx, lifetime, onFirstDeath); err != nil {
 				t.Fatalf("Watch: %v", err)
 			}
 
@@ -219,7 +236,7 @@ func TestWatchAgainDuringDeathCallback(t *testing.T) {
 				case <-time.After(3 * time.Second):
 					t.Fatal("first onDeath did not fire within 3s of kill")
 				}
-				rewatchErr <- s.Watch(ctx, child.PID, func() { second <- struct{}{} })
+				rewatchErr <- s.Watch(ctx, lifetime, func() { second <- struct{}{} })
 				close(releaseFirst)
 			}
 
@@ -246,4 +263,103 @@ func TestWatchAgainDuringDeathCallback(t *testing.T) {
 			waitWatchedEmpty(t, s)
 		})
 	}
+}
+
+// #97: Watch is keyed by lifetime and proves its pidfd refers to that
+// lifetime by re-reading the birth token after the open. Each row stages,
+// with a live child and no timing race, one shape of a pid that changed hands
+// before or around the open.
+func TestWatchShouldBeKeyedByLifetimeAndRecheckedAfterOpen(t *testing.T) {
+	requirePidfd(t)
+
+	t.Run("should report the watched lifetime dead at once when its pid already belongs to another", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		child := testsupport.SpawnSleep(t, 60*time.Second)
+		s := newLinuxSource()
+		stale := Lifetime{PID: child.PID, Birth: "boot:1"} // the lifetime the scanner read, since replaced by child
+
+		fired := make(chan struct{}, 4)
+		if err := s.Watch(ctx, stale, func() { fired <- struct{}{} }); err != nil {
+			t.Fatalf("Watch: %v", err)
+		}
+		select {
+		case <-fired:
+		case <-time.After(3 * time.Second):
+			t.Fatal("onDeath did not fire: the watcher is watching the replacement")
+		}
+		if watching(s, child.PID) {
+			t.Error("the replacement's pid is watched on the stale lifetime's behalf")
+		}
+	})
+
+	t.Run("should report the watched lifetime dead when its pid is gone by the re-read", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		child := testsupport.SpawnSleep(t, 60*time.Second)
+		s := newLinuxSource()
+		lifetime := liveLifetime(t, s, child.PID)
+		s.readBirth = func(int) (string, error) { return "", proc.ErrGone }
+
+		fired := make(chan struct{}, 4)
+		if err := s.Watch(ctx, lifetime, func() { fired <- struct{}{} }); err != nil {
+			t.Fatalf("Watch: %v", err)
+		}
+		select {
+		case <-fired:
+		case <-time.After(3 * time.Second):
+			t.Fatal("onDeath did not fire for a lifetime gone at the re-read")
+		}
+	})
+
+	t.Run("should refuse without firing when the re-read cannot verify the lifetime", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		child := testsupport.SpawnSleep(t, 60*time.Second)
+		s := newLinuxSource()
+		lifetime := liveLifetime(t, s, child.PID)
+		s.readBirth = func(int) (string, error) { return "", nil }
+
+		fired := make(chan struct{}, 4)
+		if err := s.Watch(ctx, lifetime, func() { fired <- struct{}{} }); !errors.Is(err, ErrUnverifiedLifetime) {
+			t.Fatalf("Watch err = %v, want ErrUnverifiedLifetime", err)
+		}
+		select {
+		case <-fired:
+			t.Fatal("onDeath fired for a live process whose token was merely unreadable")
+		case <-time.After(300 * time.Millisecond):
+		}
+	})
+
+	t.Run("should refuse an unverified lifetime when it has no birth token", func(t *testing.T) {
+		s := newLinuxSource()
+		child := testsupport.SpawnSleep(t, 60*time.Second)
+		err := s.Watch(context.Background(), Lifetime{PID: child.PID}, func() { t.Error("onDeath fired for a refused watch") })
+		if !errors.Is(err, ErrUnverifiedLifetime) {
+			t.Fatalf("Watch err = %v, want ErrUnverifiedLifetime", err)
+		}
+		if watching(s, child.PID) {
+			t.Error("an unverified lifetime entered the watched set")
+		}
+	})
+
+	t.Run("should keep a lifetime's watcher when Stop names another lifetime of the pid", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		child := testsupport.SpawnSleep(t, 60*time.Second)
+		s := newLinuxSource()
+		lifetime := liveLifetime(t, s, child.PID)
+
+		fired := make(chan struct{}, 4)
+		if err := s.Watch(ctx, lifetime, func() { fired <- struct{}{} }); err != nil {
+			t.Fatalf("Watch: %v", err)
+		}
+		s.Stop(Lifetime{PID: child.PID, Birth: "boot:1"})
+		child.Kill(t)
+		select {
+		case <-fired:
+		case <-time.After(3 * time.Second):
+			t.Fatal("onDeath did not fire: a Stop for another lifetime cancelled this one")
+		}
+	})
 }

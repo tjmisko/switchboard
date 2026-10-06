@@ -29,14 +29,15 @@ type herdrDiscovery struct {
 	procs  osproc.Source
 
 	// pids caches each pane's agent process, so a tool the agent runs in the
-	// foreground cannot take its place; it is re-validated every tick.
+	// foreground cannot take its place; it is re-validated every tick, by
+	// lifetime and not by pid alone.
 	pids map[herdr.PaneKey]herdrAgentProcess
 }
 
 type herdrAgentProcess struct {
-	pid   int
-	agent string
-	tty   string
+	lifetime osproc.Lifetime
+	agent    string
+	tty      string
 }
 
 // herdrCandidate is one herdr-observed agent: its process and the pane it runs
@@ -93,11 +94,14 @@ func (d *herdrDiscovery) tick(ctx context.Context) (candidates []herdrCandidate,
 }
 
 // agentProcess returns the process running a pane's agent: the cached one while
-// it still runs on the pane's tty, else the pane's foreground process group
-// leader from herdr's process_info.
+// the same lifetime still runs on the pane's tty, else the pane's foreground
+// process group leader from herdr's process_info. A cached pid that another
+// process took over, even on the same tty, is not the cached agent (#97); nor
+// is one whose birth token cannot be verified, so it is looked up afresh.
 func (d *herdrDiscovery) agentProcess(ctx context.Context, key herdr.PaneKey, agent, tty string) (osproc.Info, bool) {
 	if cached, ok := d.pids[key]; ok && cached.agent == agent && cached.tty == tty {
-		if info, err := d.procs.Read(cached.pid); err == nil && info.TTY == tty {
+		info, err := d.procs.Read(cached.lifetime.PID)
+		if err == nil && info.TTY == tty && osproc.CompareBirth(info.Birth, cached.lifetime.Birth) == osproc.BirthSame {
 			return info, true
 		}
 	}
@@ -129,7 +133,7 @@ func (d *herdrDiscovery) agentProcess(ctx context.Context, key herdr.PaneKey, ag
 	if err != nil || info.TTY != tty {
 		return osproc.Info{}, false // exited, or not the pane's: retry next tick
 	}
-	d.pids[key] = herdrAgentProcess{pid: pid, agent: agent, tty: tty}
+	d.pids[key] = herdrAgentProcess{lifetime: info.Lifetime(), agent: agent, tty: tty}
 	return info, true
 }
 
@@ -137,16 +141,19 @@ func (d *herdrDiscovery) agentProcess(ctx context.Context, key herdr.PaneKey, ag
 // started in herdr appears as fast as one the scanner finds.
 const herdrDiscoveryInterval = time.Second
 
-// runHerdrDiscovery announces every herdr-observed agent once per daemon run.
-// That includes one hydrated from state.json: like the scanner's survivors, it
-// is announced again so its pidfd death watch exists in this process (appear
-// keeps the hydrated lifetime). A pid tracked as some other agent is left
-// alone. A session ends like any other, when its process dies (the pidfd
-// watch, or the liveness sweep's processIsSession check).
+// runHerdrDiscovery announces every herdr-observed agent lifetime once per
+// daemon run. That includes one hydrated from state.json: like the scanner's
+// survivors, it is announced again so its pidfd death watch exists in this
+// process (appear keeps the hydrated lifetime when the birth token matches). A
+// pid tracked as some other agent is left alone. Announcements are keyed by
+// lifetime, so a pid reused by a new agent process is announced again, and
+// admitRoot gives it nothing of the old one. A session ends like any other,
+// when its process dies (the pidfd watch, or the liveness sweep's
+// processIsSession check).
 func runHerdrDiscovery(ctx context.Context, store *state.Store, d *herdrDiscovery, interval time.Duration, appear func(osproc.Info, string, *terminal.PaneRef)) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
-	announced := make(map[int]string) // pid → agent, for this daemon run
+	announced := make(map[osproc.Lifetime]string) // lifetime → agent, for this daemon run
 	for {
 		candidates, ok := d.tick(ctx)
 		if ok {
@@ -154,22 +161,23 @@ func runHerdrDiscovery(ctx context.Context, store *state.Store, d *herdrDiscover
 			for _, sess := range store.Snapshot().Sessions {
 				tracked[sess.PID] = sess.Agent
 			}
-			current := make(map[int]string, len(candidates))
+			current := make(map[osproc.Lifetime]string, len(candidates))
 			for _, c := range candidates {
-				current[c.info.PID] = c.agent
-				if announced[c.info.PID] == c.agent {
+				lifetime := c.info.Lifetime()
+				current[lifetime] = c.agent
+				if announced[lifetime] == c.agent {
 					continue
 				}
 				if agent, ok := tracked[c.info.PID]; ok && agent != c.agent {
 					continue
 				}
-				announced[c.info.PID] = c.agent
+				announced[lifetime] = c.agent
 				pane := c.pane
 				appear(c.info, c.agent, &pane)
 			}
-			for pid, agent := range announced {
-				if current[pid] != agent {
-					delete(announced, pid)
+			for lifetime, agent := range announced {
+				if current[lifetime] != agent {
+					delete(announced, lifetime)
 				}
 			}
 		}

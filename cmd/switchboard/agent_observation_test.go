@@ -153,7 +153,7 @@ func testCodexObservation(ref provider.RootRef, rootID string, observed time.Tim
 
 func seedCoordinatorSession(store *state.Store, pid int, started time.Time, agent, sessionID, cwd string) provider.RootRef {
 	store.Apply(func(sessions map[int]*state.Session) {
-		sess := &state.Session{PID: pid, StartedAt: started, Agent: agent, CWD: cwd}
+		sess := &state.Session{PID: pid, StartedAt: started, Agent: agent, CWD: cwd, Birth: testBirth(pid)}
 		if sessionID != "" {
 			sess.AgentBlock(agent).SessionID = sessionID
 		}

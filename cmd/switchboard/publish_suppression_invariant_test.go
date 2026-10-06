@@ -13,6 +13,7 @@ import (
 	"github.com/tjmisko/switchboard/internal/fanout"
 	"github.com/tjmisko/switchboard/internal/history"
 	"github.com/tjmisko/switchboard/internal/mapping"
+	"github.com/tjmisko/switchboard/internal/osproc"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/statustune"
 	"github.com/tjmisko/switchboard/internal/terminal"
@@ -128,7 +129,7 @@ func suppressionFixture(t *testing.T, pid int, procs map[int]procState) (
 
 	tick = func() {
 		reconcileOnce(context.Background(), store, resolver, manager, stack,
-			statustune.Default(), sink, rstate, func(int) {})
+			statustune.Default(), sink, rstate, func(osproc.Lifetime) {})
 	}
 	return store, flushHistory, histDir, transcriptPath, tick
 }
@@ -365,7 +366,7 @@ func sharedWindowFixture(t *testing.T) (store *state.Store, tick func(sink *hist
 
 	tick = func(sink *history.Sink) {
 		reconcileOnce(context.Background(), store, resolver, manager, stack,
-			statustune.Default(), sink, rstate, func(int) {})
+			statustune.Default(), sink, rstate, func(osproc.Lifetime) {})
 	}
 	return store, tick
 }

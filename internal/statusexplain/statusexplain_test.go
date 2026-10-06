@@ -213,3 +213,29 @@ func TestEvidenceKindOfShouldClassifyEveryGraphSourceWhenOneIsGiven(t *testing.T
 		}
 	}
 }
+
+// #97: a root whose birth token was unavailable is reported as degraded, in
+// both renderings, and a verified root says nothing extra.
+func TestRootShouldReportAnUnverifiedLifetimeWhenTheBirthTokenWasUnavailable(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		unverified bool
+	}{
+		{"should mark the root when its lifetime is unverified", true},
+		{"should not mark the root when its lifetime is verified", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := Decision{Root: Root{PID: 7, Provider: "pi", LifetimeUnverified: tc.unverified}}.Sanitize()
+			raw, err := json.Marshal(d)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Contains(string(raw), `"lifetime_unverified":true`); got != tc.unverified {
+				t.Errorf("JSON %s: lifetime_unverified present = %v, want %v", raw, got, tc.unverified)
+			}
+			if got := strings.Contains(d.Text(), " lifetime=unverified\n"); got != tc.unverified {
+				t.Errorf("text %q: lifetime=unverified present = %v, want %v", d.Text(), got, tc.unverified)
+			}
+		})
+	}
+}

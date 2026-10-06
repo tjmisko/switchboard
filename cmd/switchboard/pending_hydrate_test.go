@@ -81,7 +81,7 @@ func hydrateFromMirror(t *testing.T, pid int, sid, mainTranscript, status string
 			// persisted (§9.5).
 			info.SetPending(w, state.PendingPrompt{Tool: "Bash", InputHash: "cafe1234"})
 		}
-		m[pid] = &state.Session{PID: pid, Agent: state.AgentKindClaude, CWD: "/home/u/proj", Claude: info}
+		m[pid] = &state.Session{PID: pid, Agent: state.AgentKindClaude, CWD: "/home/u/proj", Birth: testBirth(pid), Claude: info}
 	})
 
 	return hydrateMirrorAt(t, path, pid)
@@ -240,7 +240,7 @@ func TestHydratePendingHandlesEveryMirrorCombination(t *testing.T) {
 
 	t.Run("should seed the main thread when a permission chip has no persisted writers", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "state.json")
-		legacy := `{"sessions":[{"pid":42,"cwd":"/p","tty":"/dev/pts/1","started_at":"2026-05-28T09:00:00Z","agent":"claude",` +
+		legacy := `{"sessions":[{"pid":42,"birth":"` + testBirth(42) + `","cwd":"/p","tty":"/dev/pts/1","started_at":"2026-05-28T09:00:00Z","agent":"claude",` +
 			`"claude":{"session_id":"` + sid + `","status":"permission"}}],"updated_at":"2026-05-28T09:05:00Z"}`
 		if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
 			t.Fatal(err)

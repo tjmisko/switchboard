@@ -720,6 +720,42 @@ func TestFindTrackedAncestorNonAgentWrappersStillWalk(t *testing.T) {
 	}
 }
 
+// #97: a hook whose walk reaches a tracked pid is attributed to that session
+// only while the pid still holds the session's process lifetime. A reused pid,
+// even running the same agent, is an untracked agent whose hook must not land
+// on the previous session.
+func TestFindTrackedAncestorShouldRejectATrackedPIDWhenAnotherLifetimeHoldsIt(t *testing.T) {
+	session := func(birth string) map[int]*state.Session {
+		return map[int]*state.Session{100: {PID: 100, Birth: birth}}
+	}
+	chain := func(birth string) map[int]proc.Info {
+		live := claudeProc(100, 1)
+		live.Birth = birth
+		return map[int]proc.Info{
+			300: {PID: 300, PPID: 100, Comm: "sh", Exe: "/usr/bin/sh"},
+			100: live,
+		}
+	}
+	for _, tc := range []struct {
+		name         string
+		trackedBirth string
+		liveBirth    string
+		want         int
+	}{
+		{"should attribute the hook when the pid still holds the tracked lifetime", "boot:1", "boot:1", 100},
+		{"should drop the hook when the tracked pid was reused by another process", "boot:1", "boot:2", 0},
+		{"should attribute the hook as before when the tracked lifetime is unverified", "", "boot:2", 100},
+		{"should attribute the hook as before when the live token is unreadable", "boot:1", "", 100},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			if got := findTrackedAncestor(session(tc.trackedBirth), 300, procChainReader(chain(tc.liveBirth), &calls)); got != tc.want {
+				t.Errorf("findTrackedAncestor = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestSharedCodexDaemonCannotAttributeHooksToLaunchingTUI(t *testing.T) {
 	for _, args := range [][]string{
 		{"codex", "app-server", "--listen", "unix://", "--managed-daemon"},

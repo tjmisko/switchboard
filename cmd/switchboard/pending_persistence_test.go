@@ -289,7 +289,7 @@ func TestPromptStatePersistsAcrossADaemonRestart(t *testing.T) {
 		path := filepath.Join(dir, "state.json")
 		transcriptPath := hydrateFixture(t, restartSID, map[string]string{restartTeammate: hydrateBlocked})
 		legacy := `{"schema_version":` + strconv.Itoa(state.CurrentSchemaVersion) + `,"sessions":[{"pid":` + strconv.Itoa(restartPID) +
-			`,"cwd":"/project","tty":"/dev/pts/3","started_at":"2026-08-30T09:00:00Z","agent":"claude","claude":` +
+			`,"birth":"` + testBirth(restartPID) + `","cwd":"/project","tty":"/dev/pts/3","started_at":"2026-08-30T09:00:00Z","agent":"claude","claude":` +
 			`{"session_id":"` + restartSID + `","transcript":"` + transcriptPath + `","status":"permission",` +
 			`"pending_writers":["` + restartTeammate + `"]}}],"updated_at":"2026-08-30T09:05:00Z"}`
 		if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {

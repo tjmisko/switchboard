@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -39,6 +40,10 @@ const (
 	procUnreadable                  // a transient / unsupported-backend read failure: liveness UNKNOWN
 )
 
+// testBirth is the birth token the fakes give the first lifetime of pid. A
+// test that reuses a pid gives the replacement another token.
+func testBirth(pid int) string { return "boot-test:" + strconv.Itoa(pid) }
+
 // fakeProcSource is an osproc.Source whose per-pid liveness the test drives.
 // Pids absent from st read as procAlive.
 type fakeProcSource struct{ st map[int]procState }
@@ -49,22 +54,22 @@ func (f fakeProcSource) Read(pid int) (osproc.Info, error) {
 		return osproc.Info{PID: pid}, osproc.ErrGone
 	case procRecycled:
 		// A real process, but somebody else's: the kernel handed our pid to bash.
-		return osproc.Info{PID: pid, Comm: "bash", Exe: "/usr/bin/bash"}, nil
+		return osproc.Info{PID: pid, Comm: "bash", Exe: "/usr/bin/bash", Birth: "reused:" + strconv.Itoa(pid)}, nil
 	case procUnreadable:
 		return osproc.Info{PID: pid}, osproc.ErrUnsupported
 	default:
 		// Comm "claude" with a masked exe is a valid claude snapshot (see IsClaude).
-		return osproc.Info{PID: pid, Comm: "claude"}, nil
+		return osproc.Info{PID: pid, Comm: "claude", Birth: testBirth(pid)}, nil
 	}
 }
 
-func (f fakeProcSource) Enumerate() ([]osproc.Info, error)        { return nil, nil }
-func (f fakeProcSource) Watch(context.Context, int, func()) error { return nil }
-func (f fakeProcSource) Stop(int)                                 {}
+func (f fakeProcSource) Enumerate() ([]osproc.Info, error)                    { return nil, nil }
+func (f fakeProcSource) Watch(context.Context, osproc.Lifetime, func()) error { return nil }
+func (f fakeProcSource) Stop(osproc.Lifetime)                                 {}
 
 // trackedSession is one session in the store map, as the daemon holds it.
 func trackedSession(pid int, sid string) *state.Session {
-	return &state.Session{PID: pid, Agent: "claude", CWD: "/home/u/proj",
+	return &state.Session{PID: pid, Agent: "claude", CWD: "/home/u/proj", Birth: testBirth(pid),
 		Claude: &state.AgentInfo{SessionID: sid}}
 }
 
@@ -125,7 +130,7 @@ func TestSessionLifecycleHazards(t *testing.T) {
 
 			m := map[int]*state.Session{pid: trackedSession(pid, "sid-1")}
 			var forgotten []int
-			sweepDeadSessions(m, src, sink, func(p int) { forgotten = append(forgotten, p) }, time.Now())
+			sweepDeadSessions(m, src, sink, func(l osproc.Lifetime) { forgotten = append(forgotten, l.PID) }, time.Now())
 			sink.Close()
 
 			ends := eventsOfType(readEvents(t, histDir), history.EventSessionEnd)
@@ -170,7 +175,7 @@ func TestDropStaleSessionsRecordsSessionEnd(t *testing.T) {
 
 	src := fakeProcSource{st: map[int]procState{deadPID: procGone, livePID: procAlive}}
 	var forgotten []int
-	dropStaleSessions(store, src, sink, func(p int) { forgotten = append(forgotten, p) }, transcript.DefaultTailBytes)
+	dropStaleSessions(store, src, sink, func(l osproc.Lifetime) { forgotten = append(forgotten, l.PID) }, transcript.DefaultTailBytes)
 	sink.Close()
 
 	ends := eventsOfType(readEvents(t, histDir), history.EventSessionEnd)
@@ -208,13 +213,13 @@ func TestEndSessionEmitsExactlyOncePerDeath(t *testing.T) {
 	now := time.Now()
 
 	// The sweep notices first...
-	sweepDeadSessions(m, src, sink, func(int) {}, now)
+	sweepDeadSessions(m, src, sink, func(osproc.Lifetime) {}, now)
 	// ...then the orphaned-but-late pidfd callback fires for the same death.
-	if endSession(m, pid, sink, func(int) {}, now) {
+	if endSession(m, pid, sink, func(osproc.Lifetime) {}, now) {
 		t.Error("second endSession reported closing the lane again; it must be a no-op")
 	}
 	// ...and a later tick sweeps again for good measure.
-	sweepDeadSessions(m, src, sink, func(int) {}, now)
+	sweepDeadSessions(m, src, sink, func(osproc.Lifetime) {}, now)
 	sink.Close()
 
 	if ends := eventsOfType(readEvents(t, histDir), history.EventSessionEnd); len(ends) != 1 {
@@ -273,7 +278,7 @@ func TestWindowClosedClosesTheLaneOnlyWhenTheProcessIsGone(t *testing.T) {
 			var forgotten []int
 			handleWMEvent(context.Background(), store, nil,
 				wm.Event{Kind: wm.EventWindowClosed, Address: address},
-				sink, src, func(p int) { forgotten = append(forgotten, p) }, nil)
+				sink, src, func(l osproc.Lifetime) { forgotten = append(forgotten, l.PID) }, nil)
 			sink.Close()
 
 			ends := eventsOfType(readEvents(t, histDir), history.EventSessionEnd)
@@ -390,30 +395,37 @@ func TestGhostLaneIsBoundedBySessionEnd(t *testing.T) {
 }
 
 // deathCapturingProcSource is a fakeProcSource whose Watch keeps each
-// registered death callback so the test decides when, and how late, it fires.
+// registered death callback, and the lifetime it was registered for, so the
+// test decides when, and how late, it fires.
 type deathCapturingProcSource struct {
 	fakeProcSource
-	deaths []func()
+	deaths    []func()
+	lifetimes []osproc.Lifetime
 }
 
-func (f *deathCapturingProcSource) Watch(_ context.Context, _ int, onDeath func()) error {
+func (f *deathCapturingProcSource) Watch(_ context.Context, lifetime osproc.Lifetime, onDeath func()) error {
 	f.deaths = append(f.deaths, onDeath)
+	f.lifetimes = append(f.lifetimes, lifetime)
 	return nil
 }
 
-// lifetimeSession is a tracked session with an explicit discovery lifetime.
-func lifetimeSession(pid int, agent, sid string, startedAt time.Time) *state.Session {
+// lifetimeSession is a tracked session with an explicit process lifetime: its
+// birth token, and the discovery stamp shown as its start.
+func lifetimeSession(pid int, agent, sid, birth string, startedAt time.Time) *state.Session {
 	s := trackedSession(pid, sid)
 	s.Agent = agent
+	s.Birth = birth
 	s.StartedAt = startedAt
 	return s
 }
 
-// L9: a pidfd death callback is bound to the session lifetime it was registered
-// for, not to the bare pid. The sweep can close a session first and the scanner
-// re-discover its recycled pid as a new session before the old pidfd's callback
-// runs; an unfenced endSession(pid) then ended the replacement, writing a
-// session_end for a live session and dropping it from the store.
+// L9: a pidfd death callback is bound to the process lifetime it was
+// registered for (its birth token, #97), not to the bare pid. The sweep can
+// close a session first and the scanner re-discover its recycled pid as a new
+// session before the old pidfd's callback runs; an unfenced endSession(pid)
+// then ended the replacement, writing a session_end for a live session and
+// dropping it from the store. Phase 0's StartedAt fence could not separate a
+// same-agent replacement that inherited StartedAt; the birth token can.
 func TestDeathCallbackIsFencedBySessionLifetime(t *testing.T) {
 	const pid = 7070
 	oldStart := time.Date(2026, 10, 5, 9, 0, 0, 0, time.UTC)
@@ -425,12 +437,20 @@ func TestDeathCallbackIsFencedBySessionLifetime(t *testing.T) {
 		replacement *state.Session
 	}{
 		{
-			name:        "should not end a replacement session when the previous lifetime's death callback fires late",
-			replacement: lifetimeSession(pid, "claude", "sid-new", oldStart.Add(20*time.Minute)),
+			name:        "should not end a replacement session of the same agent when the previous lifetime's death callback fires late",
+			replacement: lifetimeSession(pid, "claude", "sid-new", "boot:2", oldStart.Add(20*time.Minute)),
+		},
+		{
+			name:        "should not end a same-agent replacement carrying the old start time when the previous lifetime's death callback fires late",
+			replacement: lifetimeSession(pid, "claude", "sid-new", "boot:2", oldStart),
 		},
 		{
 			name:        "should not end a replacement session of another agent when the previous lifetime's death callback fires late",
-			replacement: lifetimeSession(pid, "codex", "sid-new", oldStart),
+			replacement: lifetimeSession(pid, "codex", "sid-new", "boot:2", oldStart),
+		},
+		{
+			name:        "should not end an unverified replacement when the previous lifetime's death callback fires late",
+			replacement: lifetimeSession(pid, "claude", "sid-new", "", oldStart),
 		},
 	}
 	for _, row := range replacements {
@@ -438,14 +458,17 @@ func TestDeathCallbackIsFencedBySessionLifetime(t *testing.T) {
 			histDir := t.TempDir()
 			sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
 			store := state.New(filepath.Join(t.TempDir(), "state.json"))
-			old := lifetimeSession(pid, "claude", "sid-old", oldStart)
+			old := lifetimeSession(pid, "claude", "sid-old", "boot:1", oldStart)
 			store.Apply(func(m map[int]*state.Session) { m[pid] = old })
 
 			src := &deathCapturingProcSource{}
-			var forgotten []int
-			forget := func(p int) { forgotten = append(forgotten, p) }
-			if err := watchSessionDeath(context.Background(), src, store, lifetimeOf(old), sink, forget, clock); err != nil {
+			var forgotten []osproc.Lifetime
+			forget := func(l osproc.Lifetime) { forgotten = append(forgotten, l) }
+			if err := watchSessionDeath(context.Background(), src, store, lifetimeOf(old), old.Agent, sink, forget, clock); err != nil {
 				t.Fatalf("watchSessionDeath: %v", err)
+			}
+			if want := (osproc.Lifetime{PID: pid, Birth: "boot:1"}); len(src.lifetimes) != 1 || src.lifetimes[0] != want {
+				t.Fatalf("watched %v, want exactly the old lifetime %v", src.lifetimes, want)
 			}
 
 			// The sweep closes the old lifetime first, then the scanner re-discovers
@@ -465,8 +488,8 @@ func TestDeathCallbackIsFencedBySessionLifetime(t *testing.T) {
 					t.Errorf("m[%d] = %+v after the stale callback, want the replacement left tracked", pid, got)
 				}
 			})
-			if len(forgotten) != 1 {
-				t.Errorf("forgot %v, want only the sweep's single forget of pid %d", forgotten, pid)
+			if len(forgotten) != 1 || forgotten[0] != lifetimeOf(old) {
+				t.Errorf("forgot %v, want only the sweep's single forget of the old lifetime", forgotten)
 			}
 		})
 	}
@@ -475,12 +498,12 @@ func TestDeathCallbackIsFencedBySessionLifetime(t *testing.T) {
 		histDir := t.TempDir()
 		sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
 		store := state.New(filepath.Join(t.TempDir(), "state.json"))
-		sess := lifetimeSession(pid, "claude", "sid-1", oldStart)
+		sess := lifetimeSession(pid, "claude", "sid-1", "boot:1", oldStart)
 		store.Apply(func(m map[int]*state.Session) { m[pid] = sess })
 
 		src := &deathCapturingProcSource{}
-		var forgotten []int
-		if err := watchSessionDeath(context.Background(), src, store, lifetimeOf(sess), sink, func(p int) { forgotten = append(forgotten, p) }, clock); err != nil {
+		var forgotten []osproc.Lifetime
+		if err := watchSessionDeath(context.Background(), src, store, lifetimeOf(sess), sess.Agent, sink, func(l osproc.Lifetime) { forgotten = append(forgotten, l) }, clock); err != nil {
 			t.Fatalf("watchSessionDeath: %v", err)
 		}
 		if len(src.deaths) != 1 {
@@ -501,8 +524,20 @@ func TestDeathCallbackIsFencedBySessionLifetime(t *testing.T) {
 				t.Errorf("pid %d still tracked after its death callback", pid)
 			}
 		})
-		if len(forgotten) != 1 || forgotten[0] != pid {
-			t.Errorf("forgot %v, want the scanner to forget pid %d", forgotten, pid)
+		if len(forgotten) != 1 || forgotten[0] != lifetimeOf(sess) {
+			t.Errorf("forgot %v, want the scanner to forget lifetime %v", forgotten, lifetimeOf(sess))
+		}
+	})
+
+	t.Run("should leave an unverified session to the sweep when a death callback names it", func(t *testing.T) {
+		histDir := t.TempDir()
+		sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
+		m := map[int]*state.Session{pid: lifetimeSession(pid, "claude", "sid-1", "", oldStart)}
+		if endSessionIf(m, osproc.Lifetime{PID: pid}, sink, nil, died) {
+			t.Fatal("an unverified lifetime matched a death callback")
+		}
+		if _, tracked := m[pid]; !tracked {
+			t.Fatal("unverified session dropped by a death callback")
 		}
 	})
 
@@ -510,15 +545,15 @@ func TestDeathCallbackIsFencedBySessionLifetime(t *testing.T) {
 		histDir := t.TempDir()
 		sink := history.NewSink(history.Config{Enabled: true, Detail: history.DetailFull, Dir: histDir})
 		store := state.New(filepath.Join(t.TempDir(), "state.json"))
-		sess := lifetimeSession(pid, "claude", "sid-1", oldStart)
+		sess := lifetimeSession(pid, "claude", "sid-1", "boot:1", oldStart)
 		store.Apply(func(m map[int]*state.Session) { m[pid] = sess })
 
 		src := &deathCapturingProcSource{fakeProcSource: fakeProcSource{st: map[int]procState{pid: procGone}}}
-		if err := watchSessionDeath(context.Background(), src, store, lifetimeOf(sess), sink, func(int) {}, clock); err != nil {
+		if err := watchSessionDeath(context.Background(), src, store, lifetimeOf(sess), sess.Agent, sink, func(osproc.Lifetime) {}, clock); err != nil {
 			t.Fatalf("watchSessionDeath: %v", err)
 		}
 		src.deaths[0]()
-		store.Apply(func(m map[int]*state.Session) { sweepDeadSessions(m, src, sink, func(int) {}, died) })
+		store.Apply(func(m map[int]*state.Session) { sweepDeadSessions(m, src, sink, func(osproc.Lifetime) {}, died) })
 		src.deaths[0]()
 		sink.Close()
 

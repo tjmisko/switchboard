@@ -88,3 +88,37 @@ matches.
 
 Every acceptance criterion above becomes a test. Use a fake proc source that
 can reuse a PID on demand; never race real processes.
+
+## As built
+
+One PR, `feat/process-birth-token`.
+
+- **Token.** `boot_id:starttime`, read in `proc.Reader.Read` (and alone by
+  `proc.Birth` for the watch re-check). A missing stat or boot id leaves it
+  empty without failing the read. `osproc.CompareBirth` is three-valued:
+  same, different, unverified.
+- **Lifetime.** `osproc.Lifetime{PID, Birth}` keys `Watch`/`Stop`, the
+  scanner's `Forget`, herdr's pane cache and announcements, and the daemon's
+  `forget` callback. The store map stays keyed by pid: one pid holds one
+  lifetime at a time, and every entry carries its `Birth`.
+- **Inheritance.** `admitRoot` inherits only the same agent and the same
+  verified lifetime. A reused pid gets a fresh `StartedAt`, so the
+  `StartedAt` fences in the WM and reconcile paths separate lifetimes too; a
+  provably dead prior has its lane closed there.
+- **Unavailable token.** Never matches: no inheritance, `Watch` refuses it
+  (`osproc.ErrUnverifiedLifetime`), death callbacks leave it to the liveness
+  sweep, which keeps the classifier rule for it, restart drops it without a
+  `session_end` and rediscovers it fresh, and `explain` reports
+  `lifetime_unverified`. Hook attribution keeps its old behaviour for it.
+- **Persistence.** `birth` on each session, `omitempty`, cleared from
+  federation frames in both directions.
+- **Upgrade.** A `state.json` written before this phase carries no token. The
+  first restart after the upgrade trusts such a session on first use: when a
+  token is readable now and the process still classifies as the session (the
+  pre-#97 check), it is restored, start time, name and status included, and
+  adopts the live token, which is persisted. From then on every restart and
+  death is fenced by that token. A pid reused while the daemon was down by
+  the same agent passes that one restart, as it did before #97. With no token
+  readable now, the session is dropped and rediscovered fresh, as above.
+- **Hook attribution.** A ppid walk that reaches a tracked pid now held by
+  another lifetime drops the hook.

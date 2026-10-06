@@ -22,15 +22,21 @@ type Session struct {
 	// view. The host-local Store deliberately leaves it empty: local discovery,
 	// liveness, persistence, and navigation remain keyed exactly as before.
 	// Together with PID it namespaces a live aggregate row; StartedAt is the
-	// daemon's discovery-lifetime fence for actions and bindings. It rejects
-	// stale observations while daemon continuity is intact, but is not a kernel
-	// process-birth token. Omitted from ordinary local snapshots, so the frozen
-	// host-local state.json shape is unchanged.
+	// daemon's discovery-lifetime fence for actions and bindings. It is the
+	// display start time, not a kernel process-birth token (that is Birth), but
+	// a new process lifetime always gets a new one. Omitted from ordinary local
+	// snapshots, so the frozen host-local state.json shape is unchanged.
 	Hostname  string    `json:"hostname,omitempty"`
 	CWD       string    `json:"cwd"`
 	TTY       string    `json:"tty"`
 	StartedAt time.Time `json:"started_at"`
-	Focused   bool      `json:"focused"`
+	// Birth is the OS process-birth token of the root's process lifetime
+	// (osproc.Info.Birth, #97): opaque and host-local. It is what proves the
+	// pid still holds this session's process across a pid reuse or a daemon
+	// restart. Empty means unverified, which never matches. Omitted when empty,
+	// so state.json stays schema v3, and cleared from every federation frame.
+	Birth   string `json:"birth,omitempty"`
+	Focused bool   `json:"focused"`
 	// Remote is populated only on detached aggregate copies. Renderers use it
 	// to avoid treating remote CWD, transcript, and PID values as paths or
 	// process identities on this machine. Like Hostname and Navigable, it is

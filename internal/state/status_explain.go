@@ -69,7 +69,7 @@ func (s Session) ExplainStatus(now time.Time) statusexplain.Decision {
 }
 
 func (s Session) explainRoot() statusexplain.Root {
-	root := statusexplain.Root{PID: s.PID, StartedAt: s.StartedAt, Provider: s.Agent}
+	root := statusexplain.Root{PID: s.PID, StartedAt: s.StartedAt, Provider: s.Agent, LifetimeUnverified: s.Birth == ""}
 	if info := s.Enrichment(); info != nil {
 		root.SessionID = info.SessionID
 	}

@@ -228,7 +228,15 @@ func (c *agentCoordinator) Request(key provider.RootKey) {
 func (c *agentCoordinator) RequestCleanup() { c.Request(provider.RootKey{}) }
 
 func providerRootKey(sess state.Session) provider.RootKey {
-	return provider.RootKey{PID: sess.PID, StartedAt: sess.StartedAt}
+	return provider.RootKey{PID: sess.PID, StartedAt: sess.StartedAt, Birth: sess.Birth}
+}
+
+// sessionHoldsRoot reports whether a tracked session is still the process
+// lifetime a root key names: the same pid, discovery stamp and birth token.
+// Every asynchronous result, timer and hook landing compares through it, so
+// one gathered for an old lifetime cannot modify that pid's replacement (#97).
+func sessionHoldsRoot(s *state.Session, key provider.RootKey) bool {
+	return s != nil && s.PID == key.PID && s.StartedAt.Equal(key.StartedAt) && s.Birth == key.Birth
 }
 
 func (c *agentCoordinator) run(ctx context.Context, interval time.Duration) {
@@ -369,7 +377,7 @@ func providerRootRef(sess state.Session) (provider.RootRef, bool) {
 	default:
 		return provider.RootRef{}, false
 	}
-	ref := provider.RootRef{PID: sess.PID, StartedAt: sess.StartedAt, Provider: kind, CWD: sess.CWD}
+	ref := provider.RootRef{PID: sess.PID, StartedAt: sess.StartedAt, Birth: sess.Birth, Provider: kind, CWD: sess.CWD}
 	if info := sess.Enrichment(); info != nil {
 		ref.ProviderSessionID = info.SessionID
 		ref.Transcript = info.Transcript
@@ -596,7 +604,7 @@ func (c *agentCoordinator) applyObservationAs(ref provider.RootRef, generation u
 		observation.Source == agentgraph.SourceCodexAppServer && observation.Complete && hasNativeName
 	c.store.Apply(func(sessions map[int]*state.Session) {
 		sess := sessions[ref.PID]
-		if sess == nil || !sess.StartedAt.Equal(ref.StartedAt) || agentgraph.ProviderKind(sess.Agent) != ref.Provider {
+		if !sessionHoldsRoot(sess, ref.Key()) || agentgraph.ProviderKind(sess.Agent) != ref.Provider {
 			return
 		}
 		// The published status is read under the lock on both sides: herdr can
@@ -814,7 +822,7 @@ func observationFromState(kind agentgraph.ProviderKind, graph *state.AgentGraph)
 
 func sessionForKey(snapshot state.Snapshot, key provider.RootKey) (state.Session, bool) {
 	for _, sess := range snapshot.Sessions {
-		if sess.PID == key.PID && sess.StartedAt.Equal(key.StartedAt) {
+		if sessionHoldsRoot(&sess, key) {
 			return sess, true
 		}
 	}
@@ -1071,7 +1079,7 @@ func (c *agentCoordinator) reconcileCodexBinding(ref provider.RootRef, threadID 
 	rotated := false
 	c.store.Apply(func(sessions map[int]*state.Session) {
 		sess := sessions[ref.PID]
-		if sess == nil || !sess.StartedAt.Equal(ref.StartedAt) || sess.Agent != state.AgentKindCodex {
+		if !sessionHoldsRoot(sess, ref.Key()) || sess.Agent != state.AgentKindCodex {
 			return
 		}
 		currentID := ""
@@ -1242,7 +1250,7 @@ func (c *agentCoordinator) runCodexNaming(ctx context.Context, input codexNaming
 	committed := false
 	c.store.Apply(func(sessions map[int]*state.Session) {
 		sess := sessions[input.key.PID]
-		if sess == nil || !sess.StartedAt.Equal(input.key.StartedAt) || sess.Agent != state.AgentKindCodex ||
+		if !sessionHoldsRoot(sess, input.key) || sess.Agent != state.AgentKindCodex ||
 			conversationIDForSession(*sess) != input.conversationID || sess.DisplayName.ValidFor(input.conversationID) ||
 			!c.currentCodexNamingAttempt(input) {
 			return

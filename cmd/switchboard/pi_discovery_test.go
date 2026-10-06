@@ -40,30 +40,30 @@ func (p *infoProcs) Read(pid int) (osproc.Info, error) {
 	}
 	return info, nil
 }
-func (p *infoProcs) Enumerate() ([]osproc.Info, error)        { return nil, nil }
-func (p *infoProcs) Watch(context.Context, int, func()) error { return nil }
-func (p *infoProcs) Stop(int)                                 {}
+func (p *infoProcs) Enumerate() ([]osproc.Info, error)                    { return nil, nil }
+func (p *infoProcs) Watch(context.Context, osproc.Lifetime, func()) error { return nil }
+func (p *infoProcs) Stop(osproc.Lifetime)                                 {}
 
 // interactivePi is a TUI Pi as the scanner reads it (see discovery.IsPi).
 func interactivePi(pid int, tty string) osproc.Info {
 	return osproc.Info{PID: pid, Comm: "pi", Exe: "/usr/bin/node-22", CWD: "/repo", TTY: tty, StdinTTY: true,
-		Args: []string{"pi"}}
+		Args: []string{"pi"}, Birth: testBirth(pid)}
 }
 
 // discoveredPi is the session appear builds from a Pi before admitRoot.
 func discoveredPi(pid int, tty string) state.Session {
-	return state.Session{PID: pid, Agent: state.AgentKindPi, CWD: "/repo", TTY: tty}
+	return state.Session{PID: pid, Agent: state.AgentKindPi, CWD: "/repo", TTY: tty, Birth: testBirth(pid)}
 }
 
 func TestAdmitRootShouldMergeScannerAndHerdrDiscoveryOfOnePiWhicheverArrivesFirst(t *testing.T) {
 	const pid, tty = 901, "/dev/pts/7"
 	pane := terminal.PaneRef{Backend: "herdr", Handle: "w1:p1", MuxSocket: testHerdrSock, TTY: tty}
 	scanner := func(m map[int]*state.Session, source herdrStatusSource, now time.Time) {
-		admitRoot(m, discoveredPi(pid, tty), nil, source, nil, now)
+		admitRoot(m, discoveredPi(pid, tty), nil, source, nil, nil, now)
 	}
 	herdrFind := func(m map[int]*state.Session, source herdrStatusSource, now time.Time) {
 		p := pane
-		admitRoot(m, discoveredPi(pid, tty), &p, source, nil, now)
+		admitRoot(m, discoveredPi(pid, tty), &p, source, nil, nil, now)
 	}
 	for _, tc := range []struct {
 		name          string
@@ -105,7 +105,7 @@ func TestRunHerdrDiscoveryShouldAnnounceAPiTheScannerAlreadyTracks(t *testing.T)
 	f.pane("w1:p1", "/dev/pts/7", "pi", 901)
 	store := state.New("")
 	store.Apply(func(m map[int]*state.Session) {
-		admitRoot(m, discoveredPi(901, "/dev/pts/7"), nil, f.status, nil, herdrT0)
+		admitRoot(m, discoveredPi(901, "/dev/pts/7"), nil, f.status, nil, nil, herdrT0)
 	})
 	if got := runDiscoveryTicks(t, f, store, 2, nil); len(got) != 1 || got[0] != 901 {
 		t.Fatalf("appeared = %v, want the scanner's pi announced once for its pane", got)
@@ -132,13 +132,13 @@ func TestSweepShouldKeepTrackingAPiOutsideHerdrThroughDeath(t *testing.T) {
 			sink, dir := newTestSink(t)
 			procs := &infoProcs{infos: map[int]osproc.Info{pid: interactivePi(pid, tty)}}
 			m := map[int]*state.Session{}
-			admitRoot(m, discoveredPi(pid, tty), nil, newFakeHerdrSource(), sink, herdrT0)
+			admitRoot(m, discoveredPi(pid, tty), nil, newFakeHerdrSource(), sink, nil, herdrT0)
 			if m[pid].Herdr != nil {
 				t.Fatal("a scanner-only pi got a herdr block")
 			}
 
 			for tick := range 3 {
-				sweepDeadSessions(m, procs, sink, func(int) {}, herdrT0.Add(time.Duration(tick)*time.Second))
+				sweepDeadSessions(m, procs, sink, func(osproc.Lifetime) {}, herdrT0.Add(time.Duration(tick)*time.Second))
 				if _, ok := m[pid]; !ok {
 					t.Fatalf("tick %d: live pi dropped", tick)
 				}
@@ -146,7 +146,7 @@ func TestSweepShouldKeepTrackingAPiOutsideHerdrThroughDeath(t *testing.T) {
 
 			tc.die(procs)
 			forgot := 0
-			sweepDeadSessions(m, procs, sink, func(int) { forgot++ }, herdrT0.Add(5*time.Second))
+			sweepDeadSessions(m, procs, sink, func(osproc.Lifetime) { forgot++ }, herdrT0.Add(5*time.Second))
 			if _, ok := m[pid]; ok {
 				t.Fatal("pi kept after its process stopped being one")
 			}

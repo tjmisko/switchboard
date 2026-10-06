@@ -153,6 +153,11 @@ type Root struct {
 	StartedAt time.Time `json:"started_at"`
 	Provider  string    `json:"provider"`
 	SessionID string    `json:"session_id,omitempty"`
+	// LifetimeUnverified reports the degraded identity of a root whose OS
+	// process-birth token was unavailable (#97): nothing proves its pid still
+	// holds the process it was discovered as, so it inherited no authority, no
+	// death watch covers it, and only the liveness sweep ends it.
+	LifetimeUnverified bool `json:"lifetime_unverified,omitempty"`
 }
 
 // Choice is one decided status and the evidence behind it.
@@ -339,8 +344,12 @@ func idValue(value string) string {
 // Text renders d as key=value lines, from the same fields its JSON carries.
 func (d Decision) Text() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "root pid=%d started_at=%s provider=%s session_id=%s\n",
+	fmt.Fprintf(&b, "root pid=%d started_at=%s provider=%s session_id=%s",
 		d.Root.PID, textTime(d.Root.StartedAt), textValue(d.Root.Provider), textValue(d.Root.SessionID))
+	if d.Root.LifetimeUnverified {
+		b.WriteString(" lifetime=unverified")
+	}
+	b.WriteString("\n")
 	fmt.Fprintf(&b, "decision %s\n", choiceText(d.Choice))
 	if d.Underlying != nil {
 		fmt.Fprintf(&b, "underlying %s\n", choiceText(*d.Underlying))

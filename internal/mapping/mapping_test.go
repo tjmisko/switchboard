@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/osproc"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/terminal"
 	"github.com/tjmisko/switchboard/internal/wm"
@@ -533,5 +534,14 @@ func TestActivePaneMarkerIsScopedToTheExactWindow(t *testing.T) {
 				t.Fatalf("pane = %v, want %d", got, tc.want)
 			}
 		})
+	}
+}
+
+// #97: the session appear builds carries the live process's birth token, or
+// every root would be admitted as an unverified lifetime.
+func TestResolveShouldCarryTheBirthTokenWhenTheProcessHasOne(t *testing.T) {
+	sess := NewResolver(nil, nil).Resolve(context.Background(), osproc.Info{PID: 9, Birth: "boot:9"})
+	if sess.PID != 9 || sess.Birth != "boot:9" {
+		t.Fatalf("Resolve = %+v, want pid 9 with birth boot:9", sess)
 	}
 }

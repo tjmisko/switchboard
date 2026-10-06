@@ -14,8 +14,11 @@ import (
 // one switchable root process. Observe may perform I/O and callers must invoke
 // it outside the state-store lock.
 type RootRef struct {
-	PID               int
-	StartedAt         time.Time
+	PID       int
+	StartedAt time.Time
+	// Birth is the OS process-birth token of the root's lifetime (#97); empty
+	// when unverified. It is opaque and never sent to a provider.
+	Birth             string
 	Provider          agentgraph.ProviderKind
 	ProviderSessionID string
 	Transcript        string
@@ -24,14 +27,18 @@ type RootRef struct {
 
 // Key returns the PID-reuse-safe identity used by observers.
 func (r RootRef) Key() RootKey {
-	return RootKey{PID: r.PID, StartedAt: r.StartedAt}
+	return RootKey{PID: r.PID, StartedAt: r.StartedAt, Birth: r.Birth}
 }
 
 // RootKey identifies one process lifetime. PID alone is insufficient because a
-// later root can reuse it.
+// later root can reuse it. Birth is the OS process-birth token that proves the
+// lifetime; StartedAt is the daemon's discovery stamp, which a new lifetime
+// never inherits. Timers, bindings and asynchronous results keyed by it can
+// therefore never land on a replacement process.
 type RootKey struct {
 	PID       int
 	StartedAt time.Time
+	Birth     string
 }
 
 // Observer supplies immutable-boundary graph snapshots for roots. Observe may
