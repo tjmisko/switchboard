@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 type Info struct {
@@ -23,6 +24,14 @@ type Info struct {
 	// takes the first of fd 0..2 on a pts, and a child whose stdin is /dev/null
 	// can still write to the terminal.
 	StdinTTY bool
+
+	// Birth is the process's lifetime token: the boot id joined with the
+	// kernel's starttime (/proc/<pid>/stat field 22). A pid the kernel reuses
+	// gets a new starttime, and a reboot a new boot id, so (PID, Birth) names
+	// exactly one process lifetime. It is opaque to every caller. Empty means
+	// the token could not be read (a masked /proc, a fixture without stat): the
+	// lifetime is unverified, never a match.
+	Birth string
 }
 
 // Reader reads from a /proc-shaped directory tree. Its zero value reads the
@@ -31,6 +40,12 @@ type Info struct {
 // is what makes these paths unit-testable without spawning real processes.
 type Reader struct {
 	root string // "" means the real /proc
+
+	// bootID caches /proc/sys/kernel/random/boot_id, which is fixed for the
+	// life of a boot. Only a successful read is cached, so a transient failure
+	// costs one unverified token rather than every later one.
+	bootMu sync.Mutex
+	bootID string
 }
 
 // NewReader returns a Reader rooted at root instead of /proc.
@@ -77,6 +92,13 @@ func (r *Reader) Read(pid int) (Info, error) {
 		out.CWD = cwd
 	}
 
+	// stat is read before status: a process that vanishes between the two
+	// fails the status read below, so a missing stat on its own means a /proc
+	// that does not carry it, and the token is left unverified.
+	if birth, err := r.Birth(pid); err == nil {
+		out.Birth = birth
+	}
+
 	status, err := readSmallFile(r.pidPath(pid, "status"))
 	if err != nil {
 		return out, wrapGone(err)
@@ -86,6 +108,68 @@ func (r *Reader) Read(pid int) (Info, error) {
 
 	out.TTY, out.StdinTTY = r.readTTY(pid)
 	return out, nil
+}
+
+// Birth reads only pid's lifetime token: /proc/<pid>/stat and the cached boot
+// id. It is the cheap re-check a death watch makes after opening its pidfd.
+// It returns ErrGone if the process vanished, and an empty token with a nil
+// error when the token is unavailable (no boot id, an unparseable stat).
+func Birth(pid int) (string, error) { return hostProc.Birth(pid) }
+
+func (r *Reader) Birth(pid int) (string, error) {
+	stat, err := readSmallFile(r.pidPath(pid, "stat"))
+	if err != nil {
+		return "", wrapGone(err)
+	}
+	start, ok := parseStartTime(stat)
+	if !ok {
+		return "", nil
+	}
+	boot := r.readBootID()
+	if boot == "" {
+		return "", nil
+	}
+	return boot + ":" + start, nil
+}
+
+func (r *Reader) readBootID() string {
+	if r == nil {
+		return ""
+	}
+	r.bootMu.Lock()
+	defer r.bootMu.Unlock()
+	if r.bootID != "" {
+		return r.bootID
+	}
+	raw, err := readSmallFile(filepath.Join(r.procRoot(), "sys", "kernel", "random", "boot_id"))
+	if err != nil {
+		return ""
+	}
+	r.bootID = strings.TrimSpace(raw)
+	return r.bootID
+}
+
+// parseStartTime extracts field 22 (starttime, clock ticks since boot) from a
+// /proc/<pid>/stat line. Field 2 is the comm in parentheses, and a comm may
+// itself hold spaces and parentheses ("a) (b"), so the fields are counted
+// from the LAST ')': the field after it is 3 (state), which puts starttime
+// 19 fields further on. ok is false for a line too short or a value that is
+// not a decimal number.
+func parseStartTime(stat string) (string, bool) {
+	end := strings.LastIndexByte(stat, ')')
+	if end < 0 {
+		return "", false
+	}
+	fields := strings.Fields(stat[end+1:])
+	const startTimeIndex = 22 - 3
+	if len(fields) <= startTimeIndex {
+		return "", false
+	}
+	value := fields[startTimeIndex]
+	if _, err := strconv.ParseUint(value, 10, 64); err != nil {
+		return "", false
+	}
+	return value, true
 }
 
 // State reads only /proc/<pid>/status and returns the single-char run-state
