@@ -292,7 +292,7 @@ func TestRunHerdrDiscoveryShouldAnnounceAgainWhenAPIDReturnsAsANewAgent(t *testi
 }
 
 func TestProcessIsSessionShouldKeepAHerdrAgentWhileItRunsOnItsTTY(t *testing.T) {
-	sess := &state.Session{PID: 901, Agent: "pi", TTY: "/dev/pts/7"}
+	sess := &state.Session{PID: 901, Agent: "pi", TTY: "/dev/pts/7", Herdr: &state.HerdrInfo{PaneID: "w1:p1", Socket: testHerdrSock}}
 	if !processIsSession(osproc.Info{PID: 901, Comm: "node", TTY: "/dev/pts/7"}, sess) {
 		t.Fatal("a pi process on its own tty read as not the session")
 	}

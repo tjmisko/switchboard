@@ -11,10 +11,12 @@ import (
 	"github.com/tjmisko/switchboard/internal/terminal"
 )
 
-// herdrDiscovery finds agents that only herdr observes: the ones herdr detects
-// in a pane (Pi, OpenCode, Cursor, Gemini, Copilot, …) that the process
-// scanner does not classify. Claude Code and Codex are left to the scanner and
-// their provider adapters; herdr only decides their status (herdr_status.go).
+// herdrDiscovery finds the agents herdr detects in a pane that have no provider
+// adapter (Pi, OpenCode, Cursor, Gemini, Copilot, …). Most of them the process
+// scanner does not classify. Pi it does, so a Pi in herdr is found by both and
+// admitRoot merges the two into one session carrying the pane. Claude Code and
+// Codex are left to the scanner and their provider adapters; herdr only decides
+// their status (herdr_status.go).
 //
 // It also owns which herdr servers the status watcher follows. It reads the
 // herdr backend alone, not the composed terminal chain: a chain snapshot drops
