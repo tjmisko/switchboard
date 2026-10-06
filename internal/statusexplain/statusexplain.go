@@ -56,6 +56,25 @@ const (
 	ReasonSourceOutranked  Reason = "source_outranked"
 	ReasonStaleVsFresh     Reason = "stale_vs_fresh"
 	ReasonOlderThanCurrent Reason = "older_than_current"
+
+	// The pure status resolver's rules (#96). The authority reasons name the
+	// kind of evidence that decided; the rest name the rule that held a status
+	// against it or kept a candidate from deciding.
+	ReasonEventAuthority      Reason = "event_authority"
+	ReasonTranscriptAuthority Reason = "transcript_authority"
+	ReasonTerminalAuthority   Reason = "terminal_authority"
+	// Restored last-known presentation decides because nothing live does.
+	ReasonLastKnown Reason = "last_known"
+	// Open provider attention holds against evidence not authorized to
+	// resolve it.
+	ReasonAttentionHeld Reason = "attention_held"
+	// An idle root with working descendants stays delegating.
+	ReasonDescendantsLive Reason = "descendants_live"
+	// Nothing current decides, and the previous decision holds until its own
+	// deadline.
+	ReasonPriorHeld Reason = "prior_held"
+	// The evidence is about another agent, session, process lifetime or pane.
+	ReasonIdentityMismatch Reason = "identity_mismatch"
 )
 
 var knownReasons = map[Reason]bool{
@@ -65,6 +84,9 @@ var knownReasons = map[Reason]bool{
 	ReasonObservationPending: true, ReasonObservationExpired: true,
 	ReasonCoverageUnsupported: true, ReasonUnrecorded: true, ReasonSourceOutranked: true,
 	ReasonStaleVsFresh: true, ReasonOlderThanCurrent: true,
+	ReasonEventAuthority: true, ReasonTranscriptAuthority: true, ReasonTerminalAuthority: true,
+	ReasonLastKnown: true, ReasonAttentionHeld: true, ReasonDescendantsLive: true,
+	ReasonPriorHeld: true, ReasonIdentityMismatch: true,
 }
 
 // Known reports whether r is one of the codes above.
@@ -76,8 +98,15 @@ type EvidenceKind string
 const (
 	// A provider's own snapshot: app-server, transcript, rollout, session file.
 	EvidenceProviderSnapshot EvidenceKind = "provider_snapshot"
-	// A provider hook edge.
+	// A provider hook edge: an exact lifecycle event from the provider.
 	EvidenceHook EvidenceKind = "hook"
+	// A child's hook edge that arrived before the provider's topology placed
+	// it: an overlay of the root's descendants, never the root's own status.
+	EvidenceHookEdge EvidenceKind = "hook_edge"
+	// A transcript or session-file tail correlated to the root (Codex rollout,
+	// Pi session file): working or idle, never attention. EvidenceKindOf does
+	// not return it yet; the pure resolver's builders do (#96).
+	EvidenceTranscript EvidenceKind = "transcript"
 	// A terminal's reading of the screen (herdr).
 	EvidenceTerminal EvidenceKind = "terminal"
 	// Last-known state restored across a daemon restart.
@@ -91,6 +120,7 @@ const (
 var knownEvidence = map[EvidenceKind]bool{
 	EvidenceProviderSnapshot: true, EvidenceHook: true, EvidenceTerminal: true,
 	EvidenceRestored: true, EvidenceUsageLimit: true, EvidenceNone: true,
+	EvidenceHookEdge: true, EvidenceTranscript: true,
 }
 
 // Known reports whether k is one of the kinds above.
