@@ -18,6 +18,11 @@ type Info struct {
 	TTY   string   // e.g. "/dev/pts/2" or "" if not a tty-attached process
 	Args  []string // full argv from /proc/<pid>/cmdline; nil when the kernel masks it (zombies, kernel threads)
 	State string   // single-char run state from /proc/<pid>/status (R/S/D/T/t/Z/...)
+
+	// StdinTTY is true when fd 0 itself is the pts. TTY alone cannot say so: it
+	// takes the first of fd 0..2 on a pts, and a child whose stdin is /dev/null
+	// can still write to the terminal.
+	StdinTTY bool
 }
 
 // Reader reads from a /proc-shaped directory tree. Its zero value reads the
@@ -79,7 +84,7 @@ func (r *Reader) Read(pid int) (Info, error) {
 	out.PPID = parsePPID(status)
 	out.State = parseState(status)
 
-	out.TTY = r.readTTY(pid)
+	out.TTY, out.StdinTTY = r.readTTY(pid)
 	return out, nil
 }
 
@@ -123,18 +128,19 @@ func (r *Reader) readArgs(pid int) []string {
 
 // readTTY tries /proc/<pid>/fd/{0,1,2} for a /dev/pts/N link. Interactive TUIs
 // like claude reliably have at least one of these attached to the controlling
-// terminal. Returns "" if none of them point at a pts.
-func (r *Reader) readTTY(pid int) string {
+// terminal. Returns "" if none of them point at a pts. stdin reports whether
+// the pts was found on fd 0.
+func (r *Reader) readTTY(pid int) (tty string, stdin bool) {
 	for _, fd := range []int{0, 1, 2} {
 		link, err := os.Readlink(r.pidPath(pid, "fd", strconv.Itoa(fd)))
 		if err != nil {
 			continue
 		}
 		if strings.HasPrefix(link, "/dev/pts/") {
-			return link
+			return link, fd == 0
 		}
 	}
-	return ""
+	return "", false
 }
 
 // AllPIDs lists every numeric entry under /proc. Cheap (one getdents).
