@@ -493,15 +493,18 @@ labels, prompts, assistant content, commands, or raw provider payloads.
 
 `diagnose` is the history; `switchboard-ctl explain --pid <pid> [--json]` is
 the present. It asks the daemon why one local root shows the status it does
-now: the source that decided (provider graph, hook, herdr, usage limit), a
-reason code (`graph_authority`, `hook_owned`, `herdr_override`,
-`herdr_yield_attention`, `pi_hook_authority`, `herdr_fallback`, `herdr_only`,
-`usage_limit_overlay`, or why the status is unknown: `binding_missing`,
-`observation_pending`, `observation_expired`, `coverage_unsupported`,
-`unrecorded`), the evidence's observation time and freshness deadline, when
-the decision was last made, and up to eight readings that lost with the rule
-that rejected each (`source_outranked`, `stale_vs_fresh`,
-`older_than_current`, or the deciding reason). Under a usage limit it shows
+now, as the one status resolver decided it: the source that decided
+(provider graph, hook, transcript tail, herdr, restored state, usage limit), a
+reason code (`graph_authority`, `event_authority`, `transcript_authority`,
+`terminal_authority`, `last_known`, `attention_held`, `descendants_live`,
+`prior_held`, `usage_limit_overlay`, or why the status is unknown:
+`binding_missing`, `observation_pending`, `observation_expired`,
+`coverage_unsupported`, `identity_mismatch`, `unrecorded`), the evidence's
+observation time and freshness deadline, when the decision was last made, and
+up to eight readings that lost with the rule that rejected each
+(`source_outranked`, `older_than_current`, `observation_expired`,
+`identity_mismatch`, `coverage_unsupported`, or the deciding reason). Under a
+usage limit it shows
 `limited` with the decision beneath it. The record is in memory, bound to the
 process lifetime and provider session, and carries ids, enums and times only.
 

@@ -226,8 +226,9 @@ func TestSetAgentGraphProjectsLegacyWithoutDiscardingClaudeCompatibilityFields(t
 		t.Fatal(err)
 	}
 	sess := state.Session{
-		PID:   7,
-		Agent: state.AgentKindCodex,
+		PID:       7,
+		StartedAt: graphObserved.Add(-time.Hour),
+		Agent:     state.AgentKindCodex,
 		Codex: &state.AgentInfo{
 			Status:            state.StatusIdle,
 			StatusSince:       graphObserved.Add(-time.Hour),
@@ -275,7 +276,7 @@ func TestSetAgentGraphProjectsLegacyWithoutDiscardingClaudeCompatibilityFields(t
 	if second.Summary.Since.Equal(first.Summary.Since) {
 		t.Fatal("structured graph summary transition did not reset graph summary since")
 	}
-	sess.SetAgentGraph(second, graphObserved)
+	sess.SetAgentGraph(second, obs.ObservedAt)
 	if !sess.Codex.StatusSince.Equal(priorLegacySince) {
 		t.Fatalf("same legacy status moved status_since: got %v want %v", sess.Codex.StatusSince, priorLegacySince)
 	}
@@ -293,7 +294,7 @@ func TestSetAgentGraphProjectsLegacyWithoutDiscardingClaudeCompatibilityFields(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	sess.SetAgentGraph(third, graphObserved)
+	sess.SetAgentGraph(third, obs.ObservedAt)
 	if sess.Codex.Status != state.StatusIdle || !sess.Codex.StatusSince.Equal(obs.ObservedAt) {
 		t.Fatalf("real legacy transition = %+v, want idle since %v", sess.Codex, obs.ObservedAt)
 	}

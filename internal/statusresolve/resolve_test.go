@@ -411,6 +411,11 @@ func TestResolveShouldStayDelegatingWhenAnIdleRootHasWorkingDescendants(t *testi
 	now := t0.Add(time.Second)
 	running := agentgraph.Node{Lifecycle: agentgraph.LifecycleRunning}
 	edge := CodexChildHooks(lifetime, observation(agentgraph.ProviderCodex, agentgraph.SourceHook, t0, time.Minute, agentgraph.RuntimeUnknown, none, workingChild))
+	// The rollout tail's idle correction keeps the children of the graph it
+	// corrected; the hook it superseded no longer reports them.
+	superseded := CodexHook(lifetime, observation(agentgraph.ProviderCodex, agentgraph.SourceHook, t0.Add(-time.Minute), time.Hour, idle, none, workingChild))
+	superseded.Superseded = true
+	correction := CodexRolloutTail(lifetime, observation(agentgraph.ProviderCodex, agentgraph.SourceCodexRollout, t0, time.Minute, idle, none, workingChild))
 	for _, tc := range []struct {
 		name       string
 		target     Target
@@ -422,6 +427,7 @@ func TestResolveShouldStayDelegatingWhenAnIdleRootHasWorkingDescendants(t *testi
 		{"codex running child under herdr done", codex, []Candidate{codexSnap(t0, time.Minute, idle, none, running), herdr("codex", "done", now, now)},
 			agentgraph.SourceCodexAppServer},
 		{"codex child hook edge under a root hook idle", codex, []Candidate{edge, codexHook(t0, time.Hour, idle, none)}, agentgraph.SourceHook},
+		{"codex rollout idle correction over a superseded hook", codex, []Candidate{superseded, correction}, agentgraph.SourceCodexRollout},
 	} {
 		d := Resolve(tc.target, tc.candidates, statusexplain.Decision{}, now)
 		want(t, tc.name, d, agentgraph.LegacyDelegating, statusexplain.ReasonDescendantsLive)
@@ -447,6 +453,13 @@ func TestResolveShouldEndDelegationWhenBackgroundWorkEndsOrItsEvidenceExpires(t 
 	done := codexSnap(at, time.Minute, idle, none, agentgraph.Node{Lifecycle: agentgraph.LifecycleCompleted})
 	ended := Resolve(codex, []Candidate{edge, done, herdr("codex", "idle", t0, at)}, statusexplain.Decision{}, at)
 	want(t, "newer snapshot shows the child done", ended, agentgraph.LegacyIdle, statusexplain.ReasonTerminalAuthority)
+
+	// A hook a newer sample superseded does not bring its child back once
+	// that sample lapses.
+	superseded := CodexHook(lifetime, observation(agentgraph.ProviderCodex, agentgraph.SourceHook, t0, time.Hour, idle, none, workingChild))
+	superseded.Superseded = true
+	lapsed := Resolve(codex, []Candidate{superseded, codexSnap(at, time.Second, idle, none), herdr("codex", "idle", t0, at)}, statusexplain.Decision{}, at.Add(time.Minute))
+	want(t, "superseded hook after the newer sample lapsed", lapsed, agentgraph.LegacyIdle, statusexplain.ReasonTerminalAuthority)
 }
 
 func TestResolveShouldKeepTheRootsOwnStatusWhenItIsNotIdle(t *testing.T) {
@@ -532,4 +545,115 @@ func TestResolveShouldReadTheDecisionBeneathAnOverlayWhenThePriorCarriesOne(t *t
 	at := t0.Add(time.Second)
 	d := Resolve(codex, []Candidate{herdr("codex", "working", at, at)}, overlaid, at)
 	want(t, "attention beneath a limit overlay", d, agentgraph.LegacyPermission, statusexplain.ReasonAttentionHeld)
+}
+
+func TestTargetShouldMatchATerminalReadingByItsTerminalIDWhenThePaneMovedWorkspace(t *testing.T) {
+	tracked := Target{Root: claude.Root, PaneID: "w1:p1", TerminalID: "term_1"}
+	moved := Herdr(HerdrReading{PaneID: "w2:p4", TerminalID: "term_1", Agent: "claude", Status: "working", Live: true, Since: t0}, t0)
+	if !tracked.Matches(moved) {
+		t.Fatal("a reading of the tracked terminal under its new pane id did not match")
+	}
+	d := Resolve(tracked, []Candidate{moved}, statusexplain.Decision{}, t0)
+	want(t, "moved pane", d, agentgraph.LegacyWorking, statusexplain.ReasonTerminalAuthority)
+
+	reused := Herdr(HerdrReading{PaneID: "w1:p1", TerminalID: "term_2", Agent: "claude", Status: "working", Live: true, Since: t0}, t0)
+	if tracked.Matches(reused) {
+		t.Error("a reading of another terminal matched because it reused the tracked pane id")
+	}
+}
+
+func TestTargetShouldFallBackToThePaneIDWhenEitherSideHasNoTerminalID(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		target, reading string // terminal ids
+		readingPane     string
+		match           bool
+	}{
+		{"neither side", "", "", "w1:p1", true},
+		{"target only", "term_1", "", "w1:p1", true},
+		{"reading only", "", "term_1", "w1:p1", true},
+		{"neither side, other pane", "", "", "w1:p2", false},
+		{"reading only, other pane", "", "term_1", "w1:p2", false},
+	} {
+		tracked := Target{Root: claude.Root, PaneID: "w1:p1", TerminalID: tc.target}
+		c := Herdr(HerdrReading{PaneID: tc.readingPane, TerminalID: tc.reading, Agent: "claude", Status: "idle", Live: true, Since: t0}, t0)
+		if got := tracked.Matches(c); got != tc.match {
+			t.Errorf("%s: matches = %v, want %v", tc.name, got, tc.match)
+		}
+	}
+}
+
+func TestResolveShouldLetTheHookResolveItsOwnRequestWhenASnapshotOnlyCarriedIt(t *testing.T) {
+	// A Codex app-server sample composed with a question the hooks hold open:
+	// the request is the hook's, so the hook's own later answer resolves it.
+	latched := HookLatched(codexSnap(t0.Add(time.Second), time.Minute, active, input))
+	answered := codexHook(t0.Add(2*time.Second), time.Hour, active, none)
+	at := t0.Add(3 * time.Second)
+
+	d := Resolve(codex, []Candidate{latched}, statusexplain.Decision{}, at)
+	if d.Status != agentgraph.LegacyPermission || d.EvidenceKind != statusexplain.EvidenceHook || d.Source != string(agentgraph.SourceHook) {
+		t.Fatalf("latched request decided %q by %s/%s, want permission by the hook", d.Status, d.EvidenceKind, d.Source)
+	}
+	// The answer resolves both the carried request and the prior decision.
+	after := Resolve(codex, []Candidate{latched, answered}, d, at)
+	want(t, "hook answers its own request", after, agentgraph.LegacyWorking, statusexplain.ReasonEventAuthority)
+	afterPrior := Resolve(codex, []Candidate{answered}, d, at)
+	want(t, "hook answers the prior hold", afterPrior, agentgraph.LegacyWorking, statusexplain.ReasonEventAuthority)
+}
+
+func TestResolveShouldKeepTheAppServersOwnRequestWhenOnlyAHookSaysOtherwise(t *testing.T) {
+	// Coordinator decision (1): a Codex hook does not clear app-server
+	// attention; only the next snapshot (or the request's deadline) does.
+	asked := codexSnap(t0.Add(time.Second), time.Minute, active, input)
+	hook := codexHook(t0.Add(2*time.Second), time.Hour, active, none)
+	at := t0.Add(3 * time.Second)
+	d := Resolve(codex, []Candidate{asked, hook}, statusexplain.Decision{}, at)
+	want(t, "hook over app-server request", d, agentgraph.LegacyPermission, statusexplain.ReasonAttentionHeld)
+	held := Resolve(codex, []Candidate{hook}, d, at)
+	want(t, "hook over the held request", held, agentgraph.LegacyPermission, statusexplain.ReasonAttentionHeld)
+	cleared := Resolve(codex, []Candidate{codexSnap(t0.Add(4*time.Second), time.Minute, active, none), hook}, d, t0.Add(4*time.Second))
+	want(t, "next snapshot clears it", cleared, agentgraph.LegacyWorking, statusexplain.ReasonGraphAuthority)
+}
+
+func TestResolveIndexShouldNameTheCandidateTheDecisionRestsOnWhenOneDoes(t *testing.T) {
+	snap := claudeSnap(t0, time.Minute, idle, none)
+	red := claudeHook(t0.Add(time.Second), time.Minute, active, ask)
+	reading := herdr("claude", "working", t0, t0)
+	at := t0.Add(2 * time.Second)
+	for _, tc := range []struct {
+		name       string
+		candidates []Candidate
+		prior      statusexplain.Decision
+		want       int
+	}{
+		{"base", []Candidate{snap}, statusexplain.Decision{}, 0},
+		{"terminal", []Candidate{snap, reading}, statusexplain.Decision{}, 1},
+		{"attention", []Candidate{snap, reading, red}, statusexplain.Decision{}, 2},
+		{"nothing", nil, statusexplain.Decision{}, -1},
+	} {
+		if _, got := ResolveIndex(claude, tc.candidates, tc.prior, at); got != tc.want {
+			t.Errorf("%s: index %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestResolveShouldNotLetSupersededEvidenceDecideWhenTheNewerObservationLapses(t *testing.T) {
+	// A Codex SessionStart hook (long lease) superseded by an app-server sample
+	// that has since lapsed: the hook does not decide again.
+	hook := codexHook(t0, 24*time.Hour, idle, none)
+	hook.Superseded = true
+	sample := codexSnap(t0.Add(time.Second), time.Second, idle, none, workingChild)
+	at := t0.Add(5 * time.Second)
+	d := Resolve(codex, []Candidate{hook, sample}, statusexplain.Decision{}, at)
+	want(t, "lapsed sample over superseded hook", d, "", statusexplain.ReasonObservationExpired)
+	if got := rejected(d, agentgraph.SourceHook, agentgraph.LegacyIdle); got != statusexplain.ReasonOlderThanCurrent {
+		t.Errorf("superseded hook rejected for %q, want older_than_current", got)
+	}
+
+	// A superseded snapshot still holds its own request open (decision 1).
+	asked := codexSnap(t0, time.Minute, active, input)
+	asked.Superseded = true
+	newer := codexHook(t0.Add(time.Second), time.Hour, active, none)
+	d = Resolve(codex, []Candidate{asked, newer}, statusexplain.Decision{}, t0.Add(2*time.Second))
+	want(t, "superseded request", d, agentgraph.LegacyPermission, statusexplain.ReasonAttentionHeld)
 }

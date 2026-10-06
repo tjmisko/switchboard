@@ -20,22 +20,22 @@ import (
 type Reason string
 
 const (
-	// The provider graph's own summary decides.
+	// A provider snapshot (the provider graph's own summary) decides.
 	ReasonGraphAuthority Reason = "graph_authority"
-	// The provider graph decides, and the graph that holds it was landed by a
-	// hook reduction that owned the transition, bypassing source ranking.
-	ReasonHookOwned Reason = "hook_owned"
-	// A live herdr reading decides over the provider graph.
-	ReasonHerdrOverride Reason = "herdr_override"
-	// herdr is live but yields to fresh Codex input or approval attention.
+	// Retired with the resolver (#96), which produces none of the next six;
+	// they stay in the closed set so a record from an older daemon still
+	// reads. hook_owned: a hook reduction landed the graph past source
+	// ranking. herdr_override: live herdr decided over the provider graph.
+	// herdr_yield_attention: herdr yielded to Codex attention (now
+	// attention_held). herdr_only, herdr_fallback: herdr decided alone or
+	// after a Pi hook lapsed (now terminal_authority). pi_hook_authority: a
+	// Pi hook decided (now event_authority).
+	ReasonHookOwned           Reason = "hook_owned"
+	ReasonHerdrOverride       Reason = "herdr_override"
 	ReasonHerdrYieldAttention Reason = "herdr_yield_attention"
-	// herdr is the only source: the agent has no provider adapter, or a Pi
-	// session no hook has bound yet.
-	ReasonHerdrOnly Reason = "herdr_only"
-	// A bound Pi session's hook evidence has lapsed and live herdr decides.
-	ReasonHerdrFallback Reason = "herdr_fallback"
-	// A bound Pi session's fresh hook evidence decides.
-	ReasonPiHookAuthority Reason = "pi_hook_authority"
+	ReasonHerdrOnly           Reason = "herdr_only"
+	ReasonHerdrFallback       Reason = "herdr_fallback"
+	ReasonPiHookAuthority     Reason = "pi_hook_authority"
 	// Publication reads limited over the decision beneath it.
 	ReasonUsageLimitOverlay Reason = "usage_limit_overlay"
 
@@ -52,7 +52,9 @@ const (
 	// so rather than attributing it to evidence that did not decide it.
 	ReasonUnrecorded Reason = "unrecorded"
 
-	// Rejections at graph admission.
+	// Rejections: by a higher-ranked kind, by fresher evidence, or by a newer
+	// observation (an older graph refused at landing, or event-time evidence
+	// a newer observation superseded).
 	ReasonSourceOutranked  Reason = "source_outranked"
 	ReasonStaleVsFresh     Reason = "stale_vs_fresh"
 	ReasonOlderThanCurrent Reason = "older_than_current"
@@ -130,9 +132,10 @@ func (k EvidenceKind) Known() bool { return knownEvidence[k] }
 // sources; their choice names EvidenceUsageLimit itself.
 func EvidenceKindOf(source agentgraph.SourceKind) EvidenceKind {
 	switch source {
-	case agentgraph.SourceCodexAppServer, agentgraph.SourceClaudeTranscript,
-		agentgraph.SourceCodexRollout, agentgraph.SourcePiSessionFile:
+	case agentgraph.SourceCodexAppServer, agentgraph.SourceClaudeTranscript:
 		return EvidenceProviderSnapshot
+	case agentgraph.SourceCodexRollout, agentgraph.SourcePiSessionFile:
+		return EvidenceTranscript
 	case agentgraph.SourceHook:
 		return EvidenceHook
 	case agentgraph.SourceHerdr:
@@ -178,16 +181,6 @@ type Candidate struct {
 
 // Present reports whether c holds a rejection; the zero Candidate is none.
 func (c Candidate) Present() bool { return c.RejectReason != "" }
-
-// Projection is the decision a status projection made, kept on the session it
-// decided. It is a plain value with no references, so a copied session carries
-// a detached copy. StartedAt is the process lifetime it was made for: a record
-// read against a different lifetime is not current.
-type Projection struct {
-	Choice
-	StartedAt time.Time
-	Rejected  Candidate
-}
 
 // MaxRejected bounds a decision's rejected list.
 const MaxRejected = 8

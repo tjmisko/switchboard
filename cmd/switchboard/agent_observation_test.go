@@ -16,6 +16,7 @@ import (
 	claudeprovider "github.com/tjmisko/switchboard/internal/provider/claude"
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
+	"github.com/tjmisko/switchboard/internal/statusexplain"
 	"github.com/tjmisko/switchboard/internal/statustune"
 )
 
@@ -384,7 +385,9 @@ func TestNewerCodexHookIsImmediateAndLaterAppServerCorrectsIt(t *testing.T) {
 	coordinator := newAgentCoordinator(store, nil, nil, fake)
 	coordinator.refreshTrackedRoots()
 	now := time.Now().Add(-time.Second)
-	observation := testCodexObservation(ref, "root", now, agentgraph.RuntimeIdle, agentgraph.AttentionApproval)
+	// The sample asks nothing of the user: a hook may move it (see
+	// TestCodexHookShouldNotClearTheAppServersOwnRequestWhenItArrivesNewer).
+	observation := testCodexObservation(ref, "root", now, agentgraph.RuntimeIdle, agentgraph.AttentionNone)
 	observation.Nodes[0].Nickname = "kept-name"
 	observation.Nodes = append(observation.Nodes, agentgraph.Node{
 		ID: "child", ParentID: "root", Runtime: agentgraph.RuntimeIdle,
@@ -413,6 +416,42 @@ func TestNewerCodexHookIsImmediateAndLaterAppServerCorrectsIt(t *testing.T) {
 	graph = store.Snapshot().Sessions[0].AgentGraph
 	if graph.Source != agentgraph.SourceCodexAppServer || graph.Summary.Status != state.StatusPermission {
 		t.Fatalf("later app-server snapshot did not correct hook state: %#v", graph)
+	}
+}
+
+// #96 (coordinator decision 1 on 3A's open questions): a Codex hook does not
+// resolve a request the app-server itself observed; only a newer app-server
+// snapshot reporting none, or the request's own deadline, does. Before the
+// resolver the newer hook painted working over it at once.
+func TestCodexHookShouldNotClearTheAppServersOwnRequestWhenItArrivesNewer(t *testing.T) {
+	startedAt := explainT0.Add(-time.Hour)
+	store := state.New("")
+	ref := seedCoordinatorSession(store, 4103, startedAt, state.AgentKindCodex, "root", "/same")
+	coordinator := newAgentCoordinator(store, nil, nil, newFakeCodexCoordinatorObserver())
+	defer coordinator.Close()
+	coordinator.refreshTrackedRoots()
+	asked := testCodexObservation(ref, "root", explainT0, agentgraph.RuntimeActive, agentgraph.AttentionApproval)
+	if !coordinator.applyObservation(ref, coordinator.begin(ref.Key()), asked, claudeprovider.Compatibility{}, explainT0) {
+		t.Fatal("app-server request was not applied")
+	}
+
+	hookAt := explainT0.Add(500 * time.Millisecond)
+	coordinator.HandleHook(rpc.Request{Agent: state.AgentKindCodex, Event: "PostToolUse", ObservedAt: hookAt}, store.Snapshot().Sessions[0])
+	sess := store.Snapshot().Sessions[0]
+	if sess.Codex.Status != state.StatusPermission || sess.AgentGraph.Summary.Status != state.StatusPermission {
+		t.Fatalf("hook cleared the app-server's request: status %q, graph %q", sess.Codex.Status, sess.AgentGraph.Summary.Status)
+	}
+	if d := explainAt(t, coordinator, ref.PID, hookAt); d.Reason != statusexplain.ReasonAttentionHeld {
+		t.Fatalf("decision = %+v, want attention_held", d.Choice)
+	}
+
+	answered := explainT0.Add(time.Second)
+	clear := testCodexObservation(ref, "root", answered, agentgraph.RuntimeActive, agentgraph.AttentionNone)
+	if !coordinator.applyObservation(ref, coordinator.begin(ref.Key()), clear, claudeprovider.Compatibility{}, answered) {
+		t.Fatal("app-server answer was not applied")
+	}
+	if got := store.Snapshot().Sessions[0].Codex.Status; got != state.StatusWorking {
+		t.Fatalf("app-server snapshot with no request left %q", got)
 	}
 }
 
@@ -823,4 +862,31 @@ func TestParallelPromptProbeCountsOneEpisodePerWriterNotOneEdgePerCall(t *testin
 			t.Fatalf("a verbatim redelivery re-counted the episode: %d, want 2", got)
 		}
 	})
+}
+
+// A question the Codex hooks latched rides every app-server sample as attention
+// the sample did not observe itself; the hook that answers it resolves it at
+// once, as it did when the hook owned the transition outright.
+func TestCodexHookShouldResolveItsOwnLatchedQuestionWhenASampleCarriedIt(t *testing.T) {
+	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
+	ref, _ := providerRootRef(store.Snapshot().Sessions[0])
+	base := time.Now().Add(-time.Minute)
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PreToolUse", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "ask-1",
+		ToolName: "request_user_input", ObservedAt: base,
+	})
+	sample := testCodexObservation(ref, "thread-1", base.Add(time.Second), agentgraph.RuntimeActive, agentgraph.AttentionNone)
+	if !coordinator.applyObservation(ref, coordinator.begin(ref.Key()), sample, claudeprovider.Compatibility{}, sample.ObservedAt) {
+		t.Fatal("app-server sample was not applied")
+	}
+	if got := store.Snapshot().Sessions[0].Codex.Status; got != state.StatusPermission {
+		t.Fatalf("latched question under a newer sample published %q, want permission", got)
+	}
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PostToolUse", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "ask-1",
+		ToolName: "request_user_input", ObservedAt: base.Add(2 * time.Second),
+	})
+	if got := store.Snapshot().Sessions[0].Codex.Status; got != state.StatusWorking {
+		t.Fatalf("the hook's own answer left %q, want working", got)
+	}
 }

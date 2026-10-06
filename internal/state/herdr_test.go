@@ -11,9 +11,15 @@ import (
 )
 
 // graphSession is a Claude session whose provider graph reports status.
-func graphSession(status string, since time.Time) *Session {
-	s := &Session{PID: 10, Agent: AgentKindClaude, Claude: &AgentInfo{Status: status, StatusSince: since}}
-	s.AgentGraph = &AgentGraph{RootID: "sess-1", Summary: AgentGraphSummary{Status: status, Since: since}}
+// graphSession is a Claude session whose transcript graph, observed at since
+// and fresh for a day, published status.
+func graphSession(t *testing.T, status string, since time.Time) *Session {
+	t.Helper()
+	s := claudeSession()
+	s.SetAgentGraph(claudeStatusGraph(t, agentgraph.SourceClaudeTranscript, status, since, 24*time.Hour), since)
+	if s.Claude.Status != status || !s.Claude.StatusSince.Equal(since) {
+		t.Fatalf("graph session published %q since %v, want %q since %v", s.Claude.Status, s.Claude.StatusSince, status, since)
+	}
 	return s
 }
 
@@ -48,7 +54,7 @@ func TestHerdrLegacyStatusShouldMapEveryHerdrState(t *testing.T) {
 }
 
 func TestSetHerdrShouldOverrideTheProviderStatusWhenHerdrIsLive(t *testing.T) {
-	s := graphSession(StatusIdle, herdrT0)
+	s := graphSession(t, StatusIdle, herdrT0)
 	now := herdrT0.Add(time.Minute)
 
 	before, after := s.SetHerdr(reading(HerdrBlocked, true, now), now)
@@ -64,7 +70,7 @@ func TestSetHerdrShouldOverrideTheProviderStatusWhenHerdrIsLive(t *testing.T) {
 }
 
 func TestSetHerdrShouldHandTheStatusBackToTheProviderWhenHerdrStopsBeingLive(t *testing.T) {
-	s := graphSession(StatusIdle, herdrT0)
+	s := graphSession(t, StatusIdle, herdrT0)
 	s.SetHerdr(reading(HerdrWorking, true, herdrT0.Add(time.Minute)), herdrT0.Add(time.Minute))
 
 	before, after := s.SetHerdr(reading(HerdrWorking, false, herdrT0.Add(2*time.Minute)), herdrT0.Add(2*time.Minute))
@@ -77,7 +83,7 @@ func TestSetHerdrShouldHandTheStatusBackToTheProviderWhenHerdrStopsBeingLive(t *
 }
 
 func TestSetHerdrShouldLeaveTheProviderStatusWhenHerdrReportsUnknown(t *testing.T) {
-	s := graphSession(StatusWorking, herdrT0)
+	s := graphSession(t, StatusWorking, herdrT0)
 	before, after := s.SetHerdr(reading(HerdrUnknown, true, herdrT0.Add(time.Minute)), herdrT0.Add(time.Minute))
 	if before != StatusWorking || after != StatusWorking {
 		t.Fatalf("SetHerdr = %q → %q, want working unchanged", before, after)
@@ -85,7 +91,7 @@ func TestSetHerdrShouldLeaveTheProviderStatusWhenHerdrReportsUnknown(t *testing.
 }
 
 func TestSetHerdrShouldNotMoveStatusSinceWhenThePublishedStatusIsUnchanged(t *testing.T) {
-	s := graphSession(StatusWorking, herdrT0)
+	s := graphSession(t, StatusWorking, herdrT0)
 	s.SetHerdr(reading(HerdrWorking, true, herdrT0.Add(time.Minute)), herdrT0.Add(time.Minute))
 	if !s.Claude.StatusSince.Equal(herdrT0) {
 		t.Fatalf("StatusSince = %v, want %v kept: working was already published", s.Claude.StatusSince, herdrT0)
@@ -104,45 +110,49 @@ func TestSetHerdrShouldLeaveASessionWithoutAProviderGraphUnchanged(t *testing.T)
 }
 
 // A provider observation landing while herdr is the authority must not paint
-// over herdr's status.
+// over herdr's status, unless it opens a request for the user (#96: fresh
+// unresolved provider attention survives terminal working or idle readings).
 func TestSetAgentGraphShouldKeepHerdrsStatusWhenAProviderObservationLands(t *testing.T) {
-	s := graphSession(StatusIdle, herdrT0)
+	s := graphSession(t, StatusIdle, herdrT0)
 	s.SetHerdr(reading(HerdrWorking, true, herdrT0.Add(time.Minute)), herdrT0.Add(time.Minute))
 
-	s.SetAgentGraph(&AgentGraph{RootID: "sess-1", Summary: AgentGraphSummary{Status: StatusPermission, Since: herdrT0.Add(2 * time.Minute)}}, herdrT0.Add(2*time.Minute))
+	at := herdrT0.Add(2 * time.Minute)
+	s.SetAgentGraph(claudeStatusGraph(t, agentgraph.SourceClaudeTranscript, StatusIdle, at, time.Hour), at)
 	if s.Claude.Status != StatusWorking {
 		t.Fatalf("status = %q, want herdr's working to hold", s.Claude.Status)
 	}
-	if s.AgentGraph.Summary.Status != StatusPermission {
-		t.Fatalf("graph summary = %q, want the provider's permission recorded", s.AgentGraph.Summary.Status)
+	if s.AgentGraph.Summary.Status != StatusIdle {
+		t.Fatalf("graph summary = %q, want the provider's idle recorded", s.AgentGraph.Summary.Status)
+	}
+
+	// Intentional change (#96): a Claude request for the user now survives
+	// herdr's working reading; before the resolver herdr painted it over.
+	at = at.Add(time.Minute)
+	s.SetAgentGraph(claudeStatusGraph(t, agentgraph.SourceClaudeTranscript, StatusPermission, at, time.Hour), at)
+	if s.Claude.Status != StatusPermission || s.AgentGraph.Summary.Status != StatusPermission {
+		t.Fatalf("status = %q (graph %q), want the provider's request held over herdr's working", s.Claude.Status, s.AgentGraph.Summary.Status)
 	}
 }
 
 func TestFreshCodexInputAttentionOverridesHerdrAndReleasesOnResolution(t *testing.T) {
 	for _, herdrStatus := range []string{HerdrWorking, HerdrIdle, HerdrDone} {
 		t.Run(herdrStatus, func(t *testing.T) {
-			now := time.Now()
-			s := &Session{Agent: AgentKindCodex, Codex: &AgentInfo{Status: StatusWorking}}
-			s.SetHerdr(reading(herdrStatus, true, now), now)
-			graph := &AgentGraph{
-				RootID: "root", ObservedAt: now, FreshUntil: now.Add(time.Hour),
-				Summary: AgentGraphSummary{Status: StatusPermission, Attention: agentgraph.AttentionUserInput, Since: now},
-			}
-			s.SetAgentGraph(graph, now)
+			now := herdrT0
+			s := codexSession()
+			s.SetHerdr(codexReading(herdrStatus, true, now), now)
+			asked := codexGraph(t, agentgraph.RuntimeActive, agentgraph.AttentionUserInput, now, time.Hour)
+			s.SetAgentGraph(asked, now)
 			if s.Codex.Status != StatusPermission {
 				t.Fatalf("herdr hid input: status=%s", s.Codex.Status)
 			}
-			graph.Summary.Attention = agentgraph.AttentionNone
-			graph.Summary.Status = StatusWorking
-			s.SetAgentGraph(graph, now)
+			resolved := now.Add(time.Second)
+			s.SetAgentGraph(codexGraph(t, agentgraph.RuntimeActive, agentgraph.AttentionNone, resolved, time.Hour), resolved)
 			want, _ := HerdrLegacyStatus(herdrStatus, StatusWorking)
 			if s.Codex.Status != want {
 				t.Fatalf("herdr authority did not resume: got=%s want=%s", s.Codex.Status, want)
 			}
-			graph.Summary.Attention = agentgraph.AttentionUserInput
-			graph.Summary.Status = StatusPermission
-			graph.FreshUntil = now.Add(-time.Second)
-			s.SetAgentGraph(graph, now)
+			expired := resolved.Add(time.Second)
+			s.SetAgentGraph(codexGraph(t, agentgraph.RuntimeActive, agentgraph.AttentionUserInput, expired, time.Nanosecond), expired.Add(time.Second))
 			if s.Codex.Status != want {
 				t.Fatal("expired input overrode live herdr status")
 			}
@@ -151,10 +161,11 @@ func TestFreshCodexInputAttentionOverridesHerdrAndReleasesOnResolution(t *testin
 }
 
 func TestSetAgentGraphShouldKeepDelegatingWhenHerdrSeesAnIdlePrompt(t *testing.T) {
-	s := graphSession(StatusIdle, herdrT0)
+	s := graphSession(t, StatusIdle, herdrT0)
 	s.SetHerdr(reading(HerdrIdle, true, herdrT0.Add(time.Minute)), herdrT0.Add(time.Minute))
 
-	s.SetAgentGraph(&AgentGraph{RootID: "sess-1", Summary: AgentGraphSummary{Status: StatusDelegating, Since: herdrT0.Add(2 * time.Minute)}}, herdrT0.Add(2*time.Minute))
+	at := herdrT0.Add(2 * time.Minute)
+	s.SetAgentGraph(claudeStatusGraph(t, agentgraph.SourceClaudeTranscript, StatusDelegating, at, time.Hour), at)
 	if s.Claude.Status != StatusDelegating {
 		t.Fatalf("status = %q, want delegating: herdr cannot see background agents", s.Claude.Status)
 	}
@@ -163,7 +174,7 @@ func TestSetAgentGraphShouldKeepDelegatingWhenHerdrSeesAnIdlePrompt(t *testing.T
 // After a restart the persisted herdr status is stale until the watcher
 // confirms it; only the wire fields survive, and they carry no authority.
 func TestHerdrShouldCarryNoAuthorityWhenHydratedFromJSON(t *testing.T) {
-	live := graphSession(StatusIdle, herdrT0)
+	live := graphSession(t, StatusIdle, herdrT0)
 	live.SetHerdr(reading(HerdrBlocked, true, herdrT0), herdrT0)
 	raw, err := json.Marshal(live)
 	if err != nil {
@@ -176,7 +187,7 @@ func TestHerdrShouldCarryNoAuthorityWhenHydratedFromJSON(t *testing.T) {
 	if err := json.Unmarshal(raw, &restored); err != nil {
 		t.Fatal(err)
 	}
-	restored.SetAgentGraph(&AgentGraph{RootID: "sess-1", Summary: AgentGraphSummary{Status: StatusIdle}}, herdrT0)
+	restored.SetAgentGraph(claudeStatusGraph(t, agentgraph.SourceClaudeTranscript, StatusIdle, herdrT0, time.Hour), herdrT0)
 	if restored.Claude.Status != StatusIdle {
 		t.Fatalf("status = %q, want the provider's idle: a hydrated herdr block is not live", restored.Claude.Status)
 	}
@@ -185,7 +196,7 @@ func TestHerdrShouldCarryNoAuthorityWhenHydratedFromJSON(t *testing.T) {
 func TestSnapshotShouldDetachTheHerdrBlockWhenTheStoreChangesLater(t *testing.T) {
 	store := New(filepath.Join(t.TempDir(), "state.json"))
 	store.Apply(func(m map[int]*Session) {
-		s := graphSession(StatusIdle, herdrT0)
+		s := graphSession(t, StatusIdle, herdrT0)
 		s.SetHerdr(reading(HerdrWorking, true, herdrT0), herdrT0)
 		m[s.PID] = s
 	})
@@ -249,7 +260,7 @@ func TestSetHerdrShouldKeepAHydratedStatusWhenTheFirstReadingIsNotLive(t *testin
 		t.Fatalf("SetHerdr = %q → %q root %q, want idle kept under root %q", before, after, s.AgentGraph.RootID, root)
 	}
 
-	claude := graphSession(StatusWorking, herdrT0)
+	claude := graphSession(t, StatusWorking, herdrT0)
 	if before, after := claude.SetHerdr(HerdrReading{PaneID: "w1:p1", Socket: "/h.sock"}, herdrT0); before != after {
 		t.Fatalf("claude SetHerdr = %q → %q, want no change", before, after)
 	}

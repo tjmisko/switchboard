@@ -56,8 +56,10 @@ func TestExplainShouldListASourceOutrankedCandidateAsRejectedWhenAFreshHigherRan
 	c, ref := claudeExplainCoordinator(t)
 	at := explainT0.Add(time.Second)
 	hook := claudeExplainObservation("claude-root", agentgraph.SourceHook, agentgraph.RuntimeActive, at, time.Minute)
-	if c.applyObservation(ref, c.begin(ref.Key()), hook, claudeprovider.Compatibility{}, at) {
-		t.Fatal("a hook graph replaced a fresh transcript graph")
+	// The hook is evidence of its own kind: it lands, and the resolver weighs
+	// it against the fresh transcript graph, which outranks it.
+	if !c.applyObservationAs(ref, c.begin(ref.Key()), hook, claudeprovider.Compatibility{}, at, "", state.GraphHookEvent) {
+		t.Fatal("the hook's evidence did not land")
 	}
 
 	d := explainAt(t, c, ref.PID, at)
@@ -78,27 +80,33 @@ func TestExplainShouldBoundTheRejectedListWhenManyCandidatesArrive(t *testing.T)
 	c, ref := claudeExplainCoordinator(t)
 	const arrivals = 3 * statusexplain.MaxRejected
 	for i := range arrivals {
-		at := explainT0.Add(time.Duration(i+1) * time.Millisecond)
-		hook := claudeExplainObservation("claude-root", agentgraph.SourceHook, agentgraph.RuntimeActive, at, time.Minute)
-		c.applyObservation(ref, c.begin(ref.Key()), hook, claudeprovider.Compatibility{}, at)
+		// Each is older than the transcript graph its kind already holds, so the
+		// landing path refuses it before it becomes evidence.
+		at := explainT0.Add(-time.Duration(i+1) * time.Millisecond)
+		old := claudeExplainObservation("claude-root", agentgraph.SourceClaudeTranscript, agentgraph.RuntimeActive, at, time.Minute)
+		if c.applyObservation(ref, c.begin(ref.Key()), old, claudeprovider.Compatibility{}, explainT0) {
+			t.Fatalf("an older transcript graph landed over a newer one")
+		}
 	}
 	d := explainAt(t, c, ref.PID, explainT0.Add(time.Second))
 	if len(d.Rejected) != statusexplain.MaxRejected || d.RejectedOmitted != arrivals-statusexplain.MaxRejected {
 		t.Fatalf("rejected = %d omitted = %d, want %d and %d", len(d.Rejected), d.RejectedOmitted,
 			statusexplain.MaxRejected, arrivals-statusexplain.MaxRejected)
 	}
-	newest := explainT0.Add(time.Duration(arrivals) * time.Millisecond)
-	if got := d.Rejected[len(d.Rejected)-1].ObservedAt; !got.Equal(newest) {
-		t.Fatalf("newest rejected = %v, want %v", got, newest)
+	last := explainT0.Add(-time.Duration(arrivals) * time.Millisecond)
+	if got := d.Rejected[len(d.Rejected)-1]; !got.ObservedAt.Equal(last) || got.RejectReason != statusexplain.ReasonOlderThanCurrent {
+		t.Fatalf("last rejected = %+v, want the last arrival refused as older_than_current", got)
 	}
 }
 
 func TestExplainShouldStartAFreshRejectedListWhenANewGraphIsAdmitted(t *testing.T) {
 	c, ref := claudeExplainCoordinator(t)
-	at := explainT0.Add(time.Second)
 	c.applyObservation(ref, c.begin(ref.Key()),
-		claudeExplainObservation("claude-root", agentgraph.SourceHook, agentgraph.RuntimeActive, at, time.Minute),
-		claudeprovider.Compatibility{}, at)
+		claudeExplainObservation("claude-root", agentgraph.SourceClaudeTranscript, agentgraph.RuntimeActive, explainT0.Add(-time.Second), time.Minute),
+		claudeprovider.Compatibility{}, explainT0)
+	if d := explainAt(t, c, ref.PID, explainT0); len(d.Rejected) != 1 {
+		t.Fatalf("setup: rejected = %+v, want the older graph refused", d.Rejected)
+	}
 	later := explainT0.Add(2 * time.Second)
 	if !c.applyObservation(ref, c.begin(ref.Key()),
 		claudeExplainObservation("claude-root", agentgraph.SourceClaudeTranscript, agentgraph.RuntimeActive, later, time.Minute),
@@ -110,7 +118,7 @@ func TestExplainShouldStartAFreshRejectedListWhenANewGraphIsAdmitted(t *testing.
 	}
 }
 
-func TestExplainShouldSayHookOwnedWhenAHookReductionOwnedTheTransition(t *testing.T) {
+func TestExplainShouldSayEventAuthorityWhenAHooksEventDecides(t *testing.T) {
 	store := state.New("")
 	ref := seedCoordinatorSession(store, 620, explainT0.Add(-time.Hour), state.AgentKindCodex, "thread-1", "/repo")
 	c := newAgentCoordinator(store, nil, nil, nil)
@@ -119,15 +127,15 @@ func TestExplainShouldSayHookOwnedWhenAHookReductionOwnedTheTransition(t *testin
 	observation := testCodexObservation(ref, "thread-1", explainT0, agentgraph.RuntimeActive, agentgraph.AttentionNone)
 	observation.Source = agentgraph.SourceHook
 	observation.Complete = false
-	if !c.applyObservationWithHookOwnership(ref, c.begin(ref.Key()), observation, claudeprovider.Compatibility{}, explainT0, true) {
-		t.Fatal("hook-owned graph did not land")
+	if !c.applyObservationAs(ref, c.begin(ref.Key()), observation, claudeprovider.Compatibility{}, explainT0, "", state.GraphHookEvent) {
+		t.Fatal("hook graph did not land")
 	}
 	d := explainAt(t, c, ref.PID, explainT0)
-	if d.Status != state.StatusWorking || d.Reason != statusexplain.ReasonHookOwned || d.Source != string(agentgraph.SourceHook) {
-		t.Fatalf("decision = %+v, want working as hook_owned", d.Choice)
+	if d.Status != state.StatusWorking || d.Reason != statusexplain.ReasonEventAuthority || d.Source != string(agentgraph.SourceHook) {
+		t.Fatalf("decision = %+v, want working as event_authority", d.Choice)
 	}
 
-	// The same graph admitted by ranking is graph authority.
+	// A newer app-server sample is a provider snapshot: graph authority.
 	later := explainT0.Add(time.Second)
 	sample := testCodexObservation(ref, "thread-1", later, agentgraph.RuntimeActive, agentgraph.AttentionNone)
 	if !c.applyObservation(ref, c.begin(ref.Key()), sample, claudeprovider.Compatibility{}, later) {
@@ -189,9 +197,9 @@ func TestExplainShouldGiveDistinctReasonsWhenBindingIsMissingObservationExpiredO
 func TestExplainShouldNotExposeThePreviousRootsDecisionWhenTheProcessIsReplaced(t *testing.T) {
 	c, ref := claudeExplainCoordinator(t)
 	at := explainT0.Add(time.Second)
-	c.applyObservation(ref, c.begin(ref.Key()),
+	c.applyObservationAs(ref, c.begin(ref.Key()),
 		claudeExplainObservation("claude-root", agentgraph.SourceHook, agentgraph.RuntimeActive, at, time.Minute),
-		claudeprovider.Compatibility{}, at)
+		claudeprovider.Compatibility{}, at, "", state.GraphHookEvent)
 	if d := explainAt(t, c, ref.PID, at); len(d.Rejected) != 1 {
 		t.Fatalf("setup: rejected = %+v", d.Rejected)
 	}
@@ -274,13 +282,13 @@ func TestExplainShouldExplainAPiDialogsPermissionAndTheRejectedTerminalReadingWh
 	h.wantStatus("dialog open under herdr working", state.StatusPermission)
 
 	d := explainAt(t, h.c, piTestPID, at)
-	if d.Status != state.StatusPermission || d.Reason != statusexplain.ReasonPiHookAuthority ||
+	if d.Status != state.StatusPermission || d.Reason != statusexplain.ReasonEventAuthority ||
 		d.Root.SessionID != piTestSession {
 		t.Fatalf("decision = %+v root = %+v, want permission from the Pi hook", d.Choice, d.Root)
 	}
 	if len(d.Rejected) != 1 || d.Rejected[0].Status != state.StatusWorking ||
-		d.Rejected[0].RejectReason != statusexplain.ReasonPiHookAuthority {
-		t.Fatalf("rejected = %+v, want herdr's working rejected for pi_hook_authority", d.Rejected)
+		d.Rejected[0].RejectReason != statusexplain.ReasonSourceOutranked {
+		t.Fatalf("rejected = %+v, want herdr's working outranked by the Pi hook", d.Rejected)
 	}
 }
 
@@ -295,14 +303,14 @@ func TestExplainShouldFollowAPiDecisionToHerdrWhenTheHookLeaseLapsesWithoutAStat
 		sessions[piTestPID].SetHerdr(state.HerdrReading{PaneID: "w1:p1", Socket: "/h.sock", TerminalID: "t1",
 			Agent: "pi", Status: state.HerdrWorking, Live: true, Since: at}, at)
 	})
-	if d := explainAt(t, h.c, piTestPID, at); d.Reason != statusexplain.ReasonPiHookAuthority {
+	if d := explainAt(t, h.c, piTestPID, at); d.Reason != statusexplain.ReasonEventAuthority {
 		t.Fatalf("before the lapse: %+v", d.Choice)
 	}
 	lapsed := h.base.Add(time.Second + piHookActiveLease + time.Second)
 	h.c.reconcilePiRoots(lapsed)
 	h.wantStatus("lease lapsed onto herdr working", state.StatusWorking)
 	d := explainAt(t, h.c, piTestPID, lapsed)
-	if d.Reason != statusexplain.ReasonHerdrFallback || d.Source != string(agentgraph.SourceHerdr) {
-		t.Fatalf("after the lapse: %+v, want herdr_fallback", d.Choice)
+	if d.Reason != statusexplain.ReasonTerminalAuthority || d.Source != string(agentgraph.SourceHerdr) {
+		t.Fatalf("after the lapse: %+v, want terminal_authority", d.Choice)
 	}
 }

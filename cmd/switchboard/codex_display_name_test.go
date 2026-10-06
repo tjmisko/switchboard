@@ -556,7 +556,7 @@ func TestCodexDisplayNameNativeBaselineAndRenamePrecedence(t *testing.T) {
 	partial.Source = agentgraph.SourceHook
 	partial.Complete = false
 	partial.Nodes[0].Nickname = "partial-fabrication"
-	if !coordinator.applyObservationWithHookOwnership(ref, coordinator.begin(ref.Key()), partial, claudeprovider.Compatibility{}, partial.ObservedAt, true) {
+	if !coordinator.applyObservationAs(ref, coordinator.begin(ref.Key()), partial, claudeprovider.Compatibility{}, partial.ObservedAt, "", state.GraphHookEvent) {
 		t.Fatal("partial hook observation was not applied")
 	}
 	if got := store.Snapshot().Sessions[0].DisplayName; got == nil {

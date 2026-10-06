@@ -386,7 +386,8 @@ func TestPiReducerShouldHandHerdrTheStatusWhenTheHookLeaseLapses(t *testing.T) {
 	h.hook("SessionStart", 0)
 	h.hook("UserPromptSubmit", time.Second)
 	h.store.Apply(func(sessions map[int]*state.Session) {
-		sessions[piTestPID].Herdr = &state.HerdrInfo{PaneID: "w1:p1", Socket: "/s", Status: state.HerdrIdle, Live: true, StatusSince: h.base}
+		sessions[piTestPID].Herdr = &state.HerdrInfo{PaneID: "w1:p1", Socket: "/s", Agent: state.AgentKindPi,
+			Status: state.HerdrIdle, Live: true, StatusSince: h.base}
 	})
 	h.c.reconcilePiRoots(h.base.Add(time.Second + piHookActiveLease - time.Millisecond))
 	h.wantStatus("inside the working lease", state.StatusWorking)

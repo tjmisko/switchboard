@@ -14,19 +14,31 @@ type Target struct {
 	Root statusexplain.Root
 	// PaneID is the herdr pane the agent runs in, "" when none.
 	PaneID string
+	// TerminalID is herdr's stable id for the terminal the agent runs in, ""
+	// when herdr has not reported one.
+	TerminalID string
 }
 
 // Matches reports whether c is about t. A terminal reading must name t's
-// agent and pane. Every other kind must name t's agent kind, its bound
-// provider session and its process lifetime; nothing matches an unbound root.
+// agent and terminal: herdr's stable terminal id when both sides carry one,
+// else the pane id, which changes when a pane moves workspace. Every other
+// kind must name t's agent kind, its bound provider session and its process
+// lifetime; nothing matches an unbound root.
 func (t Target) Matches(c Candidate) bool {
 	id := c.Identity
 	if c.Kind == statusexplain.EvidenceTerminal {
-		return id.PaneID != "" && id.PaneID == t.PaneID && id.Provider != "" && id.Provider == t.Root.Provider
+		return id.Provider != "" && id.Provider == t.Root.Provider && t.sameTerminal(id)
 	}
 	return id.Provider != "" && id.Provider == t.Root.Provider &&
 		id.SessionID != "" && id.SessionID == t.Root.SessionID &&
 		!id.StartedAt.IsZero() && id.StartedAt.Equal(t.Root.StartedAt)
+}
+
+func (t Target) sameTerminal(id Identity) bool {
+	if t.TerminalID != "" && id.TerminalID != "" {
+		return id.TerminalID == t.TerminalID
+	}
+	return id.PaneID != "" && id.PaneID == t.PaneID
 }
 
 // Rank orders the kinds that may select a root's status, highest first. A
@@ -106,7 +118,9 @@ type claim struct {
 
 // resolves reports whether r is authorized to resolve the request c holds
 // open: r reports no attention, observed after the request, and is either a
-// provider snapshot or an exact lifecycle event from the request's own writer.
+// provider snapshot or an exact lifecycle event from the request's own writer
+// (the claim's choice names the writer, which for a hook-latched request is
+// the hook rather than the snapshot that carried it).
 // A terminal reading, a transcript tail, a partial edge and restored
 // presentation never resolve one.
 func resolves(r Candidate, c claim) bool {
@@ -140,7 +154,8 @@ func resolves(r Candidate, c claim) bool {
 // The rules, in order:
 //
 //  1. A candidate that is not about the target, or not fresh at now, cannot
-//     select; one that cannot classify the root contributes nothing.
+//     select; one that cannot classify the root contributes nothing; one a
+//     newer observation superseded may only hold its own request open.
 //  2. The best remaining candidate by Rank is the base.
 //  3. Open provider attention (a current exact event's or snapshot's, or the
 //     prior decision's until its deadline) holds the root at permission
@@ -152,6 +167,15 @@ func resolves(r Candidate, c claim) bool {
 //  6. An idle result stays delegating while the newest fresh snapshot,
 //     partial edge or exact event reports working descendants.
 func Resolve(target Target, candidates []Candidate, prior statusexplain.Decision, now time.Time) statusexplain.Decision {
+	d, _ := ResolveIndex(target, candidates, prior, now)
+	return d
+}
+
+// ResolveIndex is Resolve, also returning the index of the candidate the
+// decision rests on: the one that selected the status, the one holding the
+// request open, or the one reporting live descendants; -1 when the prior
+// decision holds or nothing decides.
+func ResolveIndex(target Target, candidates []Candidate, prior statusexplain.Decision, now time.Time) (statusexplain.Decision, int) {
 	d := statusexplain.Decision{Root: target.Root}
 	reasons := make([]statusexplain.Reason, len(candidates))
 	admitted := make([]bool, len(candidates))
@@ -169,7 +193,10 @@ func Resolve(target Target, candidates []Candidate, prior statusexplain.Decision
 
 	base, restored := -1, -1
 	for i, c := range candidates {
-		if !admitted[i] || c.Status == "" {
+		if admitted[i] && c.Superseded {
+			reasons[i] = statusexplain.ReasonOlderThanCurrent
+		}
+		if !admitted[i] || c.Status == "" || c.Superseded {
 			continue
 		}
 		switch Rank(c) {
@@ -189,7 +216,7 @@ func Resolve(target Target, candidates []Candidate, prior statusexplain.Decision
 		}
 	}
 	for i, c := range candidates {
-		if !admitted[i] || c.Status == "" || Rank(c) == rankNone || i == base {
+		if !admitted[i] || c.Status == "" || c.Superseded || Rank(c) == rankNone || i == base {
 			continue
 		}
 		reasons[i] = statusexplain.ReasonOlderThanCurrent
@@ -216,6 +243,12 @@ func Resolve(target Target, candidates []Candidate, prior statusexplain.Decision
 	case base >= 0:
 		chosen = base
 		choice = choiceOf(candidates[base], authority(candidates[base]))
+		if b := candidates[base]; holdsAttention(b.Kind, b.Attention) {
+			// The request is its writer's: a later decision holding it as prior
+			// must know who may resolve it.
+			w := b.writer()
+			choice.EvidenceKind, choice.Source = w.Kind, string(w.Source)
+		}
 	case held && priorChoice.Status != "" && !priorChoice.FreshUntil.IsZero() && now.Before(priorChoice.FreshUntil):
 		choice = priorChoice
 		choice.Reason = statusexplain.ReasonPriorHeld
@@ -251,7 +284,7 @@ func Resolve(target Target, candidates []Candidate, prior statusexplain.Decision
 			ObservedAt: c.ObservedAt, FreshUntil: c.FreshUntil, RejectReason: reasons[i],
 		})
 	}
-	return d
+	return d, chosen
 }
 
 // priorFor returns prior's decision beneath any overlay, and whether it is
@@ -273,7 +306,10 @@ func openAttention(candidates []Candidate, admitted []bool, held bool, prior sta
 	var claims []claim
 	for i, c := range candidates {
 		if admitted[i] && holdsAttention(c.Kind, c.Attention) {
-			claims = append(claims, claim{index: i, choice: choiceOf(c, statusexplain.ReasonAttentionHeld)})
+			choice := choiceOf(c, statusexplain.ReasonAttentionHeld)
+			w := c.writer()
+			choice.EvidenceKind, choice.Source = w.Kind, string(w.Source)
+			claims = append(claims, claim{index: i, choice: choice})
 		}
 	}
 	if held && prior.Status == agentgraph.LegacyPermission && !prior.FreshUntil.IsZero() && now.Before(prior.FreshUntil) &&
@@ -300,12 +336,12 @@ func openAttention(candidates []Candidate, admitted []bool, held bool, prior sta
 }
 
 // newestDescendants returns the newest fresh candidate that may report the
-// root's descendants (a provider snapshot, a partial hook edge or an exact
-// event), or -1.
+// root's descendants (a provider snapshot, a partial hook edge, an exact event
+// or the Codex rollout tail's correction), or -1.
 func newestDescendants(candidates []Candidate, admitted []bool) int {
 	newest := -1
 	for i, c := range candidates {
-		if !admitted[i] || !reportsDescendants(c.Kind) {
+		if !admitted[i] || c.Superseded || !reportsDescendants(c) {
 			continue
 		}
 		if newest < 0 || c.ObservedAt.After(candidates[newest].ObservedAt) ||
@@ -316,9 +352,15 @@ func newestDescendants(candidates []Candidate, admitted []bool) int {
 	return newest
 }
 
-func reportsDescendants(kind statusexplain.EvidenceKind) bool {
-	return kind == statusexplain.EvidenceProviderSnapshot || kind == statusexplain.EvidenceHookEdge ||
-		kind == statusexplain.EvidenceHook
+func reportsDescendants(c Candidate) bool {
+	switch c.Kind {
+	case statusexplain.EvidenceProviderSnapshot, statusexplain.EvidenceHookEdge, statusexplain.EvidenceHook:
+		return true
+	case statusexplain.EvidenceTranscript:
+		return c.Source == agentgraph.SourceCodexRollout
+	default:
+		return false
+	}
 }
 
 func authority(c Candidate) statusexplain.Reason {

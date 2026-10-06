@@ -4,25 +4,29 @@ import (
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/agentgraph"
-	"github.com/tjmisko/switchboard/internal/statusexplain"
 )
 
 // HerdrInfo is the herdr (herdr.dev) pane hosting a session and herdr's own
 // reading of the agent in it.
 //
-// herdr is the status authority for every agent in one of its panes: while
-// the daemon is following that pane's server, the session's published status
-// (the enrichment block's, and so every renderer's) is herdr's, projected onto
-// Switchboard's legacy values by HerdrLegacyStatus. The provider graph keeps
-// running underneath it (children, names, usage), and AgentGraph.Summary keeps
-// the provider's own verdict, so the two can be compared when they disagree.
-// Fresh Codex input/approval attention takes precedence: a screen reporting work
-// cannot determine whether an asynchronous question still needs an answer.
+// herdr's reading is a coarse terminal reading, one candidate the status
+// resolver weighs (resolveStatus): while the daemon follows the pane's server
+// and herdr names the tracked agent in the tracked terminal, it outranks a
+// provider's snapshots and Claude's and Codex's hooks, but never resolves an
+// open request for the user (a screen reporting work cannot tell whether a
+// question still needs an answer), and Pi's complete hook lifecycle outranks
+// it. The provider graph keeps running underneath it (children, names, usage),
+// and AgentGraph.Summary keeps the provider's own verdict, so the two can be
+// compared when they disagree.
 type HerdrInfo struct {
 	// PaneID is herdr's public pane id ("w1:p2"). It changes when the pane
 	// moves to another workspace; the reconciler refreshes it from the terminal
 	// backend every tick.
 	PaneID string `json:"pane_id"`
+	// TerminalID is herdr's id for the pane's terminal, stable across moves;
+	// the resolver matches readings by it when present. In-memory only: every
+	// reading carries it again.
+	TerminalID string `json:"-"`
 	// Socket is the API socket of the herdr server that owns the pane.
 	Socket string `json:"socket"`
 	// Agent is the agent herdr detected in the pane, "" when none.
@@ -75,26 +79,6 @@ func HerdrLegacyStatus(herdr, provider string) (string, bool) {
 	}
 }
 
-// herdrAuthority returns the status herdr decides for this session given the
-// provider's own, or false when herdr is not the authority right now. reason
-// says why: herdr_override when it decides, herdr_yield_attention when it
-// yields to Codex attention, coverage_unsupported when its live reading
-// classifies nothing, and "" when herdr is not followed.
-func (s *Session) herdrAuthority(provider string) (status string, since time.Time, reason statusexplain.Reason, ok bool) {
-	if s.Herdr == nil || !s.Herdr.Live {
-		return "", time.Time{}, "", false
-	}
-	if s.Agent == AgentKindCodex && s.AgentGraph != nil && s.AgentGraph.Fresh(time.Now()) &&
-		(s.AgentGraph.Summary.Attention == agentgraph.AttentionUserInput || s.AgentGraph.Summary.Attention == agentgraph.AttentionApproval) {
-		return "", time.Time{}, statusexplain.ReasonHerdrYieldAttention, false
-	}
-	status, ok = HerdrLegacyStatus(s.Herdr.Status, provider)
-	if !ok {
-		return "", time.Time{}, statusexplain.ReasonCoverageUnsupported, false
-	}
-	return status, s.Herdr.StatusSince, statusexplain.ReasonHerdrOverride, true
-}
-
 // HerdrReading is one reading of a session's herdr pane.
 type HerdrReading struct {
 	PaneID     string
@@ -111,16 +95,16 @@ type HerdrReading struct {
 	ActivePaneID string
 }
 
-// SetHerdr records a reading of the session's herdr pane and re-projects the
+// SetHerdr records a reading of the session's herdr pane and re-resolves the
 // published status, returning it before and after so the caller can record a
 // transition when they differ.
 //
-// A Claude or Codex session publishes herdr's status over its provider graph
-// (see projectStatus); one with no graph yet has nothing to replace and is left
+// A Claude or Codex session weighs the reading against its provider evidence
+// (resolveStatus); one with no graph yet has nothing to weigh and is left
 // unchanged. Any other agent has no provider adapter at all, so herdr is its
 // only source until a Pi hook binds the session: the reading becomes its whole
-// agent graph, rooted at Pi's session id once bound. A bound Pi session takes
-// its status from piStatusAuthority, which prefers fresh hook evidence.
+// agent graph, rooted at Pi's session id once bound. A bound Pi session weighs
+// it against its hook and session-file evidence.
 //
 // A reading that is not live, for a block that was not live either, carries no
 // news: it is what the daemon sees at startup before the watcher reconnects.
@@ -133,6 +117,7 @@ func (s *Session) SetHerdr(r HerdrReading, now time.Time) (before, after string)
 			s.Herdr = &HerdrInfo{}
 		}
 		s.Herdr.PaneID, s.Herdr.Socket, s.Herdr.ActivePaneID = r.PaneID, r.Socket, r.ActivePaneID
+		s.Herdr.TerminalID = r.TerminalID
 		status := s.publishedStatus(now)
 		return status, status
 	}
@@ -144,20 +129,22 @@ func (s *Session) SetHerdr(r HerdrReading, now time.Time) (before, after string)
 		h.StatusSince = r.Since
 	}
 	h.PaneID, h.Socket, h.Agent, h.Status, h.Live = r.PaneID, r.Socket, r.Agent, r.Status, r.Live
-	h.ActivePaneID = r.ActivePaneID
+	h.TerminalID, h.ActivePaneID = r.TerminalID, r.ActivePaneID
 	if !IsProviderAgent(s.Agent) {
 		before = s.publishedStatus(now)
-		// Fresh Pi hook evidence owns the graph; herdr's reading waits in the
-		// block until that evidence lapses (see piStatusAuthority).
+		// Fresh Pi hook evidence owns the published graph; herdr's reading waits
+		// in the block until that evidence lapses.
 		if !s.piHookGraphFresh(now) {
 			s.AgentGraph = herdrAgentGraph(s.Agent, r, s.AgentGraph, s.boundRootID(), now)
+			s.displayKind = graphKindNone
 		}
 		// A Pi session a hook has bound publishes through its own block; until
-		// then it has none and publishes its herdr graph.
+		// then it has none and publishes its herdr graph, whose status the
+		// resolver's decision explains.
 		if s.Agent == AgentKindPi && s.Pi != nil {
-			s.projectPiStatus(s.Pi, r.Since, now)
+			s.project(s.Pi, r.Since, now)
 		} else {
-			s.recordHerdrOnly(now)
+			s.resolveStatus(now)
 		}
 		return before, s.publishedStatus(now)
 	}
@@ -166,7 +153,7 @@ func (s *Session) SetHerdr(r HerdrReading, now time.Time) (before, after string)
 		return "", ""
 	}
 	before = info.Status
-	s.projectStatus(info, r.Since, now)
+	s.project(info, r.Since, now)
 	return before, info.Status
 }
 
@@ -272,7 +259,7 @@ func (s *Session) boundRootID() string {
 
 // graphEnrichment returns the enrichment block the provider graph projects
 // into, or nil when the session has no graph (and so no status to replace).
-// A Pi block is not one: it projects through projectPiStatus.
+// A Pi block is not one: it lands through SetPiHookGraph.
 func (s *Session) graphEnrichment() *AgentInfo {
 	if s.AgentGraph == nil {
 		return nil
@@ -284,27 +271,6 @@ func (s *Session) graphEnrichment() *AgentInfo {
 		return s.Codex
 	}
 	return nil
-}
-
-// projectStatus sets the published status from the provider graph's summary,
-// overridden by herdr while it is the authority. StatusSince moves only when
-// the published status changes. fallback dates a provider-decided edge whose
-// summary carries no Since. now dates the decision record, changed or not; it
-// decides nothing.
-func (s *Session) projectStatus(info *AgentInfo, fallback, now time.Time) {
-	status, since := s.AgentGraph.Summary.Status, s.AgentGraph.Summary.Since
-	herdrStatus, herdrSince, herdrReason, herdrDecides := s.herdrAuthority(status)
-	if herdrDecides {
-		status, since = herdrStatus, herdrSince
-	}
-	s.recordGraphProjection(status, herdrReason, now)
-	if info.Status == status {
-		return
-	}
-	if since.IsZero() {
-		since = fallback
-	}
-	info.Status, info.StatusSince = status, since
 }
 
 func cloneHerdr(h *HerdrInfo) *HerdrInfo {

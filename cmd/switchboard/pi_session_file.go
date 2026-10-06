@@ -44,8 +44,9 @@ type piSessionFileCandidate struct {
 // for a tool → working; an assistant message stopped for anything else → idle.
 //
 // The read lands as a pi_session_file graph with piSessionFileLease and is
-// renewed while the file stays readable. It yields to herdr outright
-// (piStatusAuthority), so a root with a live herdr reading is not read at all,
+// renewed while the file stays readable. It is correlated transcript evidence,
+// which a live herdr reading outranks, so a root with a live herdr reading is
+// not read at all,
 // and it stops for good once a hook reaches the root: the reducer owns it from
 // then on.
 func (c *agentCoordinator) seedPiFromSessionFiles(now time.Time) {
@@ -145,7 +146,7 @@ func (c *agentCoordinator) seedPiFromSessionFile(candidate piSessionFileCandidat
 			return
 		}
 		beforeSince = s.Pi.StatusSince
-		before, after = s.SetPiHookGraph(projected, now)
+		before, after = s.SetPiSessionFileGraph(projected, now)
 		cwd, applied = s.CWD, true
 	})
 	if !applied || before == after {

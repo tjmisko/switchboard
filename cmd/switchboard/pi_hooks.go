@@ -19,7 +19,8 @@ import (
 // hooks, so its hook graph is edge-triggered evidence of the same kind as the
 // Codex hook fallback, and takes that path's state-specific windows rather
 // than a lease of its own. When one runs out with no newer hook, the status
-// falls back to herdr, else to unknown (state.piStatusAuthority).
+// falls back to herdr, else to unknown (the status resolver, through
+// state.Session.ReprojectPi).
 const (
 	piHookActiveLease    = codexHookActiveFreshness
 	piHookAttentionLease = codexHookAttentionFreshness
@@ -157,7 +158,7 @@ func piSessionIDFromFile(path string) string {
 // Every edge lands as a one-node hook graph rooted at Pi's session id, and
 // every published status change becomes a history transition with a Pi rule
 // code and a statustune decision line. The published status itself comes from
-// state.piStatusAuthority, which weighs this evidence against herdr's.
+// the status resolver, which weighs this evidence against herdr's.
 func (c *agentCoordinator) handlePiHook(req rpc.Request, sess state.Session) {
 	key := providerRootKey(sess)
 	if key.PID <= 0 || key.StartedAt.IsZero() {
@@ -165,7 +166,7 @@ func (c *agentCoordinator) handlePiHook(req rpc.Request, sess state.Session) {
 	}
 	now := req.ObservedAt
 	if now.IsZero() {
-		now = time.Now()
+		now = c.now()
 	}
 
 	c.piMu.Lock()
@@ -329,7 +330,7 @@ func (c *agentCoordinator) recordPiRotation(req rpc.Request, pid int, cwd, prevI
 // lapses onto a herdr reading of the same colour. Such a move is applied to the
 // store so explain does not keep attributing the status to the lapsed hook; it
 // publishes nothing, since no published field changes.
-func piDecisionMoved(before, after statusexplain.Projection) bool {
+func piDecisionMoved(before, after statusexplain.Decision) bool {
 	return before.Reason != after.Reason || before.Source != after.Source
 }
 

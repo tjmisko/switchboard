@@ -167,7 +167,7 @@ func TestPromptStatePersistsAcrossADaemonRestart(t *testing.T) {
 		}
 
 		second := bootDaemon(t, path, first.transcript)
-		second.coordinator(t).restoreClaude(second.ref)
+		second.coordinator(t).restoreClaude(second.ref, time.Now())
 
 		if got := second.graph(t).Summary.Attention; got != agentgraph.AttentionUserInput {
 			t.Errorf("restored attention = %q, want user_input — a question that comes back an approval is a silent downgrade", got)
@@ -195,7 +195,7 @@ func TestPromptStatePersistsAcrossADaemonRestart(t *testing.T) {
 		}
 
 		second := bootDaemon(t, path, first.transcript)
-		second.coordinator(t).restoreClaude(second.ref)
+		second.coordinator(t).restoreClaude(second.ref, time.Now())
 
 		restored := second.claude(t)
 		if got := recordsFor(restored, state.PendingWriterMain); len(got) != 2 {
@@ -227,7 +227,7 @@ func TestPromptStatePersistsAcrossADaemonRestart(t *testing.T) {
 
 		second := bootDaemon(t, path, first.transcript)
 		restarted := second.coordinator(t)
-		restarted.restoreClaude(second.ref)
+		restarted.restoreClaude(second.ref, time.Now())
 
 		second.postToolUse(t, restarted, "", "Bash", "call-b", "", now.Add(time.Minute))
 
@@ -297,7 +297,7 @@ func TestPromptStatePersistsAcrossADaemonRestart(t *testing.T) {
 		}
 
 		old := bootDaemon(t, path, transcriptPath)
-		old.coordinator(t).restoreClaude(old.ref)
+		old.coordinator(t).restoreClaude(old.ref, time.Now())
 
 		info := old.claude(t)
 		if got := info.PendingWriterKeys(); len(got) != 1 || got[0] != restartTeammate {

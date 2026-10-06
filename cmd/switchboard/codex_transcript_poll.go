@@ -67,11 +67,14 @@ func (c *agentCoordinator) pollCodexStoppedRoot(ref provider.RootRef, now time.T
 	root.transcriptStoppedAt = at
 	root.rootObservedAt, root.rootFreshUntil = now, now.Add(codexTranscriptQuietWindow)
 	observation.ObservedAt, observation.FreshUntil = now, root.rootFreshUntil
+	// The correction is the rollout tail's own evidence (correlated transcript
+	// evidence), not the graph it was read against: it says so in its source.
+	observation.Source = agentgraph.SourceCodexRollout
 	// Reserve while holding the hook reducer lock so an arriving hook fences
 	// this observation before publication rather than being overwritten by it.
 	generation := c.begin(ref.Key())
 	c.codexHookMu.Unlock()
-	c.applyObservationWithHookOwnership(ref, generation, observation, claudeprovider.Compatibility{}, now, true)
+	c.applyObservationAs(ref, generation, observation, claudeprovider.Compatibility{}, now, "", state.GraphTranscriptTail)
 }
 
 // recordCodexUsageLimit records a usage-limit turn end, the root's or a

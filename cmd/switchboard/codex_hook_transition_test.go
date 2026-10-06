@@ -702,8 +702,8 @@ func TestCodexApprovalRedShouldSurviveUnrelatedProgressWhenTheGateIsUndecided(t 
 	waitForCodexAttention(t, store, agentgraph.AttentionApproval)
 
 	// A sibling's completed call says nothing about this gate. The timestamps must
-	// be real wall clock and later than the timer's publication, or shouldApplyObservation
-	// fences the edge on staleness and the test passes without proving anything.
+	// be real wall clock and later than the timer's publication, or the landing
+	// path refuses the edge as older and the test passes without proving anything.
 	sendCodexHook(coordinator, store, rpc.Request{
 		Event: "PostToolUse", SessionID: "thread-1", TurnID: "turn-1", AgentID: "sibling-writer",
 		ToolUseID: "exec-1", ToolName: "exec_command", ObservedAt: time.Now(),
