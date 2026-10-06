@@ -40,8 +40,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"maps"
 	"os"
+	"slices"
 	"strings"
 	"time"
 )
@@ -568,6 +571,13 @@ func ResolveKind(path string, since time.Time, maxBytes int64) (ResolutionKind, 
 // ResolutionResumed otherwise, including when the tool ran and failed:
 // declinedResult explains why `is_error` alone cannot make that call.
 func ResolveKindFor(path string, since time.Time, callID string, maxBytes int64) (ResolutionKind, error) {
+	key := fmt.Sprintf("resolve-kind/%d/%d/%s", maxBytes, since.UnixNano(), callID)
+	return cached(path, key, func(path string) (ResolutionKind, error) {
+		return resolveKindFor(path, since, callID, maxBytes)
+	})
+}
+
+func resolveKindFor(path string, since time.Time, callID string, maxBytes int64) (ResolutionKind, error) {
 	entries, err := readTailEntries(path, maxBytes)
 	if err != nil {
 		return ResolutionNone, err
@@ -591,6 +601,14 @@ func ResolveKindForCalls(path string, since time.Time, callIDs []string, maxByte
 	if len(callIDs) == 0 {
 		return nil, nil
 	}
+	key := fmt.Sprintf("resolve-kind-for-calls/%d/%d/%s", maxBytes, since.UnixNano(), strings.Join(callIDs, "\x00"))
+	kinds, err := cached(path, key, func(path string) (map[string]ResolutionKind, error) {
+		return resolveKindForCalls(path, since, callIDs, maxBytes)
+	})
+	return maps.Clone(kinds), err
+}
+
+func resolveKindForCalls(path string, since time.Time, callIDs []string, maxBytes int64) (map[string]ResolutionKind, error) {
 	entries, err := readTailEntries(path, maxBytes)
 	if err != nil {
 		return nil, err
@@ -777,6 +795,12 @@ func (e BlockedEvidence) String() string {
 // The error is returned for the caller's logs only; every failure mode already
 // maps to BlockedUnknown, which means keep.
 func BlockedByPendingTool(path string, maxBytes int64) (BlockedEvidence, error) {
+	return cached(path, fmt.Sprintf("blocked-by-pending-tool/%d", maxBytes), func(path string) (BlockedEvidence, error) {
+		return blockedByPendingTool(path, maxBytes)
+	})
+}
+
+func blockedByPendingTool(path string, maxBytes int64) (BlockedEvidence, error) {
 	entries, err := readTailEntries(path, maxBytes)
 	if err != nil {
 		return BlockedUnknown, err
@@ -857,6 +881,13 @@ func PendingCall(path, toolName string, maxBytes int64) ([]PendingToolCall, erro
 	if toolName == "" {
 		return nil, nil
 	}
+	calls, err := cached(path, fmt.Sprintf("pending-call/%d/%s", maxBytes, toolName), func(path string) ([]PendingToolCall, error) {
+		return pendingCall(path, toolName, maxBytes)
+	})
+	return slices.Clone(calls), err
+}
+
+func pendingCall(path, toolName string, maxBytes int64) ([]PendingToolCall, error) {
 	entries, err := readTailEntries(path, maxBytes)
 	if err != nil {
 		return nil, err
@@ -1135,6 +1166,18 @@ func NewestSignal(path string, maxBytes int64) (Signal, time.Time, error) {
 // It is separate from prompt-resolution and hook anchors: terminal evidence
 // describes runtime, not whether an individual permission call was resolved.
 func NewestRuntimeSignal(path string, maxBytes int64) (Signal, time.Time, error) {
+	type newest struct {
+		signal Signal
+		at     time.Time
+	}
+	found, err := cached(path, fmt.Sprintf("newest-runtime-signal/%d", maxBytes), func(path string) (newest, error) {
+		signal, at, err := newestRuntimeSignal(path, maxBytes)
+		return newest{signal, at}, err
+	})
+	return found.signal, found.at, err
+}
+
+func newestRuntimeSignal(path string, maxBytes int64) (Signal, time.Time, error) {
 	return newestSignalMode(path, maxBytes, true, func(e entry) Signal {
 		if e.Type == "system" && e.Subtype == "stop_hook_summary" && !e.PreventedContinuation {
 			return SignalStopped

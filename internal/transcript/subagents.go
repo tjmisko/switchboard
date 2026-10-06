@@ -301,14 +301,13 @@ func SubagentsForTranscript(transcriptPath string) ([]Subagent, error) {
 			if id == "" {
 				continue
 			}
-			raw, err := os.ReadFile(filepath.Join(dir, name))
+			m, err := cached(filepath.Join(dir, name), "subagent-meta", readSubagentMeta)
 			if err != nil {
 				return nil, err // listed but unreadable: a genuine I/O failure
 			}
 			s := upsert(id)
 			s.HasMeta = true
-			var m subagentMeta
-			if json.Unmarshal(raw, &m) == nil { // tolerate a non-JSON meta: id stays reported, fields zero
+			if m.parsed { // tolerate a non-JSON meta: id stays reported, fields zero
 				s.AgentType = m.AgentType
 				s.Name = m.Name
 				s.Description = m.Description
@@ -329,7 +328,8 @@ func SubagentsForTranscript(transcriptPath string) ([]Subagent, error) {
 				continue
 			}
 			s := upsert(id)
-			s.Done, s.ModTime, s.LatestEntryAt = subagentJSONLActivity(filepath.Join(dir, name))
+			activity, _ := cached(filepath.Join(dir, name), "subagent-activity", readSubagentActivity)
+			s.Done, s.ModTime, s.LatestEntryAt = activity.done, activity.mod, activity.latest
 		}
 	}
 
@@ -338,6 +338,34 @@ func SubagentsForTranscript(transcriptPath string) ([]Subagent, error) {
 		subs = append(subs, *byID[id])
 	}
 	return subs, nil
+}
+
+// parsedSubagentMeta is a meta file's fields and whether it parsed as JSON.
+type parsedSubagentMeta struct {
+	subagentMeta
+	parsed bool
+}
+
+func readSubagentMeta(path string) (parsedSubagentMeta, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return parsedSubagentMeta{}, err
+	}
+	var m parsedSubagentMeta
+	m.parsed = json.Unmarshal(raw, &m.subagentMeta) == nil
+	return m, nil
+}
+
+// subagentActivity is subagentJSONLActivity's answer, cached by the file's
+// identity: a child transcript that has not moved is not re-read.
+type subagentActivity struct {
+	done        bool
+	mod, latest time.Time
+}
+
+func readSubagentActivity(path string) (subagentActivity, error) {
+	done, mod, latest := subagentJSONLActivity(path)
+	return subagentActivity{done: done, mod: mod, latest: latest}, nil
 }
 
 // subagentJSONLState reads the subagent's own transcript at path and reports

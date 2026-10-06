@@ -479,6 +479,9 @@ func (o *Observer) ApplyHook(signal HookSignal) HookResult {
 	if !recognizedHook(signal.Event) {
 		return HookResult{Root: signal.Root.Key()}
 	}
+	// A hook announces that the root's transcripts are moving, even where the
+	// file identity cannot show it yet: the next Observe re-reads them (#98).
+	transcript.ForgetCached(signal.Root.Transcript)
 
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -1145,6 +1148,9 @@ func (o *Observer) ensureRootLocked(root provider.RootRef) *rootState {
 	}
 	if rs != nil {
 		o.fanout.Forget(rs.ref.ProviderSessionID)
+		// A rotated session's cached extractions are about files this root
+		// no longer reads; dropping them is not I/O.
+		transcript.ForgetCached(rs.ref.Transcript)
 	}
 	var carriedEvents []history.Event
 	if rs != nil {
@@ -1695,6 +1701,7 @@ func (o *Observer) Forget(key provider.RootKey) {
 	o.mu.Unlock()
 	if rs != nil {
 		o.fanout.Forget(rs.ref.ProviderSessionID)
+		transcript.ForgetCached(rs.ref.Transcript)
 	}
 }
 
