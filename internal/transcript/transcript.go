@@ -380,6 +380,10 @@ func readTailEntries(path string, maxBytes int64) ([]entry, error) {
 	return readTailEntriesMode(path, maxBytes, false)
 }
 
+// errIncompleteTail is a requireComplete read that ended mid-line: a write in
+// progress, not an I/O failure. The write that completes it moves the size.
+var errIncompleteTail = errors.New("transcript: incomplete runtime tail")
+
 func readTailEntriesMode(path string, maxBytes int64, requireComplete bool) ([]entry, error) {
 	if path == "" {
 		return nil, errors.New("transcript: empty path")
@@ -406,7 +410,7 @@ func readTailEntriesMode(path string, maxBytes int64, requireComplete bool) ([]e
 		return nil, err
 	}
 	if requireComplete && len(data) != 0 && data[len(data)-1] != '\n' {
-		return nil, errors.New("transcript: incomplete runtime tail")
+		return nil, errIncompleteTail
 	}
 
 	lines := bytes.Split(data, []byte{'\n'})

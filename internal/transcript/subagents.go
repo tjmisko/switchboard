@@ -328,6 +328,8 @@ func SubagentsForTranscript(transcriptPath string) ([]Subagent, error) {
 				continue
 			}
 			s := upsert(id)
+			// An unreadable child reads as not done this poll; the error keeps it
+			// out of the cache so the next poll reads again.
 			activity, _ := cached(filepath.Join(dir, name), "subagent-activity", readSubagentActivity)
 			s.Done, s.ModTime, s.LatestEntryAt = activity.done, activity.mod, activity.latest
 		}
@@ -363,9 +365,16 @@ type subagentActivity struct {
 	mod, latest time.Time
 }
 
+// readSubagentActivity returns stat and read failures so the cache never keeps
+// them: a finished child's transcript does not change again, so a transient
+// open failure cached against its identity would report it live indefinitely.
+// An incomplete tail is not a failure; the write completing it moves the size.
 func readSubagentActivity(path string) (subagentActivity, error) {
-	done, mod, latest := subagentJSONLActivity(path)
-	return subagentActivity{done: done, mod: mod, latest: latest}, nil
+	done, mod, latest, err := subagentJSONLActivity(path)
+	if errors.Is(err, errIncompleteTail) {
+		err = nil
+	}
+	return subagentActivity{done: done, mod: mod, latest: latest}, err
 }
 
 // subagentJSONLState reads the subagent's own transcript at path and reports
@@ -374,11 +383,13 @@ func readSubagentActivity(path string) (subagentActivity, error) {
 // bookkeeping rows do not reopen a completed child. A bounded tail is read;
 // missing files and unreadable evidence yield Done=false.
 func subagentJSONLState(path string) (done bool, mod time.Time) {
-	done, mod, _ = subagentJSONLActivity(path)
+	done, mod, _, _ = subagentJSONLActivity(path)
 	return
 }
 
-func subagentJSONLActivity(path string) (done bool, mod, latest time.Time) {
+// subagentJSONLActivity is subagentJSONLState plus the newest conversational
+// entry's time and the error that left the answer not done, if any.
+func subagentJSONLActivity(path string) (done bool, mod, latest time.Time, err error) {
 	fi, err := os.Stat(path)
 	if err != nil {
 		return
