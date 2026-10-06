@@ -1,5 +1,5 @@
 // Package discovery scans the OS process source (osproc.Source — /proc on Linux,
-// libproc on macOS) for coding-agent sessions (Claude Code and Codex; see
+// libproc on macOS) for coding-agent sessions (Claude Code, Codex and Pi; see
 // Classify). We poll once a second rather than subscribing to a kernel process-
 // event stream because a process-table scan is cheap (~200-500 entries,
 // kernel-side memory) and needs no extra capability. Latency is bounded by the
@@ -96,10 +96,11 @@ const (
 	AgentNone   Agent = ""
 	AgentClaude Agent = "claude"
 	AgentCodex  Agent = "codex"
+	AgentPi     Agent = "pi"
 )
 
 // Classify reports which interactive coding-agent session a process snapshot is,
-// or AgentNone when it is neither Claude Code nor Codex. It is the single
+// or AgentNone when it is none of Claude Code, Codex or Pi. It is the single
 // predicate the scanner filters on, so adding an agent is a matter of extending
 // this switch. The returned value's string matches state.AgentKind*.
 func Classify(p osproc.Info) Agent {
@@ -108,9 +109,50 @@ func Classify(p osproc.Info) Agent {
 		return AgentClaude
 	case IsCodex(p):
 		return AgentCodex
+	case IsPi(p):
+		return AgentPi
 	default:
 		return AgentNone
 	}
+}
+
+// IsPi reports whether a process snapshot is an interactive Pi session
+// (pi-coding-agent). Pi is a node script that renames its process: comm reads
+// "pi", exe is the node binary, and argv is overwritten with "pi" plus padding,
+// so neither exe nor argv can tell the TUI from the json-mode Pi children an
+// agent starts through Pi's bash tool. What does is the terminal: a TUI Pi has
+// its pty on fd 0, while a json child runs in its own session with /dev/null on
+// fd 0 (verified in the Phase 1 spike, phase-1-pi-provider.md). Pi's rpc mode
+// runs as comm "pi-rpc" and is rejected by the comm gate.
+func IsPi(p osproc.Info) bool {
+	if p.Comm != "pi" {
+		return false
+	}
+	if !p.StdinTTY {
+		return false
+	}
+	return nodeExeValid(p.Exe)
+}
+
+// nodeExeValid reports whether exe is a plausible node binary: basename "node",
+// or "node" plus a version ("node22", "node-22", Fedora's /usr/bin/node-22). A
+// masked (empty) exe is accepted, as for Claude. Linux appends " (deleted)" to
+// the exe link when the binary was replaced under a running process — a node
+// upgrade while Pi runs — so that suffix is ignored.
+func nodeExeValid(exe string) bool {
+	if exe == "" {
+		return true // kernel masked the exe; comm and the tty gate already matched
+	}
+	base := filepath.Base(strings.TrimSuffix(exe, " (deleted)"))
+	version, ok := strings.CutPrefix(base, "node")
+	if !ok {
+		return false
+	}
+	if version == "" {
+		return true
+	}
+	version = strings.TrimPrefix(version, "-")
+	return version != "" && strings.Trim(version, "0123456789.") == ""
 }
 
 // IsHeadless reports whether a discovered claude process is a non-interactive
