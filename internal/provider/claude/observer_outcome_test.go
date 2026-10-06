@@ -2,10 +2,13 @@ package claude
 
 import (
 	"context"
+	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/agentgraph"
+	"github.com/tjmisko/switchboard/internal/tailcache"
 )
 
 // #98: a failed scan is unavailable, carrying the prior graph to its original
@@ -57,5 +60,48 @@ func TestObserveShouldReportUnavailableWhenTheFirstScanFailsWithNothingToHold(t 
 	}
 	if got := agentgraph.OutcomeOf(observation, err); got != agentgraph.OutcomeUnavailable || observation.RootID != "" {
 		t.Fatalf("first failed scan = %q root=%q, want unavailable with nothing carried", got, observation.RootID)
+	}
+}
+
+// #98 operation counts: an unchanged poll stats each file once and reads none;
+// a hook makes the next poll re-read the root's files; an append re-reads only
+// the file that moved.
+func TestObserveShouldStatEachFileOnceAndReadNoneWhenThePollIsUnchanged(t *testing.T) {
+	t.Cleanup(tailcache.SetDefault(tailcache.New(tailcache.OS{}, 0)))
+	o, root, now := newTestObserver(t)
+	defer o.Close()
+	o.ApplyHook(HookSignal{Root: root, Event: "SessionStart", At: now})
+	o.ApplyHook(HookSignal{Root: root, Event: "UserPromptSubmit", At: now.Add(time.Second)})
+	appendClaudeLine(t, root.Transcript, fmt.Sprintf(`{"type":"user","timestamp":%q,"message":{"role":"user","content":"go"}}`, now.Add(time.Second).Format(time.RFC3339Nano)))
+	writeClaudeChild(t, claudeSubagentDir(root), "first", "general-purpose", "work", "", now)
+	writeClaudeChild(t, claudeSubagentDir(root), "second", "general-purpose", "work", "", now)
+	cache := tailcache.Default()
+
+	observe := func(at time.Time) tailcache.Stats {
+		t.Helper()
+		before := cache.Stats()
+		if _, err := o.Observe(context.Background(), root, at); err != nil {
+			t.Fatal(err)
+		}
+		after := cache.Stats()
+		return tailcache.Stats{Stats: after.Stats - before.Stats, Reads: after.Reads - before.Reads, Hits: after.Hits - before.Hits}
+	}
+	// The main transcript's runtime signal, and each child's meta and transcript.
+	const files = 5
+	if work := observe(now.Add(2 * time.Second)); work.Reads != files {
+		t.Fatalf("first poll = %+v, want every file read once", work)
+	}
+	if work := observe(now.Add(3 * time.Second)); work.Stats != files || work.Reads != 0 {
+		t.Fatalf("unchanged poll = %+v, want %d stats and no read", work, files)
+	}
+
+	o.ApplyHook(HookSignal{Root: root, Event: "PreToolUse", At: now.Add(4 * time.Second)})
+	if work := observe(now.Add(5 * time.Second)); work.Reads != files {
+		t.Fatalf("poll after a hook = %+v, want the root's files re-read", work)
+	}
+
+	appendClaudeLine(t, filepath.Join(claudeSubagentDir(root), "agent-first.jsonl"), `{"type":"assistant","message":{"role":"assistant","stop_reason":null}}`)
+	if work := observe(now.Add(6 * time.Second)); work.Stats != files || work.Reads != 1 {
+		t.Fatalf("poll after one child appended = %+v, want only that child re-read", work)
 	}
 }
