@@ -105,3 +105,28 @@ func TestObserveShouldStatEachFileOnceAndReadNoneWhenThePollIsUnchanged(t *testi
 		t.Fatalf("poll after one child appended = %+v, want only that child re-read", work)
 	}
 }
+
+// #98 criterion 4: transcript-inferred idle waits out its quiet window, so a
+// stop summary between hooks does not split an active interval, while the
+// explicit Stop hook publishes idle on the very next tick.
+func TestObserveShouldDelayOnlyInferredIdleWhenAStopIsExplicit(t *testing.T) {
+	o, root, now := newTestObserver(t)
+	defer o.Close()
+	o.ApplyHook(HookSignal{Root: root, Event: "UserPromptSubmit", At: now})
+	appendClaudeLine(t, root.Transcript, fmt.Sprintf(`{"type":"system","subtype":"stop_hook_summary","preventedContinuation":false,"timestamp":%q}`, now.Add(time.Second).Format(time.RFC3339Nano)))
+	inferred := now.Add(2 * time.Second)
+	obs, err := o.Observe(context.Background(), root, inferred)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSummary(t, obs, inferred, agentgraph.LegacyWorking, agentgraph.AttentionNone)
+
+	stopAt := now.Add(3 * time.Second)
+	o.ApplyHook(HookSignal{Root: root, Event: "Stop", At: stopAt})
+	next := stopAt.Add(time.Millisecond)
+	obs, err = o.Observe(context.Background(), root, next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSummary(t, obs, next, agentgraph.LegacyIdle, agentgraph.AttentionNone)
+}
