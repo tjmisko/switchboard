@@ -500,6 +500,7 @@ func runDiagnose(w io.Writer, lines []string, sym symptom, sessionFilter string,
 	}
 
 	fmt.Fprintf(w, "switchboard diagnose — %s\n", sym.headline)
+	fmt.Fprintln(w, "(history of decisions; for the decision in force now: switchboard-ctl explain --pid <pid>)")
 	if len(recs) == 0 {
 		fmt.Fprintln(w, "\nno status-decision lines matched. widen --window/--since, drop --session/--pid, or check the unit with --unit.")
 		return
