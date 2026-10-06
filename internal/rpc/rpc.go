@@ -29,6 +29,7 @@ import (
 	"github.com/tjmisko/switchboard/internal/osproc"
 	"github.com/tjmisko/switchboard/internal/proc"
 	"github.com/tjmisko/switchboard/internal/state"
+	"github.com/tjmisko/switchboard/internal/statusexplain"
 	"github.com/tjmisko/switchboard/internal/statustune"
 	"github.com/tjmisko/switchboard/internal/terminal"
 	"github.com/tjmisko/switchboard/internal/transcript"
@@ -213,8 +214,11 @@ const (
 type Response struct {
 	Snapshot    *state.Snapshot   `json:"snapshot,omitempty"`
 	Diagnostics []AgentDiagnostic `json:"diagnostics,omitempty"`
-	OK          bool              `json:"ok,omitempty"`
-	Error       string            `json:"error,omitempty"`
+	// Explanation answers cmd "explain": the content-free decision record of
+	// one local root's published status.
+	Explanation *statusexplain.Decision `json:"explanation,omitempty"`
+	OK          bool                    `json:"ok,omitempty"`
+	Error       string                  `json:"error,omitempty"`
 }
 
 // rawSnapshotResponse splices an already-encoded snapshot into the response
@@ -261,6 +265,11 @@ type AgentHookHandler func(Request, state.Session)
 // AgentDiagnosticSource supplies the content-free provider health snapshot.
 type AgentDiagnosticSource func() []AgentDiagnostic
 
+// StatusExplainer explains the published status of the local root with pid
+// (#95). hostname is the request's, "" for this machine; an explainer refuses
+// any other host rather than answer for it from local state.
+type StatusExplainer func(hostname string, pid int) (statusexplain.Decision, error)
+
 // SnapshotView is the read-only aggregate exposed to local UI clients. The
 // host-local Store remains separate and continues to back list/subscribe and
 // the remote-stream source, preventing federation loops.
@@ -285,6 +294,7 @@ type Server struct {
 	fanout      *fanout.Observer
 	agentHook   AgentHookHandler
 	diagnostics AgentDiagnosticSource
+	explain     StatusExplainer
 	view        SnapshotView
 	exactFocus  ExactFocusHandler
 	paneBind    PaneBindHandler
@@ -345,6 +355,9 @@ func (s *Server) SetAgentHookHandler(handler AgentHookHandler) { s.agentHook = h
 
 // SetAgentDiagnosticSource installs the additive, content-free diagnostics RPC.
 func (s *Server) SetAgentDiagnosticSource(source AgentDiagnosticSource) { s.diagnostics = source }
+
+// SetStatusExplainer wires cmd "explain". Install once before Serve.
+func (s *Server) SetStatusExplainer(explain StatusExplainer) { s.explain = explain }
 
 // SetFederation installs the detached aggregate view and its exact action
 // resolver. Local-only list/subscribe remain unchanged.
@@ -520,6 +533,13 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 				diagnostics = s.diagnostics()
 			}
 			_ = enc.Encode(Response{OK: true, Diagnostics: diagnostics})
+		case "explain":
+			explanation, err := s.explainStatus(req)
+			if err != nil {
+				_ = enc.Encode(Response{Error: err.Error()})
+			} else {
+				_ = enc.Encode(Response{OK: true, Explanation: &explanation})
+			}
 		case "activity":
 			err := s.handleActivity(req)
 			if err != nil {
@@ -531,6 +551,16 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 			_ = enc.Encode(Response{Error: "unknown cmd: " + req.Cmd})
 		}
 	}
+}
+
+func (s *Server) explainStatus(req Request) (statusexplain.Decision, error) {
+	if s.explain == nil {
+		return statusexplain.Decision{}, errors.New("status explanation is not configured")
+	}
+	if req.PID <= 0 {
+		return statusexplain.Decision{}, errors.New("explain requires a pid")
+	}
+	return s.explain(req.Hostname, req.PID)
 }
 
 func (s *Server) aggregateSnapshot() state.Snapshot {
