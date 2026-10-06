@@ -9,6 +9,9 @@ const (
 	ProviderUnknown ProviderKind = ""
 	ProviderClaude  ProviderKind = "claude"
 	ProviderCodex   ProviderKind = "codex"
+	// ProviderPi is Pi, observed through its extension's hooks and herdr; it
+	// has no adapter of its own (cmd/switchboard/pi_hooks.go reduces its hooks).
+	ProviderPi ProviderKind = "pi"
 )
 
 // RuntimeState describes what a thread is doing now. RuntimeUnknown is an

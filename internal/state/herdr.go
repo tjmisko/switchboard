@@ -111,8 +111,9 @@ type HerdrReading struct {
 // A Claude or Codex session publishes herdr's status over its provider graph
 // (see projectStatus); one with no graph yet has nothing to replace and is left
 // unchanged. Any other agent has no provider adapter at all, so herdr is its
-// only source: the reading becomes its whole agent graph, which a Pi session
-// a hook has bound roots at Pi's session id and projects into its Pi block.
+// only source until a Pi hook binds the session: the reading becomes its whole
+// agent graph, rooted at Pi's session id once bound. A bound Pi session takes
+// its status from piStatusAuthority, which prefers fresh hook evidence.
 //
 // A reading that is not live, for a block that was not live either, carries no
 // news: it is what the daemon sees at startup before the watcher reconnects.
@@ -139,11 +140,15 @@ func (s *Session) SetHerdr(r HerdrReading, now time.Time) (before, after string)
 	h.ActivePaneID = r.ActivePaneID
 	if !IsProviderAgent(s.Agent) {
 		before = s.publishedStatus(now)
-		s.AgentGraph = herdrAgentGraph(s.Agent, r, s.AgentGraph, s.boundRootID(), now)
-		// A Pi session a hook has bound publishes through its own block, so
-		// the herdr graph projects into it; until then it has none.
-		if info := s.graphEnrichment(); info != nil {
-			s.projectStatus(info, r.Since)
+		// Fresh Pi hook evidence owns the graph; herdr's reading waits in the
+		// block until that evidence lapses (see piStatusAuthority).
+		if !s.piHookGraphFresh(now) {
+			s.AgentGraph = herdrAgentGraph(s.Agent, r, s.AgentGraph, s.boundRootID(), now)
+		}
+		// A Pi session a hook has bound publishes through its own block; until
+		// then it has none and publishes its herdr graph.
+		if s.Agent == AgentKindPi && s.Pi != nil {
+			s.projectPiStatus(s.Pi, r.Since, now)
 		}
 		return before, s.publishedStatus(now)
 	}
@@ -258,6 +263,7 @@ func (s *Session) boundRootID() string {
 
 // graphEnrichment returns the enrichment block the provider graph projects
 // into, or nil when the session has no graph (and so no status to replace).
+// A Pi block is not one: it projects through projectPiStatus.
 func (s *Session) graphEnrichment() *AgentInfo {
 	if s.AgentGraph == nil {
 		return nil
@@ -267,8 +273,6 @@ func (s *Session) graphEnrichment() *AgentInfo {
 		return s.Claude
 	case AgentKindCodex:
 		return s.Codex
-	case AgentKindPi:
-		return s.Pi
 	}
 	return nil
 }

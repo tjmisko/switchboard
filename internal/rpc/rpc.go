@@ -1178,12 +1178,10 @@ func (s *Server) dispatchAgentHook(req Request) {
 }
 
 // forwardAgentHook applies the hook's usage-limit evidence to the attributed
-// session, then hands the hook to its provider. Pi has no provider adapter.
+// session, then hands the hook to its provider, or for Pi to the Pi hook
+// reducer.
 func (s *Server) forwardAgentHook(req Request, pid int, sess state.Session) {
 	s.applyUsageLimitHook(req, pid)
-	if req.Agent == state.AgentKindPi {
-		return
-	}
 	s.agentHook(req, sess)
 }
 

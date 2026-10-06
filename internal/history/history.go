@@ -93,8 +93,12 @@ type Event struct {
 	Type          string    `json:"type"`                 // one of the Event* constants
 	SessionID     string    `json:"session_id,omitempty"` // agent session UUID, when known
 	PID           int       `json:"pid,omitempty"`        // OS pid (always set in practice)
-	Agent         string    `json:"agent,omitempty"`      // claude | codex
+	Agent         string    `json:"agent,omitempty"`      // claude | codex | pi
 	Project       string    `json:"project,omitempty"`    // project abbreviation (resolved from cwd)
+	// PrevSessionID pairs a session_start with the session the same process
+	// rotated away from (Pi's /new, /resume, /fork, /clone). An id, so it is
+	// kept at every detail tier.
+	PrevSessionID string `json:"prev_session_id,omitempty"`
 
 	// Transition payload.
 	From      string `json:"from,omitempty"`        // status before the edge

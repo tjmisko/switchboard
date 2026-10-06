@@ -589,7 +589,9 @@ func cmdHook(c *rpc.Client, event, agent string) {
 	observedAt := time.Now().UTC()
 	req := parseHookPayloadAt(body, event, agent, observedAt)
 	req.PID = os.Getppid()
-	req.ObservedAt = observedAt
+	if req.ObservedAt.IsZero() {
+		req.ObservedAt = observedAt
+	}
 	if agent == state.AgentKindCodex {
 		req.HookClientHints = hookClientHints()
 	}
@@ -666,6 +668,7 @@ func parseHookPayloadAt(body []byte, event, agent string, observedAt time.Time) 
 	}
 	if agent == state.AgentKindPi {
 		carryPiLifecycle(&req, body, event)
+		req.ObservedAt = piEventInstant(body, observedAt)
 	}
 	return req
 }
@@ -728,6 +731,40 @@ func carryPiLifecycle(req *rpc.Request, body []byte, event string) {
 		}
 		req.Usage = &usage
 	}
+}
+
+// The Pi extension stamps every hook with event_at, the instant the Pi event
+// fired, because its spawn-and-forget sender lets two hooks reach the daemon in
+// either order. The stamp and this process read the same host clock, so a
+// sane stamp is at most a few milliseconds behind: the sender kills a ctl that
+// has not finished within 2 s. Anything outside these bounds is a broken
+// clock or a forged payload, and the ctl's own clock stands in for it.
+const (
+	// piEventAtMaxFuture tolerates rounding between Date.now() and Go's clock;
+	// a stamp up to this far ahead is clamped to now rather than trusted.
+	piEventAtMaxFuture = 2 * time.Second
+	// piEventAtMaxAge is five times the sender's kill timer.
+	piEventAtMaxAge = 10 * time.Second
+)
+
+// piEventInstant returns the Pi event's own instant from the payload's
+// event_at (Unix milliseconds) when it is sane, else now. It decodes apart
+// from the other Pi fields so a malformed stamp costs only itself.
+func piEventInstant(body []byte, now time.Time) time.Time {
+	var payload struct {
+		EventAt *int64 `json:"event_at"`
+	}
+	if json.Unmarshal(body, &payload) != nil || payload.EventAt == nil {
+		return now
+	}
+	at := time.UnixMilli(*payload.EventAt).UTC()
+	if at.After(now.Add(piEventAtMaxFuture)) || at.Before(now.Add(-piEventAtMaxAge)) {
+		return now
+	}
+	if at.After(now) {
+		return now
+	}
+	return at
 }
 
 // boundedHookPath admits only a clean absolute path of bounded length.

@@ -185,6 +185,35 @@ const (
 	// RuleHerdrReleased — the daemon stopped following the pane's herdr server,
 	// so the status went back to the provider graph's own.
 	RuleHerdrReleased = "herdr_released"
+
+	// The Pi hook reducer's vocabulary (cmd/switchboard/pi_hooks.go). Every Pi
+	// edge is an exact lifecycle fact the extension reports, so none has a knob.
+	//
+	// RulePiSessionStarted — a SessionStart bound the root: working when Pi
+	// reported a run in flight, else idle.
+	RulePiSessionStarted = "pi_session_started"
+	// RulePiReloaded — a SessionStart for the same session (an extension
+	// reload) re-read Pi's busy flag; not a rotation.
+	RulePiReloaded = "pi_reloaded"
+	// RulePiSessionRotated — a hook named a session other than the bound one
+	// (/new, /resume, /fork, /clone): the root rebound and a new lane opened.
+	RulePiSessionRotated = "pi_session_rotated"
+	// RulePiRunStarted — agent_start (UserPromptSubmit) opened a run.
+	RulePiRunStarted = "pi_run_started"
+	// RulePiToolActivity — a tool started or ended inside a run.
+	RulePiToolActivity = "pi_tool_activity"
+	// RulePiDialogOpen — the open dialog count rose above zero: red.
+	RulePiDialogOpen = "pi_dialog_open"
+	// RulePiDialogClosed — the count fell to zero: working while a run is
+	// open, else idle.
+	RulePiDialogClosed = "pi_dialog_closed"
+	// RulePiRunSettled — agent_settled (Stop) ended the run.
+	RulePiRunSettled = "pi_run_settled"
+	// RulePiRunFailed — agent_settled after an error stop (StopFailure).
+	RulePiRunFailed = "pi_run_failed"
+	// RulePiHookLapsed — the last hook's lease ran out with no newer hook, so
+	// the status fell back to herdr's reading, or to unknown without one.
+	RulePiHookLapsed = "pi_hook_lapsed"
 )
 
 // KnobHint names the Tuning field that governs a rule's outcome, with a one-line
@@ -248,6 +277,16 @@ var ruleKnobs = map[string]KnobHint{
 	RuleGraphMainUnreadableTTL:  {"PermissionDecayTTL", "how long a red waits when the MAIN transcript cannot be read at all before the backstop releases it (default 30s). It stays main-only on purpose: a missing agent-<id>.jsonl is the normal state of a just-spawned teammate, so extending this to a child would release reds nobody answered"},
 	RuleHerdrAuthority:          {"", "herdr's own reading of the pane, projected onto Switchboard's statuses (blocked→permission, done→idle, idle kept delegating while the provider graph shows working subagents). Nothing in Tuning governs it: a wrong color here is herdr's detection, which `herdr agent explain <pane>` explains and a local manifest under ~/.config/herdr/agent-detection/ overrides"},
 	RuleHerdrReleased:           {"", "the herdr server stopped answering (or the pane left herdr) for longer than the watcher's grace period, so the provider graph's status took over again. Nothing to tune; it reverses on the next herdr status the daemon reads"},
+	RulePiSessionStarted:        {"", "a Pi SessionStart is an exact lifecycle fact; nothing to tune. It reads working only when Pi itself said a run was in flight (a reload mid-run)"},
+	RulePiReloaded:              {"", "an extension reload re-sent SessionStart for the same session; it is not a rotation and nothing is tunable"},
+	RulePiSessionRotated:        {"", "Pi moved to another session (/new, /resume, /fork, /clone); the root follows Pi's own session id. Nothing to tune"},
+	RulePiRunStarted:            {"", "Pi's agent_start is an exact lifecycle fact; nothing to tune"},
+	RulePiToolActivity:          {"", "a Pi tool started or ended, which proves the run is working; nothing to tune"},
+	RulePiDialogOpen:            {"", "not tunable, and deliberately unconditional: the extension counted an open dialog (Pi's ui_prompt span or herdr's blocked counter), so the agent waits on you. Pi's built-in pickers fire no dialog event and never go red"},
+	RulePiDialogClosed:          {"", "the extension's dialog count fell to zero; the chip returns to working inside a run, else idle. A count rather than an edge, so a lost hook self-corrects on the next one. Nothing to tune"},
+	RulePiRunSettled:            {"", "Pi's agent_settled is the real end of a run (agent_end can still be followed by a retry); nothing to tune"},
+	RulePiRunFailed:             {"", "the run settled after an error stop. The status is idle; a usage-limit verdict on it publishes limited separately. Nothing to tune"},
+	RulePiHookLapsed:            {"", "the Pi hook lease (the hook-only windows Codex uses: 10m working, 24h red, 7d idle) ran out without a newer hook, so herdr's reading decides, or nothing does. Nothing in Tuning governs it"},
 	RuleGraphStaleBackstop:      {"PendingWriterStaleCap", "how long one writer's transcript may sit quiescent before its prompt is dropped as unanswerable (default 30m). Applies ONLY to a writer whose tail carries no unanswered tool — one that still does is demonstrably blocked and is held red regardless. Raise it to let an abandoned teammate's red nag longer"},
 }
 

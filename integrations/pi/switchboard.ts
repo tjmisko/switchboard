@@ -13,7 +13,7 @@
 // and Codex hooks do.
 //
 // Events, in Claude Code's hook vocabulary so the daemon has one table. Every
-// payload also carries session_id, transcript_path and cwd.
+// payload also carries session_id, transcript_path, cwd and event_at.
 //   session_start                       → SessionStart {source, previous_session_file, session_name, busy}
 //   session_shutdown                    → SessionEnd {source}
 //   agent_start                         → UserPromptSubmit
@@ -27,6 +27,10 @@
 // herdr's blocked counter), not an edge, so a lost or reordered hook
 // self-corrects on the next one. Pi's built-in pickers (/model, /resume,
 // project trust) fire no ui_prompt event and are not counted.
+//
+// event_at is the instant (Unix ms) the Pi event fired. Hooks are sent
+// spawn-and-forget, so two can reach the daemon in either order; the daemon
+// orders them by event_at and drops one older than evidence it already holds.
 //
 // Nothing user-authored is sent except the /name session name: no prompt, no
 // dialog title or herdr label, no tool input or output. The one exception is
@@ -52,7 +56,7 @@ function send(event: string, payload: Record<string, unknown>): void {
     timer.unref?.();
     child.on("exit", () => clearTimeout(timer));
     child.stdin.on("error", () => {});
-    child.stdin.end(JSON.stringify(payload));
+    child.stdin.end(JSON.stringify({ ...payload, event_at: Date.now() }));
   } catch {
     // A missing or broken switchboard-ctl must never disturb the agent.
   }

@@ -91,12 +91,7 @@ func TestHookShouldKeepTheLimitWhenTheEventIsNotActivity(t *testing.T) {
 }
 
 func TestPiHookShouldLimitAHerdrOnlySession(t *testing.T) {
-	server, store, forwarded := usageLimitServer(t, state.AgentKindPi)
-	defer func() {
-		if len(*forwarded) != 0 {
-			t.Fatalf("pi hooks reached the provider handler: %+v", *forwarded)
-		}
-	}()
+	server, store, _ := usageLimitServer(t, state.AgentKindPi)
 	at := time.Now().UTC()
 	server.handleHook(Request{PID: 42, Agent: state.AgentKindPi, Event: "StopFailure", ObservedAt: at, UsageLimit: true})
 	status, limit := publishedStatus(store)
@@ -106,6 +101,23 @@ func TestPiHookShouldLimitAHerdrOnlySession(t *testing.T) {
 	server.handleHook(Request{PID: 42, Agent: state.AgentKindPi, Event: "UserPromptSubmit", ObservedAt: at.Add(time.Second)})
 	if status, _ := publishedStatus(store); status == state.StatusLimited {
 		t.Fatal("pi activity did not clear the limit")
+	}
+}
+
+func TestPiHookShouldReachThePiReducerAfterItsUsageLimitIsApplied(t *testing.T) {
+	store := state.New("")
+	store.Apply(func(sessions map[int]*state.Session) {
+		sessions[42] = &state.Session{PID: 42, StartedAt: time.Now().Add(-time.Hour), Agent: state.AgentKindPi}
+	})
+	server := New(store, "", terminal.NewNone(), wm.NewNone())
+	var limitedWhenForwarded []bool
+	server.SetAgentHookHandler(func(req Request, _ state.Session) {
+		limitedWhenForwarded = append(limitedWhenForwarded, store.Snapshot().Sessions[0].UsageLimit != nil)
+	})
+	at := time.Now().UTC()
+	server.handleHook(Request{PID: 42, Agent: state.AgentKindPi, Event: "StopFailure", ObservedAt: at, UsageLimit: true})
+	if len(limitedWhenForwarded) != 1 || !limitedWhenForwarded[0] {
+		t.Fatalf("forwarded %v, want the StopFailure forwarded once, after its limit was recorded", limitedWhenForwarded)
 	}
 }
 
