@@ -336,12 +336,12 @@ func openAttention(candidates []Candidate, admitted []bool, held bool, prior sta
 }
 
 // newestDescendants returns the newest fresh candidate that may report the
-// root's descendants (a provider snapshot, a partial hook edge or an exact
-// event), or -1.
+// root's descendants (a provider snapshot, a partial hook edge, an exact event
+// or the Codex rollout tail's correction), or -1.
 func newestDescendants(candidates []Candidate, admitted []bool) int {
 	newest := -1
 	for i, c := range candidates {
-		if !admitted[i] || c.Superseded || !reportsDescendants(c.Kind) {
+		if !admitted[i] || c.Superseded || !reportsDescendants(c) {
 			continue
 		}
 		if newest < 0 || c.ObservedAt.After(candidates[newest].ObservedAt) ||
@@ -352,9 +352,15 @@ func newestDescendants(candidates []Candidate, admitted []bool) int {
 	return newest
 }
 
-func reportsDescendants(kind statusexplain.EvidenceKind) bool {
-	return kind == statusexplain.EvidenceProviderSnapshot || kind == statusexplain.EvidenceHookEdge ||
-		kind == statusexplain.EvidenceHook
+func reportsDescendants(c Candidate) bool {
+	switch c.Kind {
+	case statusexplain.EvidenceProviderSnapshot, statusexplain.EvidenceHookEdge, statusexplain.EvidenceHook:
+		return true
+	case statusexplain.EvidenceTranscript:
+		return c.Source == agentgraph.SourceCodexRollout
+	default:
+		return false
+	}
 }
 
 func authority(c Candidate) statusexplain.Reason {

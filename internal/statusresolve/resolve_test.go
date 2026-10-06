@@ -411,6 +411,11 @@ func TestResolveShouldStayDelegatingWhenAnIdleRootHasWorkingDescendants(t *testi
 	now := t0.Add(time.Second)
 	running := agentgraph.Node{Lifecycle: agentgraph.LifecycleRunning}
 	edge := CodexChildHooks(lifetime, observation(agentgraph.ProviderCodex, agentgraph.SourceHook, t0, time.Minute, agentgraph.RuntimeUnknown, none, workingChild))
+	// The rollout tail's idle correction keeps the children of the graph it
+	// corrected; the hook it superseded no longer reports them.
+	superseded := CodexHook(lifetime, observation(agentgraph.ProviderCodex, agentgraph.SourceHook, t0.Add(-time.Minute), time.Hour, idle, none, workingChild))
+	superseded.Superseded = true
+	correction := CodexRolloutTail(lifetime, observation(agentgraph.ProviderCodex, agentgraph.SourceCodexRollout, t0, time.Minute, idle, none, workingChild))
 	for _, tc := range []struct {
 		name       string
 		target     Target
@@ -422,6 +427,7 @@ func TestResolveShouldStayDelegatingWhenAnIdleRootHasWorkingDescendants(t *testi
 		{"codex running child under herdr done", codex, []Candidate{codexSnap(t0, time.Minute, idle, none, running), herdr("codex", "done", now, now)},
 			agentgraph.SourceCodexAppServer},
 		{"codex child hook edge under a root hook idle", codex, []Candidate{edge, codexHook(t0, time.Hour, idle, none)}, agentgraph.SourceHook},
+		{"codex rollout idle correction over a superseded hook", codex, []Candidate{superseded, correction}, agentgraph.SourceCodexRollout},
 	} {
 		d := Resolve(tc.target, tc.candidates, statusexplain.Decision{}, now)
 		want(t, tc.name, d, agentgraph.LegacyDelegating, statusexplain.ReasonDescendantsLive)
@@ -447,6 +453,13 @@ func TestResolveShouldEndDelegationWhenBackgroundWorkEndsOrItsEvidenceExpires(t 
 	done := codexSnap(at, time.Minute, idle, none, agentgraph.Node{Lifecycle: agentgraph.LifecycleCompleted})
 	ended := Resolve(codex, []Candidate{edge, done, herdr("codex", "idle", t0, at)}, statusexplain.Decision{}, at)
 	want(t, "newer snapshot shows the child done", ended, agentgraph.LegacyIdle, statusexplain.ReasonTerminalAuthority)
+
+	// A hook a newer sample superseded does not bring its child back once
+	// that sample lapses.
+	superseded := CodexHook(lifetime, observation(agentgraph.ProviderCodex, agentgraph.SourceHook, t0, time.Hour, idle, none, workingChild))
+	superseded.Superseded = true
+	lapsed := Resolve(codex, []Candidate{superseded, codexSnap(at, time.Second, idle, none), herdr("codex", "idle", t0, at)}, statusexplain.Decision{}, at.Add(time.Minute))
+	want(t, "superseded hook after the newer sample lapsed", lapsed, agentgraph.LegacyIdle, statusexplain.ReasonTerminalAuthority)
 }
 
 func TestResolveShouldKeepTheRootsOwnStatusWhenItIsNotIdle(t *testing.T) {

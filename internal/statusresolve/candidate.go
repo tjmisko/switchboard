@@ -26,8 +26,9 @@ type Candidate struct {
 	// a provider snapshot carries it; other kinds report none.
 	Attention agentgraph.AttentionState
 	// WorkingDescendants counts positively live descendants doing work. A
-	// provider snapshot, a partial hook edge, or an exact event landed on a
-	// composed graph reports them; other kinds report none.
+	// provider snapshot, a partial hook edge, an exact event landed on a
+	// composed graph, or the Codex rollout tail's correction of the published
+	// graph reports them; other kinds report none.
 	WorkingDescendants int
 	// CompleteLifecycle marks an exact lifecycle event whose writer reports
 	// both edges of every state it asserts (a run's start and end, a dialog's
@@ -160,11 +161,14 @@ func CodexChildHooks(startedAt time.Time, o agentgraph.Observation) Candidate {
 // CodexRolloutTail is the root's state read from its rollout file, the one an
 // accepted hook named: correlated transcript evidence, ordered by event time.
 // The transcript-poll idle correction is this kind; it no longer borrows the
-// graph's source.
+// graph's source. The correction is the published graph with its root set
+// idle, children kept, so it reports the working descendants of the graph it
+// was read against: an idle root with live children stays delegating.
 func CodexRolloutTail(startedAt time.Time, o agentgraph.Observation) Candidate {
 	c := transcript(startedAt, o)
 	c.Source = agentgraph.SourceCodexRollout
 	c.EventTimeOrder = true
+	c.WorkingDescendants = workingDescendants(o)
 	return c
 }
 
@@ -281,7 +285,8 @@ func event(startedAt time.Time, o agentgraph.Observation, complete, eventTime bo
 }
 
 // transcript keeps only the root's runtime: a transcript tail establishes
-// working or idle, never attention or delegation.
+// working or idle, never attention. CodexRolloutTail adds the descendants of
+// the graph it corrected.
 func transcript(startedAt time.Time, o agentgraph.Observation) Candidate {
 	c := base(statusexplain.EvidenceTranscript, startedAt, o)
 	switch reduce(o).Runtime {

@@ -202,6 +202,34 @@ func TestLandAgentGraphShouldNotLetASupersededHookDecideWhenTheNewerSampleLapses
 	}
 }
 
+func TestLandAgentGraphShouldStayDelegatingWhenTheRolloutIdleCorrectionLandsOverAGraphWithWorkingChildren(t *testing.T) {
+	s := codexSession()
+	s.LandAgentGraph(codexStatusGraph(t, agentgraph.SourceHook, StatusDelegating, herdrT0, time.Hour), GraphLanding{Kind: GraphHookEvent}, herdrT0)
+	// The transcript poll corrects the published graph's root to idle and
+	// keeps its children, as codex_transcript_poll builds it.
+	at := herdrT0.Add(95 * time.Second)
+	s.LandAgentGraph(codexStatusGraph(t, agentgraph.SourceCodexRollout, StatusDelegating, at, 30*time.Second), GraphLanding{Kind: GraphTranscriptTail}, at)
+	if s.Codex.Status != StatusDelegating {
+		t.Fatalf("idle root with a working child published %q, want delegating", s.Codex.Status)
+	}
+	if s.AgentGraph.Summary.Status != s.Codex.Status {
+		t.Fatalf("graph summary %q disagrees with published %q", s.AgentGraph.Summary.Status, s.Codex.Status)
+	}
+}
+
+func TestLandAgentGraphShouldPublishIdleWhenTheRolloutIdleCorrectionCarriesNoWorkingChildren(t *testing.T) {
+	s := codexSession()
+	s.LandAgentGraph(codexStatusGraph(t, agentgraph.SourceHook, StatusDelegating, herdrT0, time.Hour), GraphLanding{Kind: GraphHookEvent}, herdrT0)
+	// A newer correction whose graph no longer holds a working child is the
+	// newest report of the root's descendants: the older hook's child does not
+	// come back.
+	at := herdrT0.Add(95 * time.Second)
+	s.LandAgentGraph(codexStatusGraph(t, agentgraph.SourceCodexRollout, StatusIdle, at, 30*time.Second), GraphLanding{Kind: GraphTranscriptTail}, at)
+	if s.Codex.Status != StatusIdle {
+		t.Fatalf("idle correction with no working child published %q, want idle", s.Codex.Status)
+	}
+}
+
 func TestProjectShouldDateAStatusHerdrDecidesFromHerdrsOwnStartWhenARequestResolvesUnderIt(t *testing.T) {
 	s := claudeSession()
 	s.SetHerdr(reading(HerdrWorking, true, herdrT0), herdrT0)
