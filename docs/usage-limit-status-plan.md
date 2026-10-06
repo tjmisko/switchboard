@@ -75,11 +75,13 @@ RPC, which keeps the hook privacy boundary.
 6. [x] Renderers: tooltip "usage limit · resets 5:15 PM"; `limited` maps to
    the `unknown` colour class plus a `limited` secondary class, so every
    existing stylesheet (chips, circles, polybar, claude-tui) greys it.
-7. [ ] Wire config: Claude `StopFailure` → `switchboard-ctl hook StopFailure`;
-   install the Pi extension; deploy.
-8. [ ] **Pi full hook lifecycle.** Superseded by
-   `docs/status-evidence/phase-1-pi-provider.md` (including installing the
-   Pi extension as a symlink, the open half of item 7).
+7. [~] **Moved to Phase 1.** Wire config: Claude `StopFailure` →
+   `switchboard-ctl hook StopFailure`; install the Pi extension; deploy. Now
+   tracked by `docs/status-evidence/phase-1-pi-provider.md` and its manual
+   end-to-end check.
+8. [~] **Moved to Phase 1.** Pi full hook lifecycle, built in
+   `docs/status-evidence/phase-1-pi-provider.md` (PRs 1A–1D, including
+   installing the Pi extension as a symlink, the open half of item 7).
 9. [ ] Follow-ups: Codex app-server path (`turn/completed` with
    `turn.error.codexErrorInfo == "usageLimitExceeded"`, and
    `account/rateLimits/updated`); Claude transcript fallback (`isApiErrorMessage`

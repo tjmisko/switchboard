@@ -99,7 +99,7 @@ enrichment, graph, and display-name fields are omitted when unavailable.
 | `headless` | boolean | omitted when false | Whether the discovered run has no navigable interactive TUI. |
 | `local_workspace` | integer | omitted when unresolved | Federated aggregate only, and only on remote rows: the Hyprland workspace id **on the reading machine** of the window displaying this session. A remote row's own `hyprland` block is stripped (its coordinates locate the other desktop), so this is the only workspace a local reader can act on — it is what the bottom bar reports and what places the chip in workspace order. `0` means unresolved, the same convention as `workspace_id`. |
 | `agent` | string | omitted until known | `claude` or `codex`, which select the matching enrichment block; `pi`, which selects the `pi` block once a Pi extension hook has bound the session; or the label herdr gives another agent it detects in one of its panes (`opencode`, `cursor`, …), which has no enrichment block and publishes its status through `agent_graph` (see `herdr`). |
-| `display_name` | object | omitted when absent | Switchboard-owned Codex display metadata, valid only for its exact conversation. It never changes the native Codex thread. |
+| `display_name` | object | omitted when absent | Switchboard-owned Codex display metadata, or Pi's own `/name` (origin `native`), valid only for its exact conversation. It never changes the native Codex thread. |
 | `resolved_name` | string | omitted until resolved | Provider host's current Claude session name before project prefixing. Federated readers prefer this projection because only the provider host can safely resolve PID-keyed Claude metadata. It carries Claude `/name` or `/rename`; Codex generated and native names already travel in conversation-bound `display_name`/`agent_graph` state. |
 | `mem_agent_bytes` | integer | omitted when unmeasured | Root process PSS + SwapPss. |
 | `mem_tree_bytes` | integer | omitted when unmeasured | PSS + SwapPss for the root and all descendants. |
@@ -121,9 +121,15 @@ never appear in this document.
 | Field | JSON type | Presence | Meaning |
 |-------|-----------|----------|---------|
 | `value` | string | always | Validated 2–5-word lowercase kebab-case label, at most 40 Unicode characters. |
-| `origin` | string | always | `generated` for accepted model output or `fallback` after both attempts fail. |
-| `conversation_id` | string | always | Exact Codex thread ID. A record for any other live conversation is invalid and is not rendered. |
+| `origin` | string | always | `generated` for accepted model output or `fallback` after both attempts fail; `native` for a Pi session's own `/name`. A Codex record never has origin `native` (its native name stays on the graph root), and one that does is invalid. |
+| `conversation_id` | string | always | Exact Codex thread ID, or the Pi session id. A record for any other live conversation is invalid and is not rendered. |
 | `native_baseline` | string | omitted until authoritative | Native root name visible when the display record commits, or the first authoritative name observed afterward. An authoritative later value that differs clears the display record so the native rename wins. An empty string is meaningful and distinct from an omitted, unavailable baseline. |
+
+For Pi the record is Pi's `/name`, forwarded by its extension on
+`SessionStart` and on every mid-session rename (`SessionName`), and cleared
+when Pi clears the name. It is the user-set name verbatim, with no slug
+normalization, and labels prefer it over the terminal title and cwd. There is
+no generated naming for Pi.
 
 After restart, a valid record is retained only when discovery confirms the same
 process lifetime and conversation. When there is no record, Switchboard waits
@@ -197,14 +203,27 @@ while its process runs on the session's `tty`.
 
 A bound Pi session's `pi.status` comes from one precedence rule: Pi hook
 evidence within its lease wins, else a live herdr reading mapped as above,
-else unknown. While hook evidence is fresh, its graph (`source: "hook"`)
+else Pi's own session file or a restored graph within its lease, else
+unknown. While hook evidence is fresh, its graph (`source: "hook"`)
 stays in place and herdr's reading only updates the `herdr` block, so a herdr
 `working` cannot clear a hook-held `permission`. The lease is the Codex hook
 fallback's: 10 minutes working, 24 hours red, 7 days idle. When it runs out
 with no newer hook, the next reconcile tick hands the status to herdr, or to
 unknown, and history records the edge as `pi_hook_lapsed`. A Pi `/new`,
 `/resume`, `/fork` or `/clone` moves the root to the new session id and drops
-the old conversation's `display_name`.
+the old conversation's `display_name` and usage.
+
+After a daemon restart a persisted Pi graph comes back as
+`source: "restored_last_known"`: it keeps the deadline it was persisted with,
+is never renewed, and yields to any live herdr reading. Until a hook reaches
+the restarted daemon, each reconcile tick reads the tail of the session file
+named by `pi.transcript` (at most 256 KiB, re-read only when its size or mtime
+moves). The newest assistant message on the active branch, the parent chain
+from the file's last entry, reads `working` when it stopped for a tool and
+`idle` otherwise. It lands as `source: "pi_session_file"` with a 90-second
+lease, renewed while the file stays readable, and history records the edge as
+`pi_session_file_read`. A live herdr reading suspends the read, and the first
+hook ends it.
 
 The authority itself is not on the wire. A block read back from `state.json`
 after a restart decides nothing until the daemon hears from that herdr server
@@ -449,7 +468,7 @@ metadata.
 | Field | JSON type | Presence | Meaning |
 |-------|-----------|----------|---------|
 | `root_id` | string | always | Stable provider id of the root node. Exactly one element of `nodes` has this id and that node has no `parent_id`. |
-| `source` | string | omitted when empty | Structural graph authority: `codex_app_server`, `hook`, `claude_transcript`, `codex_rollout`, `restored_last_known`, or absent/unknown. A Codex graph whose child runtime/lifecycle was filled by an exact hook remains `codex_app_server`; bounded diagnostics expose overlay provenance without adding a wire field. Source precedence is daemon policy, not a confidence score consumers should recompute. |
+| `source` | string | omitted when empty | Structural graph authority: `codex_app_server`, `hook`, `claude_transcript`, `codex_rollout`, `restored_last_known`, `pi_session_file`, `herdr`, or absent/unknown. A Codex graph whose child runtime/lifecycle was filled by an exact hook remains `codex_app_server`; bounded diagnostics expose overlay provenance without adding a wire field. Source precedence is daemon policy, not a confidence score consumers should recompute. |
 | `observed_at` | RFC 3339 timestamp | omitted when unknown | Start of the observation's authority interval. Excluded from the publish gate: on a quiet graph it is the observation time as of the last actionable change. Its contractual role is the lower bound in `Fresh`, not a liveness signal. |
 | `fresh_until` | RFC 3339 timestamp | omitted when unknown | Exclusive end of the authority interval, rounded **up** to a 5-second boundary on publication. A graph is fresh only when `observed_at <= now < fresh_until`. The ceiling makes within-bucket publish suppression sound: a consumer cannot become falsely stale while the daemon still holds a fresh graph. |
 | `complete` | boolean | always | `true` means omission is authoritative for that observation; `false` means a partial view. Completeness does not imply freshness and freshness does not imply completeness. |
@@ -512,11 +531,21 @@ counts. Renderers grey the child detail and label it stale.
 | `updated_at` | RFC 3339 timestamp | omitted when unknown | Best provider transition/update time. Advisory and excluded from the publish gate: it is a display-age anchor, never a liveness or ordering key, and may lag until another actionable field publishes. |
 | `completed_at` | RFC 3339 timestamp | omitted when unknown | Terminal completion time when available. |
 | `usage` | object | omitted when wholly unmeasured | Optional token accounting; absence means unavailable, not measured zero. |
+| `billing` | object | omitted when unknown | Last-known non-secret pricing identity: `agent_client`, `execution_provider`, `model`, and the coarse route fields. Never account identifiers or credentials. |
 
 `usage`, when present, can contain `input_tokens`, `cached_input_tokens`,
 `cache_write_input_tokens`, `output_tokens`, `reasoning_output_tokens`,
 `total_tokens`, and `model_context_window`. Each is an integer omitted when
 zero. Status reduction never depends on usage.
+
+A bound Pi root node's `usage` is the running total of its session's
+assistant messages as Pi reported them, and its `billing` is
+`{"agent_client": "pi", "execution_provider": <Pi's provider>, "model": <Pi's
+model>}` from the newest one. A message is counted once, by Pi's message id
+when it has one. Each message is also a history `usage_sample` carrying Pi's
+own `cost_total` as a `client_reported` cost, which readers never reprice.
+The total restarts at zero when Pi moves to another session; under a herdr
+graph it is held by the daemon and returns with the next Pi observation.
 
 Axis strings are designed for additive evolution. A consumer must treat an
 unrecognized future runtime/lifecycle as unknown and an unrecognized attention
@@ -544,9 +573,10 @@ Applying a graph updates only these legacy compatibility values:
   authority (see `herdr` above);
 - its `status_since` moves when that legacy status changes.
 
-For a Pi session the graph is herdr's one-node graph, and it updates only the
-`pi` block's `status` and `status_since`; `pi.session_id` comes from the Pi
-hook that bound the session and is the graph's root id, never the reverse.
+For a Pi session the graph is Pi's own one-node graph (its hooks', its
+session file's, or a restored one) or herdr's, and it updates only the `pi`
+block's `status` and `status_since`; `pi.session_id` comes from the Pi hook
+that bound the session and is the graph's root id, never the reverse.
 
 Claude-only `in_flight_subagents`, workflows, pending writers, transcript, and
 other compatibility fields remain owned by the Claude adapter. Existing

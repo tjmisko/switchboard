@@ -14,7 +14,7 @@ editing.
 | # | Plan | Issue | Depends on | Status |
 |---|------|-------|-----------|--------|
 | 0 | [Correctness fixes](phase-0-correctness.md) | — | — | merged (#101, #102) |
-| 1 | [Pi as a first-class provider](phase-1-pi-provider.md) | — | 0 | in progress |
+| 1 | [Pi as a first-class provider](phase-1-pi-provider.md) | — | 0 | merged (#103, #104, #105, this PR) — manual E2E pending |
 | 2 | [Per-root decision record, `explain`](phase-2-decision-record.md) | [#95](https://github.com/tjmisko/switchboard/issues/95) | 1 | planned |
 | 3 | [One pure status resolver](phase-3-resolver.md) | [#96](https://github.com/tjmisko/switchboard/issues/96) | 2 | planned |
 | 4 | [OS process birth token](phase-4-process-identity.md) | [#97](https://github.com/tjmisko/switchboard/issues/97) | 3 | planned |
