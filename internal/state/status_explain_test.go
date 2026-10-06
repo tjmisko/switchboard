@@ -325,3 +325,17 @@ func TestStoreSnapshotShouldCarryTheDecisionRecordWhenASessionIsCopied(t *testin
 		t.Fatalf("snapshot decision reason = %q", got)
 	}
 }
+
+// #97: explain reports a session discovered without a birth token as an
+// unverified lifetime, the degraded identity, and a verified one as not.
+func TestExplainStatusShouldReportAnUnverifiedLifetimeWhenTheSessionHasNoBirthToken(t *testing.T) {
+	now := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	unverified := Session{PID: 7, Agent: AgentKindClaude, StartedAt: now}
+	if d := unverified.ExplainStatus(now); !d.Root.LifetimeUnverified {
+		t.Errorf("Root = %+v, want LifetimeUnverified for a session without a birth token", d.Root)
+	}
+	verified := Session{PID: 7, Agent: AgentKindClaude, StartedAt: now, Birth: "boot:1"}
+	if d := verified.ExplainStatus(now); d.Root.LifetimeUnverified {
+		t.Errorf("Root = %+v, want a verified lifetime when the session has a birth token", d.Root)
+	}
+}
