@@ -15,8 +15,8 @@ editing.
 |---|------|-------|-----------|--------|
 | 0 | [Correctness fixes](phase-0-correctness.md) | — | — | merged (#101, #102) |
 | 1 | [Pi as a first-class provider](phase-1-pi-provider.md) | — | 0 | merged (#103–#106), deployed 62b170e; manual E2E with owner |
-| 2 | [Per-root decision record, `explain`](phase-2-decision-record.md) | [#95](https://github.com/tjmisko/switchboard/issues/95) | 1 | in review (this PR) |
-| 3 | [One pure status resolver](phase-3-resolver.md) | [#96](https://github.com/tjmisko/switchboard/issues/96) | 2 | planned |
+| 2 | [Per-root decision record, `explain`](phase-2-decision-record.md) | [#95](https://github.com/tjmisko/switchboard/issues/95) | 1 | merged (#107) |
+| 3 | [One pure status resolver](phase-3-resolver.md) | [#96](https://github.com/tjmisko/switchboard/issues/96) | 2 | in progress (3A this PR) |
 | 4 | [OS process birth token](phase-4-process-identity.md) | [#97](https://github.com/tjmisko/switchboard/issues/97) | 3 | planned |
 | 5 | [Explicit observer outcomes, change-driven refresh](phase-5-observer-outcomes.md) | [#98](https://github.com/tjmisko/switchboard/issues/98) | 4 | planned |
 

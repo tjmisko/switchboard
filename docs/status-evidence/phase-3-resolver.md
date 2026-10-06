@@ -77,6 +77,43 @@ them to a fixed base time as they are touched.
    behaviour change.
 4. Remove the old precedence code and the remaining `time.Now()` reads.
 
+## As built: 3A (work units 1 and 2)
+
+Phase 3 ships as two PRs: 3A adds `internal/statusresolve`, pure and not
+called from production; 3B (work units 3 and 4) switches projection to it
+and removes the old precedence code. Where 3A departs from the design above:
+
+- **Signature.** `Resolve(target, candidates, prior, now)`. The tracked
+  agent is an explicit `Target` (the `statusexplain.Root` plus its herdr
+  pane): identity is matched in the resolver, and a first call has no prior
+  to carry it. A `prior` about another root (rotation, new lifetime) counts
+  for nothing.
+- **Builders.** One per source (`ClaudeGraph`, `ClaudeHook`,
+  `CodexAppServer`, `CodexHook`, `CodexChildHooks`, `CodexRolloutTail`,
+  `PiHook`, `PiSessionTail`, `Herdr`, `RestoredLastKnown`). Graph builders
+  reduce at the observation's own time and need no clock; only `Herdr`
+  takes `now` (to date a reading and to expire a withdrawn one).
+- **Complete lifecycle.** An exact event outranks a terminal reading only
+  when its writer reports both edges of every state it asserts (Pi's
+  extension). Claude's and Codex's hooks miss interrupts, so herdr keeps
+  outranking them, as today. This is a builder-declared capability, not a
+  source name.
+- **Descendants.** Claude's and Codex's hooks land on composed graphs, so an
+  exact event reports the working descendants it carries, as a snapshot and
+  a partial edge do. A partial edge never selects the root's status and, in
+  3A, establishes no attention.
+- **Prior evidence** holds in two cases only: open provider attention (an
+  event's or snapshot's) until its deadline or an authorized resolution, and
+  any prior decision with a finite deadline when nothing current selects. A
+  terminal reading has no deadline and is never held.
+- **Reasons.** Eight codes added to the closed enum, and two evidence kinds
+  (`hook_edge`, `transcript`). `EvidenceKindOf` is unchanged until 3B.
+
+The parity tests (`internal/state/resolver_parity_test.go`,
+`cmd/switchboard/resolver_parity_test.go`) run each Phase 2
+characterization situation through today's code and the resolver; every
+difference names the #96 criterion that causes it.
+
 ## Out of scope
 
 - New silence thresholds (#51).
