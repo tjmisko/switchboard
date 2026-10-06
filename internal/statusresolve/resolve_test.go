@@ -533,3 +533,93 @@ func TestResolveShouldReadTheDecisionBeneathAnOverlayWhenThePriorCarriesOne(t *t
 	d := Resolve(codex, []Candidate{herdr("codex", "working", at, at)}, overlaid, at)
 	want(t, "attention beneath a limit overlay", d, agentgraph.LegacyPermission, statusexplain.ReasonAttentionHeld)
 }
+
+func TestTargetShouldMatchATerminalReadingByItsTerminalIDWhenThePaneMovedWorkspace(t *testing.T) {
+	tracked := Target{Root: claude.Root, PaneID: "w1:p1", TerminalID: "term_1"}
+	moved := Herdr(HerdrReading{PaneID: "w2:p4", TerminalID: "term_1", Agent: "claude", Status: "working", Live: true, Since: t0}, t0)
+	if !tracked.Matches(moved) {
+		t.Fatal("a reading of the tracked terminal under its new pane id did not match")
+	}
+	d := Resolve(tracked, []Candidate{moved}, statusexplain.Decision{}, t0)
+	want(t, "moved pane", d, agentgraph.LegacyWorking, statusexplain.ReasonTerminalAuthority)
+
+	reused := Herdr(HerdrReading{PaneID: "w1:p1", TerminalID: "term_2", Agent: "claude", Status: "working", Live: true, Since: t0}, t0)
+	if tracked.Matches(reused) {
+		t.Error("a reading of another terminal matched because it reused the tracked pane id")
+	}
+}
+
+func TestTargetShouldFallBackToThePaneIDWhenEitherSideHasNoTerminalID(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		target, reading string // terminal ids
+		readingPane     string
+		match           bool
+	}{
+		{"neither side", "", "", "w1:p1", true},
+		{"target only", "term_1", "", "w1:p1", true},
+		{"reading only", "", "term_1", "w1:p1", true},
+		{"neither side, other pane", "", "", "w1:p2", false},
+		{"reading only, other pane", "", "term_1", "w1:p2", false},
+	} {
+		tracked := Target{Root: claude.Root, PaneID: "w1:p1", TerminalID: tc.target}
+		c := Herdr(HerdrReading{PaneID: tc.readingPane, TerminalID: tc.reading, Agent: "claude", Status: "idle", Live: true, Since: t0}, t0)
+		if got := tracked.Matches(c); got != tc.match {
+			t.Errorf("%s: matches = %v, want %v", tc.name, got, tc.match)
+		}
+	}
+}
+
+func TestResolveShouldLetTheHookResolveItsOwnRequestWhenASnapshotOnlyCarriedIt(t *testing.T) {
+	// A Codex app-server sample composed with a question the hooks hold open:
+	// the request is the hook's, so the hook's own later answer resolves it.
+	latched := HookLatched(codexSnap(t0.Add(time.Second), time.Minute, active, input))
+	answered := codexHook(t0.Add(2*time.Second), time.Hour, active, none)
+	at := t0.Add(3 * time.Second)
+
+	d := Resolve(codex, []Candidate{latched}, statusexplain.Decision{}, at)
+	if d.Status != agentgraph.LegacyPermission || d.EvidenceKind != statusexplain.EvidenceHook || d.Source != string(agentgraph.SourceHook) {
+		t.Fatalf("latched request decided %q by %s/%s, want permission by the hook", d.Status, d.EvidenceKind, d.Source)
+	}
+	// The answer resolves both the carried request and the prior decision.
+	after := Resolve(codex, []Candidate{latched, answered}, d, at)
+	want(t, "hook answers its own request", after, agentgraph.LegacyWorking, statusexplain.ReasonEventAuthority)
+	afterPrior := Resolve(codex, []Candidate{answered}, d, at)
+	want(t, "hook answers the prior hold", afterPrior, agentgraph.LegacyWorking, statusexplain.ReasonEventAuthority)
+}
+
+func TestResolveShouldKeepTheAppServersOwnRequestWhenOnlyAHookSaysOtherwise(t *testing.T) {
+	// Coordinator decision (1): a Codex hook does not clear app-server
+	// attention; only the next snapshot (or the request's deadline) does.
+	asked := codexSnap(t0.Add(time.Second), time.Minute, active, input)
+	hook := codexHook(t0.Add(2*time.Second), time.Hour, active, none)
+	at := t0.Add(3 * time.Second)
+	d := Resolve(codex, []Candidate{asked, hook}, statusexplain.Decision{}, at)
+	want(t, "hook over app-server request", d, agentgraph.LegacyPermission, statusexplain.ReasonAttentionHeld)
+	held := Resolve(codex, []Candidate{hook}, d, at)
+	want(t, "hook over the held request", held, agentgraph.LegacyPermission, statusexplain.ReasonAttentionHeld)
+	cleared := Resolve(codex, []Candidate{codexSnap(t0.Add(4*time.Second), time.Minute, active, none), hook}, d, t0.Add(4*time.Second))
+	want(t, "next snapshot clears it", cleared, agentgraph.LegacyWorking, statusexplain.ReasonGraphAuthority)
+}
+
+func TestResolveIndexShouldNameTheCandidateTheDecisionRestsOnWhenOneDoes(t *testing.T) {
+	snap := claudeSnap(t0, time.Minute, idle, none)
+	red := claudeHook(t0.Add(time.Second), time.Minute, active, ask)
+	reading := herdr("claude", "working", t0, t0)
+	at := t0.Add(2 * time.Second)
+	for _, tc := range []struct {
+		name       string
+		candidates []Candidate
+		prior      statusexplain.Decision
+		want       int
+	}{
+		{"base", []Candidate{snap}, statusexplain.Decision{}, 0},
+		{"terminal", []Candidate{snap, reading}, statusexplain.Decision{}, 1},
+		{"attention", []Candidate{snap, reading, red}, statusexplain.Decision{}, 2},
+		{"nothing", nil, statusexplain.Decision{}, -1},
+	} {
+		if _, got := ResolveIndex(claude, tc.candidates, tc.prior, at); got != tc.want {
+			t.Errorf("%s: index %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
