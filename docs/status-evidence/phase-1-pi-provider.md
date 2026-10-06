@@ -318,3 +318,19 @@ Additions to the plan:
   it correctly.
 - argv is overwritten (cmdline is `pi` plus padding), so the scanner cannot
   read `--mode json` from it.
+
+## PR 1C notes (1.4–1.6)
+
+- **Hook ordering** (owner decision). The extension stamps `event_at`, the
+  instant the Pi event fired, on every hook. `switchboard-ctl` makes it the
+  request's `ObservedAt` when it is at most 2 s ahead (clamped to now) and at
+  most 10 s old, else uses its own clock. The reducer drops any hook older
+  than the newest one it applied for that process.
+- **Lease.** The Claude hook path's only lease is the observer's 15 s window,
+  which its transcript scan renews every tick. Pi has no such renewal, so a
+  15 s lease would turn an idle Pi unknown within seconds when herdr is
+  absent. The reducer uses the Codex hook-only fallback windows instead
+  (`codexHookActiveFreshness`, `…AttentionFreshness`, `…IdleFreshness`).
+- **Rotation in history.** A rotation writes a `session_start` carrying the
+  new `session_id` and `prev_session_id`; as for a Claude `/clear`, the new id
+  on the live pid ends the old lane and no `session_end` is written.

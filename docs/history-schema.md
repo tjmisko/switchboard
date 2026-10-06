@@ -62,7 +62,7 @@ commitment. Recording is **local only** — Switchboard never transmits the log.
 
 | Tier | Records | Omits |
 |------|---------|-------|
-| `minimal` (default) | `ts`, `type`, `session_id`, `pid`, `agent`, `project` (abbrev), `from`/`to`, `rule`, `subagents`, `dur_prev_ms`, `agent_type`, `tool_use_id`, token counts, `model` | `cwd`, `pending`, `reason`, `description`, `label` |
+| `minimal` (default) | `ts`, `type`, `session_id`, `prev_session_id`, `pid`, `agent`, `project` (abbrev), `from`/`to`, `rule`, `subagents`, `dur_prev_ms`, `agent_type`, `tool_use_id`, token counts, `model` | `cwd`, `pending`, `reason`, `description`, `label` |
 | `full` | everything above **plus** `cwd`, `pending`, `reason`, `description`, `label` | — |
 
 The subagent `agent_type` (e.g. `Explore`), token counts, and the usage-sample
@@ -179,7 +179,7 @@ fix are unaffected.
 
 | `type` | When | Key payload |
 |--------|------|-------------|
-| `session_start` | a `claude`/`codex` process is discovered | `pid`, `agent` (no `session_id` yet) |
+| `session_start` | a `claude`/`codex` process is discovered; or a Pi process rotates to another session (`/new`, `/resume`, `/fork`, `/clone`) | `pid`, `agent` (no `session_id` yet). A Pi rotation carries the new `session_id` and `prev_session_id`, the session it replaced |
 | `transition` | any status edge — hook-driven *or* reconciler self-heal | `from`, `to`, `dur_prev_ms`, `rule`, `subagents` |
 | `suspend` / `resume` | the process is Ctrl-Z'd / resumed | bounds a greyed-out span |
 | `session_end` | the process is observed gone — by the pidfd death-watch, the reconciler's liveness sweep, or the startup stale-drop (one writer, three triggers; see `session-lifecycle-hazards.md`) | closes the last interval |
@@ -217,7 +217,7 @@ Example at the default minimal privacy tier:
 | Field | Presence | Meaning |
 |-------|----------|---------|
 | `session_id` | when known; always on projector output | Provider root id. This scopes `thread_id` and is the canonical root join. |
-| `pid`, `agent`, `project` | optional wire fields; populated when context is available | Root process/provider/project metadata. `agent` is `claude` or `codex`. |
+| `pid`, `agent`, `project` | optional wire fields; populated when context is available | Root process/provider/project metadata. `agent` is `claude`, `codex` or `pi`. |
 | `thread_id` | always on `agent_state` | Node whose axes changed. Root transitions use the root id; child transitions use the child id. |
 | `parent_thread_id` | omitted for root | Immediate parent id. Its presence identifies child transitions used by `agent_timeline`. |
 | `nickname`, `role` | optional, full tier only | Display metadata from the graph. Both are scrubbed at minimal detail. |

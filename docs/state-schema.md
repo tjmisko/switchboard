@@ -192,9 +192,19 @@ foreground process). Its whole `agent_graph` is one node with
 `source: "herdr"`, and that root id is its history `session_id`. The root is
 `herdr:<terminal id>`, except for a Pi session a Pi extension hook has bound:
 its root is then Pi's own session id (the UUID in its session file name), the
-same id as `pi.session_id`, and the graph's status projects into the `pi`
-block. Any other agent has no enrichment block. It lives while its process
-runs on the session's `tty`.
+same id as `pi.session_id`. Any other agent has no enrichment block. It lives
+while its process runs on the session's `tty`.
+
+A bound Pi session's `pi.status` comes from one precedence rule: Pi hook
+evidence within its lease wins, else a live herdr reading mapped as above,
+else unknown. While hook evidence is fresh, its graph (`source: "hook"`)
+stays in place and herdr's reading only updates the `herdr` block, so a herdr
+`working` cannot clear a hook-held `permission`. The lease is the Codex hook
+fallback's: 10 minutes working, 24 hours red, 7 days idle. When it runs out
+with no newer hook, the next reconcile tick hands the status to herdr, or to
+unknown, and history records the edge as `pi_hook_lapsed`. A Pi `/new`,
+`/resume`, `/fork` or `/clone` moves the root to the new session id and drops
+the old conversation's `display_name`.
 
 The authority itself is not on the wire. A block read back from `state.json`
 after a restart decides nothing until the daemon hears from that herdr server
