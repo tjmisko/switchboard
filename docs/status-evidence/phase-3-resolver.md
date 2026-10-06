@@ -114,6 +114,63 @@ The parity tests (`internal/state/resolver_parity_test.go`,
 characterization situation through today's code and the resolver; every
 difference names the #96 criterion that causes it.
 
+## As built: 3B (work units 3 and 4)
+
+Projection now asks the resolver. Every path that can move a published status
+(a provider graph landing, a herdr reading, a Pi hook or session-file read, a
+lease lapsing on the reconcile tick) builds candidates from the session's
+evidence and calls `statusresolve.ResolveIndex` with the clock it was given;
+the decision is the published status and the record explain reads.
+
+- **Evidence lives on the session.** `state.Session` keeps the latest graph
+  of each evidence kind for the bound conversation (snapshot, hook event,
+  partial child edge, transcript tail, restored), in memory and
+  copy-on-write. The coordinator was the suggested home, but herdr readings
+  land through `SetHerdr` without passing the coordinator; the session is
+  where both meet under the store lock. Discovery's re-announcement of a root
+  carries the evidence across (`InheritStatusEvidence` in `admitRoot`).
+- **Landing is storage.** `LandAgentGraph(graph, GraphLanding{Kind, ...},
+  now)` keeps a graph unless it is older than the graph its own kind holds
+  (`older_than_current`); a graph never displaces another kind's. The caller
+  states the kind: observe ticks land snapshots (a held observation keeps its
+  own provenance), hooks land events, child-hook overlays land partial edges
+  that amend the published graph, the transcript poll lands a transcript tail
+  under `codex_rollout`, restores land restored evidence.
+- **The published graph** (`AgentGraph`, children, names, usage) is the
+  landed graph the provider's own evidence decides by: the resolver over the
+  landed graphs without herdr. Graph reduction, legacy fields, navigation and
+  child ownership are unchanged.
+- **Removed:** `projectStatus`, `herdrAuthority` (and its Codex attention
+  exception and `time.Now()`), `piStatusAuthority` and the record helpers,
+  `admitObservation`/`shouldApplyObservation`/`sourceRank`, the
+  `hookOwnsTransition` bypasses and the transition-ownership returns of the
+  Codex pending reducers, `statusexplain.Projection`. `hook_owned` and the
+  herdr/Pi reason codes stay in the closed set for older records only.
+- **Codex event-time order across kinds.** A fresh landing supersedes older
+  event-time evidence of the other kinds (`Candidate.Superseded`): it may
+  still hold its own open request, but never decides again, so a SessionStart
+  hook does not come back when a newer app-server sample lapses.
+- **Hook-latched attention.** A Codex sample whose root request was put
+  there by the hooks' pending-input or approval latch carries it as the
+  hook's (`statusresolve.HookLatched`), so the hook that answers it resolves
+  it at once. The app-server's own request yields only to a newer snapshot or
+  its deadline (coordinator decision 1).
+- **herdr identity** matches herdr's stable terminal id when both sides carry
+  one, the pane id otherwise (decision 3). Partial child edges report working
+  descendants only (decision 2).
+- **Clock.** `reconcileCodexChildHooks`, `restoreClaude`, the hook fallback
+  for a request with no `ObservedAt`, the Pi hook fallback and the Codex
+  approval timer take the coordinator's clock (`agentCoordinator.clock`,
+  wall clock when nil); the tick, timer and RPC entry points are the only
+  reads.
+
+`unrecorded` remains only where a status is written beside the resolver: the
+legacy RPC hook path (no coordinator installed, which the daemon never runs),
+a Pi block restored from state.json whose persisted status differs from its
+restored graph before anything re-resolves it, the usage-limit hydration
+rewrite, and a herdr-only agent whose herdr reading names a different agent
+(its herdr graph still publishes).
+
 ## Out of scope
 
 - New silence thresholds (#51).
