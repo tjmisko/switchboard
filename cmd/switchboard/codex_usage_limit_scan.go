@@ -1,7 +1,6 @@
 package main
 
 import (
-	"os"
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/provider"
@@ -19,20 +18,12 @@ type codexRolloutPathSource interface {
 	RolloutPaths(provider.RootKey, string) map[string]string
 }
 
-// codexLimitScan is one root's usage-limit scan state: when it last ran and
-// the tail verdict of every rollout it read, keyed by path.
+// codexLimitScan is one root's usage-limit scan state: when it last ran. Each
+// rollout's tail verdict is cached by its file identity in ReadRolloutState
+// (internal/tailcache), so an unchanged rollout is stat'ed, not re-read.
 type codexLimitScan struct {
 	rootID    string
 	scannedAt time.Time
-	tails     map[string]codexRolloutTail
-}
-
-// codexRolloutTail caches one rollout's tail verdict against the file's size
-// and mtime, so an unchanged rollout is stat'ed, not re-read.
-type codexRolloutTail struct {
-	size    int64
-	modTime time.Time
-	state   codexprovider.RolloutState
 }
 
 type codexLimitEvidence struct {
@@ -80,7 +71,7 @@ func (c *agentCoordinator) scanCodexUsageLimit(ref provider.RootRef, now time.Ti
 	}
 	scan := c.codexLimitScans[ref.Key()]
 	if scan == nil || scan.rootID != rootID {
-		scan = &codexLimitScan{rootID: rootID, tails: make(map[string]codexRolloutTail)}
+		scan = &codexLimitScan{rootID: rootID}
 		c.codexLimitScans[ref.Key()] = scan
 	}
 	if !scan.scannedAt.IsZero() && now.Sub(scan.scannedAt) < codexUsageLimitScanInterval {
@@ -88,14 +79,17 @@ func (c *agentCoordinator) scanCodexUsageLimit(ref provider.RootRef, now time.Ti
 		return
 	}
 	scan.scannedAt = now
-	seen := make(map[string]struct{}, len(childPaths)+1)
-	root := scan.read(rootPath, seen)
+	c.codexLimitMu.Unlock()
+
+	// The reads run outside every coordinator lock; the claim on scannedAt
+	// above is what keeps two ticks from scanning the same root at once.
+	root := readCodexRolloutState(rootPath)
 	var newest *codexLimitEvidence
 	if root.UsageLimit != nil {
 		newest = &codexLimitEvidence{at: root.At, limit: root.UsageLimit}
 	}
 	for path := range childPaths {
-		child := scan.read(path, seen)
+		child := readCodexRolloutState(path)
 		if child.UsageLimit == nil || !child.At.After(root.At) {
 			continue
 		}
@@ -103,12 +97,6 @@ func (c *agentCoordinator) scanCodexUsageLimit(ref provider.RootRef, now time.Ti
 			newest = &codexLimitEvidence{at: child.At, limit: child.UsageLimit}
 		}
 	}
-	for path := range scan.tails {
-		if _, ok := seen[path]; !ok {
-			delete(scan.tails, path)
-		}
-	}
-	c.codexLimitMu.Unlock()
 
 	if newest == nil || !newest.at.After(hookAt) {
 		return
@@ -140,27 +128,17 @@ func (c *agentCoordinator) codexHookRolloutPaths(key provider.RootKey, rootID st
 	return root.transcript, childPaths, root.latestAt, true
 }
 
-// read returns the tail verdict for path, re-reading only when the file's size
-// or mtime moved. An unreadable or empty path reads as no evidence.
-func (s *codexLimitScan) read(path string, seen map[string]struct{}) codexprovider.RolloutState {
+// readCodexRolloutState returns the tail verdict for path, re-reading only
+// when the file's identity moved (ReadRolloutState caches it). An unreadable
+// or empty path reads as no evidence.
+func readCodexRolloutState(path string) codexprovider.RolloutState {
 	if path == "" {
 		return codexprovider.RolloutState{}
 	}
-	seen[path] = struct{}{}
-	info, err := os.Stat(path)
-	if err != nil {
-		delete(s.tails, path)
-		return codexprovider.RolloutState{}
-	}
-	if cached, ok := s.tails[path]; ok && cached.size == info.Size() && cached.modTime.Equal(info.ModTime()) {
-		return cached.state
-	}
 	state, err := codexprovider.ReadRolloutState(path)
 	if err != nil {
-		delete(s.tails, path)
 		return codexprovider.RolloutState{}
 	}
-	s.tails[path] = codexRolloutTail{size: info.Size(), modTime: info.ModTime(), state: state}
 	return state
 }
 

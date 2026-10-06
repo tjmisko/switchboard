@@ -12,6 +12,7 @@ import (
 	"github.com/tjmisko/switchboard/internal/provider"
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
+	"github.com/tjmisko/switchboard/internal/tailcache"
 )
 
 // rolloutActive is a turn marker that says the thread is still working.
@@ -202,15 +203,18 @@ func TestCodexUsageLimitScanShouldReuseATailWhenTheRolloutIsUnchanged(t *testing
 	}
 	now := time.Now()
 	path := writeRollout(t, t.TempDir(), "child.jsonl", rolloutCapped(now, now.Add(time.Hour)))
-	scan := &codexLimitScan{tails: make(map[string]codexRolloutTail)}
-	if got := scan.read(path, map[string]struct{}{}); got.UsageLimit == nil {
+	t.Cleanup(tailcache.SetDefault(tailcache.New(tailcache.OS{}, 0)))
+	if got := readCodexRolloutState(path); got.UsageLimit == nil {
 		t.Fatalf("first read = %+v, want the cap", got)
 	}
 	// Unreadable but unchanged: only a cached verdict can still name the cap.
 	if err := os.Chmod(path, 0); err != nil {
 		t.Fatal(err)
 	}
-	if got := scan.read(path, map[string]struct{}{}); got.UsageLimit == nil {
+	if got := readCodexRolloutState(path); got.UsageLimit == nil {
 		t.Fatalf("second read = %+v, want the cached cap without re-reading", got)
+	}
+	if stats := tailcache.Default().Stats(); stats.Reads != 1 || stats.Hits != 1 {
+		t.Fatalf("cache work = %+v, want one read and one hit", stats)
 	}
 }
