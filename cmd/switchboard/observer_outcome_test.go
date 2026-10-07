@@ -10,6 +10,7 @@ import (
 	"github.com/tjmisko/switchboard/internal/agentgraph"
 	"github.com/tjmisko/switchboard/internal/provider"
 	claudeprovider "github.com/tjmisko/switchboard/internal/provider/claude"
+	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/statusexplain"
 )
@@ -183,6 +184,27 @@ func TestObserveAtShouldExplainAndTreatUnsupportedAndResetDifferentlyWhenAPriorG
 			t.Fatalf("decision after the new binding's snapshot = %+v, want working by graph_authority", d.Choice)
 		}
 	})
+}
+
+// A reset publishes a placeholder graph bound to the new thread with no nodes.
+// A root hook for that thread has nothing to compose onto, so it must land as
+// itself rather than be composed into an empty graph the landing path drops.
+func TestObserveAtShouldPublishWorkingFromACodexUserPromptSubmitForTheNewThreadWhenAResetLeftAPlaceholderGraph(t *testing.T) {
+	c, observer, ref := outcomeCoordinator(t)
+	resetAt := outcomeT0.Add(10 * time.Second)
+	observer.script(agentgraph.Observation{Provider: agentgraph.ProviderCodex, RootID: "thread-2", Outcome: agentgraph.OutcomeReset}, nil)
+	c.observeAt(t.Context(), ref, resetAt)
+	if sess := publishedSession(t, c, ref); sess.AgentGraph == nil || sess.AgentGraph.RootID != "thread-2" || len(sess.AgentGraph.Nodes) != 0 {
+		t.Fatalf("setup: reset did not leave the placeholder graph: %v", sess.AgentGraph)
+	}
+	c.HandleHook(rpc.Request{
+		Agent: state.AgentKindCodex, Event: "UserPromptSubmit", SessionID: "thread-2",
+		TurnID: "turn-1", ObservedAt: resetAt.Add(time.Second),
+	}, publishedSession(t, c, ref))
+	sess := publishedSession(t, c, ref)
+	if got := publishedStatus(t, c, ref); got != state.StatusWorking || sess.AgentGraph == nil || len(sess.AgentGraph.Nodes) == 0 {
+		t.Fatalf("hook for the new thread published %q graph=%v, want working with its root node", got, sess.AgentGraph)
+	}
 }
 
 // A stale-event race: a reset computed before a newer graph landed must not
