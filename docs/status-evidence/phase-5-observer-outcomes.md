@@ -107,8 +107,8 @@ Every acceptance criterion above becomes a test. In addition:
 
 ## As built
 
-One PR, `feat/observer-outcomes`, covering work units 1–3 and the tests for
-unit 4's existing behaviour.
+One PR, `feat/observer-outcomes`, covering work units 1–3 and validating
+unit 4 against the existing confirmation bounds. No new timing bound is added.
 
 - **Outcome.** `agentgraph.Observation.Outcome` (`usable`, `unavailable`,
   `unsupported`, `reset`); `agentgraph.OutcomeOf` classifies an answer that
@@ -138,6 +138,47 @@ unit 4's existing behaviour.
   that raced an invalidation is not stored, I/O runs outside every lock, and
   the cache is bounded (LRU, 2048 files). The fan-out observer now scans the
   subagent directory once per tick, not twice.
-- **Delays.** No bound was added or changed: the replay that would derive
-  one was not run. Tests pin that only transcript-inferred idle waits for
-  its quiet window and an explicit Stop is idle on the next tick.
+- **Reset recovery.** A Codex root hook following an empty reset placeholder
+  lands its own root observation instead of composing into a graph with no
+  nodes. The regression test first failed with unknown status and an empty
+  graph, then passed with working status and the new root node.
+- **Delays.** No bound was added or changed. Fake-clock tests cover repeated
+  unchanged inferred-stop polls through the last millisecond before the quiet
+  boundary, activity restarting confirmation, confirmation at the boundary,
+  and an explicit Stop publishing on the next tick. Removing the quiet window
+  makes both confirmation tests fail. Existing resolver tests cover positively
+  live descendants keeping an idle root delegating and authorized request
+  resolutions publishing immediately.
+
+## Timing evidence and validation
+
+The metadata-only history survey is reproducible with:
+
+```sh
+python3 scripts/survey-idle-transitions.py \
+  "$XDG_STATE_HOME/switchboard/history" --since 2026-09-01 --until 2026-10-06
+```
+
+If `XDG_STATE_HOME` is unset, use `~/.local/state/switchboard/history`.
+The survey streams day-files; it outputs counts, rule names and durations,
+never session ids, prompts, paths, tool inputs or transcript text.
+
+The initial local survey saw 5,809 transitions in that date range (the live
+day-file keeps growing). It found 605
+idle returns to working/delegating within 120 seconds attributed to
+`agent_graph_authority` (158 under 5 seconds; median 12.031085 seconds), and
+two attributed to `herdr_authority` (7.171023 and 74.264637 seconds). Those
+labels do not identify whether the idle edge was an explicit stop, an
+inferred stop or a correct short turn. A duration-only filter would also
+delay legitimate stops: 24 short intervals follow Pi's explicit
+`pi_run_settled`, including four under 5 seconds. This survey is not an oracle
+replay and cannot justify replacing a confirmation bound. Keep the existing
+bounds; any future calibration needs candidate-kind and ground-truth capture.
+
+Final local validation:
+
+- `go vet ./...` passes.
+- The reset regression and the observer-outcome/confirmation tests pass.
+- `TZ=UTC go test ./... -count=1` passes in full, including the Unix socket
+  and process-source conformance tests that fail inside a restricted sandbox
+  (`setsockopt`/`connect: operation not permitted`).
