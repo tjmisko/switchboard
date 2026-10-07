@@ -44,6 +44,10 @@ type RootKey struct {
 // Observer supplies immutable-boundary graph snapshots for roots. Observe may
 // poll files or provider APIs, or read a long-running event-stream cache. Its
 // returned Observation must be a deep copy that callers may mutate safely.
+// Outcome distinguishes usable evidence, temporary unavailability, unsupported
+// coverage and an authoritative binding reset. An unavailable answer may carry
+// only prior evidence with its original observation time and deadline; callers
+// classify it with agentgraph.OutcomeOf, including any accompanying error.
 //
 // Updates is a non-blocking, coalesced invalidation signal: receiving a key says
 // to Observe that root again, not that the key is a complete state update.
