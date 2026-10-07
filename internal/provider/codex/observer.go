@@ -372,26 +372,33 @@ func (o *Observer) RegisterHookRollout(key provider.RootKey, threadID, path stri
 // copy of the last complete snapshot. Expiration is represented by the
 // observation's unchanged FreshUntil boundary; consumers use neutral freshness
 // reduction rather than a guessed fallback graph.
+//
+// The answer's Outcome (#98): a root with no process start identity is
+// unsupported, since no exact binding can ever be made for it; a root with no
+// binding yet, or a bound thread whose first snapshot is pending, is
+// unavailable; a root whose binding moved to another thread is reset, since
+// the graph about the previous thread is no longer about this root; the
+// cached snapshot is usable, with its original FreshUntil.
 func (o *Observer) Observe(_ context.Context, ref provider.RootRef, _ time.Time) (agentgraph.Observation, error) {
 	if ref.Provider != "" && ref.Provider != agentgraph.ProviderCodex {
-		return agentgraph.Observation{}, fmt.Errorf("codex observer cannot observe provider %q", ref.Provider)
+		return agentgraph.Observation{Outcome: agentgraph.OutcomeUnsupported}, fmt.Errorf("codex observer cannot observe provider %q", ref.Provider)
 	}
 	if ref.PID <= 0 || ref.StartedAt.IsZero() {
-		return agentgraph.Observation{Provider: agentgraph.ProviderCodex, Complete: false, Diagnostic: "process start identity unavailable"}, nil
+		return agentgraph.Observation{Provider: agentgraph.ProviderCodex, Complete: false, Outcome: agentgraph.OutcomeUnsupported, Diagnostic: "process start identity unavailable"}, nil
 	}
 	binding, diagnostic := o.bindings.resolve(ref)
 	if binding.ThreadID == "" {
-		return agentgraph.Observation{Provider: agentgraph.ProviderCodex, Complete: false, Diagnostic: diagnostic}, nil
+		return agentgraph.Observation{Provider: agentgraph.ProviderCodex, Complete: false, Outcome: agentgraph.OutcomeUnavailable, Diagnostic: diagnostic}, nil
 	}
 
 	key := ref.Key()
 	o.mu.Lock()
 	if o.closed {
 		o.mu.Unlock()
-		return agentgraph.Observation{}, errors.New("codex observer is closed")
+		return agentgraph.Observation{Outcome: agentgraph.OutcomeUnavailable}, errors.New("codex observer is closed")
 	}
 	record := o.roots[key]
-	changed := false
+	changed, rebound := false, false
 	if record == nil {
 		record = &rootRecord{threadID: binding.ThreadID, binding: binding.Source}
 		o.roots[key] = record
@@ -402,15 +409,20 @@ func (o *Observer) Observe(_ context.Context, ref provider.RootRef, _ time.Time)
 		}
 		record = &rootRecord{threadID: binding.ThreadID, binding: binding.Source}
 		o.roots[key] = record
-		changed = true
+		changed, rebound = true, true
 	}
 	observation := record.observation.Clone()
+	observation.Outcome = agentgraph.OutcomeUsable
 	if observation.RootID == "" {
 		observation = agentgraph.Observation{
 			Provider: agentgraph.ProviderCodex, RootID: binding.ThreadID,
 			Source: agentgraph.SourceCodexAppServer, Complete: false,
-			Diagnostic: "Codex app-server snapshot pending",
+			Outcome: agentgraph.OutcomeUnavailable, Diagnostic: "Codex app-server snapshot pending",
 		}
+	}
+	if rebound {
+		observation.Outcome = agentgraph.OutcomeReset
+		observation.Diagnostic = "Codex thread rebound; app-server snapshot pending"
 	}
 	o.mu.Unlock()
 	if changed {

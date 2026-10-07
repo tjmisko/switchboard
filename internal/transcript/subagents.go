@@ -301,14 +301,13 @@ func SubagentsForTranscript(transcriptPath string) ([]Subagent, error) {
 			if id == "" {
 				continue
 			}
-			raw, err := os.ReadFile(filepath.Join(dir, name))
+			m, err := cached(filepath.Join(dir, name), "subagent-meta", readSubagentMeta)
 			if err != nil {
 				return nil, err // listed but unreadable: a genuine I/O failure
 			}
 			s := upsert(id)
 			s.HasMeta = true
-			var m subagentMeta
-			if json.Unmarshal(raw, &m) == nil { // tolerate a non-JSON meta: id stays reported, fields zero
+			if m.parsed { // tolerate a non-JSON meta: id stays reported, fields zero
 				s.AgentType = m.AgentType
 				s.Name = m.Name
 				s.Description = m.Description
@@ -329,7 +328,10 @@ func SubagentsForTranscript(transcriptPath string) ([]Subagent, error) {
 				continue
 			}
 			s := upsert(id)
-			s.Done, s.ModTime, s.LatestEntryAt = subagentJSONLActivity(filepath.Join(dir, name))
+			// An unreadable child reads as not done this poll; the error keeps it
+			// out of the cache so the next poll reads again.
+			activity, _ := cached(filepath.Join(dir, name), "subagent-activity", readSubagentActivity)
+			s.Done, s.ModTime, s.LatestEntryAt = activity.done, activity.mod, activity.latest
 		}
 	}
 
@@ -340,17 +342,54 @@ func SubagentsForTranscript(transcriptPath string) ([]Subagent, error) {
 	return subs, nil
 }
 
+// parsedSubagentMeta is a meta file's fields and whether it parsed as JSON.
+type parsedSubagentMeta struct {
+	subagentMeta
+	parsed bool
+}
+
+func readSubagentMeta(path string) (parsedSubagentMeta, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return parsedSubagentMeta{}, err
+	}
+	var m parsedSubagentMeta
+	m.parsed = json.Unmarshal(raw, &m.subagentMeta) == nil
+	return m, nil
+}
+
+// subagentActivity is subagentJSONLActivity's answer, cached by the file's
+// identity: a child transcript that has not moved is not re-read.
+type subagentActivity struct {
+	done        bool
+	mod, latest time.Time
+}
+
+// readSubagentActivity returns stat and read failures so the cache never keeps
+// them: a finished child's transcript does not change again, so a transient
+// open failure cached against its identity would report it live indefinitely.
+// An incomplete tail is not a failure; the write completing it moves the size.
+func readSubagentActivity(path string) (subagentActivity, error) {
+	done, mod, latest, err := subagentJSONLActivity(path)
+	if errors.Is(err, errIncompleteTail) {
+		err = nil
+	}
+	return subagentActivity{done: done, mod: mod, latest: latest}, err
+}
+
 // subagentJSONLState reads the subagent's own transcript at path and reports
 // whether its last conversational entry is end_turn or a successful, exactly
 // correlated SubagentHandback result, along with the file's mtime. Provider
 // bookkeeping rows do not reopen a completed child. A bounded tail is read;
 // missing files and unreadable evidence yield Done=false.
 func subagentJSONLState(path string) (done bool, mod time.Time) {
-	done, mod, _ = subagentJSONLActivity(path)
+	done, mod, _, _ = subagentJSONLActivity(path)
 	return
 }
 
-func subagentJSONLActivity(path string) (done bool, mod, latest time.Time) {
+// subagentJSONLActivity is subagentJSONLState plus the newest conversational
+// entry's time and the error that left the answer not done, if any.
+func subagentJSONLActivity(path string) (done bool, mod, latest time.Time, err error) {
 	fi, err := os.Stat(path)
 	if err != nil {
 		return

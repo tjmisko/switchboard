@@ -182,10 +182,44 @@ type Node struct {
 	Usage       Usage
 }
 
+// Outcome is what one Observe answer is, apart from the graph it carries
+// (#98). It is orthogonal to Complete, which keeps its own meaning: whether the
+// snapshot's omissions are authoritative deletions.
+type Outcome string
+
+const (
+	// OutcomeUsable: the graph is the observer's current evidence for the root.
+	OutcomeUsable Outcome = "usable"
+	// OutcomeUnavailable: the observer could not read its source this time,
+	// or has not yet been able to (a binding or a first snapshot pending). It
+	// is not evidence. A graph it carries is the prior observation with its
+	// original ObservedAt and FreshUntil, so holding it never renews authority.
+	OutcomeUnavailable Outcome = "unavailable"
+	// OutcomeUnsupported: the observer cannot classify this root at all, so
+	// nothing it returns will become evidence for it.
+	OutcomeUnsupported Outcome = "unsupported"
+	// OutcomeReset: the observer authoritatively ended its earlier evidence
+	// for the root (the provider session it was bound to was replaced). RootID
+	// names the new binding; the earlier graph is no longer about this root.
+	OutcomeReset Outcome = "reset"
+)
+
+// Known reports whether o is one of the outcomes above.
+func (o Outcome) Known() bool {
+	switch o {
+	case OutcomeUsable, OutcomeUnavailable, OutcomeUnsupported, OutcomeReset:
+		return true
+	default:
+		return false
+	}
+}
+
 // Observation is a provider-owned, bounded snapshot of one root and its
 // descendants. Complete distinguishes authoritative omission/deletion from a
-// partial view. Diagnostic is for in-memory logging only and must never contain
-// prompts, commands, tool inputs, or other user content.
+// partial view. Outcome says whether the answer is evidence at all; an
+// observer that leaves it empty is classified by OutcomeOf. Diagnostic is for
+// in-memory logging only and must never contain prompts, commands, tool
+// inputs, or other user content.
 type Observation struct {
 	Provider   ProviderKind
 	RootID     string
@@ -194,7 +228,26 @@ type Observation struct {
 	ObservedAt time.Time
 	FreshUntil time.Time
 	Complete   bool
+	Outcome    Outcome
 	Diagnostic string
+}
+
+// OutcomeOf is what an Observe answer is, given the error that came with it.
+// An observer's explicit outcome stands, except that an error never makes an
+// answer usable: an error alone never publishes. An answer with no explicit
+// outcome is usable when it carries a graph, else unavailable.
+func OutcomeOf(o Observation, err error) Outcome {
+	outcome := o.Outcome
+	if !outcome.Known() {
+		outcome = OutcomeUsable
+		if o.RootID == "" || len(o.Nodes) == 0 {
+			outcome = OutcomeUnavailable
+		}
+	}
+	if err != nil && outcome == OutcomeUsable {
+		return OutcomeUnavailable
+	}
+	return outcome
 }
 
 // Fresh reports whether now lies within the caller-supplied half-open freshness

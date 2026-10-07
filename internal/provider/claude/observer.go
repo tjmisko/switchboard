@@ -363,7 +363,7 @@ func (o *Observer) Observe(ctx context.Context, root provider.RootRef, now time.
 		rs.legacyEvents = append(rs.legacyEvents, structured.Events...)
 	}
 	if !rs.observation.ObservedAt.IsZero() && now.Before(rs.observation.ObservedAt) {
-		return rs.observation.Clone(), ErrSuperseded
+		return heldObservation(rs.observation), ErrSuperseded
 	}
 	// The rule is this tick's, and only this tick's: a resolution that was fenced
 	// out below explains nothing, and a rule left over from an earlier tick would
@@ -428,7 +428,18 @@ func (o *Observer) Observe(ctx context.Context, root provider.RootRef, now time.
 	if err != nil {
 		return observation, err
 	}
-	return observation.Clone(), nil
+	observation = observation.Clone()
+	observation.Outcome = agentgraph.OutcomeUsable
+	return observation, nil
+}
+
+// heldObservation is the root's prior observation returned by a tick that
+// produced no new evidence: unavailable, with the ObservedAt and FreshUntil it
+// already had, so holding it never renews its authority (#98).
+func heldObservation(prior agentgraph.Observation) agentgraph.Observation {
+	held := prior.Clone()
+	held.Outcome = agentgraph.OutcomeUnavailable
+	return held
 }
 
 // rebuildAfterFailedScanLocked answers an Observe tick whose fanout scan failed.
@@ -439,7 +450,8 @@ func (o *Observer) Observe(ctx context.Context, root provider.RootRef, now time.
 // held child count matches what legacy Reconcile holds rather than a guessed
 // zero, and this tick's prompt resolutions reach the projection with the rule
 // that explains them. With no prior observation there is nothing to hold, and
-// the empty result sends the coordinator down its snapshot_pending path.
+// the empty result sends the coordinator down its snapshot_pending path. Either
+// way the answer's outcome is unavailable (#98): a failed read is never usable.
 func (o *Observer) rebuildAfterFailedScanLocked(rs *rootState, now time.Time, scanErr error) (agentgraph.Observation, error) {
 	prior := rs.observation
 	if prior.ObservedAt.IsZero() {
@@ -449,7 +461,7 @@ func (o *Observer) rebuildAfterFailedScanLocked(rs *rootState, now time.Time, sc
 	if err != nil {
 		return observation, err
 	}
-	return observation, scanErr
+	return heldObservation(observation), scanErr
 }
 
 // ApplyHook ingests one exact Claude hook edge. It performs no filesystem I/O;
@@ -467,6 +479,9 @@ func (o *Observer) ApplyHook(signal HookSignal) HookResult {
 	if !recognizedHook(signal.Event) {
 		return HookResult{Root: signal.Root.Key()}
 	}
+	// A hook announces that the root's transcripts are moving, even where the
+	// file identity cannot show it yet: the next Observe re-reads them (#98).
+	transcript.ForgetCached(signal.Root.Transcript)
 
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -1133,6 +1148,9 @@ func (o *Observer) ensureRootLocked(root provider.RootRef) *rootState {
 	}
 	if rs != nil {
 		o.fanout.Forget(rs.ref.ProviderSessionID)
+		// A rotated session's cached extractions are about files this root
+		// no longer reads; dropping them is not I/O.
+		transcript.ForgetCached(rs.ref.Transcript)
 	}
 	var carriedEvents []history.Event
 	if rs != nil {
@@ -1683,6 +1701,7 @@ func (o *Observer) Forget(key provider.RootKey) {
 	o.mu.Unlock()
 	if rs != nil {
 		o.fanout.Forget(rs.ref.ProviderSessionID)
+		transcript.ForgetCached(rs.ref.Transcript)
 	}
 }
 

@@ -67,7 +67,7 @@ func (c *agentCoordinator) recordAdmissionLocked(key provider.RootKey, graph *st
 }
 
 // recordObserveOutcome files why a tick observed nothing for the root:
-// binding_missing or coverage_unsupported.
+// binding_missing, coverage_unsupported or observation_reset.
 func (c *agentCoordinator) recordObserveOutcome(ref provider.RootRef, reason statusexplain.Reason) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -110,6 +110,12 @@ func (rec *admissionRecord) mergeInto(d *statusexplain.Decision) {
 	switch decided.Reason {
 	case statusexplain.ReasonBindingMissing, statusexplain.ReasonObservationPending:
 		if rec.outcome != "" {
+			decided.Reason = rec.outcome
+		}
+	case statusexplain.ReasonObservationExpired:
+		// Held evidence lapsing under an observer that cannot classify the
+		// root is explained by the coverage gap, not by the lapse (#98).
+		if rec.outcome == statusexplain.ReasonCoverageUnsupported {
 			decided.Reason = rec.outcome
 		}
 	}
