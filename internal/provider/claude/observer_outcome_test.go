@@ -114,19 +114,51 @@ func TestObserveShouldDelayOnlyInferredIdleWhenAStopIsExplicit(t *testing.T) {
 	defer o.Close()
 	o.ApplyHook(HookSignal{Root: root, Event: "UserPromptSubmit", At: now})
 	appendClaudeLine(t, root.Transcript, fmt.Sprintf(`{"type":"system","subtype":"stop_hook_summary","preventedContinuation":false,"timestamp":%q}`, now.Add(time.Second).Format(time.RFC3339Nano)))
-	inferred := now.Add(2 * time.Second)
-	obs, err := o.Observe(context.Background(), root, inferred)
-	if err != nil {
-		t.Fatal(err)
+	// Repeated unchanged reads must not promote the stop summary to an
+	// explicit stop, including just before the existing confirmation boundary.
+	for _, elapsed := range []time.Duration{2 * time.Second, 30 * time.Second, transcriptStopQuietWindow - time.Millisecond} {
+		inferred := now.Add(elapsed)
+		obs, err := o.Observe(context.Background(), root, inferred)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertSummary(t, obs, inferred, agentgraph.LegacyWorking, agentgraph.AttentionNone)
 	}
-	assertSummary(t, obs, inferred, agentgraph.LegacyWorking, agentgraph.AttentionNone)
 
-	stopAt := now.Add(3 * time.Second)
+	stopAt := now.Add(transcriptStopQuietWindow - time.Millisecond)
 	o.ApplyHook(HookSignal{Root: root, Event: "Stop", At: stopAt})
 	next := stopAt.Add(time.Millisecond)
-	obs, err = o.Observe(context.Background(), root, next)
+	obs, err := o.Observe(context.Background(), root, next)
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertSummary(t, obs, next, agentgraph.LegacyIdle, agentgraph.AttentionNone)
+}
+
+func TestObserveShouldRestartInferredIdleConfirmationWhenActivityInterruptsTheQuietWindow(t *testing.T) {
+	o, root, now := newTestObserver(t)
+	defer o.Close()
+	o.ApplyHook(HookSignal{Root: root, Event: "UserPromptSubmit", At: now})
+	appendStop := func(at time.Time) {
+		t.Helper()
+		appendClaudeLine(t, root.Transcript, fmt.Sprintf(`{"type":"system","subtype":"stop_hook_summary","preventedContinuation":false,"timestamp":%q}`, at.Format(time.RFC3339Nano)))
+	}
+	observe := func(at time.Time, want string) {
+		t.Helper()
+		obs, err := o.Observe(context.Background(), root, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertSummary(t, obs, at, want, agentgraph.AttentionNone)
+	}
+	appendStop(now.Add(time.Second))
+	observe(now.Add(30*time.Second), agentgraph.LegacyWorking)
+	resumed := now.Add(45 * time.Second)
+	o.ApplyHook(HookSignal{Root: root, Event: "PreToolUse", At: resumed})
+	appendStop(resumed.Add(time.Second))
+	// The first stop's quiet window has elapsed, but the intervening activity
+	// makes the newer inferred stop wait through its own confirmation window.
+	observe(now.Add(transcriptStopQuietWindow), agentgraph.LegacyWorking)
+	observe(resumed.Add(transcriptStopQuietWindow-time.Millisecond), agentgraph.LegacyWorking)
+	observe(resumed.Add(transcriptStopQuietWindow), agentgraph.LegacyIdle)
 }
