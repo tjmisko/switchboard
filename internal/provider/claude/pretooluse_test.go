@@ -22,7 +22,7 @@ func TestPreToolUseBindsQuestionAtOpenAndClearsRewrittenInputAtHookSpeed(t *test
 	if !staged.Applied || staged.Changed || len(staged.Projection.Pending) != 0 {
 		t.Fatalf("PreToolUse changed attention: %+v", staged)
 	}
-	assertSummary(t, staged.Observation, now.Add(time.Second), agentgraph.LegacyIdle, agentgraph.AttentionNone)
+	assertSummary(t, staged.Observation, now.Add(time.Second), agentgraph.StatusIdle, agentgraph.AttentionNone)
 	assertPromptDiagnostic(t, o, root.Key(), DiagnosticPreToolStaged)
 
 	opened := o.ApplyHook(HookSignal{
@@ -42,7 +42,7 @@ func TestPreToolUseBindsQuestionAtOpenAndClearsRewrittenInputAtHookSpeed(t *test
 	if cleared.Rule != statustune.RuleGraphCallMatchCleared || cleared.PromptDepth != 0 {
 		t.Fatalf("fast answer = rule %q depth %d, want exact call clear", cleared.Rule, cleared.PromptDepth)
 	}
-	assertSummary(t, cleared.Observation, now.Add(3*time.Second), agentgraph.LegacyWorking, agentgraph.AttentionNone)
+	assertSummary(t, cleared.Observation, now.Add(3*time.Second), agentgraph.StatusWorking, agentgraph.AttentionNone)
 }
 
 func TestPreToolUseNeverOpensRedByItself(t *testing.T) {
@@ -59,7 +59,7 @@ func TestPreToolUseNeverOpensRedByItself(t *testing.T) {
 		if !result.Applied || result.Changed || len(result.Projection.Pending) != 0 {
 			t.Fatalf("%s PreToolUse changed attention: %+v", tool, result)
 		}
-		assertSummary(t, result.Observation, now.Add(time.Duration(i+1)*time.Second), agentgraph.LegacyIdle, agentgraph.AttentionNone)
+		assertSummary(t, result.Observation, now.Add(time.Duration(i+1)*time.Second), agentgraph.StatusIdle, agentgraph.AttentionNone)
 	}
 }
 
@@ -137,7 +137,7 @@ func TestPreToolUseModifiedInputFallsBackWithoutBinding(t *testing.T) {
 		Root: root, Event: "PostToolUse", ToolName: "AskUserQuestion",
 		ToolInputHash: "completion", ToolUseID: "toolu_modified", At: now.Add(3 * time.Second),
 	})
-	if held.PromptDepth != 1 || held.Projection.Status != agentgraph.LegacyPermission {
+	if held.PromptDepth != 1 || held.Projection.Status != agentgraph.StatusPermission {
 		t.Fatalf("unbound fallback cleared early: rule=%q projection=%+v", held.Rule, held.Projection)
 	}
 }
@@ -168,7 +168,7 @@ func TestPreToolUseParallelIdenticalCallsAreNeverGuessed(t *testing.T) {
 		Root: root, Event: "PostToolUse", ToolName: "AskUserQuestion",
 		ToolInputHash: "rewritten", ToolUseID: "toolu_a", At: now.Add(4 * time.Second),
 	})
-	if held.PromptDepth != 1 || held.Projection.Status != agentgraph.LegacyPermission {
+	if held.PromptDepth != 1 || held.Projection.Status != agentgraph.StatusPermission {
 		t.Fatalf("ambiguous identity cleared the prompt: rule=%q projection=%+v", held.Rule, held.Projection)
 	}
 }
@@ -272,7 +272,7 @@ func TestPreToolUseDuplicateDeliveryIsIdempotentButCallIDCollisionIsQuarantined(
 			Root: root, Event: "PostToolUse", ToolName: "AskUserQuestion",
 			ToolInputHash: "rewritten", ToolUseID: "toolu_collision", At: now.Add(4 * time.Second),
 		})
-		if result.PromptDepth != 1 || result.Projection.Status != agentgraph.LegacyPermission {
+		if result.PromptDepth != 1 || result.Projection.Status != agentgraph.StatusPermission {
 			t.Fatalf("quarantined id cleared its former prompt: rule=%q projection=%+v", result.Rule, result.Projection)
 		}
 	})

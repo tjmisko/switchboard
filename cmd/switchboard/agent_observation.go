@@ -927,7 +927,7 @@ func compatibilityFromState(info *state.AgentInfo) claudeprovider.Compatibility 
 		return claudeprovider.Compatibility{}
 	}
 	compat := claudeprovider.Compatibility{
-		SessionID: info.SessionID, Transcript: info.Transcript, Status: info.Status,
+		SessionID: info.SessionID, Transcript: info.Transcript, Status: agentgraph.Status(info.Status),
 		StatusSince: info.StatusSince, InFlightSubagents: info.InFlightSubagents,
 		PendingWriters: append([]string(nil), info.PendingWriters...), PendingTool: info.PendingTool,
 		Pending:     make(map[string]claudeprovider.PendingPrompt, len(info.Pending)),
@@ -950,7 +950,7 @@ func compatibilityFromState(info *state.AgentInfo) claudeprovider.Compatibility 
 
 func applyClaudeCompatibility(info *state.AgentInfo, compat claudeprovider.Compatibility) {
 	info.SessionID, info.Transcript = compat.SessionID, compat.Transcript
-	info.Status, info.StatusSince = compat.Status, compat.StatusSince
+	info.Status, info.StatusSince = string(compat.Status), compat.StatusSince
 	info.InFlightSubagents = compat.InFlightSubagents
 	info.Workflows = make([]state.WorkflowStatus, len(compat.Workflows))
 	for i, workflow := range compat.Workflows {

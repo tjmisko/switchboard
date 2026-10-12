@@ -543,7 +543,7 @@ func TestExpiredObservationClearsAuthorityWithoutDroppingRoot(t *testing.T) {
 		t.Fatalf("expiration dropped root or graph detail: %+v", snap.Sessions)
 	}
 	if got := snap.Sessions[0].AgentGraph.Summary.Status; got != "" {
-		t.Fatalf("expired legacy status = %q, want unknown", got)
+		t.Fatalf("expired session status = %q, want unknown", got)
 	}
 	if len(snap.Sessions[0].AgentGraph.Nodes) != 1 {
 		t.Fatalf("expiration discarded bounded graph detail: %+v", snap.Sessions[0].AgentGraph.Nodes)

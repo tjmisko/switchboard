@@ -435,7 +435,7 @@ func sessionStatus(s state.Session) string {
 		return info.Status
 	}
 	if s.AgentGraph != nil && s.AgentGraph.Summary.Status != "" {
-		return s.AgentGraph.Summary.Status
+		return string(s.AgentGraph.Summary.Status)
 	}
 	return "unknown"
 }

@@ -22,7 +22,7 @@ func TestReduceTruthTable(t *testing.T) {
 		children         []Node
 		wantRuntime      RuntimeState
 		wantAttention    AttentionState
-		wantLegacy       string
+		wantStatus       Status
 		wantLiveChildren int
 		wantWaiting      int
 		wantApprovals    int
@@ -33,13 +33,13 @@ func TestReduceTruthTable(t *testing.T) {
 			name:        "active root is working",
 			root:        Node{Runtime: RuntimeActive},
 			wantRuntime: RuntimeActive, wantAttention: AttentionNone,
-			wantLegacy: LegacyWorking,
+			wantStatus: StatusWorking,
 		},
 		{
 			name:        "idle root is idle",
 			root:        Node{Runtime: RuntimeIdle},
 			wantRuntime: RuntimeIdle, wantAttention: AttentionNone,
-			wantLegacy: LegacyIdle,
+			wantStatus: StatusIdle,
 		},
 		{
 			name:        "not loaded root without work is unknown",
@@ -51,91 +51,91 @@ func TestReduceTruthTable(t *testing.T) {
 			root:        Node{Runtime: RuntimeIdle},
 			children:    []Node{{ID: "child", Runtime: RuntimeUnknown, Lifecycle: LifecycleUnknown}},
 			wantRuntime: RuntimeIdle, wantAttention: AttentionNone,
-			wantLegacy: LegacyIdle,
+			wantStatus: StatusIdle,
 		},
 		{
 			name:        "not loaded topology child is not live",
 			root:        Node{Runtime: RuntimeIdle},
 			children:    []Node{{ID: "child", Runtime: RuntimeNotLoaded, Lifecycle: LifecycleUnknown}},
 			wantRuntime: RuntimeIdle, wantAttention: AttentionNone,
-			wantLegacy: LegacyIdle,
+			wantStatus: StatusIdle,
 		},
 		{
 			name:        "idle root plus running child delegates",
 			root:        Node{Runtime: RuntimeIdle},
 			children:    []Node{{ID: "child", Lifecycle: LifecycleRunning}},
 			wantRuntime: RuntimeIdle, wantAttention: AttentionNone,
-			wantLegacy: LegacyDelegating, wantLiveChildren: 1,
+			wantStatus: StatusDelegating, wantLiveChildren: 1,
 		},
 		{
 			name:        "unknown root plus pending child delegates",
 			root:        Node{Runtime: RuntimeUnknown},
 			children:    []Node{{ID: "child", Lifecycle: LifecyclePending}},
 			wantRuntime: RuntimeUnknown, wantAttention: AttentionNone,
-			wantLegacy: LegacyDelegating, wantLiveChildren: 1,
+			wantStatus: StatusDelegating, wantLiveChildren: 1,
 		},
 		{
 			name:        "idle root plus active child delegates",
 			root:        Node{Runtime: RuntimeIdle},
 			children:    []Node{{ID: "child", Runtime: RuntimeActive}},
 			wantRuntime: RuntimeIdle, wantAttention: AttentionNone,
-			wantLegacy: LegacyDelegating, wantLiveChildren: 1,
+			wantStatus: StatusDelegating, wantLiveChildren: 1,
 		},
 		{
 			name:        "idle child is live but not working",
 			root:        Node{Runtime: RuntimeIdle},
 			children:    []Node{{ID: "child", Runtime: RuntimeIdle, Lifecycle: LifecycleUnknown}},
 			wantRuntime: RuntimeIdle, wantAttention: AttentionNone,
-			wantLegacy: LegacyIdle, wantLiveChildren: 1,
+			wantStatus: StatusIdle, wantLiveChildren: 1,
 		},
 		{
 			name:        "actionable unknown child is live",
 			root:        Node{Runtime: RuntimeIdle},
 			children:    []Node{{ID: "child", Runtime: RuntimeUnknown, Attention: AttentionApproval, Lifecycle: LifecycleUnknown}},
 			wantRuntime: RuntimeIdle, wantAttention: AttentionApproval,
-			wantLegacy: LegacyPermission, wantLiveChildren: 1, wantWaiting: 1, wantApprovals: 1,
+			wantStatus: StatusPermission, wantLiveChildren: 1, wantWaiting: 1, wantApprovals: 1,
 		},
 		{
 			name:        "completed child does not delegate",
 			root:        Node{Runtime: RuntimeIdle},
 			children:    []Node{{ID: "child", Runtime: RuntimeActive, Lifecycle: LifecycleCompleted}},
 			wantRuntime: RuntimeIdle, wantAttention: AttentionNone,
-			wantLegacy: LegacyIdle,
+			wantStatus: StatusIdle,
 		},
 		{
 			name:        "interrupted child does not delegate",
 			root:        Node{Runtime: RuntimeIdle},
 			children:    []Node{{ID: "child", Runtime: RuntimeActive, Lifecycle: LifecycleInterrupted}},
 			wantRuntime: RuntimeIdle, wantAttention: AttentionNone,
-			wantLegacy: LegacyIdle,
+			wantStatus: StatusIdle,
 		},
 		{
 			name:        "shutdown child does not delegate",
 			root:        Node{Runtime: RuntimeIdle},
 			children:    []Node{{ID: "child", Runtime: RuntimeActive, Lifecycle: LifecycleShutdown}},
 			wantRuntime: RuntimeIdle, wantAttention: AttentionNone,
-			wantLegacy: LegacyIdle,
+			wantStatus: StatusIdle,
 		},
 		{
 			name:        "not found child does not delegate",
 			root:        Node{Runtime: RuntimeIdle},
 			children:    []Node{{ID: "child", Runtime: RuntimeActive, Lifecycle: LifecycleNotFound}},
 			wantRuntime: RuntimeIdle, wantAttention: AttentionNone,
-			wantLegacy: LegacyIdle,
+			wantStatus: StatusIdle,
 		},
 		{
 			name:        "errored child is terminal and counted",
 			root:        Node{Runtime: RuntimeIdle},
 			children:    []Node{{ID: "child", Lifecycle: LifecycleErrored}},
 			wantRuntime: RuntimeIdle, wantAttention: AttentionNone,
-			wantLegacy: LegacyIdle, wantErrors: 1,
+			wantStatus: StatusIdle, wantErrors: 1,
 		},
 		{
 			name:        "child system error is not permission",
 			root:        Node{Runtime: RuntimeIdle},
 			children:    []Node{{ID: "child", Runtime: RuntimeSystemError, Lifecycle: LifecycleRunning}},
 			wantRuntime: RuntimeIdle, wantAttention: AttentionNone,
-			wantLegacy: LegacyDelegating, wantLiveChildren: 1, wantErrors: 1,
+			wantStatus: StatusDelegating, wantLiveChildren: 1, wantErrors: 1,
 		},
 		{
 			name:        "root system error is explicit and not permission",
@@ -148,21 +148,21 @@ func TestReduceTruthTable(t *testing.T) {
 			root:        Node{Runtime: RuntimeActive},
 			children:    []Node{{ID: "child", Attention: AttentionApproval, Lifecycle: LifecycleRunning}},
 			wantRuntime: RuntimeActive, wantAttention: AttentionApproval,
-			wantLegacy: LegacyPermission, wantLiveChildren: 1, wantWaiting: 1, wantApprovals: 1,
+			wantStatus: StatusPermission, wantLiveChildren: 1, wantWaiting: 1, wantApprovals: 1,
 		},
 		{
 			name:        "user input beats active root",
 			root:        Node{Runtime: RuntimeActive},
 			children:    []Node{{ID: "child", Attention: AttentionUserInput, Lifecycle: LifecycleRunning}},
 			wantRuntime: RuntimeActive, wantAttention: AttentionUserInput,
-			wantLegacy: LegacyPermission, wantLiveChildren: 1, wantWaiting: 1, wantUserInputs: 1,
+			wantStatus: StatusPermission, wantLiveChildren: 1, wantWaiting: 1, wantUserInputs: 1,
 		},
 		{
 			name:        "waiting child beats root system error",
 			root:        Node{Runtime: RuntimeSystemError},
 			children:    []Node{{ID: "child", Attention: AttentionUserInput, Lifecycle: LifecycleRunning}},
 			wantRuntime: RuntimeSystemError, wantAttention: AttentionUserInput,
-			wantLegacy: LegacyPermission, wantLiveChildren: 1, wantWaiting: 1,
+			wantStatus: StatusPermission, wantLiveChildren: 1, wantWaiting: 1,
 			wantUserInputs: 1, wantErrors: 1,
 		},
 		{
@@ -170,14 +170,14 @@ func TestReduceTruthTable(t *testing.T) {
 			root:        Node{Runtime: RuntimeActive},
 			children:    []Node{{ID: "child", Runtime: RuntimeActive, Lifecycle: LifecycleRunning}},
 			wantRuntime: RuntimeActive, wantAttention: AttentionNone,
-			wantLegacy: LegacyWorking, wantLiveChildren: 1,
+			wantStatus: StatusWorking, wantLiveChildren: 1,
 		},
 		{
 			name:        "approval is compact priority while both kinds are preserved",
 			root:        Node{Runtime: RuntimeIdle, Attention: AttentionUserInput},
 			children:    []Node{{ID: "child", Attention: AttentionApproval, Lifecycle: LifecycleRunning}},
 			wantRuntime: RuntimeIdle, wantAttention: AttentionApproval,
-			wantLegacy: LegacyPermission, wantLiveChildren: 1, wantWaiting: 2,
+			wantStatus: StatusPermission, wantLiveChildren: 1, wantWaiting: 2,
 			wantApprovals: 1, wantUserInputs: 1,
 		},
 		{
@@ -188,7 +188,7 @@ func TestReduceTruthTable(t *testing.T) {
 				{ID: "question", Attention: AttentionUserInput, Lifecycle: LifecycleRunning},
 			},
 			wantRuntime: RuntimeIdle, wantAttention: AttentionApproval,
-			wantLegacy: LegacyPermission, wantLiveChildren: 2, wantWaiting: 2,
+			wantStatus: StatusPermission, wantLiveChildren: 2, wantWaiting: 2,
 			wantApprovals: 1, wantUserInputs: 1,
 		},
 		{
@@ -196,7 +196,7 @@ func TestReduceTruthTable(t *testing.T) {
 			root:        Node{Runtime: RuntimeIdle},
 			children:    []Node{{ID: "child", Attention: AttentionApproval, Lifecycle: LifecycleCompleted}},
 			wantRuntime: RuntimeIdle, wantAttention: AttentionNone,
-			wantLegacy: LegacyIdle,
+			wantStatus: StatusIdle,
 		},
 	}
 
@@ -207,7 +207,7 @@ func TestReduceTruthTable(t *testing.T) {
 			got := Reduce(obs, Summary{}, testNow)
 			want := Summary{
 				Runtime: tt.wantRuntime, Attention: tt.wantAttention,
-				LegacyStatus: tt.wantLegacy, LiveChildren: tt.wantLiveChildren,
+				Status: tt.wantStatus, LiveChildren: tt.wantLiveChildren,
 				WaitingNodes: tt.wantWaiting, ApprovalNodes: tt.wantApprovals,
 				UserInputNodes: tt.wantUserInputs, ErrorNodes: tt.wantErrors,
 				Since: testNow,
@@ -273,7 +273,7 @@ func TestReduceFreshnessAndSource(t *testing.T) {
 	t.Run("deadline is exclusive", func(t *testing.T) {
 		obs := observation(Node{Runtime: RuntimeActive})
 		got := Reduce(obs, Summary{}, obs.FreshUntil)
-		if got.LegacyStatus != "" || got.Runtime != RuntimeUnknown {
+		if got.Status != "" || got.Runtime != RuntimeUnknown {
 			t.Fatalf("expired Reduce() = %#v, want unknown", got)
 		}
 	})
@@ -281,7 +281,7 @@ func TestReduceFreshnessAndSource(t *testing.T) {
 	t.Run("future observation is not fresh", func(t *testing.T) {
 		obs := observation(Node{Runtime: RuntimeActive})
 		got := Reduce(obs, Summary{}, obs.ObservedAt.Add(-time.Nanosecond))
-		if got.LegacyStatus != "" || got.Runtime != RuntimeUnknown {
+		if got.Status != "" || got.Runtime != RuntimeUnknown {
 			t.Fatalf("future Reduce() = %#v, want unknown", got)
 		}
 	})
@@ -290,7 +290,7 @@ func TestReduceFreshnessAndSource(t *testing.T) {
 		obs := observation(Node{Runtime: RuntimeActive})
 		obs.Source = SourceRestoredLastKnown
 		got := Reduce(obs, Summary{}, testNow)
-		if got.LegacyStatus != LegacyWorking || got.Runtime != RuntimeActive {
+		if got.Status != StatusWorking || got.Runtime != RuntimeActive {
 			t.Fatalf("fresh restored Reduce() = %#v, want working", got)
 		}
 	})
@@ -326,7 +326,7 @@ func TestReduceSince(t *testing.T) {
 	t.Parallel()
 
 	started := testNow.Add(-10 * time.Second)
-	prior := Summary{Runtime: RuntimeIdle, Attention: AttentionNone, LegacyStatus: LegacyIdle, Since: started}
+	prior := Summary{Runtime: RuntimeIdle, Attention: AttentionNone, Status: StatusIdle, Since: started}
 	got := Reduce(observation(Node{Runtime: RuntimeIdle}), prior, testNow)
 	if !got.Since.Equal(started) {
 		t.Fatalf("identical summary Since = %v, want %v", got.Since, started)

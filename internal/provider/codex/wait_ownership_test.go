@@ -316,8 +316,8 @@ func TestUnknownMechanicalWaitExpiresGrayWithoutAttention(t *testing.T) {
 	observer.mu.Lock()
 	observation := observer.roots[key].observation.Clone()
 	observer.mu.Unlock()
-	if summary := agentgraph.Reduce(observation, agentgraph.Summary{}, time.Now()); summary.LegacyStatus != "" {
-		t.Fatalf("unknown mechanical ownership reduced to %q, want gray/unknown", summary.LegacyStatus)
+	if summary := agentgraph.Reduce(observation, agentgraph.Summary{}, time.Now()); summary.Status != "" {
+		t.Fatalf("unknown mechanical ownership reduced to %q, want gray/unknown", summary.Status)
 	}
 }
 

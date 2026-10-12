@@ -43,7 +43,7 @@ func TestQuestionWithRewrittenInputShouldClearAtHookSpeedWhenTheCallIDMatches(t 
 		t.Fatalf("answered question with a rewritten input = rule %q depth %d, want an id-matched clear",
 			result.Rule, result.PromptDepth)
 	}
-	assertSummary(t, result.Observation, now.Add(9*time.Second), agentgraph.LegacyWorking, agentgraph.AttentionNone)
+	assertSummary(t, result.Observation, now.Add(9*time.Second), agentgraph.StatusWorking, agentgraph.AttentionNone)
 }
 
 // An id mismatch is a REAL negative, unlike a hash mismatch: the two ids say
@@ -71,7 +71,7 @@ func TestPromptShouldHoldWhenTheCompletionNamesADifferentCall(t *testing.T) {
 	if result.Rule != statustune.RuleGraphCallMismatchHeld || result.PromptDepth != 1 {
 		t.Fatalf("sibling call completion = rule %q depth %d, want the red held", result.Rule, result.PromptDepth)
 	}
-	assertSummary(t, result.Observation, now.Add(9*time.Second), agentgraph.LegacyPermission, agentgraph.AttentionUserInput)
+	assertSummary(t, result.Observation, now.Add(9*time.Second), agentgraph.StatusPermission, agentgraph.AttentionUserInput)
 }
 
 // Two unmatched calls of one tool are indistinguishable in the file, so the
@@ -220,7 +220,7 @@ func TestLatchShouldRefuseAConfirmingReadTakenInsideTheFlushGap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertSummary(t, observation, gatedAt.Add(10*time.Second), agentgraph.LegacyPermission, agentgraph.AttentionApproval)
+	assertSummary(t, observation, gatedAt.Add(10*time.Second), agentgraph.StatusPermission, agentgraph.AttentionApproval)
 }
 
 // A prompt restored from the legacy scalar stands for a writer's residual RED,
@@ -233,7 +233,7 @@ func TestRestoredPromptShouldNeverBindACallID(t *testing.T) {
 	defer o.Close()
 	restored := Compatibility{
 		SessionID: root.ProviderSessionID, Transcript: root.Transcript,
-		Status: agentgraph.LegacyPermission, StatusSince: now,
+		Status: agentgraph.StatusPermission, StatusSince: now,
 		Pending: map[string]PendingPrompt{"": {Tool: "AskUserQuestion", InputHash: "ask-before", Since: now}},
 	}
 	if _, err := o.Restore(root, restored, now); err != nil {
@@ -252,7 +252,7 @@ func TestRestoredPromptShouldNeverBindACallID(t *testing.T) {
 	if result.PromptDepth != 1 {
 		t.Fatalf("an id cleared a restored red: depth %d, want the prompt held", result.PromptDepth)
 	}
-	assertSummary(t, result.Observation, now.Add(7*time.Second), agentgraph.LegacyPermission, agentgraph.AttentionUserInput)
+	assertSummary(t, result.Observation, now.Add(7*time.Second), agentgraph.StatusPermission, agentgraph.AttentionUserInput)
 }
 
 // The second thing the id buys: an answer clears the red even when no
@@ -289,7 +289,7 @@ func TestAnsweredCallShouldClearOnlyItsOwnPromptWhenTheHookNeverArrives(t *testi
 	if len(pending) != 1 || pending[""].Tool != "Bash" {
 		t.Fatalf("pending after the question was answered = %+v, want the Bash gate alone", pending)
 	}
-	assertSummary(t, observation, now.Add(10*time.Second), agentgraph.LegacyPermission, agentgraph.AttentionApproval)
+	assertSummary(t, observation, now.Add(10*time.Second), agentgraph.StatusPermission, agentgraph.AttentionApproval)
 }
 
 // A declined call returns control to the user, so the chip exits to idle. An
@@ -299,12 +299,12 @@ func TestDeclinedCallShouldExitToIdleWhileAFailedOneResumes(t *testing.T) {
 	for name, tc := range map[string]struct {
 		declined bool
 		rule     string
-		legacy   string
+		status   agentgraph.Status
 	}{
-		"a user rejection": {true, statustune.RuleGraphCallDeclined, agentgraph.LegacyIdle},
-		"a failed tool":    {false, statustune.RuleGraphCallResolved, agentgraph.LegacyWorking},
+		"a user rejection": {true, statustune.RuleGraphCallDeclined, agentgraph.StatusIdle},
+		"a failed tool":    {false, statustune.RuleGraphCallResolved, agentgraph.StatusWorking},
 	} {
-		t.Run("should exit to "+tc.legacy+" when the answer is "+name, func(t *testing.T) {
+		t.Run("should exit to "+string(tc.status)+" when the answer is "+name, func(t *testing.T) {
 			o, root, now := newTestObserver(t)
 			defer o.Close()
 			o.ApplyHook(HookSignal{Root: root, Event: "SessionStart", At: now})
@@ -327,7 +327,7 @@ func TestDeclinedCallShouldExitToIdleWhileAFailedOneResumes(t *testing.T) {
 			if rule := o.DrainResolutionRule(root.Key()); rule != tc.rule {
 				t.Fatalf("resolution rule = %q, want %q", rule, tc.rule)
 			}
-			assertSummary(t, observation, now.Add(10*time.Second), tc.legacy, agentgraph.AttentionNone)
+			assertSummary(t, observation, now.Add(10*time.Second), tc.status, agentgraph.AttentionNone)
 		})
 	}
 }
@@ -570,7 +570,7 @@ func TestLatchShouldRefuseACallThatWasAlreadyRunningWhenThePromptOpened(t *testi
 	if pending := o.Projection(root.Key()).Pending; len(pending) != 1 {
 		t.Fatalf("pending after the sibling finished = %+v, want the gate still held", pending)
 	}
-	assertSummary(t, observation, gatedAt.Add(10*time.Second), agentgraph.LegacyPermission, agentgraph.AttentionApproval)
+	assertSummary(t, observation, gatedAt.Add(10*time.Second), agentgraph.StatusPermission, agentgraph.AttentionApproval)
 }
 
 // One tick's uniqueness is not uniqueness. A single assistant message's parallel
@@ -612,7 +612,7 @@ func TestLatchShouldRefuseACandidateTheNextTickNoLongerAgreesOn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertSummary(t, observation, gatedAt.Add(8*time.Second), agentgraph.LegacyPermission, agentgraph.AttentionApproval)
+	assertSummary(t, observation, gatedAt.Add(8*time.Second), agentgraph.StatusPermission, agentgraph.AttentionApproval)
 }
 
 // The exit colour describes the WRITER, not whichever prompt sat last in the
@@ -623,13 +623,13 @@ func TestDeclinedCallShouldSetTheExitOnlyWhenEveryClosedCallDeclined(t *testing.
 	for name, tc := range map[string]struct {
 		declined []string
 		rule     string
-		legacy   string
+		status   agentgraph.Status
 	}{
-		"the older call was rejected":    {[]string{"toolu_ask"}, statustune.RuleGraphCallResolved, agentgraph.LegacyWorking},
-		"the newer call was rejected":    {[]string{"toolu_bash"}, statustune.RuleGraphCallResolved, agentgraph.LegacyWorking},
-		"every closed call was rejected": {[]string{"toolu_ask", "toolu_bash"}, statustune.RuleGraphCallDeclined, agentgraph.LegacyIdle},
+		"the older call was rejected":    {[]string{"toolu_ask"}, statustune.RuleGraphCallResolved, agentgraph.StatusWorking},
+		"the newer call was rejected":    {[]string{"toolu_bash"}, statustune.RuleGraphCallResolved, agentgraph.StatusWorking},
+		"every closed call was rejected": {[]string{"toolu_ask", "toolu_bash"}, statustune.RuleGraphCallDeclined, agentgraph.StatusIdle},
 	} {
-		t.Run("should exit to "+tc.legacy+" when "+name, func(t *testing.T) {
+		t.Run("should exit to "+string(tc.status)+" when "+name, func(t *testing.T) {
 			o, root, now := newTestObserver(t)
 			defer o.Close()
 			o.ApplyHook(HookSignal{Root: root, Event: "SessionStart", At: now})
@@ -663,7 +663,7 @@ func TestDeclinedCallShouldSetTheExitOnlyWhenEveryClosedCallDeclined(t *testing.
 			if rule := o.DrainResolutionRule(root.Key()); rule != tc.rule {
 				t.Fatalf("resolution rule = %q, want %q", rule, tc.rule)
 			}
-			assertSummary(t, observation, now.Add(11*time.Second), tc.legacy, agentgraph.AttentionNone)
+			assertSummary(t, observation, now.Add(11*time.Second), tc.status, agentgraph.AttentionNone)
 		})
 	}
 }
@@ -713,7 +713,7 @@ func TestRetiringTheNewestPromptShouldNotResolveAnOlderOneOnItsOwnDispatch(t *te
 	if pending := o.Projection(root.Key()).Pending; len(pending) != 1 || pending[""].Tool != "Bash" {
 		t.Fatalf("the next tick released the Bash gate: %+v", pending)
 	}
-	assertSummary(t, observation, now.Add(12*time.Second), agentgraph.LegacyPermission, agentgraph.AttentionApproval)
+	assertSummary(t, observation, now.Add(12*time.Second), agentgraph.StatusPermission, agentgraph.AttentionApproval)
 }
 
 // P3's runtime half has two orderings and only one of them used to be counted.

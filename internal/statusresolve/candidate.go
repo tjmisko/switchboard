@@ -18,9 +18,9 @@ type Candidate struct {
 	// Identity is what the evidence claims to be about. Resolve compares it
 	// with the tracked agent before anything else.
 	Identity Identity
-	// Status is the legacy status the evidence establishes for the root
+	// Status is the session status the evidence establishes for the root
 	// (working, idle, permission, delegating), "" when it cannot say.
-	Status string
+	Status agentgraph.Status
 	// Attention is provider attention the evidence reports (approval or user
 	// input, on the root or a live descendant). Only an exact lifecycle event or
 	// a provider snapshot carries it; other kinds report none.
@@ -192,7 +192,7 @@ func PiSessionTail(startedAt time.Time, o agentgraph.Observation) Candidate {
 func RestoredLastKnown(startedAt time.Time, o agentgraph.Observation) Candidate {
 	c := base(statusexplain.EvidenceRestored, startedAt, o)
 	c.Source = agentgraph.SourceRestoredLastKnown
-	c.Status = reduce(o).LegacyStatus
+	c.Status = reduce(o).Status
 	return c
 }
 
@@ -235,16 +235,16 @@ func Herdr(r HerdrReading, now time.Time) Candidate {
 	return c
 }
 
-// herdrStatus maps herdr's raw status onto the legacy one: blocked is
+// herdrStatus maps herdr's raw status onto a session status: blocked is
 // permission, done is idle, unknown decides nothing.
-func herdrStatus(raw string) string {
+func herdrStatus(raw string) agentgraph.Status {
 	switch raw {
 	case "working":
-		return agentgraph.LegacyWorking
+		return agentgraph.StatusWorking
 	case "blocked":
-		return agentgraph.LegacyPermission
+		return agentgraph.StatusPermission
 	case "idle", "done":
-		return agentgraph.LegacyIdle
+		return agentgraph.StatusIdle
 	default:
 		return ""
 	}
@@ -263,7 +263,7 @@ func snapshot(source agentgraph.SourceKind, startedAt time.Time, o agentgraph.Ob
 	c := base(statusexplain.EvidenceProviderSnapshot, startedAt, o)
 	c.Source = source
 	summary := reduce(o)
-	c.Status, c.Attention = summary.LegacyStatus, summary.Attention
+	c.Status, c.Attention = summary.Status, summary.Attention
 	c.WorkingDescendants = workingDescendants(o)
 	c.EventTimeOrder = eventTime
 	return c
@@ -275,7 +275,7 @@ func event(startedAt time.Time, o agentgraph.Observation, complete, eventTime bo
 	// composed onto an app-server graph keeps that graph's source.
 	c.Source = agentgraph.SourceHook
 	summary := reduce(o)
-	c.Status, c.Attention = summary.LegacyStatus, summary.Attention
+	c.Status, c.Attention = summary.Status, summary.Attention
 	// Claude's and Codex's hooks land on the graph their provider composed,
 	// children included, so the event reports the descendants it carries.
 	c.WorkingDescendants = workingDescendants(o)
@@ -291,9 +291,9 @@ func transcript(startedAt time.Time, o agentgraph.Observation) Candidate {
 	c := base(statusexplain.EvidenceTranscript, startedAt, o)
 	switch reduce(o).Runtime {
 	case agentgraph.RuntimeActive:
-		c.Status = agentgraph.LegacyWorking
+		c.Status = agentgraph.StatusWorking
 	case agentgraph.RuntimeIdle:
-		c.Status = agentgraph.LegacyIdle
+		c.Status = agentgraph.StatusIdle
 	}
 	return c
 }

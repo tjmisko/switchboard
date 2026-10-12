@@ -89,22 +89,22 @@ func TestGraphBuildersShouldShapeWhatTheirKindMayEstablishWhenTheGraphReportsMor
 	for _, tc := range []struct {
 		name        string
 		c           Candidate
-		status      string
+		status      agentgraph.Status
 		attention   agentgraph.AttentionState
 		descendants int
 	}{
 		{"snapshot keeps the full graph", CodexAppServer(lifetime, red(agentgraph.SourceCodexAppServer)),
-			agentgraph.LegacyPermission, agentgraph.AttentionUserInput, 1},
+			agentgraph.StatusPermission, agentgraph.AttentionUserInput, 1},
 		{"event keeps attention and the children it was composed with", CodexHook(lifetime, red(agentgraph.SourceHook)),
-			agentgraph.LegacyPermission, agentgraph.AttentionUserInput, 1},
+			agentgraph.StatusPermission, agentgraph.AttentionUserInput, 1},
 		{"rollout tail keeps the root's runtime and the children of the graph it corrected", CodexRolloutTail(lifetime, red(agentgraph.SourceCodexRollout)),
-			agentgraph.LegacyWorking, agentgraph.AttentionNone, 1},
+			agentgraph.StatusWorking, agentgraph.AttentionNone, 1},
 		{"pi session tail keeps only the root's runtime", PiSessionTail(lifetime, red(agentgraph.SourcePiSessionFile)),
-			agentgraph.LegacyWorking, agentgraph.AttentionNone, 0},
+			agentgraph.StatusWorking, agentgraph.AttentionNone, 0},
 		{"partial edge keeps only descendants", CodexChildHooks(lifetime, red(agentgraph.SourceHook)),
 			"", agentgraph.AttentionNone, 1},
 		{"restored keeps presentation, no attention or descendants", RestoredLastKnown(lifetime, red(agentgraph.SourceHook)),
-			agentgraph.LegacyPermission, agentgraph.AttentionNone, 0},
+			agentgraph.StatusPermission, agentgraph.AttentionNone, 0},
 	} {
 		if tc.c.Status != tc.status || tc.c.Attention != tc.attention || tc.c.WorkingDescendants != tc.descendants {
 			t.Errorf("%s: status %q attention %s descendants %d, want %q %s %d", tc.name,
@@ -116,7 +116,7 @@ func TestGraphBuildersShouldShapeWhatTheirKindMayEstablishWhenTheGraphReportsMor
 func TestGraphBuildersShouldReportWhatTheEvidenceAssertedWhenItHasAlreadyExpired(t *testing.T) {
 	o := observation(agentgraph.ProviderClaude, agentgraph.SourceClaudeTranscript, t0, time.Second, agentgraph.RuntimeActive, agentgraph.AttentionNone)
 	c := ClaudeGraph(lifetime, o)
-	if c.Status != agentgraph.LegacyWorking {
+	if c.Status != agentgraph.StatusWorking {
 		t.Fatalf("status %q, want working: a builder reduces at the observation's own time", c.Status)
 	}
 	if c.Fresh(t0.Add(time.Second)) {
@@ -136,9 +136,9 @@ func TestRestoredLastKnownShouldKeepThePersistedDeadlineWhenLoadedLater(t *testi
 }
 
 func TestHerdrShouldMapEveryRawStatusWhenRead(t *testing.T) {
-	for raw, want := range map[string]string{
-		"working": agentgraph.LegacyWorking, "blocked": agentgraph.LegacyPermission,
-		"idle": agentgraph.LegacyIdle, "done": agentgraph.LegacyIdle, "unknown": "", "": "", "bogus": "",
+	for raw, want := range map[string]agentgraph.Status{
+		"working": agentgraph.StatusWorking, "blocked": agentgraph.StatusPermission,
+		"idle": agentgraph.StatusIdle, "done": agentgraph.StatusIdle, "unknown": "", "": "", "bogus": "",
 	} {
 		c := Herdr(HerdrReading{PaneID: "w1:p1", Agent: "claude", Status: raw, Live: true, Since: t0}, t0)
 		if c.Status != want || c.Attention != agentgraph.AttentionNone {

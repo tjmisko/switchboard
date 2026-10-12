@@ -28,7 +28,7 @@ func TestHandbackCompletionAfterRootStopStaysIdle(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		assertSummary(t, obs, now.Add(elapsed), agentgraph.LegacyIdle, agentgraph.AttentionNone)
+		assertSummary(t, obs, now.Add(elapsed), agentgraph.StatusIdle, agentgraph.AttentionNone)
 		if o.Projection(root.Key()).InFlightSubagents != 0 {
 			t.Fatal("finished children still in flight")
 		}
@@ -39,13 +39,13 @@ func TestHandbackCompletionAfterRootStopStaysIdle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertSummary(t, obs, now.Add(11*time.Minute+time.Second), agentgraph.LegacyDelegating, agentgraph.AttentionNone)
+	assertSummary(t, obs, now.Add(11*time.Minute+time.Second), agentgraph.StatusDelegating, agentgraph.AttentionNone)
 	o.ApplyHook(HookSignal{Root: root, Event: "SubagentStop", AgentID: "second", At: now.Add(12 * time.Minute)})
 	obs, err = o.Observe(context.Background(), root, now.Add(12*time.Minute+time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertSummary(t, obs, now.Add(12*time.Minute+time.Second), agentgraph.LegacyIdle, agentgraph.AttentionNone)
+	assertSummary(t, obs, now.Add(12*time.Minute+time.Second), agentgraph.StatusIdle, agentgraph.AttentionNone)
 }
 
 func TestTranscriptStopPollingRequiresQuietHooksAndTerminalEvidence(t *testing.T) {
@@ -67,14 +67,14 @@ func TestTranscriptStopPollingRequiresQuietHooksAndTerminalEvidence(t *testing.T
 			if err != nil {
 				t.Fatal(err)
 			}
-			assertSummary(t, obs, now.Add(89*time.Second), agentgraph.LegacyWorking, agentgraph.AttentionNone)
+			assertSummary(t, obs, now.Add(89*time.Second), agentgraph.StatusWorking, agentgraph.AttentionNone)
 			obs, err = o.Observe(context.Background(), root, now.Add(95*time.Second))
 			if err != nil {
 				t.Fatal(err)
 			}
-			want := agentgraph.LegacyWorking
+			want := agentgraph.StatusWorking
 			if scenario == "stopped" {
-				want = agentgraph.LegacyIdle
+				want = agentgraph.StatusIdle
 			}
 			assertSummary(t, obs, now.Add(95*time.Second), want, agentgraph.AttentionNone)
 		})
@@ -92,5 +92,5 @@ func TestPollingHealsRestoredFalseGreenWithNewerStatusAnchor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertSummary(t, obs, now.Add(95*time.Second), agentgraph.LegacyIdle, agentgraph.AttentionNone)
+	assertSummary(t, obs, now.Add(95*time.Second), agentgraph.StatusIdle, agentgraph.AttentionNone)
 }

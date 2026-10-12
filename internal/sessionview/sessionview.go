@@ -72,7 +72,7 @@ func Status(session state.Session) string {
 		return info.Status
 	}
 	if session.AgentGraph != nil && session.AgentGraph.Summary.Status != "" {
-		return session.AgentGraph.Summary.Status
+		return string(session.AgentGraph.Summary.Status)
 	}
 	return "unknown"
 }

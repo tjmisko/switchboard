@@ -23,16 +23,16 @@ func TestHookRootTransitionsAndQuestionAttention(t *testing.T) {
 	defer o.Close()
 
 	result := o.ApplyHook(HookSignal{Root: root, Event: "SessionStart", At: now})
-	assertSummary(t, result.Observation, now, agentgraph.LegacyIdle, agentgraph.AttentionNone)
+	assertSummary(t, result.Observation, now, agentgraph.StatusIdle, agentgraph.AttentionNone)
 
 	result = o.ApplyHook(HookSignal{Root: root, Event: "UserPromptSubmit", At: now.Add(time.Second)})
-	assertSummary(t, result.Observation, now.Add(time.Second), agentgraph.LegacyWorking, agentgraph.AttentionNone)
+	assertSummary(t, result.Observation, now.Add(time.Second), agentgraph.StatusWorking, agentgraph.AttentionNone)
 
 	result = o.ApplyHook(HookSignal{
 		Root: root, Event: "PermissionRequest", ToolName: "AskUserQuestion",
 		ToolInputHash: "ask-1", At: now.Add(2 * time.Second),
 	})
-	assertSummary(t, result.Observation, now.Add(2*time.Second), agentgraph.LegacyPermission, agentgraph.AttentionUserInput)
+	assertSummary(t, result.Observation, now.Add(2*time.Second), agentgraph.StatusPermission, agentgraph.AttentionUserInput)
 	if got := result.Observation.Nodes[0].Attention; got != agentgraph.AttentionUserInput {
 		t.Fatalf("root attention = %q, want user_input", got)
 	}
@@ -41,9 +41,9 @@ func TestHookRootTransitionsAndQuestionAttention(t *testing.T) {
 		Root: root, Event: "PostToolUse", ToolName: "AskUserQuestion",
 		ToolInputHash: "ask-1", At: now.Add(3 * time.Second),
 	})
-	assertSummary(t, result.Observation, now.Add(3*time.Second), agentgraph.LegacyWorking, agentgraph.AttentionNone)
+	assertSummary(t, result.Observation, now.Add(3*time.Second), agentgraph.StatusWorking, agentgraph.AttentionNone)
 	projection := result.Projection
-	if projection.Status != agentgraph.LegacyWorking || len(projection.Pending) != 0 || projection.PendingTool != "" {
+	if projection.Status != agentgraph.StatusWorking || len(projection.Pending) != 0 || projection.PendingTool != "" {
 		t.Fatalf("projection after resolution = %+v", projection)
 	}
 }
@@ -109,7 +109,7 @@ func TestChildAttentionOwnershipAndWriterCollision(t *testing.T) {
 	if byID["child-a"].Attention != agentgraph.AttentionApproval || byID["child-b"].Attention != agentgraph.AttentionUserInput {
 		t.Fatalf("child attention = a:%q b:%q", byID["child-a"].Attention, byID["child-b"].Attention)
 	}
-	assertSummary(t, result.Observation, now.Add(2*time.Second), agentgraph.LegacyPermission, agentgraph.AttentionApproval)
+	assertSummary(t, result.Observation, now.Add(2*time.Second), agentgraph.StatusPermission, agentgraph.AttentionApproval)
 
 	// Same tool/hash from a teammate cannot clear child-a's prompt.
 	result = o.ApplyHook(HookSignal{
@@ -129,7 +129,7 @@ func TestChildAttentionOwnershipAndWriterCollision(t *testing.T) {
 	if got := sortedPendingWriters(result.Projection.Pending); !reflect.DeepEqual(got, []string{"child-b"}) {
 		t.Fatalf("writer-local clear pending writers = %v, want child-b", got)
 	}
-	assertSummary(t, result.Observation, now.Add(4*time.Second), agentgraph.LegacyPermission, agentgraph.AttentionUserInput)
+	assertSummary(t, result.Observation, now.Add(4*time.Second), agentgraph.StatusPermission, agentgraph.AttentionUserInput)
 }
 
 // Two gated calls dispatched in one assistant turn are two prompts, not one.
@@ -170,7 +170,7 @@ func TestParallelPromptsFromOneWriterHoldRedUntilEveryCallIsAnswered(t *testing.
 	if got := sortedPendingWriters(result.Projection.Pending); !reflect.DeepEqual(got, []string{""}) {
 		t.Fatalf("first parallel prompt lost its owner: %v", got)
 	}
-	assertSummary(t, result.Observation, now.Add(3*time.Second), agentgraph.LegacyPermission, agentgraph.AttentionApproval)
+	assertSummary(t, result.Observation, now.Add(3*time.Second), agentgraph.StatusPermission, agentgraph.AttentionApproval)
 
 	// Only the last answer may take the chip out of red.
 	result = o.ApplyHook(HookSignal{
@@ -180,7 +180,7 @@ func TestParallelPromptsFromOneWriterHoldRedUntilEveryCallIsAnswered(t *testing.
 	if result.PromptDepth != 0 || len(result.Projection.Pending) != 0 || result.Projection.PendingTool != "" {
 		t.Fatalf("last answer did not clear the writer: depth %d projection %+v", result.PromptDepth, result.Projection)
 	}
-	assertSummary(t, result.Observation, now.Add(4*time.Second), agentgraph.LegacyWorking, agentgraph.AttentionNone)
+	assertSummary(t, result.Observation, now.Add(4*time.Second), agentgraph.StatusWorking, agentgraph.AttentionNone)
 }
 
 // A writer's node attention is the fold over its open prompts and must use the
@@ -299,7 +299,7 @@ func TestEveryCallStaysOpenWhenOneTurnDispatchesPastTheMeasuredParallelMaximum(t
 			t.Fatalf("answering call %d = rule %q depth %d, want %d still open",
 				i, result.Rule, result.PromptDepth, i-1)
 		}
-		assertSummary(t, result.Observation, answeredAt, agentgraph.LegacyPermission, agentgraph.AttentionApproval)
+		assertSummary(t, result.Observation, answeredAt, agentgraph.StatusPermission, agentgraph.AttentionApproval)
 	}
 
 	answeredAt = answeredAt.Add(time.Second)
@@ -310,7 +310,7 @@ func TestEveryCallStaysOpenWhenOneTurnDispatchesPastTheMeasuredParallelMaximum(t
 	if result.PromptDepth != 0 || len(result.Projection.Pending) != 0 {
 		t.Fatalf("last answer left depth %d projection %+v", result.PromptDepth, result.Projection)
 	}
-	assertSummary(t, result.Observation, answeredAt, agentgraph.LegacyWorking, agentgraph.AttentionNone)
+	assertSummary(t, result.Observation, answeredAt, agentgraph.StatusWorking, agentgraph.AttentionNone)
 }
 
 // The 2026-08-05 invariant (docs/subagent-permission-plan.md) restated for the
@@ -395,7 +395,7 @@ func TestMainToolMatchHoldsWithLiveTeammateAndHashMismatch(t *testing.T) {
 	if result.Rule != "writer_prompt_held" || len(result.Projection.Pending) != 1 {
 		t.Fatalf("unidentified writer with teammate = rule %q pending %+v, want hold", result.Rule, result.Projection.Pending)
 	}
-	assertSummary(t, result.Observation, now.Add(3*time.Second), agentgraph.LegacyPermission, agentgraph.AttentionApproval)
+	assertSummary(t, result.Observation, now.Add(3*time.Second), agentgraph.StatusPermission, agentgraph.AttentionApproval)
 
 	// Even with an identified child writer, a changed input hash is ambiguous
 	// (approval can rewrite input) and must await transcript evidence.
@@ -512,7 +512,7 @@ func TestObserveProjectsStructuredFanoutAndPrunesOldTerminalCohorts(t *testing.T
 		t.Fatal(err)
 	}
 	summary := agentgraph.Reduce(observation, agentgraph.Summary{}, now.Add(time.Second))
-	if summary.LegacyStatus != agentgraph.LegacyDelegating || summary.LiveChildren != 1 {
+	if summary.Status != agentgraph.StatusDelegating || summary.LiveChildren != 1 {
 		t.Fatalf("fanout summary = %+v, want delegating with one live child", summary)
 	}
 	byID := graphNodesByID(observation.Nodes)
@@ -691,7 +691,7 @@ func TestRestorePreservesPersistedWriterOwnershipWithoutInventingCorrelators(t *
 	defer o.Close()
 	statusSince := now.Add(-time.Minute)
 	observation, err := o.Restore(root, Compatibility{
-		Status: agentgraph.LegacyPermission, StatusSince: statusSince,
+		Status: agentgraph.StatusPermission, StatusSince: statusSince,
 		PendingWriters:    []string{"child", PendingWriterMain},
 		InFlightSubagents: 2,
 	}, now)
@@ -702,7 +702,7 @@ func TestRestorePreservesPersistedWriterOwnershipWithoutInventingCorrelators(t *
 		t.Fatalf("restored observation metadata = %+v", observation)
 	}
 	projection := o.Projection(root.Key())
-	if projection.Status != agentgraph.LegacyPermission || projection.StatusSince != statusSince || projection.InFlightSubagents != 2 {
+	if projection.Status != agentgraph.StatusPermission || projection.StatusSince != statusSince || projection.InFlightSubagents != 2 {
 		t.Fatalf("restored projection = %+v", projection)
 	}
 	if got := sortedPendingWriters(projection.Pending); !reflect.DeepEqual(got, []string{"", "child"}) {
@@ -817,7 +817,7 @@ func TestFailedFanoutScanDoesNotRenewFreshness(t *testing.T) {
 			if err == nil {
 				t.Fatal("a failed fanout scan returned no error")
 			}
-			assertSummary(t, observation, at, agentgraph.LegacyWorking, agentgraph.AttentionNone)
+			assertSummary(t, observation, at, agentgraph.StatusWorking, agentgraph.AttentionNone)
 		}
 		observation, err := o.Observe(context.Background(), root, deadline)
 		if err == nil {
@@ -826,7 +826,7 @@ func TestFailedFanoutScanDoesNotRenewFreshness(t *testing.T) {
 		if observation.Fresh(deadline) {
 			t.Fatalf("graph still fresh at its original deadline %v: %+v", deadline, observation)
 		}
-		if got := agentgraph.Reduce(observation, agentgraph.Summary{}, deadline); got.Runtime != agentgraph.RuntimeUnknown || got.LegacyStatus != "" {
+		if got := agentgraph.Reduce(observation, agentgraph.Summary{}, deadline); got.Runtime != agentgraph.RuntimeUnknown || got.Status != "" {
 			t.Fatalf("summary at the deadline = %+v, want unknown", got)
 		}
 		if got := o.Projection(root.Key()).Status; got != "" {
@@ -855,7 +855,7 @@ func TestFailedFanoutScanDoesNotRenewFreshness(t *testing.T) {
 			t.Fatalf("recovered observation = [%v, %v) complete=%v, want a complete scan dated [%v, %v)",
 				observation.ObservedAt, observation.FreshUntil, observation.Complete, recoveredAt, recoveredAt.Add(time.Minute))
 		}
-		assertSummary(t, observation, recoveredAt, agentgraph.LegacyWorking, agentgraph.AttentionNone)
+		assertSummary(t, observation, recoveredAt, agentgraph.StatusWorking, agentgraph.AttentionNone)
 		if _, ok := graphNodesByID(observation.Nodes)["live"]; !ok {
 			t.Fatalf("recovered observation lost the live child: %+v", observation.Nodes)
 		}
@@ -881,7 +881,7 @@ func TestFailedFanoutScanDoesNotRenewFreshness(t *testing.T) {
 			t.Fatalf("failed scan dropped or ended the live child: %+v", observation.Nodes)
 		}
 		got := agentgraph.Reduce(observation, agentgraph.Summary{}, failedAt)
-		if got.LegacyStatus != agentgraph.LegacyWorking || got.LiveChildren != 1 {
+		if got.Status != agentgraph.StatusWorking || got.LiveChildren != 1 {
 			t.Fatalf("summary after a failed scan = %+v, want working with the one live child", got)
 		}
 		if got := o.Projection(root.Key()).InFlightSubagents; got != 1 {
@@ -1015,10 +1015,10 @@ func graphNodesByID(nodes []agentgraph.Node) map[string]agentgraph.Node {
 	return byID
 }
 
-func assertSummary(t *testing.T, observation agentgraph.Observation, now time.Time, legacy string, attention agentgraph.AttentionState) {
+func assertSummary(t *testing.T, observation agentgraph.Observation, now time.Time, status agentgraph.Status, attention agentgraph.AttentionState) {
 	t.Helper()
 	got := agentgraph.Reduce(observation, agentgraph.Summary{}, now)
-	if got.LegacyStatus != legacy || got.Attention != attention {
-		t.Fatalf("summary = %+v, want status=%q attention=%q; observation=%+v", got, legacy, attention, observation)
+	if got.Status != status || got.Attention != attention {
+		t.Fatalf("summary = %+v, want status=%q attention=%q; observation=%+v", got, status, attention, observation)
 	}
 }

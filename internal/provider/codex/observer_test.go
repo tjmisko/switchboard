@@ -226,7 +226,7 @@ func TestObserverReconnectFreshnessGenerationAndCoalescing(t *testing.T) {
 	}
 	waitUpdate(t, observer.Updates(), time.Until(deadline)+time.Second) // expiry invalidation
 	expired, _ := observer.Observe(context.Background(), ref, time.Now())
-	if summary := agentgraph.Reduce(expired, agentgraph.Summary{}, time.Now()); summary.LegacyStatus != "" || summary.Runtime != agentgraph.RuntimeUnknown {
+	if summary := agentgraph.Reduce(expired, agentgraph.Summary{}, time.Now()); summary.Status != "" || summary.Runtime != agentgraph.RuntimeUnknown {
 		t.Fatalf("expired disconnected observation reduced authoritatively: %#v", summary)
 	}
 

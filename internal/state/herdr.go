@@ -39,7 +39,7 @@ type HerdrInfo struct {
 	// is current. It is in-memory only: a status hydrated from state.json after a
 	// restart carries no authority until the watcher confirms it again.
 	Live bool `json:"-"`
-	// StatusSince is when herdr's status last changed, for the legacy
+	// StatusSince is when herdr's status last changed, for the session
 	// StatusSince of an edge herdr decides.
 	StatusSince time.Time `json:"-"`
 	// ActivePaneID is the pane herdr's focus is on, on this pane's server: the
@@ -58,12 +58,12 @@ const (
 	HerdrUnknown = "unknown"
 )
 
-// HerdrLegacyStatus projects herdr's status onto Switchboard's. blocked is
+// HerdrSessionStatus projects herdr's status onto Switchboard's. blocked is
 // permission; done (idle that no one has looked at) is idle. An idle agent
 // whose provider graph shows working subagents stays delegating: herdr reads
 // the screen and cannot see background agents, so that is detail it lacks, not
 // a disagreement. unknown means herdr cannot say, so it decides nothing.
-func HerdrLegacyStatus(herdr, provider string) (string, bool) {
+func HerdrSessionStatus(herdr, provider string) (string, bool) {
 	switch herdr {
 	case HerdrWorking:
 		return StatusWorking, true
@@ -179,7 +179,7 @@ func (s *Session) graphStatus(now time.Time) string {
 	if s.AgentGraph == nil || !s.AgentGraph.Fresh(now) {
 		return ""
 	}
-	return s.AgentGraph.Summary.Status
+	return string(s.AgentGraph.Summary.Status)
 }
 
 // herdrGraphLease is how long a herdr-sourced graph stays fresh without a new
@@ -225,7 +225,7 @@ func herdrAgentGraph(agent string, r HerdrReading, prior *AgentGraph, boundRootI
 }
 
 // herdrNodeState maps herdr's status onto a graph node, so the reducer derives
-// the same legacy status HerdrLegacyStatus does.
+// the same session status HerdrSessionStatus does.
 func herdrNodeState(status string) (agentgraph.RuntimeState, agentgraph.AttentionState) {
 	switch status {
 	case HerdrWorking:

@@ -260,9 +260,9 @@ func TestSetAgentGraphProjectsLegacyWithoutDiscardingClaudeCompatibilityFields(t
 	}
 
 	// A structured-summary transition (a child count changes) may reset the
-	// graph summary's since, but status_since remains the start of the legacy
+	// graph summary's since, but status_since remains the start of the
 	// permission status until that status itself changes.
-	priorLegacySince := sess.Codex.StatusSince
+	priorStatusSince := sess.Codex.StatusSince
 	obs.Nodes = append(obs.Nodes, agentgraph.Node{
 		ID: "child-b", ParentID: obs.RootID, Runtime: agentgraph.RuntimeIdle,
 		Attention: agentgraph.AttentionNone, Lifecycle: agentgraph.LifecycleRunning,
@@ -277,8 +277,8 @@ func TestSetAgentGraphProjectsLegacyWithoutDiscardingClaudeCompatibilityFields(t
 		t.Fatal("structured graph summary transition did not reset graph summary since")
 	}
 	sess.SetAgentGraph(second, obs.ObservedAt)
-	if !sess.Codex.StatusSince.Equal(priorLegacySince) {
-		t.Fatalf("same legacy status moved status_since: got %v want %v", sess.Codex.StatusSince, priorLegacySince)
+	if !sess.Codex.StatusSince.Equal(priorStatusSince) {
+		t.Fatalf("same session status moved status_since: got %v want %v", sess.Codex.StatusSince, priorStatusSince)
 	}
 
 	for i := range obs.Nodes {

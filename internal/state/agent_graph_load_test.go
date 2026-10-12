@@ -104,7 +104,7 @@ func TestLoadExpiresRestoredAgentGraphWithoutDroppingStructure(t *testing.T) {
 		t.Fatalf("expired graph remained authoritative: %+v", sess.AgentGraph.Summary)
 	}
 	if sess.Codex.Status != "" || sess.Codex.StatusSinceWire != nil {
-		t.Fatalf("expired graph kept legacy status authoritative: %+v", sess.Codex)
+		t.Fatalf("expired graph kept session status authoritative: %+v", sess.Codex)
 	}
 }
 

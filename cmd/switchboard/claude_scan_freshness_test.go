@@ -33,7 +33,7 @@ func TestClaudeFanoutScanFailureAtTheCoordinator(t *testing.T) {
 		scannedAt := now.Add(time.Second)
 		coordinator.observeAt(context.Background(), ref, scannedAt)
 		graph := publishedGraph(t, store)
-		if !graph.ObservedAt.Equal(scannedAt) || graph.Summary.Status != agentgraph.LegacyWorking {
+		if !graph.ObservedAt.Equal(scannedAt) || graph.Summary.Status != agentgraph.StatusWorking {
 			t.Fatalf("baseline graph = observed %v status %q, want a working scan dated %v", graph.ObservedAt, graph.Summary.Status, scannedAt)
 		}
 		deadline := graph.FreshUntil
@@ -55,7 +55,7 @@ func TestClaudeFanoutScanFailureAtTheCoordinator(t *testing.T) {
 			t.Fatalf("failed scan republished the graph as [%v, %v), want the last scan's [%v, %v)",
 				graph.ObservedAt, graph.FreshUntil, scannedAt, deadline)
 		}
-		if graph.Summary.Status != agentgraph.LegacyWorking {
+		if graph.Summary.Status != agentgraph.StatusWorking {
 			t.Fatalf("status inside the held window = %q, want working", graph.Summary.Status)
 		}
 

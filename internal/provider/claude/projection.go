@@ -192,7 +192,7 @@ func (o *Observer) DrainPromptDiagnostics(key provider.RootKey) []string {
 type Compatibility struct {
 	SessionID         string
 	Transcript        string
-	Status            string
+	Status            agentgraph.Status
 	StatusSince       time.Time
 	InFlightSubagents int
 	Workflows         []fanout.Workflow
@@ -240,7 +240,7 @@ func (o *Observer) Restore(root provider.RootRef, restored Compatibility, at tim
 		return agentgraph.Observation{}, ErrClosed
 	}
 	rs := o.ensureRootLocked(root)
-	rs.runtime = runtimeFromLegacy(restored.Status)
+	rs.runtime = runtimeFromStatus(restored.Status)
 	rs.runtimeAt = restored.StatusSince
 	if rs.runtimeAt.IsZero() {
 		rs.runtimeAt = at
@@ -277,7 +277,7 @@ func (o *Observer) Restore(root provider.RootRef, restored Compatibility, at tim
 	}
 	if !restored.StatusSince.IsZero() {
 		rs.projection.StatusSince = restored.StatusSince
-		if restored.Status == rs.priorSummary.LegacyStatus {
+		if restored.Status == rs.priorSummary.Status {
 			rs.priorSummary.Since = restored.StatusSince
 		}
 	}
@@ -286,14 +286,14 @@ func (o *Observer) Restore(root provider.RootRef, restored Compatibility, at tim
 
 func projectCompatibility(rs *rootState, summary agentgraph.Summary) Compatibility {
 	statusSince := summary.Since
-	if rs.projection.Status == summary.LegacyStatus && !rs.projection.StatusSince.IsZero() {
-		// Legacy status_since dates chip-color transitions, not graph-detail
+	if rs.projection.Status == summary.Status && !rs.projection.StatusSince.IsZero() {
+		// status_since dates chip-color transitions, not graph-detail
 		// changes such as a second blocked writer or another live child.
 		statusSince = rs.projection.StatusSince
 	}
 	projection := Compatibility{
 		SessionID: rs.ref.ProviderSessionID, Transcript: rs.ref.Transcript,
-		Status: summary.LegacyStatus, StatusSince: statusSince,
+		Status: summary.Status, StatusSince: statusSince,
 		InFlightSubagents: rs.fanout.InFlight,
 		Workflows:         append([]fanout.Workflow(nil), rs.fanout.Workflows...),
 		Pending:           projectedPending(rs.pending),
@@ -482,11 +482,11 @@ func restoredPrompt(prompt PendingPrompt, at time.Time, residual bool) PendingPr
 	return prompt
 }
 
-func runtimeFromLegacy(status string) agentgraph.RuntimeState {
+func runtimeFromStatus(status agentgraph.Status) agentgraph.RuntimeState {
 	switch status {
-	case agentgraph.LegacyWorking:
+	case agentgraph.StatusWorking:
 		return agentgraph.RuntimeActive
-	case agentgraph.LegacyIdle, agentgraph.LegacyDelegating, agentgraph.LegacyPermission:
+	case agentgraph.StatusIdle, agentgraph.StatusDelegating, agentgraph.StatusPermission:
 		return agentgraph.RuntimeIdle
 	default:
 		return agentgraph.RuntimeUnknown

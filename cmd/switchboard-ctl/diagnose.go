@@ -202,7 +202,7 @@ func buildObserverDiagnostics(snap state.Snapshot, now time.Time) []observerDiag
 			d.Source = string(graph.Source)
 			d.ObservedAt = graph.ObservedAt
 			d.FreshUntil = graph.FreshUntil
-			d.GraphSummary = graph.Summary.Status
+			d.GraphSummary = string(graph.Summary.Status)
 			if graph.RootID != "" {
 				if d.ThreadID == "" {
 					d.ThreadID = graph.RootID

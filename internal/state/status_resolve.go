@@ -196,7 +196,7 @@ func (s *Session) project(info *AgentInfo, fallback, now time.Time) {
 	since := time.Time{}
 	switch {
 	case source.graph != nil:
-		if source.graph.Summary.Status == d.Status {
+		if string(source.graph.Summary.Status) == d.Status {
 			since = source.graph.Summary.Since
 		}
 	case d.EvidenceKind == statusexplain.EvidenceTerminal && s.Herdr != nil:
