@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/agentgraph"
@@ -117,7 +118,22 @@ func (c *agentCoordinator) applyPiUsage(key provider.RootKey, root *piHookRoot, 
 		CacheWriteInputTokens: usage.CacheWriteTokens, OutputTokens: usage.OutputTokens,
 		TotalTokens: usage.TotalTokens,
 	}
-	identity := agentgraph.BillingIdentity{AgentClient: state.AgentKindPi, ExecutionProvider: usage.Provider, Model: usage.Model}
+	provider := strings.ToLower(strings.TrimSpace(usage.Provider))
+	upstream := strings.ToLower(strings.TrimSpace(usage.UpstreamProvider))
+	identity := agentgraph.BillingIdentity{AgentClient: state.AgentKindPi, Model: usage.Model}
+	if provider == "openrouter" {
+		identity.Gateway, identity.BillingRoute, identity.ExecutionProvider = "openrouter", "gateway", upstream
+	} else {
+		identity.ExecutionProvider, identity.BillingRoute = provider, "api"
+	}
+	if c.sink != nil && (root.billing.Gateway != identity.Gateway || root.billing.ExecutionProvider != identity.ExecutionProvider || root.billing.BillingRoute != identity.BillingRoute) {
+		c.sink.Record(history.Event{
+			SchemaVersion: history.HistorySchemaVersion, Ts: now, Type: history.EventSessionIdentity,
+			SessionID: sessionID, PID: key.PID, Agent: state.AgentKindPi, CWD: sess.CWD,
+			Gateway: identity.Gateway, ExecutionProvider: identity.ExecutionProvider,
+			BillingRoute: identity.BillingRoute, RouteEvidence: "pi_response",
+		})
+	}
 
 	// Only the bound session's totals live on the graph. Usage for another
 	// session (a rotation whose SessionStart has not landed) still reaches
@@ -146,7 +162,8 @@ func (c *agentCoordinator) applyPiUsage(key provider.RootKey, root *piHookRoot, 
 		Source:       agentgraph.SourceHook,
 		UsageEventID: eventID, UsageSnapshot: true, UsageRevision: 1,
 		ProviderMessageID: usage.MessageID,
-		ExecutionProvider: usage.Provider, Model: usage.Model,
+		Gateway:           identity.Gateway, ExecutionProvider: identity.ExecutionProvider,
+		BillingRoute: identity.BillingRoute, Model: usage.Model,
 		Usage: &canonical, Cost: piReportedCost(usage),
 		// Legacy fields remain populated for old CLI readers, as for Codex.
 		TokIn: delta.InputTokens, TokOut: delta.OutputTokens,

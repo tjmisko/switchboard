@@ -39,14 +39,15 @@ func TestHistoryRecorderWritesVersionedUsageAndNullableVendorSnapshot(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 2 || events[0].SchemaVersion != history.HistorySchemaVersion || events[0].Usage == nil ||
-		events[0].Usage.InputTokens != 10 || events[0].UsageTotal == nil || events[0].UsageTotal.InputTokens != 100 ||
-		events[0].AuthMode != "api_key" || events[0].BillingRoute != "api" || events[0].UsageCoverage != "tokens_only" {
+	if len(events) != 3 || events[0].Type != history.EventSessionIdentity || events[0].BillingRoute != "api" ||
+		events[1].SchemaVersion != history.HistorySchemaVersion || events[1].Usage == nil ||
+		events[1].Usage.InputTokens != 10 || events[1].UsageTotal == nil || events[1].UsageTotal.InputTokens != 100 ||
+		events[1].AuthMode != "api_key" || events[1].BillingRoute != "api" || events[1].UsageCoverage != "tokens_only" {
 		t.Fatalf("usage history event = %#v", events)
 	}
-	if events[1].SchemaVersion != history.HistorySchemaVersion || events[1].Type != history.EventVendorUsageSnapshot ||
-		events[1].VendorUsage == nil || events[1].VendorUsage.EstimatedUsageUSD != nil || !events[1].VendorUsage.Stale {
-		t.Fatalf("vendor history event = %#v", events[1])
+	if events[2].SchemaVersion != history.HistorySchemaVersion || events[2].Type != history.EventVendorUsageSnapshot ||
+		events[2].VendorUsage == nil || events[2].VendorUsage.EstimatedUsageUSD != nil || !events[2].VendorUsage.Stale {
+		t.Fatalf("vendor history event = %#v", events[2])
 	}
 }
 
@@ -69,7 +70,7 @@ func TestHistoryRecorderMarksNonAPIRoutesTokenOnly(t *testing.T) {
 	}
 	sink.Close()
 	events, err := history.ReadRange(dir, time.Time{}, time.Time{})
-	if err != nil || len(events) != 1 || events[0].UsageCoverage != "tokens_only" {
+	if err != nil || len(events) != 2 || events[0].Type != history.EventSessionIdentity || events[1].UsageCoverage != "tokens_only" {
 		t.Fatalf("non-API usage coverage = %#v, %v", events, err)
 	}
 }

@@ -86,6 +86,17 @@ function count(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
 }
 
+export function selectedUpstreamFromChunk(chunk: any): { responseId: string; upstream: string } | undefined {
+  const available = chunk?.openrouter_metadata?.endpoints?.available;
+  const endpoint = Array.isArray(available) ? available.find((item) => item?.selected === true) : undefined;
+  const raw = endpoint?.provider;
+  const responseId = chunk?.id;
+  if (typeof raw !== "string" || typeof responseId !== "string" || !responseId) return undefined;
+  const upstream = raw.toLowerCase().trim().replace(/\s+/g, "-");
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(upstream)) return undefined;
+  return { responseId, upstream };
+}
+
 export default function (pi) {
   // Per-session state. A reload replaces this extension instance, so
   // session_start rebuilds all of it.
@@ -94,6 +105,23 @@ export default function (pi) {
   let herdrBlocked = 0;
   let lastAssistant: { stopReason?: string; errorMessage?: string } | undefined;
   let lastCtx: any;
+  // OpenRouter's opted-in response metadata names the selected endpoint.
+  // Match it to Pi's response id; a model's vendor prefix is never a substitute.
+  const upstreamByResponse = new Map<string, string>();
+
+  pi.on("before_provider_headers", (event, ctx) => {
+    if (ctx?.model?.provider === "openrouter") {
+      event.headers["X-OpenRouter-Metadata"] = "enabled";
+    }
+  });
+
+  pi.on("provider_stream_event", (event) => {
+    if (event?.provider !== "openrouter") return;
+    const selected = selectedUpstreamFromChunk(event.data);
+    if (!selected) return;
+    upstreamByResponse.set(selected.responseId, selected.upstream);
+    if (upstreamByResponse.size > 256) upstreamByResponse.delete(upstreamByResponse.keys().next().value);
+  });
 
   function dialogs(event: "PermissionRequest" | "PermissionResolved", ctx: any): void {
     send(event, { ...sessionFields(ctx), open_dialogs: (promptOpen ? 1 : 0) + herdrBlocked });
@@ -183,9 +211,12 @@ export default function (pi) {
     lastAssistant = { stopReason: message.stopReason, errorMessage: message.errorMessage };
     if (!interactive) return;
     const usage = message.usage ?? {};
+    const upstream = typeof message.responseId === "string" ? upstreamByResponse.get(message.responseId) : undefined;
+    if (typeof message.responseId === "string") upstreamByResponse.delete(message.responseId);
     const payload: Record<string, unknown> = {
       ...sessionFields(ctx),
       provider: message.provider,
+      upstream_provider: upstream,
       model: message.model,
       input_tokens: count(usage.input),
       output_tokens: count(usage.output),

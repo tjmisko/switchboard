@@ -391,6 +391,7 @@ func (set CatalogSet) Resolve(provider, modelID string) (Catalog, ModelPrice, bo
 // billed a request.
 type Identity struct {
 	AgentClient       string `json:"agent_client,omitempty"`
+	Gateway           string `json:"gateway,omitempty"`
 	ExecutionProvider string `json:"execution_provider,omitempty"`
 	BillingRoute      string `json:"billing_route,omitempty"`
 	AccountKind       string `json:"account_kind,omitempty"`

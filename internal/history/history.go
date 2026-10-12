@@ -32,11 +32,12 @@ import (
 // lifecycle events bound a session's first and last intervals; suspend/resume
 // mark the greyed-out spans. (Usage and subagent events arrive in Phase 4.)
 const (
-	EventTransition   = "transition"
-	EventSessionStart = "session_start"
-	EventSessionEnd   = "session_end"
-	EventSuspend      = "suspend"
-	EventResume       = "resume"
+	EventTransition      = "transition"
+	EventSessionStart    = "session_start"
+	EventSessionIdentity = "session_identity"
+	EventSessionEnd      = "session_end"
+	EventSuspend         = "suspend"
+	EventResume          = "resume"
 	// Phase 4 — fanout & plan usage.
 	EventSubagentSpawn       = "subagent_spawn"        // a Task/Agent subagent was launched
 	EventSubagentStop        = "subagent_stop"         // its result landed (it finished)
@@ -169,7 +170,10 @@ type Event struct {
 	UnclassifiedServerToolUnits int64 `json:"unclassified_server_tool_units,omitempty"`
 
 	ExecutionProvider string `json:"execution_provider,omitempty"`
+	Gateway           string `json:"gateway,omitempty"`
 	BillingRoute      string `json:"billing_route,omitempty"`
+	RouteEvidence     string `json:"route_evidence,omitempty"`
+	RateLimitsPresent *bool  `json:"rate_limits_present,omitempty"`
 	AccountKind       string `json:"account_kind,omitempty"`
 	AuthMode          string `json:"auth_mode,omitempty"`
 	ServiceTier       string `json:"service_tier,omitempty"`
@@ -238,7 +242,7 @@ func (e Event) CanonicalUsage() UsageDelta {
 // PricingIdentity separates Agent (the client) from the provider and route.
 func (e Event) PricingIdentity() BillingIdentity {
 	return BillingIdentity{
-		AgentClient: e.Agent, ExecutionProvider: e.ExecutionProvider,
+		AgentClient: e.Agent, Gateway: e.Gateway, ExecutionProvider: e.ExecutionProvider,
 		BillingRoute: e.BillingRoute, AccountKind: e.AccountKind, AuthMode: e.AuthMode, Model: e.Model,
 		ServiceTier: e.ServiceTier, Speed: e.Speed, InferenceGeo: e.InferenceGeo,
 		ReasoningEffort: e.ReasoningEffort,

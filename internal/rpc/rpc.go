@@ -67,10 +67,16 @@ type Request struct {
 	WindowFocused bool   `json:"window_focused,omitempty"`
 
 	// hook fields — set when Cmd == "hook"
-	Event      string    `json:"event,omitempty"`
-	PID        int       `json:"pid,omitempty"`
-	SessionID  string    `json:"session_id,omitempty"`
-	ObservedAt time.Time `json:"observed_at,omitzero"`
+	Event string `json:"event,omitempty"`
+	// Billing fields contain only route classifications made by the hook client.
+	Gateway           string    `json:"gateway,omitempty"`
+	ExecutionProvider string    `json:"execution_provider,omitempty"`
+	BillingRoute      string    `json:"billing_route,omitempty"`
+	RouteEvidence     string    `json:"route_evidence,omitempty"`
+	RateLimitsPresent *bool     `json:"rate_limits_present,omitempty"`
+	PID               int       `json:"pid,omitempty"`
+	SessionID         string    `json:"session_id,omitempty"`
+	ObservedAt        time.Time `json:"observed_at,omitzero"`
 	// Prompt is an ephemeral, bounded display-name input. It is never stored or
 	// logged by the daemon.
 	Prompt string `json:"prompt,omitempty"`
@@ -187,6 +193,7 @@ type Request struct {
 type HookUsage struct {
 	MessageID        string   `json:"message_id,omitempty"`
 	Provider         string   `json:"provider,omitempty"`
+	UpstreamProvider string   `json:"upstream_provider,omitempty"`
 	Model            string   `json:"model,omitempty"`
 	InputTokens      int64    `json:"input_tokens,omitempty"`
 	OutputTokens     int64    `json:"output_tokens,omitempty"`

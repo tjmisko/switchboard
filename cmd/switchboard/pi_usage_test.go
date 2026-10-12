@@ -63,7 +63,7 @@ func TestPiUsageShouldAddPisOwnPerMessageCostWithoutRepricing(t *testing.T) {
 		usage.CacheWriteInputTokens != 20 || usage.TotalTokens != 2_003_220 {
 		t.Fatalf("root usage = %+v, want the two messages summed", usage)
 	}
-	want := agentgraph.BillingIdentity{AgentClient: "pi", ExecutionProvider: "anthropic", Model: "claude-opus-4-8"}
+	want := agentgraph.BillingIdentity{AgentClient: "pi", ExecutionProvider: "anthropic", BillingRoute: "api", Model: "claude-opus-4-8"}
 	if billing != want {
 		t.Fatalf("billing = %+v, want %+v", billing, want)
 	}
@@ -88,6 +88,45 @@ func TestPiUsageShouldAddPisOwnPerMessageCostWithoutRepricing(t *testing.T) {
 	totals := history.AggregateTotalsWithCatalogs(samples, pricing.BootstrapCatalogs(), pricingNow)
 	if totals.CostUSD == nil || *totals.CostUSD != pricing.USDFromMicros(500_000) {
 		t.Fatalf("totals cost = %v, want Pi's own $0.50", totals.CostUSD)
+	}
+}
+
+func TestPiOpenRouterPreservesGatewayAndUnknownUpstream(t *testing.T) {
+	h := newPiHarness(t)
+	h.hook("SessionStart", 0, source("startup"))
+	h.hook("Usage", time.Second, func(req *rpc.Request) {
+		cost := 0.01
+		req.Usage = &rpc.HookUsage{MessageID: "gen-1", Provider: "openrouter", Model: "deepseek/deepseek-v4", InputTokens: 100, CostTotal: &cost}
+	})
+	_, billing := h.rootUsage()
+	if billing.Gateway != "openrouter" || billing.ExecutionProvider != "" || billing.BillingRoute != "gateway" {
+		t.Fatalf("gateway identity = %+v", billing)
+	}
+	samples := usageEvents(h.events())
+	if len(samples) != 1 || samples[0].Gateway != "openrouter" || samples[0].ExecutionProvider != "" {
+		t.Fatalf("gateway history = %+v", samples)
+	}
+}
+
+func TestPiOpenRouterRecordsSelectedUpstream(t *testing.T) {
+	h := newPiHarness(t)
+	h.hook("SessionStart", 0, source("startup"))
+	h.hook("Usage", time.Second, func(req *rpc.Request) {
+		cost := 0.01
+		req.Usage = &rpc.HookUsage{MessageID: "gen-2", Provider: "openrouter", UpstreamProvider: "deepinfra", Model: "deepseek/deepseek-v4", InputTokens: 100, CostTotal: &cost}
+	})
+	samples := usageEvents(h.events())
+	if len(samples) != 1 || samples[0].Gateway != "openrouter" || samples[0].ExecutionProvider != "deepinfra" || samples[0].BillingRoute != "gateway" {
+		t.Fatalf("selected upstream history = %+v", samples)
+	}
+	identities := 0
+	for _, event := range h.events() {
+		if event.Type == history.EventSessionIdentity && event.ExecutionProvider == "deepinfra" {
+			identities++
+		}
+	}
+	if identities != 1 {
+		t.Fatalf("selected upstream identity events = %d, want 1", identities)
 	}
 }
 

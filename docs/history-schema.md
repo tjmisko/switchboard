@@ -125,6 +125,13 @@ sampling or change the live state schema. See [pricing.md](pricing.md).
   "tok_cache_read": 920000, "tok_cache_create": 15000,
   "model": "claude-opus-4-8",        // the model the tokens were spent on (priced by CostUSD); minimal-safe
 
+  // billing identity (session_identity, also attached to usage when known):
+  "gateway": "openrouter",          // intermediary, if any
+  "execution_provider": "anthropic", // actual upstream; may be unknown
+  "billing_route": "gateway",        // subscription | api | cloud | gateway | unknown
+  "route_evidence": "pi_response",   // source of this classification
+  "rate_limits_present": false,       // Claude statusline evidence, once after response
+
   // session-label payload (session_label):
   "label": "sb-invest",              // the session's current name (full tier — scrubbed at minimal)
 

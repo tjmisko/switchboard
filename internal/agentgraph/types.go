@@ -144,6 +144,7 @@ func (u Usage) IsZero() bool {
 // history projection aggregates them.
 type BillingIdentity struct {
 	AgentClient       string `json:"agent_client,omitempty"`
+	Gateway           string `json:"gateway,omitempty"`
 	ExecutionProvider string `json:"execution_provider,omitempty"`
 	// AuthMode describes how the client authenticated. It is deliberately
 	// separate from BillingRoute: ChatGPT authentication does not prove whether

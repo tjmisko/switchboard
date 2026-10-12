@@ -152,10 +152,14 @@ type VendorUsageAggregate struct {
 // session's name history, its launched subagents, the spans it held focus, and
 // its token usage + recomputed dollar cost.
 type Swimlane struct {
-	SessionID string `json:"session_id,omitempty"`
-	PID       int    `json:"pid"`
-	Agent     string `json:"agent,omitempty"`
-	Project   string `json:"project,omitempty"`
+	SessionID         string `json:"session_id,omitempty"`
+	Gateway           string `json:"gateway,omitempty"`
+	ExecutionProvider string `json:"execution_provider,omitempty"`
+	BillingRoute      string `json:"billing_route,omitempty"`
+	RouteEvidence     string `json:"route_evidence,omitempty"`
+	PID               int    `json:"pid"`
+	Agent             string `json:"agent,omitempty"`
+	Project           string `json:"project,omitempty"`
 	// ProjectFull is the pretty, human-readable project display name (e.g.
 	// "Switchboard") to Project's terse abbreviation (e.g. "sb"). The history
 	// package stays a dependency-light leaf and never derives this — it is a plain
@@ -361,7 +365,7 @@ func BuildSwimlanes(events []Event, end time.Time) []Swimlane {
 // catalog snapshot. Tests and CLI callers can guarantee every lane uses one
 // coherent pricing version even if a background refresh lands mid-fold.
 func BuildSwimlanesWithCatalogs(events []Event, end time.Time, catalogs pricing.CatalogSet, pricingNow time.Time) []Swimlane {
-	events = latestUsageSnapshots(events)
+	events = latestUsageSnapshots(JoinSessionIdentities(events))
 	evs := append([]Event(nil), events...)
 	sort.SliceStable(evs, func(i, j int) bool { return evs[i].Ts.Before(evs[j].Ts) })
 
@@ -464,6 +468,14 @@ func BuildSwimlanesWithCatalogs(events []Event, end time.Time, catalogs pricing.
 			b.observe(ev.Ts)
 		}
 		switch ev.Type {
+		case EventSessionIdentity:
+			if b != nil {
+				b.absorb(ev)
+				b.lane.Gateway = ev.Gateway
+				b.lane.ExecutionProvider = ev.ExecutionProvider
+				b.lane.BillingRoute = ev.BillingRoute
+				b.lane.RouteEvidence = ev.RouteEvidence
+			}
 		case EventSessionStart:
 			if b != nil {
 				// A session_start for a lane that is still open (no session_end has
@@ -537,6 +549,18 @@ func BuildSwimlanesWithCatalogs(events []Event, end time.Time, catalogs pricing.
 			if b == nil {
 				b = newLaneBuilder(ev)
 				open[key] = b
+			}
+			if ev.Gateway != "" {
+				b.lane.Gateway = ev.Gateway
+			}
+			if ev.ExecutionProvider != "" {
+				b.lane.ExecutionProvider = ev.ExecutionProvider
+			}
+			if ev.BillingRoute != "" {
+				b.lane.BillingRoute = ev.BillingRoute
+			}
+			if ev.RouteEvidence != "" {
+				b.lane.RouteEvidence = ev.RouteEvidence
 			}
 			usage := ev.CanonicalUsage()
 			accumulateUsage(&b.lane.Usage, usage)
@@ -869,6 +893,7 @@ func AggregateTotals(events []Event) Totals {
 }
 
 func AggregateTotalsWithCatalogs(events []Event, catalogs pricing.CatalogSet, pricingNow time.Time) Totals {
+	events = JoinSessionIdentities(events)
 	t := Totals{VendorUsage: foldVendorUsage(latestVendorSnapshotEvents(events))}
 	coverageSeen := map[string]bool{}
 	for _, ev := range latestUsageSnapshots(events) {

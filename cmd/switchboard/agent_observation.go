@@ -1081,6 +1081,24 @@ func (c *agentCoordinator) HandleHook(req rpc.Request, sess state.Session) {
 	if now.IsZero() {
 		now = c.now()
 	}
+	if ref.Provider == agentgraph.ProviderClaude && req.Event == "SessionStart" && req.SessionID != "" && c.sink != nil {
+		c.sink.Record(history.Event{
+			Ts: now, Type: history.EventSessionIdentity, PID: sess.PID,
+			SessionID: req.SessionID, Agent: state.AgentKindClaude,
+			Gateway: req.Gateway, ExecutionProvider: req.ExecutionProvider,
+			BillingRoute: req.BillingRoute, RouteEvidence: req.RouteEvidence,
+		})
+	}
+	if ref.Provider == agentgraph.ProviderClaude && req.Event == "BillingEvidence" {
+		if req.SessionID != "" && req.RateLimitsPresent != nil && c.sink != nil {
+			c.sink.Record(history.Event{
+				Ts: now, Type: history.EventSessionIdentity, PID: sess.PID,
+				SessionID: req.SessionID, Agent: state.AgentKindClaude,
+				RateLimitsPresent: req.RateLimitsPresent,
+			})
+		}
+		return
+	}
 	switch ref.Provider {
 	case agentgraph.ProviderClaude:
 		if c.claude == nil {

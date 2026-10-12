@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/billing"
 	"github.com/tjmisko/switchboard/internal/buildinfo"
 	sblabel "github.com/tjmisko/switchboard/internal/label"
 	"github.com/tjmisko/switchboard/internal/projectname"
@@ -138,6 +139,8 @@ func main() {
 			fail("hook requires an event name")
 		}
 		cmdHook(c, args[1], state.AgentKindClaude)
+	case "billing-statusline":
+		cmdBillingStatusline(c)
 	case "codex-hook":
 		if len(args) < 2 {
 			fail("codex-hook requires an event name")
@@ -590,6 +593,13 @@ func cmdHook(c *rpc.Client, event, agent string) {
 	body, _ := io.ReadAll(os.Stdin)
 	observedAt := time.Now().UTC()
 	req := parseHookPayloadAt(body, event, agent, observedAt)
+	if event == "SessionStart" && agent == state.AgentKindClaude {
+		identity := billing.Probe()
+		req.Gateway = identity.Gateway
+		req.ExecutionProvider = identity.ExecutionProvider
+		req.BillingRoute = identity.BillingRoute
+		req.RouteEvidence = identity.RouteEvidence
+	}
 	req.PID = os.Getppid()
 	if req.ObservedAt.IsZero() {
 		req.ObservedAt = observedAt
@@ -690,6 +700,7 @@ type piHookPayload struct {
 	SessionName         string   `json:"session_name"`
 	MessageID           string   `json:"message_id"`
 	Provider            string   `json:"provider"`
+	UpstreamProvider    string   `json:"upstream_provider"`
 	Model               string   `json:"model"`
 	InputTokens         int64    `json:"input_tokens"`
 	OutputTokens        int64    `json:"output_tokens"`
@@ -723,6 +734,7 @@ func carryPiLifecycle(req *rpc.Request, body []byte, event string) {
 		usage := rpc.HookUsage{
 			MessageID:        truncatePrompt(payload.MessageID, maxPiUsageLabel),
 			Provider:         truncatePrompt(payload.Provider, maxPiUsageLabel),
+			UpstreamProvider: truncatePrompt(payload.UpstreamProvider, maxPiUsageLabel),
 			Model:            truncatePrompt(payload.Model, maxPiUsageLabel),
 			InputTokens:      max(payload.InputTokens, 0),
 			OutputTokens:     max(payload.OutputTokens, 0),
