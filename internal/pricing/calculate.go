@@ -207,8 +207,9 @@ func EstimateRequest(catalogs CatalogSet, identity Identity, usage Usage, now ti
 func selectRates(provider string, model ModelPrice, identity Identity, usage Usage) (RateCard, Multiplier, string) {
 	rates := model.Base
 	contextBand := false
+	promptTokens := contextBandTokens(provider, usage)
 	for _, band := range model.ContextBands {
-		if usage.InputTokens > band.MinInputTokensExclusive {
+		if promptTokens > band.MinInputTokensExclusive {
 			rates = band.Rates
 			contextBand = true
 		}
@@ -246,7 +247,7 @@ func selectRates(provider string, model ModelPrice, identity Identity, usage Usa
 		if contextBand {
 			matched := false
 			for _, band := range price.ContextBands {
-				if usage.InputTokens > band.MinInputTokensExclusive {
+				if promptTokens > band.MinInputTokensExclusive {
 					rates = band.Rates
 					matched = true
 				}
@@ -267,6 +268,21 @@ func selectRates(provider string, model ModelPrice, identity Identity, usage Usa
 		multiplier = value
 	}
 	return rates, multiplier, ""
+}
+
+// contextBandTokens is the prompt length a context band is measured against.
+// OpenAI input already includes its cached and cache-write input. An Anthropic
+// prompt counts "all of its input tokens, including cache reads and cache
+// writes", which Anthropic usage reports outside input_tokens.
+func contextBandTokens(provider string, usage Usage) int64 {
+	if provider != ProviderAnthropic {
+		return usage.InputTokens
+	}
+	writes := usage.CacheWrite5mInputTokens + usage.CacheWrite1hInputTokens
+	if usage.CacheWriteInputTokens > writes {
+		writes = usage.CacheWriteInputTokens
+	}
+	return usage.InputTokens + usage.CachedInputTokens + writes
 }
 
 func unknownEstimate(estimate Estimate, usage Usage, reason string) Estimate {

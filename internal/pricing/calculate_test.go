@@ -225,8 +225,9 @@ func TestEstimateStaleCatalogIsExplicit(t *testing.T) {
 }
 
 func TestEstimateExpiredBundledCatalogFailsClosed(t *testing.T) {
-	now := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
-	estimate := EstimateRequest(BootstrapCatalogs(), Identity{
+	set := BootstrapCatalogs()
+	now := set[ProviderAnthropic].EffectiveAt.Add(7 * 24 * time.Hour)
+	estimate := EstimateRequest(set, Identity{
 		ExecutionProvider: ProviderAnthropic, Model: "claude-opus-4-8",
 	}, Usage{InputTokens: 1_000_000}, now)
 	if estimate.APIEquivalentUSD != nil || estimate.Status != CostUnknown || estimate.UnpricedEvents != 1 {
@@ -312,5 +313,34 @@ func assertUSD(t *testing.T, got *USD, want float64) {
 	}
 	if math.Abs(got.Float64()-want) > 0.0000001 {
 		t.Fatalf("cost = %.6f, want %.6f", got.Float64(), want)
+	}
+}
+
+func TestEstimateClaudeHaiku55BandsByFullPromptIncludingCache(t *testing.T) {
+	now := time.Date(2026, 10, 12, 12, 0, 0, 0, time.UTC)
+	identity := Identity{ExecutionProvider: ProviderAnthropic, BillingRoute: "api", Model: "claude-haiku-5-5"}
+	// 60k uncached + 40k cache read is exactly 100,000: the band is exclusive.
+	atThreshold := EstimateRequest(freshCatalogs(now), identity, Usage{
+		InputTokens: 60_000, CachedInputTokens: 40_000, OutputTokens: 1_000_000,
+	}, now)
+	// 0.06 * $0.10 + 0.04 * $0.01 + 1 * $0.50
+	assertUSD(t, atThreshold.APIEquivalentUSD, 0.5064)
+	// One more cache-write token crosses it; every bucket moves to long rates.
+	over := EstimateRequest(freshCatalogs(now), identity, Usage{
+		InputTokens: 60_000, CachedInputTokens: 40_000, CacheWrite5mInputTokens: 1, OutputTokens: 1_000_000,
+	}, now)
+	// 0.06 * $0.50 + 0.04 * $0.05 + $0.000000625 + 1 * $2.50
+	assertUSD(t, over.APIEquivalentUSD, 2.532001)
+}
+
+func TestEstimateClaudeOpus55IsPricedFromTheBundledCatalog(t *testing.T) {
+	now := time.Date(2026, 10, 12, 12, 0, 0, 0, time.UTC)
+	estimate := EstimateRequest(freshCatalogs(now), Identity{
+		ExecutionProvider: ProviderAnthropic, BillingRoute: "api", Model: "claude-opus-5-5",
+	}, Usage{InputTokens: 1_000_000, CachedInputTokens: 1_000_000, CacheWrite1hInputTokens: 1_000_000, OutputTokens: 1_000_000}, now)
+	// $4 + $0.20 + $8 + $20
+	assertUSD(t, estimate.APIEquivalentUSD, 32.2)
+	if estimate.Status != CostEstimated {
+		t.Fatalf("estimate = %+v", estimate)
 	}
 }
