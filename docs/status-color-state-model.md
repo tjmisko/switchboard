@@ -13,8 +13,8 @@
 ## 0. Color semantics (the contract we are encoding)
 
 Color is an **action semantic**, not a mechanism. The daemon reduces the
-provider-neutral graph to a legacy status, and renderers map that status to the
-existing palette. Legacy `AgentInfo.Status` remains a compatibility projection.
+provider-neutral graph to the session status, and renderers map that status to
+the existing palette. `AgentInfo.Status` carries it to renderers.
 
 | Color | Status | Meaning to the user | Salience |
 |-------|--------|---------------------|----------|
@@ -76,7 +76,7 @@ The reducer ignores provider/source names and uses only a valid graph plus its
 half-open freshness interval (`observed_at <= now < fresh_until`). It evaluates
 the following table top to bottom:
 
-| Fresh valid graph | Live waits | Root runtime | Live descendant activity/lifecycle | Legacy status | Color |
+| Fresh valid graph | Live waits | Root runtime | Live descendant activity/lifecycle | Session status | Color |
 |-------------------|------------|--------------|------------------------------------|---------------|-------|
 | no | any | any | any | `""` (unknown) | gray |
 | yes | any `approval` | any | any | `permission` | red |
@@ -401,7 +401,7 @@ while the neutral graph independently represents each node's attention.
 
 States: `WORKING(green)`, `IDLE(orange)`, `DELEGATING(green; idle-but-S>0)`,
 `PERMISSION(red)`, `UNKNOWN(gray)`, plus the `SUSPENDED`/`GONE` overlays.
-`DELEGATING` is now a stored legacy summary value derived by the neutral
+`DELEGATING` is now a stored session status derived by the neutral
 reducer. It renders green like `WORKING` but remains distinct on the wire.
 
 ```
