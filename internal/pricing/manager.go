@@ -110,16 +110,19 @@ func DefaultCacheDir() string {
 func (m *Manager) Load(ctx context.Context, provider string, force bool) (Catalog, Diagnostic, error) {
 	now := m.now().UTC()
 	cached, cacheErr := m.readCache(provider)
-	if cacheErr == nil && !force && !needsRefresh(cached, now) {
+	source := m.Sources[provider]
+	reparse := cacheErr == nil && source != nil && cached.ParserRevision != source.ParserRevision()
+	if cacheErr == nil && !force && !reparse && !needsRefresh(cached, now) {
 		return cached, diagnosticFor(cached, now), nil
 	}
-	source := m.Sources[provider]
 	if source == nil {
 		err := fmt.Errorf("no pricing source for provider %q", provider)
 		return m.fallback(provider, cached, cacheErr, now, err)
 	}
 
-	refreshed, notModified, err := m.refresh(ctx, source, cached, cacheErr == nil, now)
+	// A cache from another parser revision stays the fallback but must not
+	// supply validators: a 304 would re-stamp the old parser's models as fresh.
+	refreshed, notModified, err := m.refresh(ctx, source, cached, cacheErr == nil && !reparse, now)
 	if err != nil {
 		return m.fallback(provider, cached, cacheErr, now, err)
 	}
@@ -239,6 +242,7 @@ func (m *Manager) refresh(ctx context.Context, source Source, previous Catalog, 
 		return Catalog{}, false, fmt.Errorf("parse %s pricing: %w", source.Provider(), err)
 	}
 	catalog.Provider = source.Provider()
+	catalog.ParserRevision = source.ParserRevision()
 	catalog.SourceURL = source.PrimaryURL()
 	catalog.RetrievedAt = now
 	catalog.Bundled = false

@@ -14,14 +14,18 @@ import (
 type fixtureTransport struct {
 	bodies      map[string][]byte
 	notModified bool
-	err         error
+	// notModifiedIfConditional answers 304 only to a conditional request,
+	// as a real origin does.
+	notModifiedIfConditional bool
+	err                      error
 }
 
 func (f *fixtureTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
-	if f.notModified {
+	conditional := req.Header.Get("If-None-Match") != "" || req.Header.Get("If-Modified-Since") != ""
+	if f.notModified || (f.notModifiedIfConditional && conditional) {
 		return &http.Response{
 			StatusCode: http.StatusNotModified, Status: "304 Not Modified",
 			Header: http.Header{"ETag": []string{"fixture-v1"}}, Body: io.NopCloser(bytes.NewReader(nil)), Request: req,
@@ -156,5 +160,37 @@ func openAIFixtureBodies(t *testing.T) map[string][]byte {
 		openAIModelDocuments[0].FetchURL: readFixture(t, "openai-gpt-5.6-sol.md"),
 		openAIModelDocuments[1].FetchURL: readFixture(t, "openai-gpt-5.6-terra.md"),
 		openAIModelDocuments[2].FetchURL: readFixture(t, "openai-gpt-5.6-luna.md"),
+	}
+}
+
+func TestManagerReparsesACacheFromAnOlderParserEvenWhenThePageIsUnchanged(t *testing.T) {
+	now := time.Date(2026, 10, 12, 12, 0, 0, 0, time.UTC)
+	fixture := readFixture(t, "anthropic-pricing.md")
+	transport := &fixtureTransport{bodies: map[string][]byte{AnthropicPricingURL + ".md": fixture}, notModifiedIfConditional: true}
+	manager := NewManager(t.TempDir())
+	manager.Client = &http.Client{Transport: transport}
+	manager.Now = func() time.Time { return now }
+
+	// An hour-old cache written by the revision-1 parser: fresh by age, has a
+	// validator the origin would answer with 304, and lacks Claude Opus 5.5.
+	old := BootstrapCatalogs()[ProviderAnthropic]
+	delete(old.Models, "claude-opus-5-5")
+	old.Bundled = false
+	old.RetrievedAt = now.Add(-time.Hour)
+	old.ParserRevision = 1
+	old.Validators = map[string]HTTPValidator{AnthropicPricingURL + ".md": {ETag: "fixture-v1"}}
+	if err := manager.writeCache(old); err != nil {
+		t.Fatal(err)
+	}
+
+	catalog, diagnostic, err := manager.Load(context.Background(), ProviderAnthropic, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diagnostic.NotModified || catalog.ParserRevision != 2 {
+		t.Fatalf("catalog revision=%d diagnostic=%+v", catalog.ParserRevision, diagnostic)
+	}
+	if _, ok := catalog.Lookup("claude-opus-5-5"); !ok {
+		t.Fatal("reparse kept the old parser's models")
 	}
 }

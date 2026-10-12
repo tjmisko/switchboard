@@ -24,6 +24,10 @@ type Source interface {
 	Provider() string
 	PrimaryURL() string
 	Documents() []DocumentSpec
+	// ParserRevision changes whenever Parse would read the same documents
+	// differently. A cache from another revision is re-fetched unconditionally,
+	// because a 304 would otherwise keep the old parser's result indefinitely.
+	ParserRevision() int
 	Parse(documents map[string][]byte, retrievedAt time.Time) (Catalog, error)
 }
 
@@ -40,6 +44,10 @@ type anthropicMarkdownSource struct{}
 
 func (anthropicMarkdownSource) Provider() string   { return ProviderAnthropic }
 func (anthropicMarkdownSource) PrimaryURL() string { return AnthropicPricingURL }
+
+// Revision 2 derives model ids from display names and reads prompt-length
+// bands, per-model cache multipliers and per-model fast-mode rows.
+func (anthropicMarkdownSource) ParserRevision() int { return 2 }
 func (anthropicMarkdownSource) Documents() []DocumentSpec {
 	return []DocumentSpec{{
 		Key: "pricing", FetchURL: AnthropicPricingURL + ".md", PublicURL: AnthropicPricingURL,
@@ -68,6 +76,7 @@ var openAIModelDocuments = []DocumentSpec{
 
 func (openAIMarkdownSource) Provider() string   { return ProviderOpenAI }
 func (openAIMarkdownSource) PrimaryURL() string { return OpenAIPricingURL }
+func (openAIMarkdownSource) ParserRevision() int { return 1 }
 func (openAIMarkdownSource) Documents() []DocumentSpec {
 	documents := []DocumentSpec{openAIPricingDocument}
 	return append(documents, openAIModelDocuments...)

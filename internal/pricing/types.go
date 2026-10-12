@@ -197,7 +197,10 @@ type Catalog struct {
 	VersionHash   string                   `json:"version_hash"`
 	Bundled       bool                     `json:"bundled,omitempty"`
 	Validators    map[string]HTTPValidator `json:"validators,omitempty"`
-	Models        map[string]ModelPrice    `json:"models"`
+	// ParserRevision records which Source.ParserRevision produced Models. It
+	// is provenance, not price content, so ContentHash excludes it.
+	ParserRevision int                   `json:"parser_revision,omitempty"`
+	Models         map[string]ModelPrice `json:"models"`
 }
 
 // Validate rejects incomplete or ambiguous catalogs. A source redesign must
