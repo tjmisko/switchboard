@@ -66,10 +66,31 @@ Two limits matter:
    (`ANTHROPIC_AUTH_TOKEN`, how OpenRouter is usually configured) report the
    same value, and `apiProvider` stays `firstParty` behind a gateway. The
    base-URL host and which variable is set must break the tie.
-2. **The API-key approval is not visible.** `auth status` reports `api_key`
-   whenever the variable is set, even though an interactive session whose user
-   declined the key runs on the plan. Treat `api_key` in an interactive
-   session as "API, unless declined", and say so.
+2. **The API-key approval is not visible to `auth status`.** It reports
+   `api_key` whenever the variable is set, even though an interactive session
+   whose user declined the key runs on the plan. Configuration cannot settle
+   this; evidence from the session's own responses can (next section).
+
+### Evidence from the request path: statusline `rate_limits`
+
+The statusline command receives a JSON object per session, including
+`session_id`. Its `rate_limits` field is filled from the responses to the
+session's own requests, and appears only for claude.ai Pro/Max subscribers or
+behind a gateway with spend limits, after the first API response
+([statusline](https://code.claude.com/docs/en/statusline#available-data)).
+Unlike everything above, this is observed from requests that were actually
+billed, not inferred from configuration:
+
+- `rate_limits` present, no gateway host: the session is on the subscription,
+  whatever `auth status` said. This settles the declined-key case.
+- a response seen, `rate_limits` absent, no gateway host: not the
+  subscription; with `api_key` or `api_key_helper`, the key was used.
+- no response yet: undecided. The route stays at its SessionStart value
+  marked `pending` until the first statusline update after a response.
+
+The existing statusline script (`~/.claude/claude-status`) already reads
+`rate_limits`. It forwards one boolean per session to `switchboard-ctl`,
+once, not on every refresh.
 
 Hook subprocesses inherit Claude Code's environment, including `settings.json`
 `env` values ([hooks](https://code.claude.com/docs/en/hooks): "A hook process
@@ -96,7 +117,7 @@ mid-session `/login` is picked up at the next one), `switchboard-ctl`:
    | `claude.ai` | `subscription` (+ `subscriptionType`) | `anthropic` |
    | `oauth_token`, `CLAUDE_CODE_OAUTH_TOKEN` set, no gateway host | `subscription` | `anthropic` |
    | `oauth_token` or `api_key`, gateway host (not `api.anthropic.com`) | `gateway` | the host, e.g. `openrouter` |
-   | `api_key` / `api_key_helper`, no gateway host | `api` (interactive: "unless declined") | `anthropic` |
+   | `api_key` / `api_key_helper`, no gateway host | `api`, confirmed or overturned by statusline evidence | `anthropic` |
    | `third_party` | `cloud` | `apiProvider` (`bedrock`, `vertex`, `foundry`) |
    | anything else, or the probe failed | `unknown` | unset |
 
@@ -107,7 +128,45 @@ mid-session `/login` is picked up at the next one), `switchboard-ctl`:
 The hook must not slow Claude Code's startup. The probe runs with a short
 timeout and, if it times out, the hook reports `unknown` instead of waiting.
 
-### 2. Record it once per session, not per event
+### 2. Preserve the whole route, not one provider
+
+A request can pass through several parties, and each one matters:
+
+```
+client  ->  gateway     ->  upstream provider  ->  model
+claude      openrouter      anthropic              claude-opus-5-5
+pi          openrouter      deepinfra              deepseek/deepseek-v4.1-flash
+codex       (none)          openai                 gpt-5.6-sol
+```
+
+`execution_provider` alone flattens this: "openrouter" hides who served the
+request, and "anthropic" hides that OpenRouter billed it. The identity gains a
+`gateway` field beside `execution_provider`, where `execution_provider` is
+always the party that ran the model, and `billing_route` says who charged
+(`subscription`, `api`, `gateway`, `cloud`). The model name's vendor prefix
+(`deepseek/`, `anthropic/`) is the model's author, not the provider, and must
+not fill `execution_provider`.
+
+What each client exposes today:
+
+- **Pi** records, per assistant message, `provider: "openrouter"`, the
+  prefixed model, its own cost computed from Pi's price table, and
+  `responseId` (the OpenRouter generation id, `gen-...`). It drops the
+  upstream provider that OpenRouter's response names. Two ways to recover it:
+  ask Pi to keep the response's `provider` field, or look up the generation
+  id, which returns the upstream provider and the amount OpenRouter actually
+  charged. The lookup needs the operator's OpenRouter key, so it must be opt-in
+  and run where the key already lives, never copied into Switchboard.
+- **Claude Code** through OpenRouter has not been observed here. Whether its
+  transcript keeps the generation id (as the message id) must be checked with
+  one real session before designing on it.
+- **Codex** reports `model_provider`, the configured provider entry; an
+  OpenRouter entry needs the same gateway/upstream split.
+
+When the upstream is unknown, `gateway` is still recorded and
+`execution_provider` stays empty. It is never guessed from the model name.
+
+### 3. Record it once per session, not per event
 
 A new `session_identity` history event carries the session id, agent kind,
 birth token, route, execution provider and evidence. Usage events stay as
@@ -115,7 +174,7 @@ they are. The timeline joins usage to the session's identity when pricing.
 This keeps the usage log small and lets a later correction (a re-detection on
 resume) apply to the whole session.
 
-### 3. Let the operator declare the expected route, and check it
+### 4. Let the operator declare the expected route, and check it
 
 Detection answers what happened; a declaration says what should happen. In
 `~/.config/switchboard/billing.json`:
@@ -131,18 +190,20 @@ Detection answers what happened; a declaration says what should happen. In
 | `unknown` | set | priced as declared, provenance `declared` and shown as such, never as detected |
 | `unknown` | unset | `partial`, as today |
 
+A mismatch is shown in the dashboard only, never in the status bar.
+
 The mismatch row is the point of the declaration. For a plan-only operator it
 turns "probably included" into "included, and you will be told otherwise".
 It also gives sessions recorded before detection existed an honest label:
 `declared`, not `detected`.
 
-### 4. Price each route by what it actually charges
+### 5. Price each route by what it actually charges
 
 | Route | `api_equivalent_usd` | `estimated_billed_usd` | Status |
 | --- | --- | --- | --- |
 | subscription | Anthropic list price, shown as value | null | `included` |
 | api | Anthropic list price | same | `estimated` |
-| gateway | Anthropic list price, labelled as an assumption | the gateway's own figure when the client reports one (Pi does); otherwise null | `partial` until gateway prices are sourced |
+| gateway | upstream list price when the upstream is known, labelled | the gateway's charged amount from the generation lookup; otherwise null | `partial` until the charged amount is known |
 | cloud | first-party list price, labelled | null until a cloud catalog exists | `partial` |
 
 OpenRouter publishes per-model prices at a public endpoint. That catalog is a
@@ -158,22 +219,30 @@ outside this proposal.
   never sets `billing_route`. Its provider string should map to a route through
   the same table.
 
+## Decisions
+
+- A route mismatch appears in the dashboard only, never in the status bar.
+- An approved versus declined API key is decided by statusline evidence, not
+  assumed.
+- The route is preserved end to end: gateway and upstream provider are
+  separate fields, and an unknown upstream stays unknown.
+
 ## Open questions
 
-1. Is a `gateway` route enough, or does each gateway (OpenRouter, a corporate
-   proxy) need to be named in the dashboard?
-2. Should a mismatch against the declared route also surface live (status
-   bar chip), or only in the dashboard?
-3. `api_key` in an interactive session cannot distinguish an approved key from
-   a declined one. Accept "API, unless declined", or look for a documented
-   signal (statusline `rate_limits` appears only for subscription sessions and
-   could corroborate)?
+1. Generation lookup for gateway sessions: acceptable as an opt-in that runs
+   with the operator's OpenRouter key, or should Pi be changed to record the
+   upstream provider instead?
 
 ## Tests the implementation needs
 
 - A classification table test covering every row above, including base URL
   alone (subscription) and both meanings of `oauth_token`.
 - The probe's timeout path reports `unknown` without delaying the hook.
+- Statusline evidence: `rate_limits` present overturns an `api_key`
+  classification to subscription; absent after a response confirms it; no
+  response leaves it `pending`; repeated statusline refreshes send one event.
+- Route preservation: a Pi OpenRouter message yields gateway `openrouter`
+  and an empty `execution_provider`, never `deepseek` from the model prefix.
 - No environment value other than the base-URL host reaches the daemon or
   history (assert on the serialized RPC request and event).
 - Declared/detected/mismatch resolution, including sessions with no
