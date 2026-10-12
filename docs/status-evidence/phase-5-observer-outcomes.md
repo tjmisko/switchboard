@@ -175,6 +175,10 @@ delay legitimate stops: 24 short intervals follow Pi's explicit
 replay and cannot justify replacing a confirmation bound. Keep the existing
 bounds; any future calibration needs candidate-kind and ground-truth capture.
 
+The owner closed #98 on 2026-10-12 with the existing bounds and will tune
+them later. That tuning needs each transition to record the evidence kind
+that decided it, so a survey can separate inferred idle from explicit stops.
+
 Final local validation:
 
 - `go vet ./...` passes.
