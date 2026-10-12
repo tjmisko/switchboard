@@ -53,10 +53,11 @@ func TestBootstrapCatalogsValidateAndOnlyUseExactAliases(t *testing.T) {
 		if catalog.VersionHash == "" {
 			t.Fatalf("%s bootstrap has no version hash", provider)
 		}
-		if got := catalog.FreshnessAt(time.Date(2026, 8, 25, 1, 0, 0, 0, time.UTC)); got != FreshnessStale {
+		effective := *catalog.EffectiveAt
+		if got := catalog.FreshnessAt(effective.Add(time.Hour)); got != FreshnessStale {
 			t.Fatalf("%s bundled freshness = %s, want stale", provider, got)
 		}
-		if got := catalog.FreshnessAt(time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)); got != FreshnessUnusable {
+		if got := catalog.FreshnessAt(effective.Add(7 * 24 * time.Hour)); got != FreshnessUnusable {
 			t.Fatalf("%s seven-day-old bundled freshness = %s, want unusable", provider, got)
 		}
 	}

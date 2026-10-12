@@ -1,6 +1,10 @@
 package pricing
 
-import "time"
+import (
+	"regexp"
+	"strconv"
+	"time"
+)
 
 const (
 	AnthropicPricingURL = "https://platform.claude.com/docs/en/about-claude/pricing"
@@ -12,7 +16,7 @@ const (
 // estimator labels these rates stale (and, after seven days, unusable) until
 // Manager successfully refreshes them.
 func BootstrapCatalogs() CatalogSet {
-	effective := time.Date(2026, 8, 25, 0, 0, 0, 0, time.UTC)
+	effective := time.Date(2026, 10, 12, 0, 0, 0, 0, time.UTC)
 	set := CatalogSet{
 		ProviderAnthropic: bootstrapAnthropic(effective),
 		ProviderOpenAI:    bootstrapOpenAI(effective),
@@ -49,8 +53,11 @@ func bootstrapAnthropic(effective time.Time) Catalog {
 
 	models := map[string]ModelPrice{}
 	add := func(p ModelPrice) { models[p.ExactModelID] = p }
+	add(model("claude-fable-5-1", []string{"claude-fable-5-1[1m]"}, "10", "0.25", "12.5", "20", "50"))
+	add(model("claude-mythos-5-1", []string{"claude-mythos-5-1[1m]"}, "10", "0.25", "12.5", "20", "50"))
 	add(model("claude-fable-5", []string{"claude-fable-5[1m]"}, "10", "1", "12.5", "20", "50"))
 	add(model("claude-mythos-5", []string{"claude-mythos-5[1m]"}, "10", "1", "12.5", "20", "50"))
+	add(model("claude-opus-5-5", []string{"claude-opus-5-5[1m]"}, "4", "0.2", "5", "8", "20"))
 	add(model("claude-opus-5", []string{"claude-opus-5[1m]"}, "5", "0.5", "6.25", "10", "25"))
 	add(model("claude-opus-4-8", []string{"claude-opus-4-8[1m]"}, "5", "0.5", "6.25", "10", "25"))
 	add(model("claude-opus-4-7", []string{"claude-opus-4-7[1m]"}, "5", "0.5", "6.25", "10", "25"))
@@ -58,24 +65,35 @@ func bootstrapAnthropic(effective time.Time) Catalog {
 	add(model("claude-opus-4-5", []string{"claude-opus-4-5-20251101"}, "5", "0.5", "6.25", "10", "25"))
 	add(model("claude-opus-4-1", []string{"claude-opus-4-1-20250805"}, "15", "1.5", "18.75", "30", "75"))
 	add(model("claude-opus-4", []string{"claude-opus-4-20250514"}, "15", "1.5", "18.75", "30", "75"))
+	add(model("claude-sonnet-5-5", []string{"claude-sonnet-5-5[1m]"}, "2", "0.1", "2.5", "4", "10"))
 	add(model("claude-sonnet-5", []string{"claude-sonnet-5[1m]"}, "2", "0.2", "2.5", "4", "10"))
 	add(model("claude-sonnet-4-6", []string{"claude-sonnet-4-6[1m]"}, "3", "0.3", "3.75", "6", "15"))
 	add(model("claude-sonnet-4-5-20250929", []string{"claude-sonnet-4-5"}, "3", "0.3", "3.75", "6", "15"))
 	add(model("claude-sonnet-4-20250514", []string{"claude-sonnet-4"}, "3", "0.3", "3.75", "6", "15"))
+	haiku55 := model("claude-haiku-5-5", nil, "0.1", "0.01", "0.125", "0.2", "0.5")
+	haiku55.ContextBands = []ContextBand{{MinInputTokensExclusive: 100_000, Rates: RateCard{
+		Input: rate("0.5"), CachedInput: rate("0.05"), CacheWrite5m: rate("0.625"),
+		CacheWrite1h: rate("1"), Output: rate("2.5"),
+	}}}
+	add(haiku55)
 	add(model("claude-haiku-4-5-20251001", []string{"claude-haiku-4-5"}, "1", "0.1", "1.25", "2", "5"))
 	add(model("claude-3-5-haiku-20241022", []string{"claude-3-5-haiku-latest", "claude-haiku-3-5"}, "0.8", "0.08", "1", "1.6", "4"))
 
+	fastRates := map[string][2]string{
+		"claude-opus-5-5": {"8", "40"},
+		"claude-opus-5":   {"10", "50"},
+		"claude-opus-4-8": {"10", "50"},
+	}
 	for id, p := range models {
 		if anthropicSupportsUSGeo(id) {
 			p.Multipliers = cloneMultipliers(geoUS)
 		}
-		if id == "claude-opus-5" || id == "claude-opus-4-8" {
-			p.Variants = map[string]VariantPrice{
-				"speed=fast": {Rates: RateCard{
-					Input: rate("10"), CachedInput: rate("1"), CacheWrite5m: rate("12.5"),
-					CacheWrite1h: rate("20"), Output: rate("50"),
-				}},
+		if fast, ok := fastRates[id]; ok {
+			variant, err := anthropicFastVariant(p.Base, mustUSD(fast[0]), mustUSD(fast[1]))
+			if err != nil {
+				panic(err)
 			}
+			p.Variants = map[string]VariantPrice{"speed=fast": {Rates: variant}}
 		}
 		models[id] = p
 	}
@@ -159,14 +177,22 @@ func bootstrapOpenAI(effective time.Time) Catalog {
 	}
 }
 
+var anthropicVersionedID = regexp.MustCompile(`^claude-[a-z]+-([0-9]+)(?:-([0-9]{1,2}))?$`)
+
+// anthropicSupportsUSGeo reports whether US-only inference applies; the
+// publication scopes it to "Claude 4.6 and later models". Dated ids
+// (claude-sonnet-4-5-20250929) all predate 4.6 and deliberately do not match.
 func anthropicSupportsUSGeo(modelID string) bool {
-	switch modelID {
-	case "claude-fable-5", "claude-mythos-5", "claude-opus-5", "claude-opus-4-8",
-		"claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5", "claude-sonnet-4-6":
-		return true
-	default:
+	match := anthropicVersionedID.FindStringSubmatch(modelID)
+	if match == nil {
 		return false
 	}
+	major, _ := strconv.Atoi(match[1])
+	minor := 0
+	if match[2] != "" {
+		minor, _ = strconv.Atoi(match[2])
+	}
+	return major > 4 || (major == 4 && minor >= 6)
 }
 
 func cloneMultipliers(in map[string]Multiplier) map[string]Multiplier {

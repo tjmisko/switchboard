@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -117,10 +118,10 @@ func ParseAnthropicMarkdown(body []byte, retrievedAt time.Time) (Catalog, error)
 		return Catalog{}, errors.New("model pricing table header not found")
 	}
 	bootstrap := BootstrapCatalogs()[ProviderAnthropic]
-	display := anthropicDisplayModels()
 	models := make(map[string]ModelPrice)
+	banded := make(map[string]*anthropicPromptBands)
 	for _, line := range lines[headerAt+1:] {
-		if strings.HasPrefix(strings.TrimSpace(line), "## ") && len(models) > 0 {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
 			break
 		}
 		cells := markdownCells(line)
@@ -128,9 +129,14 @@ func ParseAnthropicMarkdown(body []byte, retrievedAt time.Time) (Catalog, error)
 			continue
 		}
 		name := plainMarkdown(cells[columns.model])
-		id := matchAnthropicDisplay(name, display)
-		if id == "" {
+		if !strings.HasPrefix(name, "Claude ") {
 			continue
+		}
+		// Every Claude row must resolve. Skipping an unrecognized row is how
+		// a new model release used to leave its whole usage unpriced.
+		row, err := parseAnthropicModelName(name)
+		if err != nil {
+			return Catalog{}, err
 		}
 		values := []struct {
 			cell int
@@ -148,21 +154,56 @@ func ParseAnthropicMarkdown(body []byte, retrievedAt time.Time) (Catalog, error)
 			}
 			rates[i] = rate
 		}
-		template, ok := bootstrap.Models[id]
-		if !ok {
-			return Catalog{}, fmt.Errorf("recognized Anthropic model %s has no exact-id template", name)
-		}
-		template.Base = RateCard{
+		card := RateCard{
 			Input: usdCopy(rates[0]), CacheWrite5m: usdCopy(rates[1]),
 			CacheWrite1h: usdCopy(rates[2]), CachedInput: usdCopy(rates[3]), Output: usdCopy(rates[4]),
 		}
-		template.Variants = nil
-		template.Multipliers = nil
-		models[id] = template
+		if row.promptBand == "" {
+			if _, duplicate := models[row.id]; duplicate || banded[row.id] != nil {
+				return Catalog{}, fmt.Errorf("Anthropic model %s appears in more than one row", row.id)
+			}
+			price := anthropicTemplate(bootstrap, row.id)
+			price.Base = card
+			models[row.id] = price
+			continue
+		}
+		if _, duplicate := models[row.id]; duplicate {
+			return Catalog{}, fmt.Errorf("Anthropic model %s has both a flat and a prompt-length row", row.id)
+		}
+		bands := banded[row.id]
+		if bands == nil {
+			bands = &anthropicPromptBands{threshold: row.threshold}
+			banded[row.id] = bands
+		}
+		if bands.threshold != row.threshold {
+			return Catalog{}, fmt.Errorf("Anthropic model %s prompt-length rows disagree on the threshold", row.id)
+		}
+		switch row.promptBand {
+		case anthropicPromptUpTo:
+			if bands.upTo != nil {
+				return Catalog{}, fmt.Errorf("Anthropic model %s repeats its short-prompt row", row.id)
+			}
+			bands.upTo = &card
+		case anthropicPromptOver:
+			if bands.over != nil {
+				return Catalog{}, fmt.Errorf("Anthropic model %s repeats its long-prompt row", row.id)
+			}
+			bands.over = &card
+		}
+	}
+	for id, bands := range banded {
+		if bands.upTo == nil || bands.over == nil {
+			return Catalog{}, fmt.Errorf("Anthropic model %s lacks one of its prompt-length rows", id)
+		}
+		price := anthropicTemplate(bootstrap, id)
+		price.Base = *bands.upTo
+		price.ContextBands = []ContextBand{{MinInputTokensExclusive: bands.threshold, Rates: *bands.over}}
+		models[id] = price
 	}
 	for _, required := range []string{
-		"claude-fable-5", "claude-opus-5", "claude-opus-4-8",
-		"claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-4-5-20251001",
+		"claude-fable-5-1", "claude-fable-5", "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8",
+		"claude-sonnet-5-5", "claude-sonnet-5", "claude-sonnet-4-6",
+		"claude-haiku-5-5", "claude-haiku-4-5-20251001",
 	} {
 		if _, ok := models[required]; !ok {
 			return Catalog{}, fmt.Errorf("required Anthropic model row %s is missing", required)
@@ -201,20 +242,25 @@ func ParseAnthropicMarkdown(body []byte, retrievedAt time.Time) (Catalog, error)
 		models[id] = price
 	}
 
-	fastInput, fastOutput, err := parseAnthropicFastRates(lines)
+	fastRates, err := parseAnthropicFastRates(lines)
 	if err != nil {
 		return Catalog{}, err
 	}
-	for _, id := range []string{"claude-opus-5", "claude-opus-4-8"} {
-		price := models[id]
-		price.Variants = map[string]VariantPrice{
-			"speed=fast": {Rates: RateCard{
-				Input: usdCopy(fastInput), CachedInput: usdCopy(multiplyUSD(fastInput, Multiplier{Numerator: 1, Denominator: 10})),
-				CacheWrite5m: usdCopy(multiplyUSD(fastInput, Multiplier{Numerator: 5, Denominator: 4})),
-				CacheWrite1h: usdCopy(multiplyUSD(fastInput, Multiplier{Numerator: 2, Denominator: 1})),
-				Output:       usdCopy(fastOutput),
-			}},
+	for _, required := range []string{"claude-opus-5-5", "claude-opus-5", "claude-opus-4-8"} {
+		if _, ok := fastRates[required]; !ok {
+			return Catalog{}, fmt.Errorf("required Anthropic fast-mode row %s is missing", required)
 		}
+	}
+	for id, fast := range fastRates {
+		price, ok := models[id]
+		if !ok {
+			return Catalog{}, fmt.Errorf("Anthropic fast-mode row %s has no model-pricing row", id)
+		}
+		variant, err := anthropicFastVariant(price.Base, fast.input, fast.output)
+		if err != nil {
+			return Catalog{}, fmt.Errorf("Anthropic fast-mode rates for %s: %w", id, err)
+		}
+		price.Variants = map[string]VariantPrice{"speed=fast": {Rates: variant}}
 		models[id] = price
 	}
 
@@ -441,59 +487,177 @@ func findAnthropicHeader(lines []string) (int, anthropicColumns) {
 	return -1, anthropicColumns{}
 }
 
-func anthropicDisplayModels() map[string]string {
-	return map[string]string{
-		"Claude Fable 5":    "claude-fable-5",
-		"Claude Mythos 5":   "claude-mythos-5",
-		"Claude Opus 5":     "claude-opus-5",
-		"Claude Opus 4.8":   "claude-opus-4-8",
-		"Claude Opus 4.7":   "claude-opus-4-7",
-		"Claude Opus 4.6":   "claude-opus-4-6",
-		"Claude Opus 4.5":   "claude-opus-4-5",
-		"Claude Opus 4.1":   "claude-opus-4-1",
-		"Claude Opus 4":     "claude-opus-4",
-		"Claude Sonnet 5":   "claude-sonnet-5",
-		"Claude Sonnet 4.6": "claude-sonnet-4-6",
-		"Claude Sonnet 4.5": "claude-sonnet-4-5-20250929",
-		"Claude Sonnet 4":   "claude-sonnet-4-20250514",
-		"Claude Haiku 4.5":  "claude-haiku-4-5-20251001",
-		"Claude Haiku 3.5":  "claude-3-5-haiku-20241022",
-	}
+const (
+	anthropicPromptUpTo = "up to"
+	anthropicPromptOver = "over"
+)
+
+// anthropicModelRow is one resolved model-table row. A model priced by prompt
+// length has two rows, one per side of the threshold.
+type anthropicModelRow struct {
+	id         string
+	promptBand string // "", anthropicPromptUpTo or anthropicPromptOver
+	threshold  int64
 }
 
-func matchAnthropicDisplay(value string, models map[string]string) string {
-	// Longest name first keeps "Opus 4" from capturing "Opus 4.8".
-	names := make([]string, 0, len(models))
-	for name := range models {
-		names = append(names, name)
+type anthropicPromptBands struct {
+	threshold  int64
+	upTo, over *RateCard
+}
+
+type anthropicFastRate struct{ input, output USD }
+
+var anthropicModelName = regexp.MustCompile(`^Claude ([A-Z][a-z]+) ([0-9]+)(?:\.([0-9]+))?(?: \((.*)\))?$`)
+var anthropicPromptQualifier = regexp.MustCompile(`^for prompts (up to|over) ([0-9][0-9,]*) tokens$`)
+
+// anthropicDatedModelIDs lists the models whose exact API id carries a release
+// date instead of following claude-<family>-<major>[-<minor>].
+var anthropicDatedModelIDs = map[string]string{
+	"Claude Sonnet 4.5": "claude-sonnet-4-5-20250929",
+	"Claude Sonnet 4":   "claude-sonnet-4-20250514",
+	"Claude Haiku 4.5":  "claude-haiku-4-5-20251001",
+	"Claude Haiku 3.5":  "claude-3-5-haiku-20241022",
+}
+
+// parseAnthropicModelName resolves a pricing-table display name such as
+// "Claude Opus 5.5" or "Claude Haiku 5.5 (for prompts over 100,000 tokens)" to
+// its exact API id. Ids are derived rather than listed so that a model release
+// is priced without a code change; a row this cannot read is an error.
+func parseAnthropicModelName(name string) (anthropicModelRow, error) {
+	match := anthropicModelName.FindStringSubmatch(name)
+	if match == nil {
+		return anthropicModelRow{}, fmt.Errorf("unrecognized Anthropic model row %q", name)
 	}
-	sort.Slice(names, func(i, j int) bool { return len(names[i]) > len(names[j]) })
-	for _, name := range names {
-		if value == name || strings.HasPrefix(value, name+" ") || strings.HasPrefix(value, name+"(") {
-			return models[name]
+	family, major, minor, qualifier := match[1], match[2], match[3], match[4]
+	display := "Claude " + family + " " + major
+	id := "claude-" + strings.ToLower(family) + "-" + major
+	if minor != "" {
+		display += "." + minor
+		id += "-" + minor
+	}
+	if dated, ok := anthropicDatedModelIDs[display]; ok {
+		id = dated
+	}
+	row := anthropicModelRow{id: id}
+	if qualifier == "" || strings.HasPrefix(qualifier, "retired") || strings.HasPrefix(qualifier, "limited availability") {
+		return row, nil
+	}
+	band := anthropicPromptQualifier.FindStringSubmatch(qualifier)
+	if band == nil {
+		return anthropicModelRow{}, fmt.Errorf("unrecognized Anthropic model row qualifier %q", name)
+	}
+	threshold, err := strconv.ParseInt(strings.ReplaceAll(band[2], ",", ""), 10, 64)
+	if err != nil || threshold <= 0 {
+		return anthropicModelRow{}, fmt.Errorf("invalid prompt-length threshold in %q", name)
+	}
+	row.promptBand, row.threshold = band[1], threshold
+	return row, nil
+}
+
+// anthropicTemplate keeps a bootstrap model's exact-id aliases when one
+// exists; a model released after this build gets its long-context alias.
+func anthropicTemplate(bootstrap Catalog, id string) ModelPrice {
+	template, ok := bootstrap.Models[id]
+	if !ok {
+		return ModelPrice{ExactModelID: id, Aliases: []string{id + "[1m]"}}
+	}
+	template.Variants = nil
+	template.Multipliers = nil
+	template.ContextBands = nil
+	return template
+}
+
+// parseAnthropicFastRates reads the fast-mode table, whose rows may name
+// several models ("Claude Opus 5 / Claude Opus 4.8"). It reads only the
+// table under its own heading so a later three-column table cannot leak in.
+func parseAnthropicFastRates(lines []string) (map[string]anthropicFastRate, error) {
+	start := -1
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") && strings.EqualFold(strings.TrimSpace(strings.TrimLeft(trimmed, "#")), "Fast mode pricing") {
+			start = i + 1
+			break
 		}
 	}
-	return ""
-}
-
-func parseAnthropicFastRates(lines []string) (USD, USD, error) {
-	for _, line := range lines {
-		plain := plainMarkdown(line)
-		if !strings.Contains(plain, "Claude Opus 5") || !strings.Contains(plain, "Claude Opus 4.8") {
-			continue
+	if start < 0 {
+		return nil, errors.New("Claude fast-mode pricing section is missing")
+	}
+	rates := make(map[string]anthropicFastRate)
+	for _, line := range lines[start:] {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			break
 		}
 		cells := markdownCells(line)
-		var rates []USD
-		for _, cell := range cells {
-			if value, err := dollarFromText(cell); err == nil {
-				rates = append(rates, value)
-			}
+		if len(cells) != 3 || markdownSeparator(cells) {
+			continue
 		}
-		if len(rates) == 2 && rates[0] == mustUSD("10") && rates[1] == mustUSD("50") {
-			return rates[0], rates[1], nil
+		names := plainMarkdown(cells[0])
+		if !strings.HasPrefix(names, "Claude ") {
+			continue
+		}
+		input, err := dollarFromText(cells[1])
+		if err != nil {
+			return nil, fmt.Errorf("fast-mode input rate for %s: %w", names, err)
+		}
+		output, err := dollarFromText(cells[2])
+		if err != nil {
+			return nil, fmt.Errorf("fast-mode output rate for %s: %w", names, err)
+		}
+		for _, name := range strings.Split(names, "/") {
+			row, err := parseAnthropicModelName(strings.TrimSpace(name))
+			if err != nil {
+				return nil, err
+			}
+			if row.promptBand != "" {
+				return nil, fmt.Errorf("fast-mode row %q has a prompt-length qualifier", name)
+			}
+			if _, duplicate := rates[row.id]; duplicate {
+				return nil, fmt.Errorf("fast-mode rates for %s appear twice", row.id)
+			}
+			rates[row.id] = anthropicFastRate{input: input, output: output}
 		}
 	}
-	return 0, 0, errors.New("Claude Opus fast-mode rate row is missing or invalid")
+	if len(rates) == 0 {
+		return nil, errors.New("Claude fast-mode rate table is empty")
+	}
+	return rates, nil
+}
+
+// anthropicFastVariant builds a fast-mode card. The publication lists only
+// input and output; prompt-caching multipliers "apply on top of fast mode
+// pricing", and those multipliers differ by model (0.1x, 0.05x, 0.025x cache
+// hits), so each cache rate keeps the model's own ratio to its base input.
+func anthropicFastVariant(base RateCard, input, output USD) (RateCard, error) {
+	if base.Input == nil || base.Input.Micros() <= 0 || base.CachedInput == nil ||
+		base.CacheWrite5m == nil || base.CacheWrite1h == nil || base.Output == nil {
+		return RateCard{}, errors.New("base rates are incomplete")
+	}
+	if input <= *base.Input || output <= *base.Output {
+		return RateCard{}, errors.New("fast-mode rates are not a premium over standard rates")
+	}
+	scale := func(rate *USD) (*USD, error) {
+		value, err := applyMultiplier(input, Multiplier{Numerator: rate.Micros(), Denominator: base.Input.Micros()})
+		if err != nil {
+			return nil, err
+		}
+		return &value, nil
+	}
+	cached, err := scale(base.CachedInput)
+	if err != nil {
+		return RateCard{}, err
+	}
+	write5m, err := scale(base.CacheWrite5m)
+	if err != nil {
+		return RateCard{}, err
+	}
+	write1h, err := scale(base.CacheWrite1h)
+	if err != nil {
+		return RateCard{}, err
+	}
+	return RateCard{
+		Input: usdCopy(input), CachedInput: cached, CacheWrite5m: write5m,
+		CacheWrite1h: write1h, Output: usdCopy(output),
+	}, nil
 }
 
 func parseAnthropicWebSearchRate(normalized string) (USD, error) {
