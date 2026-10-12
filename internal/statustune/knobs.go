@@ -178,6 +178,11 @@ const (
 	// and has not moved past the stale cap, and its tail carries no unanswered
 	// tool, so the prompt is unanswerable. The graph's case 19.
 	RuleGraphStaleBackstop = "writer_stale_backstop"
+	// RuleGraphObservationReset — the observer authoritatively ended its earlier
+	// evidence for the root (the provider session it was bound to was
+	// replaced), so the graph about the old session was dropped at once rather
+	// than held to its deadline (#98).
+	RuleGraphObservationReset = "observation_reset"
 
 	// RuleHerdrAuthority — herdr decided the edge: the session runs in a herdr
 	// pane, and herdr is the status authority for every agent in one.
@@ -294,6 +299,7 @@ var ruleKnobs = map[string]KnobHint{
 	RulePiSessionFileRead:       {"", "a restarted daemon read the tail of Pi's session file because no hook had reached it yet; the next hook or a live herdr reading takes over. Nothing to tune"},
 	RulePiHookLapsed:            {"", "the Pi hook lease (the hook-only windows Codex uses: 10m working, 24h red, 7d idle) ran out without a newer hook, so herdr's reading decides, or nothing does. Nothing in Tuning governs it"},
 	RuleGraphStaleBackstop:      {"PendingWriterStaleCap", "how long one writer's transcript may sit quiescent before its prompt is dropped as unanswerable (default 30m). Applies ONLY to a writer whose tail carries no unanswered tool — one that still does is demonstrably blocked and is held red regardless. Raise it to let an abandoned teammate's red nag longer"},
+	RuleGraphObservationReset:   {"", "the observer reported that the root's provider session was replaced (a Codex thread rebind), so the graph about the old session was dropped instead of held to its deadline. An exact identity fact; nothing to tune"},
 }
 
 // RuleKnob returns the tuning hint for a rule id. An unknown rule yields a zero

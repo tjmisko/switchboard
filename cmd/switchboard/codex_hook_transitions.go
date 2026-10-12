@@ -13,6 +13,7 @@ import (
 	claudeprovider "github.com/tjmisko/switchboard/internal/provider/claude"
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
+	"github.com/tjmisko/switchboard/internal/tailcache"
 )
 
 const (
@@ -96,10 +97,15 @@ const codexChildTranscriptLimit = 64
 
 // rememberTranscript files a hook's transcript_path under the writer that
 // fired it: the root's own rollout when agentID is empty, a child's otherwise.
+//
+// The hook also announces that this rollout is moving, so its cached tail
+// verdict is dropped (#98): the next read re-extracts it even where the file
+// identity cannot show the change yet.
 func (s *codexHookRootState) rememberTranscript(agentID, path string) {
 	if path == "" {
 		return
 	}
+	tailcache.Default().Invalidate(path)
 	if agentID == "" {
 		s.transcript = path
 		return
@@ -1404,6 +1410,12 @@ func (c *agentCoordinator) forgetCodexHookState(key provider.RootKey) {
 		delete(c.codexStarts, key)
 	}
 	c.clearCodexApprovalsLocked(c.codexHookRoots[key])
+	if root := c.codexHookRoots[key]; root != nil {
+		tailcache.Default().Invalidate(root.transcript)
+		for _, path := range root.childTranscripts {
+			tailcache.Default().Invalidate(path)
+		}
+	}
 	delete(c.codexHookRoots, key)
 	c.codexHookMu.Unlock()
 	c.forgetCodexLimitScan(key)

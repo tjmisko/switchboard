@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/agentgraph"
+	"github.com/tjmisko/switchboard/internal/tailcache"
 	"github.com/tjmisko/switchboard/internal/tailread"
 	"github.com/tjmisko/switchboard/internal/usagelimit"
 )
@@ -39,7 +40,32 @@ func ReadRolloutRuntime(path string) (agentgraph.RuntimeState, time.Time, error)
 //	               message: "… try again at 5:15 PM."}}
 //
 // and fires no Stop hook, so this read is how a capped turn is seen at all.
+//
+// The verdict is cached by the rollout's file identity (#98): an unchanged
+// rollout is stat'ed, not re-read.
 func ReadRolloutState(path string) (RolloutState, error) {
+	if path == "" {
+		return readRolloutState(path)
+	}
+	state, err := tailcache.Load(tailcache.Default(), path, "codex/rollout-state", readRolloutState)
+	return state.clone(), err
+}
+
+// clone detaches the usage-limit verdict from the cached one.
+func (s RolloutState) clone() RolloutState {
+	if s.UsageLimit == nil {
+		return s
+	}
+	limit := *s.UsageLimit
+	if limit.ResetsAt != nil {
+		resetsAt := *limit.ResetsAt
+		limit.ResetsAt = &resetsAt
+	}
+	s.UsageLimit = &limit
+	return s
+}
+
+func readRolloutState(path string) (RolloutState, error) {
 	const tailBytes = 256 * 1024
 	unknown := RolloutState{Runtime: agentgraph.RuntimeUnknown}
 	data, complete, err := tailread.Lines(path, tailBytes)

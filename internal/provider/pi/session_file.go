@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/agentgraph"
+	"github.com/tjmisko/switchboard/internal/tailcache"
 	"github.com/tjmisko/switchboard/internal/tailread"
 )
 
@@ -50,7 +51,17 @@ type sessionEntry struct {
 // until the next append, which always extends the leaf. The walk stops at the
 // first user or assistant message; when the chain leaves the window first, or
 // the newest row is still being written, the tail is no evidence.
+//
+// The answer is cached by the file's identity (#98): an unchanged session file
+// is stat'ed, not re-read.
 func ReadSessionTail(path string) (SessionTail, error) {
+	if path == "" {
+		return readSessionTail(path)
+	}
+	return tailcache.Load(tailcache.Default(), path, "pi/session-tail", readSessionTail)
+}
+
+func readSessionTail(path string) (SessionTail, error) {
 	unknown := SessionTail{Runtime: agentgraph.RuntimeUnknown}
 	data, complete, err := tailread.Lines(path, sessionTailBytes)
 	if err != nil || !complete {

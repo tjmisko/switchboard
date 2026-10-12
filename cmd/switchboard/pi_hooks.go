@@ -13,6 +13,7 @@ import (
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/statusexplain"
 	"github.com/tjmisko/switchboard/internal/statustune"
+	"github.com/tjmisko/switchboard/internal/tailcache"
 )
 
 // Pi hook evidence leases. Pi has no adapter that re-observes it between
@@ -220,6 +221,11 @@ func (c *agentCoordinator) handlePiHook(req rpc.Request, sess state.Session) {
 		rule = statustune.RulePiSessionRotated
 	}
 	observation := piRootObservation(&next, now)
+	// The hook announces that the session file is moving: drop its cached
+	// tail so any later read re-extracts it (#98).
+	if req.Transcript != "" {
+		tailcache.Default().Invalidate(req.Transcript)
+	}
 
 	applied := false
 	before, after, cwd := "", "", ""

@@ -285,6 +285,72 @@ func (s *Session) InheritStatusEvidence(prior *Session) {
 	s.evidence, s.displayKind, s.statusDecision = prior.evidence, prior.displayKind, prior.statusDecision
 }
 
+// HeldEvidence is the window of the latest graph of kind landed for rootID:
+// what an observer that could not read its source may still carry (#98). ok
+// is false when no graph of that kind about rootID is held.
+func (s Session) HeldEvidence(rootID string, kind GraphKind) (observedAt, freshUntil time.Time, ok bool) {
+	held, ok := s.evidence[kind]
+	if !ok || held.graph == nil || held.graph.RootID != rootID {
+		return time.Time{}, time.Time{}, false
+	}
+	return held.graph.ObservedAt, held.graph.FreshUntil, true
+}
+
+// ResetAgentEvidence applies an observer's authoritative reset (#98): the
+// provider session the root was bound to was replaced by rootID, so every
+// landed graph about another conversation is dropped now rather than held to
+// its deadline, the root is bound to rootID, and the published status is
+// re-resolved at now from what remains (a graph already landed for rootID,
+// herdr's reading, or nothing). It returns the status before and after and
+// whether anything was dropped; with nothing to drop it changes nothing.
+func (s *Session) ResetAgentEvidence(rootID string, now time.Time) (before, after string, dropped bool) {
+	info := s.graphEnrichment()
+	if info == nil {
+		return "", "", false
+	}
+	kept := make(graphEvidence, len(s.evidence))
+	for kind, held := range s.evidence {
+		if rootID != "" && held.graph.RootID == rootID {
+			kept[kind] = held
+			continue
+		}
+		dropped = true
+	}
+	if s.AgentGraph.RootID != rootID {
+		dropped = true
+	}
+	before = info.Status
+	if !dropped {
+		return before, before, false
+	}
+	s.evidence = kept
+	if s.AgentGraph.RootID != rootID {
+		s.AgentGraph, s.displayKind = unobservedAgentGraph(rootID, s.providerOf()), graphKindNone
+	}
+	if rootID != "" {
+		info.SessionID = rootID
+	}
+	if len(kept) > 0 {
+		s.selectDisplay(s.AgentGraph, s.displayKind, now)
+	}
+	s.project(info, now, now)
+	return before, info.Status, true
+}
+
+// unobservedAgentGraph is the graph a reset root publishes until evidence
+// about rootID lands: bound to rootID, never observed and so never fresh, with
+// no nodes and an unknown summary. It keeps the session graph-owned, so herdr's
+// later readings are still weighed by the resolver (SetHerdr) instead of the
+// reading at the reset staying published.
+func unobservedAgentGraph(rootID string, provider agentgraph.ProviderKind) *AgentGraph {
+	return &AgentGraph{
+		RootID:   rootID,
+		Summary:  AgentGraphSummary{Runtime: agentgraph.RuntimeUnknown, Attention: agentgraph.AttentionNone},
+		Nodes:    []AgentNode{},
+		provider: provider,
+	}
+}
+
 // ReprojectStatus re-resolves a Claude or Codex session's published status at
 // now with no new evidence: a deadline alone can move it (an open request
 // expiring, a snapshot lapsing onto a hook). It returns the status before and
