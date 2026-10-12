@@ -63,7 +63,7 @@ func TestShouldPreserveLiveAppServerProvenanceCompletenessAndHorizonWhenAHookCom
 	hookAt := providerAt.Add(time.Second)
 	hook := provenanceHook(t, "UserPromptSubmit", hookAt)
 
-	overlay := overlayCodexHookObservation(hook, current)
+	overlay := overlayCodexHookObservation(hook, current, true)
 	if overlay.Source != agentgraph.SourceCodexAppServer {
 		t.Fatalf("Source = %q, want codex_app_server: a root hook must not relabel child topology", overlay.Source)
 	}
@@ -117,7 +117,7 @@ func TestShouldStillApplyTheHookFallbackWhenNoUsableAppServerGraphExists(t *test
 	hookAt := provenanceBase.Add(time.Second)
 	hook := provenanceHook(t, "UserPromptSubmit", hookAt)
 
-	if got := overlayCodexHookObservation(hook, nil); got.Source != agentgraph.SourceHook ||
+	if got := overlayCodexHookObservation(hook, nil, true); got.Source != agentgraph.SourceHook ||
 		!got.FreshUntil.Equal(hook.FreshUntil) || got.Complete != hook.Complete {
 		t.Fatalf("nil-current fallback changed: %#v", got)
 	}
@@ -126,7 +126,7 @@ func TestShouldStillApplyTheHookFallbackWhenNoUsableAppServerGraphExists(t *test
 	for _, runtime := range []agentgraph.RuntimeState{agentgraph.RuntimeUnknown, agentgraph.RuntimeNotLoaded} {
 		t.Run(string(runtime), func(t *testing.T) {
 			current := provenanceGraph(t, provenanceAppServerObservation(ref, provenanceBase, runtime))
-			overlay := overlayCodexHookObservation(hook, current)
+			overlay := overlayCodexHookObservation(hook, current, true)
 			if overlay.Source != agentgraph.SourceHook || overlay.Complete || !overlay.FreshUntil.Equal(hook.FreshUntil) {
 				t.Fatalf("unavailable-root fallback = %#v", overlay)
 			}
@@ -138,7 +138,7 @@ func TestShouldStillApplyTheHookFallbackWhenNoUsableAppServerGraphExists(t *test
 
 	hookCurrent := provenanceGraph(t, hook)
 	later := provenanceHook(t, "Stop", hookAt.Add(time.Second))
-	if got := overlayCodexHookObservation(later, hookCurrent); got.Source != agentgraph.SourceHook ||
+	if got := overlayCodexHookObservation(later, hookCurrent, true); got.Source != agentgraph.SourceHook ||
 		!got.FreshUntil.Equal(later.FreshUntil) {
 		t.Fatalf("hook-on-hook fallback adopted non-hook authority: %#v", got)
 	}
@@ -152,7 +152,7 @@ func TestShouldNotMoveFreshUntilAcrossABurstOfHooksOnOneAppServerHorizon(t *test
 	for i := 1; i <= 10; i++ {
 		hookAt := provenanceBase.Add(time.Duration(i) * time.Second)
 		hook := provenanceHook(t, "UserPromptSubmit", hookAt)
-		overlay := overlayCodexHookObservation(hook, current)
+		overlay := overlayCodexHookObservation(hook, current, true)
 		if !overlay.FreshUntil.Equal(providerObservation.FreshUntil) {
 			t.Fatalf("hook %d moved FreshUntil to %v, want fixed %v", i, overlay.FreshUntil, providerObservation.FreshUntil)
 		}

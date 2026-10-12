@@ -125,6 +125,87 @@ func TestNewerAppServerNonAttentionCancelsHookTimeoutFallback(t *testing.T) {
 	}
 }
 
+// notLoadedCodexSnapshot is what a standalone app-server reports for a root
+// owned by an interactive TUI: topology without the root's own runtime.
+func notLoadedCodexSnapshot(ref provider.RootRef, rootID string, observed time.Time) agentgraph.Observation {
+	observation := testCodexObservation(ref, rootID, observed, agentgraph.RuntimeNotLoaded, agentgraph.AttentionNone)
+	observation.Nodes[0].Lifecycle = agentgraph.LifecycleUnknown
+	return observation
+}
+
+func TestCodexApprovalShouldPublishRedWhenTheAppServerCannotSeeTheRoot(t *testing.T) {
+	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
+	coordinator.codexApprovalGrace = 40 * time.Millisecond
+	ref, _ := providerRootRef(store.Snapshot().Sessions[0])
+	base := time.Now()
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "UserPromptSubmit", SessionID: "thread-1", TurnID: "turn-1", ObservedAt: base,
+	})
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PermissionRequest", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "call-1",
+		ToolName: "exec_command", ObservedAt: base.Add(time.Millisecond),
+	})
+	// The live failure: a poll lands inside the grace window, the overlay fills
+	// the notLoaded root with the hook's own deferred "working", and the graph
+	// reads as an active, attention-free codex_app_server graph newer than the gate.
+	snapshotAt := base.Add(2 * time.Millisecond)
+	if !coordinator.applyObservation(ref, coordinator.begin(ref.Key()), notLoadedCodexSnapshot(ref, "thread-1", snapshotAt),
+		claudeprovider.Compatibility{}, snapshotAt) {
+		t.Fatal("notLoaded app-server snapshot was not applied")
+	}
+	if graph := codexGraph(t, store); graph.Source != agentgraph.SourceCodexAppServer || graph.Summary.Runtime != agentgraph.RuntimeActive {
+		t.Fatalf("precondition: notLoaded snapshot should compose hook working under app-server source: %#v", graph)
+	}
+
+	graph := waitForCodexGraph(t, store, "thread-1", state.StatusPermission)
+	if graph.Summary.Attention != agentgraph.AttentionApproval {
+		t.Fatalf("approval over a notLoaded root was settled by its own hook state: %#v", graph.Summary)
+	}
+}
+
+func TestCodexApprovalShouldStillSettleWhenALiveAppServerSnapshotFollowsANotLoadedOne(t *testing.T) {
+	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
+	coordinator.codexApprovalGrace = 40 * time.Millisecond
+	ref, _ := providerRootRef(store.Snapshot().Sessions[0])
+	base := time.Now()
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PermissionRequest", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "call-1",
+		ToolName: "exec_command", ObservedAt: base,
+	})
+	notLoadedAt := base.Add(time.Millisecond)
+	coordinator.applyObservation(ref, coordinator.begin(ref.Key()), notLoadedCodexSnapshot(ref, "thread-1", notLoadedAt),
+		claudeprovider.Compatibility{}, notLoadedAt)
+	liveAt := base.Add(2 * time.Millisecond)
+	live := testCodexObservation(ref, "thread-1", liveAt, agentgraph.RuntimeActive, agentgraph.AttentionNone)
+	if !coordinator.applyObservation(ref, coordinator.begin(ref.Key()), live, claudeprovider.Compatibility{}, liveAt) {
+		t.Fatal("live app-server snapshot was not applied")
+	}
+
+	time.Sleep(2 * coordinator.codexApprovalGrace)
+	if graph := codexGraph(t, store); graph.Summary.Status != state.StatusWorking || graph.Summary.Attention != agentgraph.AttentionNone {
+		t.Fatalf("direct app-server evidence of the root should settle the gate: %#v", graph.Summary)
+	}
+}
+
+func TestCodexHookShouldKeepHookProvenanceWhenTheAppServerRootIsOnlyOverlaid(t *testing.T) {
+	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
+	ref, _ := providerRootRef(store.Snapshot().Sessions[0])
+	base := time.Now()
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "UserPromptSubmit", SessionID: "thread-1", TurnID: "turn-1", ObservedAt: base,
+	})
+	snapshotAt := base.Add(time.Millisecond)
+	coordinator.applyObservation(ref, coordinator.begin(ref.Key()), notLoadedCodexSnapshot(ref, "thread-1", snapshotAt),
+		claudeprovider.Compatibility{}, snapshotAt)
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PreToolUse", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "call-1",
+		ToolName: "exec_command", ObservedAt: base.Add(2 * time.Millisecond),
+	})
+	if graph := codexGraph(t, store); graph.Source != agentgraph.SourceHook {
+		t.Fatalf("hook over an overlaid notLoaded root borrowed app-server authority: source=%q", graph.Source)
+	}
+}
+
 func TestCodexHumanInputPermissionRemainsImmediate(t *testing.T) {
 	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
 	coordinator.codexApprovalGrace = time.Second

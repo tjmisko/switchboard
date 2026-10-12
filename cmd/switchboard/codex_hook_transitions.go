@@ -321,7 +321,8 @@ func (c *agentCoordinator) handleCodexHookNow(ref provider.RootRef, req rpc.Requ
 				// cannot clear an independently proven human-owned request.
 				mapped = false
 			}
-			observation = overlayCodexHookObservation(observation, current.AgentGraph)
+			observation = overlayCodexHookObservation(observation, current.AgentGraph,
+				c.codexAppServerRootLiveSince(ref.Key(), rootID, time.Time{}))
 		}
 	}
 	if mapped {
@@ -877,6 +878,7 @@ func (c *agentCoordinator) overlayCodexHookRootObservation(key provider.RootKey,
 		return observation
 	}
 	c.codexHookMu.Lock()
+	c.recordCodexAppServerRootLocked(key, observation)
 	state := c.codexHookRoots[key]
 	if state == nil || state.sessionID != observation.RootID || state.rootNode.ID != observation.RootID ||
 		state.rootFreshUntil.IsZero() || !now.Before(state.rootFreshUntil) {
@@ -912,6 +914,50 @@ func (c *agentCoordinator) overlayCodexHookRootObservation(key provider.RootKey,
 		return observation
 	}
 	return observation
+}
+
+// codexAppServerRootEvidence is what the last direct app-server snapshot said
+// about the root's own runtime. A published graph cannot answer this: when the
+// standalone app-server reports a TUI root notLoaded, the hook root overlay
+// fills that root with hook state and the graph keeps Source=codex_app_server.
+// Reading the composed graph as app-server proof is circular — the hook's own
+// deferred "working" would then settle the hook's own approval gate.
+type codexAppServerRootEvidence struct {
+	rootID string
+	// liveAt is the ObservedAt of the latest direct snapshot, zero when that
+	// snapshot reported the root unavailable (notLoaded/unknown).
+	liveAt time.Time
+}
+
+// recordCodexAppServerRootLocked files direct app-server evidence only.
+// Composed observations are rebuilt from the published graph and may already
+// carry overlaid hook state, so they never count. c.codexHookMu must be held.
+func (c *agentCoordinator) recordCodexAppServerRootLocked(key provider.RootKey, observation agentgraph.Observation) {
+	if observation.Diagnostic == codexComposedObservationDiagnostic {
+		return
+	}
+	evidence := codexAppServerRootEvidence{rootID: observation.RootID}
+	for _, node := range observation.Nodes {
+		if node.ID == observation.RootID && !codexRootStateUnavailable(node.Runtime, node.Attention) {
+			evidence.liveAt = observation.ObservedAt
+			break
+		}
+	}
+	c.codexAppServerRoot[key] = evidence
+}
+
+// codexAppServerRootLiveSince reports whether the latest direct app-server
+// snapshot of rootID carried the root's own runtime and was taken at or after
+// since.
+func (c *agentCoordinator) codexAppServerRootLiveSince(key provider.RootKey, rootID string, since time.Time) bool {
+	c.codexHookMu.Lock()
+	defer c.codexHookMu.Unlock()
+	return c.codexAppServerRootLiveSinceLocked(key, rootID, since)
+}
+
+func (c *agentCoordinator) codexAppServerRootLiveSinceLocked(key provider.RootKey, rootID string, since time.Time) bool {
+	evidence, ok := c.codexAppServerRoot[key]
+	return ok && evidence.rootID == rootID && !evidence.liveAt.IsZero() && !evidence.liveAt.Before(since)
 }
 
 func codexAppServerRootUnavailable(graph *state.AgentGraph) bool {
@@ -1102,6 +1148,11 @@ func (c *agentCoordinator) startCodexApprovalTimerLocked(state *codexHookRootSta
 			c.codexHookMu.Unlock()
 			return
 		}
+		// The graph alone cannot settle the gate: a notLoaded root overlaid with
+		// this hook's own deferred "working" looks identical. Only a direct
+		// app-server reading of the root since the gate opened is evidence.
+		appServerSettled = appServerSettled &&
+			c.codexAppServerRootLiveSinceLocked(pending.ref.Key(), pending.sessionID, pending.startedAt)
 		now := c.now()
 		if existingAttention {
 			// The chip is already red for something else, so publishing this gate
@@ -1147,7 +1198,8 @@ func (c *agentCoordinator) startCodexApprovalTimerLocked(state *codexHookRootSta
 		c.recordDiagnostic(agentgraph.ProviderCodex, "hook_approval_timeout_red", now)
 		observation := codexHookApprovalObservation(pending.sessionID, pending.ref.StartedAt, now)
 		if currentSession, ok := sessionForKey(c.store.Snapshot(), pending.ref.Key()); ok {
-			observation = overlayCodexHookObservation(observation, currentSession.AgentGraph)
+			observation = overlayCodexHookObservation(observation, currentSession.AgentGraph,
+				c.codexAppServerRootLiveSince(pending.ref.Key(), pending.sessionID, time.Time{}))
 		}
 		c.applyObservationAs(
 			pending.ref, generation, observation, claudeprovider.Compatibility{}, now, "", codexHookLanding,
@@ -1417,6 +1469,7 @@ func (c *agentCoordinator) forgetCodexHookState(key provider.RootKey) {
 		}
 	}
 	delete(c.codexHookRoots, key)
+	delete(c.codexAppServerRoot, key)
 	c.codexHookMu.Unlock()
 	c.forgetCodexLimitScan(key)
 	c.cancelCodexNaming(key, true)

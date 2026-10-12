@@ -102,6 +102,7 @@ type agentCoordinator struct {
 
 	codexHookMu        sync.Mutex
 	codexHookRoots     map[provider.RootKey]*codexHookRootState
+	codexAppServerRoot map[provider.RootKey]codexAppServerRootEvidence
 	codexStarts        map[provider.RootKey]*pendingCodexStart
 	codexStartSettle   time.Duration
 	codexApprovalGrace time.Duration
@@ -149,7 +150,8 @@ func newAgentCoordinator(store *state.Store, sink *history.Sink, claude claudeOb
 		diagnostics: make(map[string]rpc.AgentDiagnostic), lastLog: make(map[string]time.Time),
 		naming: make(map[provider.RootKey]*codexNamingState), namer: codexprovider.EphemeralNamer{},
 		namingModel: codexprovider.DefaultDisplayNameModel, namingTimeout: 45 * time.Second,
-		codexHookRoots: make(map[provider.RootKey]*codexHookRootState), codexStarts: make(map[provider.RootKey]*pendingCodexStart),
+		codexHookRoots: make(map[provider.RootKey]*codexHookRootState), codexAppServerRoot: make(map[provider.RootKey]codexAppServerRootEvidence),
+		codexStarts:      make(map[provider.RootKey]*pendingCodexStart),
 		codexStartSettle: codexHookStartSettle, codexApprovalGrace: codexHookApprovalGrace,
 		piRoots: make(map[provider.RootKey]*piHookRoot), piTails: make(map[provider.RootKey]*piSessionTail),
 	}
@@ -204,6 +206,7 @@ func (c *agentCoordinator) Close() {
 		}
 		clear(c.codexStarts)
 		clear(c.codexHookRoots)
+		clear(c.codexAppServerRoot)
 		c.codexHookMu.Unlock()
 		c.codexTimerWG.Wait()
 		c.wg.Wait()
@@ -825,12 +828,14 @@ func observationRootName(observation agentgraph.Observation) (string, bool) {
 // child graph, completeness verdict, or freshness horizon. When app-server
 // evidence is absent, stale, or explicitly lacks the root runtime, the hook
 // remains the bounded fallback authority exactly as it was before composition.
-func overlayCodexHookObservation(hook agentgraph.Observation, current *state.AgentGraph) agentgraph.Observation {
+// appServerRootLive is the coordinator's direct evidence that the app-server
+// itself, not an earlier hook overlay, last reported the root's runtime.
+func overlayCodexHookObservation(hook agentgraph.Observation, current *state.AgentGraph, appServerRootLive bool) agentgraph.Observation {
 	if current == nil || current.RootID != hook.RootID || len(current.Nodes) == 0 || len(hook.Nodes) != 1 {
 		return hook
 	}
 	overlay := observationFromState(agentgraph.ProviderCodex, current)
-	if !codexAppServerGraphOwnsHookHorizon(current, hook.ObservedAt) {
+	if !codexAppServerGraphOwnsHookHorizon(current, hook.ObservedAt, appServerRootLive) {
 		overlay.Source = agentgraph.SourceHook
 		overlay.FreshUntil = hook.FreshUntil
 		overlay.Complete = false
@@ -856,9 +861,12 @@ func overlayCodexHookObservation(hook agentgraph.Observation, current *state.Age
 // codexAppServerGraphOwnsHookHorizon reports whether a hook at hookAt composes
 // onto app-server evidence that is still authoritative. The source check is
 // load-bearing: codexAppServerRootUnavailable also returns false for graphs
-// whose source is not the app-server.
-func codexAppServerGraphOwnsHookHorizon(current *state.AgentGraph, hookAt time.Time) bool {
-	return current != nil && current.Source == agentgraph.SourceCodexAppServer &&
+// whose source is not the app-server. appServerRootLive is load-bearing too: a
+// notLoaded root filled from hook state keeps Source=codex_app_server and looks
+// available, so the graph alone would let hook evidence borrow app-server
+// authority.
+func codexAppServerGraphOwnsHookHorizon(current *state.AgentGraph, hookAt time.Time, appServerRootLive bool) bool {
+	return appServerRootLive && current != nil && current.Source == agentgraph.SourceCodexAppServer &&
 		current.Fresh(hookAt) && !codexAppServerRootUnavailable(current)
 }
 

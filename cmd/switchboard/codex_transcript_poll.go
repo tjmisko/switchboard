@@ -57,7 +57,10 @@ func (c *agentCoordinator) pollCodexStoppedRoot(ref provider.RootRef, now time.T
 				c.codexHookMu.Unlock()
 				return
 			}
-			if observation.Source == agentgraph.SourceCodexAppServer && observation.Fresh(now) && !codexRootStateUnavailable(node.Runtime, node.Attention) {
+			// A notLoaded root overlaid with hook state also looks available here;
+			// only direct app-server evidence of the root may veto the rollout.
+			if observation.Source == agentgraph.SourceCodexAppServer && observation.Fresh(now) && !codexRootStateUnavailable(node.Runtime, node.Attention) &&
+				c.codexAppServerRootLiveSinceLocked(ref.Key(), sessionID, time.Time{}) {
 				c.codexHookMu.Unlock()
 				return
 			}
