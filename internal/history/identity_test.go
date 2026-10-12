@@ -39,10 +39,15 @@ func TestRateLimitResponseEvidenceSettlesAnAmbiguousAPIKey(t *testing.T) {
 	now := time.Date(2026, 10, 12, 12, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {
 		present bool
+		base    string
 		want    string
-	}{{true, "subscription"}, {false, "api"}} {
+	}{{true, "api", "subscription"}, {false, "api", "api"}, {false, "subscription", "api"}} {
+		evidence := "auth_status_pending_response"
+		if tc.base == "subscription" {
+			evidence = "auth_status"
+		}
 		events := []Event{
-			{Ts: now, Type: EventSessionIdentity, Agent: "claude", SessionID: "a", ExecutionProvider: "anthropic", BillingRoute: "api", RouteEvidence: "auth_status_pending_response"},
+			{Ts: now, Type: EventSessionIdentity, Agent: "claude", SessionID: "a", ExecutionProvider: "anthropic", BillingRoute: tc.base, RouteEvidence: evidence},
 			{Ts: now.Add(time.Second), Type: EventUsageSample, Agent: "claude", SessionID: "a"},
 			{Ts: now.Add(2 * time.Second), Type: EventSessionIdentity, Agent: "claude", SessionID: "a", RateLimitsPresent: &tc.present},
 		}

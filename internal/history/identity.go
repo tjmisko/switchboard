@@ -32,11 +32,12 @@ func JoinSessionIdentities(events []Event) []Event {
 		if identity.RouteEvidence == "auth_status_pending_response" && identity.BillingRoute == "api" {
 			identity.BillingRoute = ""
 		}
-		if route.evidence != nil && identity.Gateway == "" {
+		if route.evidence != nil && identity.Gateway == "" &&
+			(identity.ExecutionProvider == "anthropic" || identity.BillingRoute == "subscription" || identity.BillingRoute == "api") {
 			if *route.evidence {
 				identity.ExecutionProvider, identity.BillingRoute = "anthropic", "subscription"
 				identity.RouteEvidence = "rate_limits_present"
-			} else if route.base.BillingRoute == "api" {
+			} else {
 				identity.ExecutionProvider, identity.BillingRoute = "anthropic", "api"
 				identity.RouteEvidence = "rate_limits_absent"
 			}
