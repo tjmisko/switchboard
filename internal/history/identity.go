@@ -59,15 +59,17 @@ func JoinSessionIdentities(events []Event) []Event {
 		if ev.Type != EventUsageSample && ev.Type != EventUsageCutover {
 			continue
 		}
-		if ev.BillingRoute == "" && identity.BillingRoute != "unknown" {
-			ev.BillingRoute = identity.BillingRoute
-			ev.RouteEvidence = identity.RouteEvidence
-		}
-		if ev.ExecutionProvider == "" {
-			ev.ExecutionProvider = identity.ExecutionProvider
-		}
-		if ev.Gateway == "" {
-			ev.Gateway = identity.Gateway
+		if ev.BillingRoute == "" {
+			if identity.BillingRoute != "unknown" {
+				ev.BillingRoute = identity.BillingRoute
+				ev.RouteEvidence = identity.RouteEvidence
+			}
+			if ev.ExecutionProvider == "" {
+				ev.ExecutionProvider = identity.ExecutionProvider
+			}
+			if ev.Gateway == "" {
+				ev.Gateway = identity.Gateway
+			}
 		}
 	}
 	return joined

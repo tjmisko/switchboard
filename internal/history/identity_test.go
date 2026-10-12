@@ -73,3 +73,16 @@ func TestUnknownRouteRemainsUnknownWithoutSessionEvidence(t *testing.T) {
 		t.Fatalf("detected route lost: %+v", got[2])
 	}
 }
+
+func TestExplicitPiGatewayUsageKeepsUnknownUpstream(t *testing.T) {
+	now := time.Date(2026, 10, 12, 12, 0, 0, 0, time.UTC)
+	events := []Event{
+		{Ts: now, Type: EventUsageSample, Agent: "pi", SessionID: "same", Gateway: "openrouter", BillingRoute: "gateway"},
+		{Ts: now.Add(time.Second), Type: EventSessionIdentity, Agent: "pi", SessionID: "same", Gateway: "openrouter", ExecutionProvider: "deepinfra", BillingRoute: "gateway"},
+		{Ts: now.Add(2 * time.Second), Type: EventUsageSample, Agent: "pi", SessionID: "same", Gateway: "openrouter", ExecutionProvider: "deepinfra", BillingRoute: "gateway"},
+	}
+	joined := JoinSessionIdentities(events)
+	if joined[0].ExecutionProvider != "" || joined[2].ExecutionProvider != "deepinfra" {
+		t.Fatalf("per-response upstreams changed: %+v", joined)
+	}
+}
