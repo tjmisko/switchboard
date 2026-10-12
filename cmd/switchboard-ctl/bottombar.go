@@ -316,6 +316,15 @@ func reconcileWith(cfg bottomBarConfig, count int) {
 	reconcileDisplayMode(cfg, count)
 }
 
+// reconcileWithMode is reconcileWith for a caller that has already published
+// a frame for mode. Re-reading the mode file here could launch chips while the
+// published frame still shows circles; the next render handles a newer mode.
+func reconcileWithMode(cfg bottomBarConfig, mode display.Mode, count int) {
+	unlock := mustFlock(cfg.lockFile)
+	defer unlock()
+	setBottom(cfg, display.WantsBottom(mode, topVisible(cfg), count))
+}
+
 func reconcileDisplayMode(cfg bottomBarConfig, count int) {
 	mode, err := display.ReadMode(cfg.modeFile)
 	if err != nil {
@@ -515,7 +524,7 @@ func renderDisplaySnapshots(cfg bottomBarConfig, renderer *waybarchip.Renderer, 
 				return false
 			}
 		}
-		reconcileWith(cfg, len(latest.Sessions))
+		reconcileWithMode(cfg, mode, len(latest.Sessions))
 		if mode == display.Circles {
 			visible := topVisible(cfg)
 			if !cfg.attached {

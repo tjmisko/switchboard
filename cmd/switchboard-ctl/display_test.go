@@ -148,6 +148,25 @@ func TestQuietCircleTooltipBeyondBottomSlotsAdvancesWithoutSnapshot(t *testing.T
 	t.Fatal("quiet circle hover did not advance at its minute boundary")
 }
 
+func TestReconcileWithModeShouldNotLaunchChipsWhenTheModeFileChangedAfterACirclesFrame(t *testing.T) {
+	cfg := bottomLifecycleConfig(t)
+	cfg.modeFile = filepath.Join(t.TempDir(), "mode")
+	// The render published circles, then the toggle landed before reconcile.
+	if _, err := setDisplayMode(cfg.modeFile, "chips"); err != nil {
+		t.Fatal(err)
+	}
+	starts := 0
+	cfg.ops.start = func(bottomBarConfig) error { starts++; return nil }
+	reconcileWithMode(cfg, display.Circles, 1)
+	if starts != 0 {
+		t.Fatalf("launched chips for a circles frame: starts=%d", starts)
+	}
+	reconcileWithMode(cfg, display.Chips, 1)
+	if starts != 1 {
+		t.Fatalf("chips frame did not launch the bottom bar: starts=%d", starts)
+	}
+}
+
 func TestLiveModeTransitionsKeepOneOwnerAndWakeOnExit(t *testing.T) {
 	cfg := bottomLifecycleConfig(t)
 	cfg.modeFile = filepath.Join(t.TempDir(), "mode")
