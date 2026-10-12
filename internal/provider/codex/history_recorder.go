@@ -3,6 +3,7 @@ package codex
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"github.com/tjmisko/switchboard/internal/agentgraph"
 	"github.com/tjmisko/switchboard/internal/history"
@@ -13,7 +14,9 @@ import (
 // schema. It deliberately owns no pricing logic: the pricing manager selects a
 // live/LKG catalog when readers estimate each canonical token delta.
 type HistoryUsageRecorder struct {
-	sink *history.Sink
+	sink       *history.Sink
+	mu         sync.Mutex
+	identities map[string]agentgraph.BillingIdentity
 }
 
 func NewHistoryUsageRecorder(sink *history.Sink) *HistoryUsageRecorder {
@@ -23,6 +26,9 @@ func NewHistoryUsageRecorder(sink *history.Sink) *HistoryUsageRecorder {
 func (r *HistoryUsageRecorder) PersistUsage(ctx context.Context, update UsageUpdate) error {
 	if r == nil || r.sink == nil {
 		return errRolloutRecorderUnavailable
+	}
+	if err := r.persistIdentity(ctx, update); err != nil {
+		return err
 	}
 	coverage := update.Coverage
 	// Rollout token counters do not expose potentially billable OpenAI tool
@@ -62,6 +68,36 @@ func (r *HistoryUsageRecorder) PersistUsage(ctx context.Context, update UsageUpd
 	}
 	_, err := r.sink.RecordDurable(ctx, event)
 	return err
+}
+
+// persistIdentity writes the first known identity for a root session and any
+// later route change. Usage events still carry their own request-level route.
+func (r *HistoryUsageRecorder) persistIdentity(ctx context.Context, update UsageUpdate) error {
+	if update.RootSessionID == "" {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.identities == nil {
+		r.identities = make(map[string]agentgraph.BillingIdentity)
+	}
+	key := update.RootSessionID
+	if prior, ok := r.identities[key]; ok && prior == update.Identity {
+		return nil
+	}
+	event := history.Event{
+		SchemaVersion: history.HistorySchemaVersion, Ts: update.ObservedAt, Type: history.EventSessionIdentity,
+		SessionID: key, PID: update.RootKey.PID, Agent: "codex",
+		UsageEventID: "codex:session-identity:" + key, UsageRevision: update.ObservedAt.UnixNano(),
+		Gateway: update.Identity.Gateway, ExecutionProvider: update.Identity.ExecutionProvider,
+		BillingRoute: update.Identity.BillingRoute, RouteEvidence: "codex_observation",
+		AccountKind: update.Identity.AccountKind, AuthMode: update.Identity.AuthMode,
+	}
+	if _, err := r.sink.RecordDurable(ctx, event); err != nil {
+		return err
+	}
+	r.identities[key] = update.Identity
+	return nil
 }
 
 func (r *HistoryUsageRecorder) PersistVendorUsage(ctx context.Context, update UsageUpdate) error {

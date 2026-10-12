@@ -262,6 +262,12 @@ func (c *agentCoordinator) handlePiHook(req rpc.Request, sess state.Session) {
 		next.nameAt = now
 	}
 	*root = next
+	if req.Event == "SessionStart" && c.sink != nil {
+		c.sink.Record(history.Event{
+			SchemaVersion: history.HistorySchemaVersion, Ts: now, Type: history.EventSessionIdentity,
+			SessionID: sessionID, PID: key.PID, Agent: state.AgentKindPi, CWD: cwd,
+		})
+	}
 
 	if rotated {
 		c.recordPiRotation(req, key.PID, cwd, prevID, sessionID, now)

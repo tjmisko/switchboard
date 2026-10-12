@@ -59,6 +59,12 @@ func cmdTimeline(args []string) {
 	if err != nil {
 		fail("read %s: %v", *dir, err)
 	}
+	if carried, err := history.CarrySessionIdentities(*dir, from, events); err != nil {
+		log.Printf("carried billing identity: %v — prior-day routes may be unknown", err)
+	} else {
+		events = append(carried, events...)
+	}
+	events = history.JoinSessionIdentities(events)
 	// The activity stream carries across midnight exactly like names do: an edge
 	// is written only on change, so an operator idle since last night has no edge
 	// in this window until morning. Seed the window with the carried state as a
@@ -117,6 +123,12 @@ func cmdTimeline(args []string) {
 		if err != nil {
 			fail("read plan window %s: %v", *dir, err)
 		}
+		if carried, err := history.CarrySessionIdentities(*dir, pwFrom, pwEvents); err != nil {
+			log.Printf("carried plan billing identity: %v — prior-day routes may be unknown", err)
+		} else {
+			pwEvents = append(carried, pwEvents...)
+		}
+		pwEvents = history.JoinSessionIdentities(pwEvents)
 		pw := history.AggregatePlanWindowWithCatalogs(pwEvents, pwFrom, pwTo, catalogs, now)
 		planWin = &pw
 	}
