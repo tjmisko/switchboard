@@ -3,7 +3,7 @@ package history
 type sessionRoute struct {
 	base     Event
 	seenBase bool
-	evidence *bool
+	evidence *Event
 }
 
 // joinSessionIdentities resolves each session's latest auth classification and
@@ -19,8 +19,10 @@ func JoinSessionIdentities(events []Event) []Event {
 		key := ev.Agent + "\x00" + ev.SessionID
 		route := routes[key]
 		if ev.RateLimitsPresent != nil {
-			present := *ev.RateLimitsPresent
-			route.evidence = &present
+			if route.evidence == nil || !ev.Ts.Before(route.evidence.Ts) {
+				copy := ev
+				route.evidence = &copy
+			}
 		} else if !route.seenBase || !ev.Ts.Before(route.base.Ts) {
 			route.base, route.seenBase = ev, true
 		}
@@ -32,9 +34,9 @@ func JoinSessionIdentities(events []Event) []Event {
 		if identity.RouteEvidence == "auth_status_pending_response" && identity.BillingRoute == "api" {
 			identity.BillingRoute = ""
 		}
-		if route.evidence != nil && identity.Gateway == "" &&
+		if route.evidence != nil && !route.evidence.Ts.Before(identity.Ts) && identity.Gateway == "" &&
 			(identity.ExecutionProvider == "anthropic" || identity.BillingRoute == "subscription" || identity.BillingRoute == "api") {
-			if *route.evidence {
+			if *route.evidence.RateLimitsPresent {
 				identity.ExecutionProvider, identity.BillingRoute = "anthropic", "subscription"
 				identity.RouteEvidence = "rate_limits_present"
 			} else {

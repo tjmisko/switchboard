@@ -86,3 +86,18 @@ func TestExplicitPiGatewayUsageKeepsUnknownUpstream(t *testing.T) {
 		t.Fatalf("per-response upstreams changed: %+v", joined)
 	}
 }
+
+func TestEarlierResponseEvidenceDoesNotSettleNewAuthProbe(t *testing.T) {
+	now := time.Date(2026, 10, 12, 12, 0, 0, 0, time.UTC)
+	present := true
+	events := []Event{
+		{Ts: now, Type: EventSessionIdentity, Agent: "claude", SessionID: "same", BillingRoute: "subscription", ExecutionProvider: "anthropic"},
+		{Ts: now.Add(time.Second), Type: EventSessionIdentity, Agent: "claude", SessionID: "same", RateLimitsPresent: &present},
+		{Ts: now.Add(2 * time.Second), Type: EventSessionIdentity, Agent: "claude", SessionID: "same", BillingRoute: "api", ExecutionProvider: "anthropic", RouteEvidence: "auth_status_pending_response"},
+		{Ts: now.Add(3 * time.Second), Type: EventUsageSample, Agent: "claude", SessionID: "same"},
+	}
+	got := JoinSessionIdentities(events)
+	if got[3].BillingRoute != "" {
+		t.Fatalf("prior response settled new auth: %+v", got[3])
+	}
+}
