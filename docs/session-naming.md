@@ -104,6 +104,32 @@ available.
 Codex terminal titles are not naming inputs. Their spinner, model, branch, and
 full UUID therefore cannot leak into a chip label.
 
+## Pi names
+
+Pi's own `/name` is forwarded by its extension (`session_info_changed`, and
+`session_start` for the name a resumed session already has) and stored as a
+native display record bound to the Pi session id:
+
+```json
+{
+  "value": "Refactor auth module",
+  "origin": "native",
+  "conversation_id": "<pi-session-id>"
+}
+```
+
+The stored value is Pi's name verbatim. Normalization happens only at the
+display boundary: `internal/label` folds it to a lowercase kebab slug of at
+most **four** words (Codex caps at three), after which the usual project prefix
+is applied — so `Refactor auth module` in Switchboard renders as
+`sb-refactor-auth-module`. A name that normalizes to nothing (only separators)
+falls through to the ordinary cwd/pid chain, exactly like an unnamed session.
+
+Pi's name record is bound to one Pi session: a `/new` or `/resume` that changes
+the session id drops it, and a rename addressed to a session the root is no
+longer bound to is ignored. Like a Codex rename, a Pi rename carries no status
+evidence and never renews the hook lease.
+
 ## Components
 
 - **`internal/projectname`** — the pure resolver: prefix + dedup (longest-alias,

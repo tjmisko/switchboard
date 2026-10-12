@@ -39,7 +39,10 @@ import (
 // Claude prefers its authoritative ~/.claude/sessions/<pid>.json name, then a
 // spinner-stripped terminal title. Pi prefers its own /name, carried as a
 // native display name bound to the Pi session, then follows Claude's chain.
-// Every provider falls back to cwd and finally pid.
+// Pi's /name is normalized at this display boundary to a lowercase kebab slug
+// with at most four words, so the chip reads `<project>-<task-words>` without
+// mutating the name Pi itself holds. Every provider falls back to cwd and
+// finally pid.
 func RawName(s state.Session) string {
 	return rawName(s, claudeSessionName)
 }
@@ -137,15 +140,28 @@ func codexRawName(s state.Session) string {
 }
 
 // piNativeName is Pi's own /name for the session's bound Pi session, or ""
-// when Pi has none. It travels on the snapshot, so it is federation-safe.
+// when Pi has none. It travels on the snapshot, so it is federation-safe. The
+// value is normalized for display to a lowercase kebab slug of at most four
+// words; the value Pi itself holds is never rewritten.
 func piNativeName(s state.Session) string {
 	if s.Pi == nil || !s.DisplayName.NativeFor(s.Pi.SessionID) {
 		return ""
 	}
-	return strings.TrimSpace(s.DisplayName.Value)
+	return piDisplaySlug(s.DisplayName.Value)
 }
 
-const maxCodexDisplayWords = 3
+const (
+	maxCodexDisplayWords = 3
+	maxPiDisplayWords    = 4
+)
+
+// piDisplaySlug normalizes Pi's own /name at the display boundary, the way
+// codexDisplaySlug normalizes Codex's. Pi's /name is free-form, and the chip
+// convention is `<project>-<two-to-four-task-words>`, so a longer or
+// punctuated name is folded rather than rendered verbatim.
+func piDisplaySlug(value string) string {
+	return displaySlug(value, maxPiDisplayWords)
+}
 
 // codexDisplaySlug normalizes an untrusted Codex name at the display boundary.
 // Codex's native name is intentionally free-form (and may be changed with
@@ -153,10 +169,16 @@ const maxCodexDisplayWords = 3
 // revisions. Keeping normalization here gives every renderer the same stable
 // contract without mutating either source of truth.
 func codexDisplaySlug(value string) string {
-	words := make([]string, 0, maxCodexDisplayWords)
+	return displaySlug(value, maxCodexDisplayWords)
+}
+
+// displaySlug folds value to a lowercase kebab slug of at most maxWords words,
+// dropping non-alphanumeric separators. A value with no usable word yields "".
+func displaySlug(value string, maxWords int) string {
+	words := make([]string, 0, maxWords)
 	var word strings.Builder
 	flush := func() {
-		if word.Len() == 0 || len(words) == maxCodexDisplayWords {
+		if word.Len() == 0 || len(words) == maxWords {
 			word.Reset()
 			return
 		}
@@ -169,7 +191,7 @@ func codexDisplaySlug(value string) string {
 			continue
 		}
 		flush()
-		if len(words) == maxCodexDisplayWords {
+		if len(words) == maxWords {
 			break
 		}
 	}

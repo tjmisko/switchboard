@@ -14,8 +14,10 @@ func named(name string) func(*rpc.Request) {
 	return func(req *rpc.Request) { req.SessionName = name }
 }
 
-// wantName checks the session's display name, as the bar's label resolves it.
-func (h *piHarness) wantName(step, want string) {
+// wantName checks the session's stored native name and, when wantLabel is
+// given, the label the bar derives from it. The two differ because Pi's /name
+// is stored verbatim and normalized only at the display boundary.
+func (h *piHarness) wantName(step, want string, wantLabel ...string) {
 	h.t.Helper()
 	sess := h.session()
 	if want == "" {
@@ -27,8 +29,12 @@ func (h *piHarness) wantName(step, want string) {
 	if sess.DisplayName == nil || sess.DisplayName.Origin != state.DisplayNameNative || sess.DisplayName.Value != want {
 		h.t.Fatalf("%s: display name = %+v, want native %q", step, sess.DisplayName, want)
 	}
-	if got := label.RawName(sess); got != want {
-		h.t.Fatalf("%s: label = %q, want %q", step, got, want)
+	rendered := want
+	if len(wantLabel) > 0 {
+		rendered = wantLabel[0]
+	}
+	if got := label.RawName(sess); got != rendered {
+		h.t.Fatalf("%s: label = %q, want %q", step, got, rendered)
 	}
 }
 
@@ -36,7 +42,7 @@ func TestPiNamingShouldShowPisNameAsTheDisplayNameWhenTheSessionStarts(t *testin
 	t.Setenv("HOME", t.TempDir())
 	h := newPiHarness(t)
 	h.hook("SessionStart", 0, source("startup"), named("Refactor auth module"))
-	h.wantName("session start", "Refactor auth module")
+	h.wantName("session start", "Refactor auth module", "refactor-auth-module")
 	if conversation := h.session().DisplayName.ConversationID; conversation != piTestSession {
 		t.Fatalf("name bound to %q, want the Pi session %q", conversation, piTestSession)
 	}
@@ -51,12 +57,12 @@ func TestPiNamingShouldUpdateTheDisplayNameWhenPisSessionIsRenamedMidSession(t *
 	freshUntil := h.session().AgentGraph.FreshUntil
 
 	h.hook("SessionName", 2*time.Second, named("first name"))
-	h.wantName("first rename", "first name")
+	h.wantName("first rename", "first name", "first-name")
 	h.hook("SessionName", 3*time.Second, named("second name"))
-	h.wantName("second rename", "second name")
+	h.wantName("second rename", "second name", "second-name")
 	// A rename sent earlier but delivered late does not undo the newer one.
 	h.hook("SessionName", 2500*time.Millisecond, named("first name"))
-	h.wantName("late rename", "second name")
+	h.wantName("late rename", "second name", "second-name")
 
 	h.wantStatus("renames carry no status", state.StatusWorking)
 	if got := h.session().AgentGraph.FreshUntil; !got.Equal(freshUntil) {
@@ -82,7 +88,7 @@ func TestPiNamingShouldResetTheNameWhenPiMovesToAnotherSession(t *testing.T) {
 	h.hook("SessionName", 2*time.Second, named("stale"))
 	h.wantName("rename for the old session", "")
 	h.hook("SessionName", 3*time.Second, session(piTestNext), named("new work"))
-	h.wantName("rename for the new session", "new work")
+	h.wantName("rename for the new session", "new work", "new-work")
 	h.hook("SessionStart", 4*time.Second, source("resume"), session(piTestSession), named("old work"))
-	h.wantName("after /resume", "old work")
+	h.wantName("after /resume", "old work", "old-work")
 }

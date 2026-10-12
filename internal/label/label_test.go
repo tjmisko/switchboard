@@ -893,19 +893,45 @@ func TestNameCache_BlockedWriters_servesConcurrentCallersTheSameName(t *testing.
 	}
 }
 
-func TestRawNameShouldShowPisNameWhenPiNamedTheBoundSession(t *testing.T) {
+func TestPiDisplaySlug(t *testing.T) {
+	for _, test := range []struct {
+		input string
+		want  string
+	}{
+		{"Refactor auth module", "refactor-auth-module"},
+		{"Plan faster abstract extraction", "plan-faster-abstract-extraction"},
+		{"  Fix__THE / API!!! later", "fix-the-api-later"},
+		{"One", "one"},
+		{"Already-kebab-case-name-here", "already-kebab-case-name"},
+		{"Déboguer l’API vite", "déboguer-l-api-vite"},
+		{"---", ""},
+	} {
+		if got := piDisplaySlug(test.input); got != test.want {
+			t.Errorf("piDisplaySlug(%q) = %q, want %q", test.input, got, test.want)
+		}
+	}
+}
+
+func TestRawNameShouldNormalizePisNameAtTheDisplayBoundary(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	s := state.Session{PID: 4300, Agent: state.AgentKindPi, CWD: "/home/u/Projects/Arachne",
 		Pi:          &state.AgentInfo{SessionID: "pi-1"},
 		DisplayName: &state.DisplayName{Value: "Refactor auth module", Origin: state.DisplayNameNative, ConversationID: "pi-1"},
 		Wezterm:     &state.WeztermInfo{WindowTitle: "π - Arachne"},
 	}
-	if got := RawName(s); got != "Refactor auth module" {
-		t.Errorf("RawName = %q, want Pi's /name verbatim", got)
+	if got := RawName(s); got != "refactor-auth-module" {
+		t.Errorf("RawName = %q, want the display slug", got)
+	}
+	if got := Chip(projectname.DefaultConfig(), s); got != "arachne-refactor-auth-module" {
+		t.Errorf("Chip = %q, want arachne-refactor-auth-module", got)
+	}
+	// The persisted /name Pi holds is left untouched.
+	if got := s.DisplayName.Value; got != "Refactor auth module" {
+		t.Errorf("DisplayName.Value = %q, want Pi's name untouched", got)
 	}
 	s.Remote = true
-	if got := RawName(s); got != "Refactor auth module" {
-		t.Errorf("remote RawName = %q, want Pi's /name from the snapshot", got)
+	if got := RawName(s); got != "refactor-auth-module" {
+		t.Errorf("remote RawName = %q, want the display slug from the snapshot", got)
 	}
 }
 
