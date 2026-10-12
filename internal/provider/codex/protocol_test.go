@@ -30,7 +30,7 @@ func TestSchemaFixturesMapNestedRuntimeLifecycleAndAttention(t *testing.T) {
 	assertNode(t, observation, fixtureRoot, "", "", "", agentgraph.RuntimeIdle, agentgraph.AttentionNone, agentgraph.LifecycleUnknown)
 	assertNode(t, observation, fixtureAtlas, fixtureRoot, "Atlas", "researcher", agentgraph.RuntimeActive, agentgraph.AttentionNone, agentgraph.LifecycleRunning)
 	assertNode(t, observation, fixtureNova, fixtureRoot, "Nova", "reviewer", agentgraph.RuntimeActive, agentgraph.AttentionNone, agentgraph.LifecycleRunning)
-	if summary := agentgraph.Reduce(observation, agentgraph.Summary{}, fixtureNow); summary.LegacyStatus != agentgraph.LegacyDelegating {
+	if summary := agentgraph.Reduce(observation, agentgraph.Summary{}, fixtureNow); summary.Status != agentgraph.StatusDelegating {
 		t.Fatalf("idle root with active children = %#v", summary)
 	}
 
@@ -43,7 +43,7 @@ func TestSchemaFixturesMapNestedRuntimeLifecycleAndAttention(t *testing.T) {
 	assertNodeAttention(t, observation, fixtureAtlas, agentgraph.AttentionApproval)
 	assertNodeAttention(t, observation, fixtureNova, agentgraph.AttentionUserInput)
 	summary := agentgraph.Reduce(observation, agentgraph.Summary{}, fixtureNow)
-	if summary.LegacyStatus != agentgraph.LegacyPermission || summary.ApprovalNodes != 1 || summary.UserInputNodes != 1 {
+	if summary.Status != agentgraph.StatusPermission || summary.ApprovalNodes != 1 || summary.UserInputNodes != 1 {
 		t.Fatalf("simultaneous waits = %#v", summary)
 	}
 
@@ -54,7 +54,7 @@ func TestSchemaFixturesMapNestedRuntimeLifecycleAndAttention(t *testing.T) {
 	observation = observer.roots[key].observation
 	assertNode(t, observation, fixtureAtlas, fixtureRoot, "Atlas", "researcher", agentgraph.RuntimeIdle, agentgraph.AttentionNone, agentgraph.LifecycleShutdown)
 	assertNode(t, observation, fixtureNova, fixtureRoot, "Nova", "reviewer", agentgraph.RuntimeIdle, agentgraph.AttentionNone, agentgraph.LifecycleShutdown)
-	if summary := agentgraph.Reduce(observation, agentgraph.Summary{}, fixtureNow); summary.LegacyStatus != agentgraph.LegacyIdle || summary.LiveChildren != 0 {
+	if summary := agentgraph.Reduce(observation, agentgraph.Summary{}, fixtureNow); summary.Status != agentgraph.StatusIdle || summary.LiveChildren != 0 {
 		t.Fatalf("drain summary = %#v", summary)
 	}
 }

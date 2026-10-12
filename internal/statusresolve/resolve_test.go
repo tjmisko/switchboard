@@ -61,18 +61,18 @@ func restored(provider agentgraph.ProviderKind, at time.Time, lease time.Duratio
 
 // rejected returns the reason d rejected the candidate from source with
 // status, "" when it holds none.
-func rejected(d statusexplain.Decision, source agentgraph.SourceKind, status string) statusexplain.Reason {
+func rejected(d statusexplain.Decision, source agentgraph.SourceKind, status agentgraph.Status) statusexplain.Reason {
 	for _, c := range d.Rejected {
-		if c.Source == string(source) && c.Status == status {
+		if c.Source == string(source) && c.Status == string(status) {
 			return c.RejectReason
 		}
 	}
 	return ""
 }
 
-func want(t *testing.T, name string, d statusexplain.Decision, status string, reason statusexplain.Reason) {
+func want(t *testing.T, name string, d statusexplain.Decision, status agentgraph.Status, reason statusexplain.Reason) {
 	t.Helper()
-	if d.Status != status || d.Reason != reason {
+	if d.Status != string(status) || d.Reason != reason {
 		t.Errorf("%s: decided %q for %q, want %q for %q", name, d.Status, d.Reason, status, reason)
 	}
 }
@@ -122,7 +122,7 @@ func TestResolveShouldHoldAttentionWhenATerminalReadingSaysWorkingOrIdle(t *test
 		now := t0.Add(time.Second)
 		reading := herdr(tc.target.Root.Provider, tc.herdr, now, now)
 		d := Resolve(tc.target, []Candidate{tc.red, reading}, statusexplain.Decision{}, now)
-		want(t, tc.name, d, agentgraph.LegacyPermission, statusexplain.ReasonAttentionHeld)
+		want(t, tc.name, d, agentgraph.StatusPermission, statusexplain.ReasonAttentionHeld)
 		if d.Source != string(tc.red.Source) || d.EvidenceKind != tc.red.Kind {
 			t.Errorf("%s: attributed to %s/%s", tc.name, d.Source, d.EvidenceKind)
 		}
@@ -135,14 +135,14 @@ func TestResolveShouldHoldAttentionWhenATerminalReadingSaysWorkingOrIdle(t *test
 func TestResolveShouldHoldRedForAFreshPiDialogWhenHerdrReadsWorking(t *testing.T) {
 	now := t0.Add(time.Second)
 	d := Resolve(pi, []Candidate{piHook(t0, time.Hour, active, input), herdr("pi", "working", now, now)}, statusexplain.Decision{}, now)
-	want(t, "pi dialog", d, agentgraph.LegacyPermission, statusexplain.ReasonEventAuthority)
-	if got := rejected(d, agentgraph.SourceHerdr, agentgraph.LegacyWorking); got != statusexplain.ReasonSourceOutranked {
+	want(t, "pi dialog", d, agentgraph.StatusPermission, statusexplain.ReasonEventAuthority)
+	if got := rejected(d, agentgraph.SourceHerdr, agentgraph.StatusWorking); got != statusexplain.ReasonSourceOutranked {
 		t.Errorf("herdr rejected for %q", got)
 	}
 	// The dialog's writer withdrawing does not release it either, until its
 	// deadline: herdr cannot resolve a request it cannot see.
 	held := Resolve(pi, []Candidate{herdr("pi", "working", now, now)}, d, now.Add(time.Minute))
-	want(t, "pi dialog after hook withdrawal", held, agentgraph.LegacyPermission, statusexplain.ReasonAttentionHeld)
+	want(t, "pi dialog after hook withdrawal", held, agentgraph.StatusPermission, statusexplain.ReasonAttentionHeld)
 }
 
 // --- request resolution: only authorized evidence resolves attention ---
@@ -154,21 +154,21 @@ func TestResolveShouldReleaseAttentionWhenAuthorizedEvidenceReportsItResolved(t 
 		target   Target
 		red      Candidate
 		resolver Candidate
-		want     string
+		want     agentgraph.Status
 	}{
-		{"pi dialog closed by its own hook", pi, piHook(t0, time.Hour, active, input), piHook(t1, time.Hour, active, none), agentgraph.LegacyWorking},
-		{"codex input answered by its own hook", codex, codexHook(t0, time.Hour, idle, input), codexHook(t1, time.Hour, active, none), agentgraph.LegacyWorking},
-		{"codex hook request cleared by a newer snapshot", codex, codexHook(t0, time.Hour, idle, input), codexSnap(t1, time.Minute, active, none), agentgraph.LegacyWorking},
-		{"claude hook request cleared by a newer transcript graph", claude, claudeHook(t0, time.Hour, idle, ask), claudeSnap(t1, time.Minute, active, none), agentgraph.LegacyWorking},
+		{"pi dialog closed by its own hook", pi, piHook(t0, time.Hour, active, input), piHook(t1, time.Hour, active, none), agentgraph.StatusWorking},
+		{"codex input answered by its own hook", codex, codexHook(t0, time.Hour, idle, input), codexHook(t1, time.Hour, active, none), agentgraph.StatusWorking},
+		{"codex hook request cleared by a newer snapshot", codex, codexHook(t0, time.Hour, idle, input), codexSnap(t1, time.Minute, active, none), agentgraph.StatusWorking},
+		{"claude hook request cleared by a newer transcript graph", claude, claudeHook(t0, time.Hour, idle, ask), claudeSnap(t1, time.Minute, active, none), agentgraph.StatusWorking},
 	} {
 		now := t1.Add(time.Millisecond)
 		reading := herdr(tc.target.Root.Provider, "working", t0, now)
 		first := Resolve(tc.target, []Candidate{tc.red, reading}, statusexplain.Decision{}, t1)
-		if first.Status != agentgraph.LegacyPermission {
+		if agentgraph.Status(first.Status) != agentgraph.StatusPermission {
 			t.Fatalf("%s: setup decided %q", tc.name, first.Status)
 		}
 		d := Resolve(tc.target, []Candidate{tc.resolver, reading}, first, now)
-		if d.Status != tc.want {
+		if agentgraph.Status(d.Status) != tc.want {
 			t.Errorf("%s: decided %q for %q, want %q", tc.name, d.Status, d.Reason, tc.want)
 		}
 	}
@@ -199,12 +199,12 @@ func TestResolveShouldKeepAttentionWhenOnlyUnauthorizedEvidenceSaysOtherwise(t *
 		// The request held as the prior decision, its writer still present.
 		prior := Resolve(tc.target, []Candidate{tc.red}, statusexplain.Decision{}, tc.red.ObservedAt)
 		d := Resolve(tc.target, append([]Candidate{tc.red}, tc.others...), prior, now)
-		if d.Status != agentgraph.LegacyPermission {
+		if agentgraph.Status(d.Status) != agentgraph.StatusPermission {
 			t.Errorf("%s: decided %q for %q, want permission held", tc.name, d.Status, d.Reason)
 		}
 		// And with the writer withdrawn, held from the prior decision.
 		d = Resolve(tc.target, tc.others, prior, now)
-		if d.Status != agentgraph.LegacyPermission || d.Reason != statusexplain.ReasonAttentionHeld {
+		if agentgraph.Status(d.Status) != agentgraph.StatusPermission || d.Reason != statusexplain.ReasonAttentionHeld {
 			t.Errorf("%s, writer withdrawn: decided %q for %q, want permission held", tc.name, d.Status, d.Reason)
 		}
 	}
@@ -214,29 +214,29 @@ func TestResolveShouldKeepAttentionWhenOnlyUnauthorizedEvidenceSaysOtherwise(t *
 
 func TestResolveShouldHoldPriorAttentionOnlyUntilItsDeadlineWhenItsWriterWithdraws(t *testing.T) {
 	first := Resolve(codex, []Candidate{codexSnap(t0, 30*time.Second, idle, input), herdr("codex", "working", t0, t0)}, statusexplain.Decision{}, t0)
-	want(t, "open", first, agentgraph.LegacyPermission, statusexplain.ReasonAttentionHeld)
+	want(t, "open", first, agentgraph.StatusPermission, statusexplain.ReasonAttentionHeld)
 
 	at := t0.Add(10 * time.Second)
 	unavailable := codexSnap(at, 30*time.Second, agentgraph.RuntimeUnknown, none)
 	held := Resolve(codex, []Candidate{unavailable, herdr("codex", "working", t0, at)}, first, at)
-	want(t, "writer unavailable", held, agentgraph.LegacyPermission, statusexplain.ReasonAttentionHeld)
+	want(t, "writer unavailable", held, agentgraph.StatusPermission, statusexplain.ReasonAttentionHeld)
 	if !held.FreshUntil.Equal(t0.Add(30 * time.Second)) {
 		t.Errorf("held attention renewed its deadline to %s", held.FreshUntil)
 	}
 
 	at = t0.Add(30 * time.Second)
 	lapsed := Resolve(codex, []Candidate{herdr("codex", "working", t0, at)}, held, at)
-	want(t, "deadline passed", lapsed, agentgraph.LegacyWorking, statusexplain.ReasonTerminalAuthority)
+	want(t, "deadline passed", lapsed, agentgraph.StatusWorking, statusexplain.ReasonTerminalAuthority)
 }
 
 func TestResolveShouldContributeNothingWhenCandidatesAreUnknownAndHoldPriorOnlyThroughItsDeadline(t *testing.T) {
 	first := Resolve(codex, []Candidate{codexSnap(t0, 30*time.Second, active, none)}, statusexplain.Decision{}, t0)
-	want(t, "first", first, agentgraph.LegacyWorking, statusexplain.ReasonGraphAuthority)
+	want(t, "first", first, agentgraph.StatusWorking, statusexplain.ReasonGraphAuthority)
 
 	at := t0.Add(10 * time.Second)
 	unknown := []Candidate{codexSnap(at, 30*time.Second, agentgraph.RuntimeUnknown, none), herdr("codex", "unknown", at, at)}
 	held := Resolve(codex, unknown, first, at)
-	want(t, "unknown readings", held, agentgraph.LegacyWorking, statusexplain.ReasonPriorHeld)
+	want(t, "unknown readings", held, agentgraph.StatusWorking, statusexplain.ReasonPriorHeld)
 	if !held.ObservedAt.Equal(t0) || !held.FreshUntil.Equal(t0.Add(30*time.Second)) || !held.DecidedAt.Equal(at) {
 		t.Errorf("held decision window %s..%s decided %s", held.ObservedAt, held.FreshUntil, held.DecidedAt)
 	}
@@ -254,7 +254,7 @@ func TestResolveShouldContributeNothingWhenCandidatesAreUnknownAndHoldPriorOnlyT
 func TestResolveShouldNotHoldATerminalReadingWhenHerdrWithdraws(t *testing.T) {
 	gemini := Target{Root: statusexplain.Root{PID: 9, StartedAt: lifetime, Provider: "gemini"}, PaneID: "w1:p1"}
 	first := Resolve(gemini, []Candidate{herdr("gemini", "blocked", t0, t0)}, statusexplain.Decision{}, t0)
-	want(t, "followed", first, agentgraph.LegacyPermission, statusexplain.ReasonTerminalAuthority)
+	want(t, "followed", first, agentgraph.StatusPermission, statusexplain.ReasonTerminalAuthority)
 
 	at := t0.Add(time.Second)
 	withdrawn := Herdr(HerdrReading{PaneID: "w1:p1", Agent: "gemini", Status: "blocked", Live: false, Since: t0}, at)
@@ -265,12 +265,12 @@ func TestResolveShouldNotHoldATerminalReadingWhenHerdrWithdraws(t *testing.T) {
 func TestResolveShouldFallToTheGraphWhenHerdrWithdraws(t *testing.T) {
 	snap := claudeSnap(t0, time.Hour, idle, none)
 	first := Resolve(claude, []Candidate{snap, herdr("claude", "working", t0, t0)}, statusexplain.Decision{}, t0)
-	want(t, "followed", first, agentgraph.LegacyWorking, statusexplain.ReasonTerminalAuthority)
+	want(t, "followed", first, agentgraph.StatusWorking, statusexplain.ReasonTerminalAuthority)
 	at := t0.Add(time.Second)
 	withdrawn := Herdr(HerdrReading{PaneID: "w1:p1", Agent: "claude", Status: "working", Live: false, Since: t0}, at)
 	d := Resolve(claude, []Candidate{snap, withdrawn}, first, at)
-	want(t, "withdrawn", d, agentgraph.LegacyIdle, statusexplain.ReasonGraphAuthority)
-	if got := rejected(d, agentgraph.SourceHerdr, agentgraph.LegacyWorking); got != statusexplain.ReasonObservationExpired {
+	want(t, "withdrawn", d, agentgraph.StatusIdle, statusexplain.ReasonGraphAuthority)
+	if got := rejected(d, agentgraph.SourceHerdr, agentgraph.StatusWorking); got != statusexplain.ReasonObservationExpired {
 		t.Errorf("withdrawn herdr rejected for %q", got)
 	}
 }
@@ -281,8 +281,8 @@ func TestResolveShouldRejectExpiredCandidatesWhenTheyWouldOtherwiseDecide(t *tes
 	at := t0.Add(time.Minute)
 	expired := piHook(t0, time.Minute, active, input)
 	d := Resolve(pi, []Candidate{expired, herdr("pi", "idle", t0, at)}, statusexplain.Decision{}, at)
-	want(t, "expired pi dialog", d, agentgraph.LegacyIdle, statusexplain.ReasonTerminalAuthority)
-	if got := rejected(d, agentgraph.SourceHook, agentgraph.LegacyPermission); got != statusexplain.ReasonObservationExpired {
+	want(t, "expired pi dialog", d, agentgraph.StatusIdle, statusexplain.ReasonTerminalAuthority)
+	if got := rejected(d, agentgraph.SourceHook, agentgraph.StatusPermission); got != statusexplain.ReasonObservationExpired {
 		t.Errorf("expired hook rejected for %q", got)
 	}
 
@@ -314,7 +314,7 @@ func TestResolveShouldRejectIdentityMismatchesWhenAnyIdentityFieldDiffers(t *tes
 	} {
 		at := t0.Add(2 * time.Second)
 		d := Resolve(claude, []Candidate{tc.candidate, fallback}, statusexplain.Decision{}, at)
-		want(t, tc.name, d, agentgraph.LegacyIdle, statusexplain.ReasonGraphAuthority)
+		want(t, tc.name, d, agentgraph.StatusIdle, statusexplain.ReasonGraphAuthority)
 		if got := rejected(d, tc.candidate.Source, tc.candidate.Status); got != statusexplain.ReasonIdentityMismatch {
 			t.Errorf("%s: rejected for %q", tc.name, got)
 		}
@@ -334,7 +334,7 @@ func TestResolveShouldIgnoreAPriorDecisionWhenItIsAboutAnotherRoot(t *testing.T)
 	rotated.Root.SessionID = "sess-2"
 	at := t0.Add(time.Second)
 	d := Resolve(rotated, []Candidate{herdr("codex", "working", at, at)}, prior, at)
-	want(t, "rotated session", d, agentgraph.LegacyWorking, statusexplain.ReasonTerminalAuthority)
+	want(t, "rotated session", d, agentgraph.StatusWorking, statusexplain.ReasonTerminalAuthority)
 
 	restarted := codex
 	restarted.Root.StartedAt = lifetime.Add(time.Minute)
@@ -349,20 +349,20 @@ func TestResolveShouldGiveRestoredPresentationNoLiveAuthorityWhenLoaded(t *testi
 	red := restored(agentgraph.ProviderPi, t0, 5*time.Minute, active, input)
 
 	alone := Resolve(pi, []Candidate{red}, statusexplain.Decision{}, at)
-	want(t, "restored alone", alone, agentgraph.LegacyPermission, statusexplain.ReasonLastKnown)
+	want(t, "restored alone", alone, agentgraph.StatusPermission, statusexplain.ReasonLastKnown)
 	if !alone.FreshUntil.Equal(t0.Add(5 * time.Minute)) {
 		t.Errorf("restored deadline %s, want the persisted one", alone.FreshUntil)
 	}
 
 	live := Resolve(pi, []Candidate{red, herdr("pi", "working", at, at)}, alone, at)
-	want(t, "restored red under herdr working", live, agentgraph.LegacyWorking, statusexplain.ReasonTerminalAuthority)
-	if got := rejected(live, agentgraph.SourceRestoredLastKnown, agentgraph.LegacyPermission); got != statusexplain.ReasonSourceOutranked {
+	want(t, "restored red under herdr working", live, agentgraph.StatusWorking, statusexplain.ReasonTerminalAuthority)
+	if got := rejected(live, agentgraph.SourceRestoredLastKnown, agentgraph.StatusPermission); got != statusexplain.ReasonSourceOutranked {
 		t.Errorf("restored rejected for %q", got)
 	}
 
 	tail := PiSessionTail(lifetime, observation(agentgraph.ProviderPi, agentgraph.SourcePiSessionFile, at, time.Minute, idle, none))
 	d := Resolve(pi, []Candidate{red, tail}, alone, at)
-	want(t, "restored under session tail", d, agentgraph.LegacyIdle, statusexplain.ReasonTranscriptAuthority)
+	want(t, "restored under session tail", d, agentgraph.StatusIdle, statusexplain.ReasonTranscriptAuthority)
 
 	lapsed := Resolve(pi, []Candidate{red}, alone, t0.Add(5*time.Minute))
 	want(t, "restored past its persisted deadline", lapsed, "", statusexplain.ReasonObservationExpired)
@@ -394,7 +394,7 @@ func TestResolveShouldRankKindsWhenCandidatesConflict(t *testing.T) {
 	} {
 		for _, order := range [][]Candidate{{tc.a, tc.b}, {tc.b, tc.a}} {
 			d := Resolve(tc.target, order, statusexplain.Decision{}, now)
-			if d.Status != tc.a.Status || d.Source != string(tc.a.Source) || !d.ObservedAt.Equal(tc.a.ObservedAt) {
+			if agentgraph.Status(d.Status) != tc.a.Status || d.Source != string(tc.a.Source) || !d.ObservedAt.Equal(tc.a.ObservedAt) {
 				t.Errorf("%s: decided %q from %s at %s, want %q from %s", tc.name, d.Status, d.Source, d.ObservedAt, tc.a.Status, tc.a.Source)
 				continue
 			}
@@ -430,7 +430,7 @@ func TestResolveShouldStayDelegatingWhenAnIdleRootHasWorkingDescendants(t *testi
 		{"codex rollout idle correction over a superseded hook", codex, []Candidate{superseded, correction}, agentgraph.SourceCodexRollout},
 	} {
 		d := Resolve(tc.target, tc.candidates, statusexplain.Decision{}, now)
-		want(t, tc.name, d, agentgraph.LegacyDelegating, statusexplain.ReasonDescendantsLive)
+		want(t, tc.name, d, agentgraph.StatusDelegating, statusexplain.ReasonDescendantsLive)
 		if d.Source != string(tc.source) {
 			t.Errorf("%s: attributed to %s", tc.name, d.Source)
 		}
@@ -443,29 +443,29 @@ func TestResolveShouldStayDelegatingWhenAnIdleRootHasWorkingDescendants(t *testi
 func TestResolveShouldEndDelegationWhenBackgroundWorkEndsOrItsEvidenceExpires(t *testing.T) {
 	edge := CodexChildHooks(lifetime, observation(agentgraph.ProviderCodex, agentgraph.SourceHook, t0, 10*time.Second, agentgraph.RuntimeUnknown, none, workingChild))
 	reading := herdr("codex", "idle", t0, t0)
-	if d := Resolve(codex, []Candidate{edge, reading}, statusexplain.Decision{}, t0.Add(5*time.Second)); d.Status != agentgraph.LegacyDelegating {
+	if d := Resolve(codex, []Candidate{edge, reading}, statusexplain.Decision{}, t0.Add(5*time.Second)); agentgraph.Status(d.Status) != agentgraph.StatusDelegating {
 		t.Fatalf("background work decided %q", d.Status)
 	}
 	expired := Resolve(codex, []Candidate{edge, reading}, statusexplain.Decision{}, t0.Add(10*time.Second))
-	want(t, "child evidence expired", expired, agentgraph.LegacyIdle, statusexplain.ReasonTerminalAuthority)
+	want(t, "child evidence expired", expired, agentgraph.StatusIdle, statusexplain.ReasonTerminalAuthority)
 
 	at := t0.Add(2 * time.Second)
 	done := codexSnap(at, time.Minute, idle, none, agentgraph.Node{Lifecycle: agentgraph.LifecycleCompleted})
 	ended := Resolve(codex, []Candidate{edge, done, herdr("codex", "idle", t0, at)}, statusexplain.Decision{}, at)
-	want(t, "newer snapshot shows the child done", ended, agentgraph.LegacyIdle, statusexplain.ReasonTerminalAuthority)
+	want(t, "newer snapshot shows the child done", ended, agentgraph.StatusIdle, statusexplain.ReasonTerminalAuthority)
 
 	// A hook a newer sample superseded does not bring its child back once
 	// that sample lapses.
 	superseded := CodexHook(lifetime, observation(agentgraph.ProviderCodex, agentgraph.SourceHook, t0, time.Hour, idle, none, workingChild))
 	superseded.Superseded = true
 	lapsed := Resolve(codex, []Candidate{superseded, codexSnap(at, time.Second, idle, none), herdr("codex", "idle", t0, at)}, statusexplain.Decision{}, at.Add(time.Minute))
-	want(t, "superseded hook after the newer sample lapsed", lapsed, agentgraph.LegacyIdle, statusexplain.ReasonTerminalAuthority)
+	want(t, "superseded hook after the newer sample lapsed", lapsed, agentgraph.StatusIdle, statusexplain.ReasonTerminalAuthority)
 }
 
 func TestResolveShouldKeepTheRootsOwnStatusWhenItIsNotIdle(t *testing.T) {
 	now := t0.Add(time.Second)
 	snap := codexSnap(t0, time.Minute, idle, none, workingChild)
-	for raw, status := range map[string]string{"working": agentgraph.LegacyWorking, "blocked": agentgraph.LegacyPermission} {
+	for raw, status := range map[string]agentgraph.Status{"working": agentgraph.StatusWorking, "blocked": agentgraph.StatusPermission} {
 		d := Resolve(codex, []Candidate{snap, herdr("codex", raw, now, now)}, statusexplain.Decision{}, now)
 		want(t, "herdr "+raw+" with background work", d, status, statusexplain.ReasonTerminalAuthority)
 	}
@@ -473,7 +473,7 @@ func TestResolveShouldKeepTheRootsOwnStatusWhenItIsNotIdle(t *testing.T) {
 	r := restored(agentgraph.ProviderCodex, t0, time.Minute, idle, none)
 	d := Resolve(codex, []Candidate{r, CodexChildHooks(lifetime, observation(agentgraph.ProviderCodex, agentgraph.SourceHook, t0, time.Minute, agentgraph.RuntimeUnknown, none, workingChild))},
 		statusexplain.Decision{}, now)
-	want(t, "restored idle with a live edge", d, agentgraph.LegacyIdle, statusexplain.ReasonLastKnown)
+	want(t, "restored idle with a live edge", d, agentgraph.StatusIdle, statusexplain.ReasonLastKnown)
 }
 
 // --- the record ---
@@ -544,7 +544,7 @@ func TestResolveShouldReadTheDecisionBeneathAnOverlayWhenThePriorCarriesOne(t *t
 	overlaid.Choice = statusexplain.Choice{Status: "limited", EvidenceKind: statusexplain.EvidenceUsageLimit, Reason: statusexplain.ReasonUsageLimitOverlay}
 	at := t0.Add(time.Second)
 	d := Resolve(codex, []Candidate{herdr("codex", "working", at, at)}, overlaid, at)
-	want(t, "attention beneath a limit overlay", d, agentgraph.LegacyPermission, statusexplain.ReasonAttentionHeld)
+	want(t, "attention beneath a limit overlay", d, agentgraph.StatusPermission, statusexplain.ReasonAttentionHeld)
 }
 
 func TestTargetShouldMatchATerminalReadingByItsTerminalIDWhenThePaneMovedWorkspace(t *testing.T) {
@@ -554,7 +554,7 @@ func TestTargetShouldMatchATerminalReadingByItsTerminalIDWhenThePaneMovedWorkspa
 		t.Fatal("a reading of the tracked terminal under its new pane id did not match")
 	}
 	d := Resolve(tracked, []Candidate{moved}, statusexplain.Decision{}, t0)
-	want(t, "moved pane", d, agentgraph.LegacyWorking, statusexplain.ReasonTerminalAuthority)
+	want(t, "moved pane", d, agentgraph.StatusWorking, statusexplain.ReasonTerminalAuthority)
 
 	reused := Herdr(HerdrReading{PaneID: "w1:p1", TerminalID: "term_2", Agent: "claude", Status: "working", Live: true, Since: t0}, t0)
 	if tracked.Matches(reused) {
@@ -591,14 +591,14 @@ func TestResolveShouldLetTheHookResolveItsOwnRequestWhenASnapshotOnlyCarriedIt(t
 	at := t0.Add(3 * time.Second)
 
 	d := Resolve(codex, []Candidate{latched}, statusexplain.Decision{}, at)
-	if d.Status != agentgraph.LegacyPermission || d.EvidenceKind != statusexplain.EvidenceHook || d.Source != string(agentgraph.SourceHook) {
+	if agentgraph.Status(d.Status) != agentgraph.StatusPermission || d.EvidenceKind != statusexplain.EvidenceHook || d.Source != string(agentgraph.SourceHook) {
 		t.Fatalf("latched request decided %q by %s/%s, want permission by the hook", d.Status, d.EvidenceKind, d.Source)
 	}
 	// The answer resolves both the carried request and the prior decision.
 	after := Resolve(codex, []Candidate{latched, answered}, d, at)
-	want(t, "hook answers its own request", after, agentgraph.LegacyWorking, statusexplain.ReasonEventAuthority)
+	want(t, "hook answers its own request", after, agentgraph.StatusWorking, statusexplain.ReasonEventAuthority)
 	afterPrior := Resolve(codex, []Candidate{answered}, d, at)
-	want(t, "hook answers the prior hold", afterPrior, agentgraph.LegacyWorking, statusexplain.ReasonEventAuthority)
+	want(t, "hook answers the prior hold", afterPrior, agentgraph.StatusWorking, statusexplain.ReasonEventAuthority)
 }
 
 func TestResolveShouldKeepTheAppServersOwnRequestWhenOnlyAHookSaysOtherwise(t *testing.T) {
@@ -608,11 +608,11 @@ func TestResolveShouldKeepTheAppServersOwnRequestWhenOnlyAHookSaysOtherwise(t *t
 	hook := codexHook(t0.Add(2*time.Second), time.Hour, active, none)
 	at := t0.Add(3 * time.Second)
 	d := Resolve(codex, []Candidate{asked, hook}, statusexplain.Decision{}, at)
-	want(t, "hook over app-server request", d, agentgraph.LegacyPermission, statusexplain.ReasonAttentionHeld)
+	want(t, "hook over app-server request", d, agentgraph.StatusPermission, statusexplain.ReasonAttentionHeld)
 	held := Resolve(codex, []Candidate{hook}, d, at)
-	want(t, "hook over the held request", held, agentgraph.LegacyPermission, statusexplain.ReasonAttentionHeld)
+	want(t, "hook over the held request", held, agentgraph.StatusPermission, statusexplain.ReasonAttentionHeld)
 	cleared := Resolve(codex, []Candidate{codexSnap(t0.Add(4*time.Second), time.Minute, active, none), hook}, d, t0.Add(4*time.Second))
-	want(t, "next snapshot clears it", cleared, agentgraph.LegacyWorking, statusexplain.ReasonGraphAuthority)
+	want(t, "next snapshot clears it", cleared, agentgraph.StatusWorking, statusexplain.ReasonGraphAuthority)
 }
 
 func TestResolveIndexShouldNameTheCandidateTheDecisionRestsOnWhenOneDoes(t *testing.T) {
@@ -646,7 +646,7 @@ func TestResolveShouldNotLetSupersededEvidenceDecideWhenTheNewerObservationLapse
 	at := t0.Add(5 * time.Second)
 	d := Resolve(codex, []Candidate{hook, sample}, statusexplain.Decision{}, at)
 	want(t, "lapsed sample over superseded hook", d, "", statusexplain.ReasonObservationExpired)
-	if got := rejected(d, agentgraph.SourceHook, agentgraph.LegacyIdle); got != statusexplain.ReasonOlderThanCurrent {
+	if got := rejected(d, agentgraph.SourceHook, agentgraph.StatusIdle); got != statusexplain.ReasonOlderThanCurrent {
 		t.Errorf("superseded hook rejected for %q, want older_than_current", got)
 	}
 
@@ -655,5 +655,5 @@ func TestResolveShouldNotLetSupersededEvidenceDecideWhenTheNewerObservationLapse
 	asked.Superseded = true
 	newer := codexHook(t0.Add(time.Second), time.Hour, active, none)
 	d = Resolve(codex, []Candidate{asked, newer}, statusexplain.Decision{}, t0.Add(2*time.Second))
-	want(t, "superseded request", d, agentgraph.LegacyPermission, statusexplain.ReasonAttentionHeld)
+	want(t, "superseded request", d, agentgraph.StatusPermission, statusexplain.ReasonAttentionHeld)
 }

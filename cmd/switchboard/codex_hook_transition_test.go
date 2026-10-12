@@ -47,7 +47,7 @@ func waitForCodexGraph(t *testing.T, store *state.Store, rootID, status string) 
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		graph := store.Snapshot().Sessions[0].AgentGraph
-		if graph != nil && graph.RootID == rootID && graph.Summary.Status == status {
+		if graph != nil && graph.RootID == rootID && string(graph.Summary.Status) == status {
 			return graph
 		}
 		time.Sleep(time.Millisecond)
@@ -182,7 +182,7 @@ func TestStandardCodexHookRPCOwnsRequestUserInputLifecycle(t *testing.T) {
 
 	requests := []struct {
 		req        rpc.Request
-		wantStatus string
+		wantStatus agentgraph.Status
 	}{
 		{rpc.Request{
 			Cmd: "hook", PID: 8123, Agent: state.AgentKindCodex, Event: "PreToolUse", SessionID: "thread-1",
@@ -733,7 +733,7 @@ func TestCodexPublishedApprovalRedShouldStillReleaseWhenItsResolvingEdgeArrives(
 	release := []struct {
 		name       string
 		req        rpc.Request
-		wantStatus string
+		wantStatus agentgraph.Status
 	}{
 		{
 			name: "should release when its own call completes",
@@ -904,7 +904,7 @@ func TestCodexRequestUserInputLifecycleShouldBeUnchangedWhenOpenedByPreToolUse(t
 	})
 	steps := []struct {
 		req        rpc.Request
-		wantStatus string
+		wantStatus agentgraph.Status
 	}{
 		{rpc.Request{
 			Event: "PreToolUse", SessionID: "thread-1", TurnID: "turn-1", ToolUseID: "exec-1",

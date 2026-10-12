@@ -232,9 +232,9 @@ func ResolveIndex(target Target, candidates []Candidate, prior statusexplain.Dec
 	var choice statusexplain.Choice
 	chosen := -1
 	switch open, ok := openAttention(candidates, admitted, held, priorChoice, now); {
-	case ok && (base < 0 || candidates[base].Status != agentgraph.LegacyPermission):
+	case ok && (base < 0 || candidates[base].Status != agentgraph.StatusPermission):
 		choice = open.choice
-		choice.Status = agentgraph.LegacyPermission
+		choice.Status = string(agentgraph.StatusPermission)
 		choice.Reason = statusexplain.ReasonAttentionHeld
 		chosen = open.index
 		if base >= 0 {
@@ -262,14 +262,14 @@ func ResolveIndex(target Target, candidates []Candidate, prior statusexplain.Dec
 		reasons[restored] = statusexplain.ReasonSourceOutranked
 	}
 
-	if choice.Status == agentgraph.LegacyIdle && choice.EvidenceKind != statusexplain.EvidenceRestored {
+	if choice.Status == string(agentgraph.StatusIdle) && choice.EvidenceKind != statusexplain.EvidenceRestored {
 		if live := newestDescendants(candidates, admitted); live >= 0 && candidates[live].WorkingDescendants > 0 {
 			if chosen >= 0 && chosen != live {
 				reasons[chosen] = statusexplain.ReasonDescendantsLive
 			}
 			chosen = live
 			choice = choiceOf(candidates[live], statusexplain.ReasonDescendantsLive)
-			choice.Status = agentgraph.LegacyDelegating
+			choice.Status = string(agentgraph.StatusDelegating)
 		}
 	}
 
@@ -280,7 +280,7 @@ func ResolveIndex(target Target, candidates []Candidate, prior statusexplain.Dec
 			continue
 		}
 		d.AddRejected(statusexplain.Candidate{
-			Source: string(c.Source), EvidenceKind: c.Kind, Status: c.Status,
+			Source: string(c.Source), EvidenceKind: c.Kind, Status: string(c.Status),
 			ObservedAt: c.ObservedAt, FreshUntil: c.FreshUntil, RejectReason: reasons[i],
 		})
 	}
@@ -312,7 +312,7 @@ func openAttention(candidates []Candidate, admitted []bool, held bool, prior sta
 			claims = append(claims, claim{index: i, choice: choice})
 		}
 	}
-	if held && prior.Status == agentgraph.LegacyPermission && !prior.FreshUntil.IsZero() && now.Before(prior.FreshUntil) &&
+	if held && prior.Status == string(agentgraph.StatusPermission) && !prior.FreshUntil.IsZero() && now.Before(prior.FreshUntil) &&
 		(prior.EvidenceKind == statusexplain.EvidenceHook || prior.EvidenceKind == statusexplain.EvidenceProviderSnapshot) {
 		claims = append(claims, claim{index: -1, choice: prior})
 	}
@@ -378,7 +378,7 @@ func authority(c Candidate) statusexplain.Reason {
 
 func choiceOf(c Candidate, reason statusexplain.Reason) statusexplain.Choice {
 	return statusexplain.Choice{
-		Status: c.Status, Source: string(c.Source), EvidenceKind: c.Kind, Reason: reason,
+		Status: string(c.Status), Source: string(c.Source), EvidenceKind: c.Kind, Reason: reason,
 		ObservedAt: c.ObservedAt, FreshUntil: c.FreshUntil,
 	}
 }

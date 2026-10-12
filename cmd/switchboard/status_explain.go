@@ -49,7 +49,7 @@ func (c *agentCoordinator) recordRejectionLocked(key provider.RootKey, observati
 	rec := c.admissionLocked(key, observation.RootID)
 	rec.rejected.Add(statusexplain.Candidate{
 		Source: string(observation.Source), EvidenceKind: statusexplain.EvidenceKindOf(observation.Source),
-		Status:     agentgraph.Reduce(observation, agentgraph.Summary{}, now).LegacyStatus,
+		Status:     string(agentgraph.Reduce(observation, agentgraph.Summary{}, now).Status),
 		ObservedAt: observation.ObservedAt, FreshUntil: observation.FreshUntil, RejectReason: reason,
 	})
 }

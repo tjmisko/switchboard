@@ -79,7 +79,7 @@ func applyHerdrPane(sess *state.Session, pane *terminal.PaneRef, source herdrSta
 		return
 	}
 	rule := statustune.RuleHerdrAuthority
-	if _, decides := state.HerdrLegacyStatus(status.Status, ""); !live || !decides {
+	if _, decides := state.HerdrSessionStatus(status.Status, ""); !live || !decides {
 		rule = statustune.RuleHerdrReleased
 	}
 	_, sessionID, subagents := herdrLaneFacts(sess)

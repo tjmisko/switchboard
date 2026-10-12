@@ -22,7 +22,7 @@ func restoredWith(sessionID, transcriptPath string, sets map[string][]PendingPro
 	}
 	return Compatibility{
 		SessionID: sessionID, Transcript: transcriptPath,
-		Status: agentgraph.LegacyPermission, Pending: writers, PendingSets: sets,
+		Status: agentgraph.StatusPermission, Pending: writers, PendingSets: sets,
 	}
 }
 
@@ -119,7 +119,7 @@ func TestRestoreRebuildsAWritersWholeOpenSet(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		assertSummary(t, observation, now.Add(time.Second), agentgraph.LegacyPermission, agentgraph.AttentionUserInput)
+		assertSummary(t, observation, now.Add(time.Second), agentgraph.StatusPermission, agentgraph.AttentionUserInput)
 	})
 
 	t.Run("should restore a record with no attention as its tool's own kind", func(t *testing.T) {
@@ -146,7 +146,7 @@ func TestRestoreRebuildsAWritersWholeOpenSet(t *testing.T) {
 		if got := sets["child-a"][0].Attention; got != agentgraph.AttentionApproval {
 			t.Errorf("restored attention = %q, want approval for an unrecognized value", got)
 		}
-		assertSummary(t, observation, now, agentgraph.LegacyPermission, agentgraph.AttentionApproval)
+		assertSummary(t, observation, now, agentgraph.StatusPermission, agentgraph.AttentionApproval)
 	})
 
 	t.Run("should keep a legacy block restoring exactly as it always did", func(t *testing.T) {
@@ -157,7 +157,7 @@ func TestRestoreRebuildsAWritersWholeOpenSet(t *testing.T) {
 		defer o.Close()
 		restored := Compatibility{
 			SessionID: root.ProviderSessionID, Transcript: root.Transcript,
-			Status:  agentgraph.LegacyPermission,
+			Status:  agentgraph.StatusPermission,
 			Pending: map[string]PendingPrompt{"": {Since: now.Add(-time.Minute)}},
 		}
 		if _, err := o.Restore(root, restored, now); err != nil {

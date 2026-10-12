@@ -16,7 +16,7 @@
 // orchestration own source precedence. Reduction is source-agnostic and uses
 // only the caller-supplied observation and freshness interval. The interval is
 // half-open: ObservedAt <= now < FreshUntil. Expired, not-yet-observed, or
-// structurally invalid observations reduce to an unknown legacy status.
+// structurally invalid observations reduce to an unknown session status.
 //
 // This package is pure domain logic. It performs no filesystem, process,
 // network, transcript, state-store, RPC, or renderer I/O.

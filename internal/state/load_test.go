@@ -45,7 +45,7 @@ func TestLoadHydratesFromGolden(t *testing.T) {
 	}
 	// The Codex session keeps its identity and bounded graph structure. The
 	// golden's fixed graph horizon is intentionally expired, so hydration must
-	// clear its legacy status rather than resurrecting stale idle authority.
+	// clear its session status rather than resurrecting stale idle authority.
 	if s, ok := byPID[4999]; !ok {
 		t.Errorf("codex session 4999 not hydrated")
 	} else {

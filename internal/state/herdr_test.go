@@ -30,7 +30,7 @@ func reading(status string, live bool, since time.Time) HerdrReading {
 	return HerdrReading{PaneID: "w1:p1", Socket: "/h.sock", TerminalID: "term_1", Agent: "claude", Status: status, Live: live, Since: since}
 }
 
-func TestHerdrLegacyStatusShouldMapEveryHerdrState(t *testing.T) {
+func TestHerdrSessionStatusShouldMapEveryHerdrState(t *testing.T) {
 	for _, tc := range []struct {
 		herdr, provider, want string
 		ok                    bool
@@ -46,9 +46,9 @@ func TestHerdrLegacyStatusShouldMapEveryHerdrState(t *testing.T) {
 		{"", StatusWorking, "", false},
 		{"sleeping", StatusWorking, "", false},
 	} {
-		got, ok := HerdrLegacyStatus(tc.herdr, tc.provider)
+		got, ok := HerdrSessionStatus(tc.herdr, tc.provider)
 		if got != tc.want || ok != tc.ok {
-			t.Errorf("HerdrLegacyStatus(%q, %q) = %q, %v; want %q, %v", tc.herdr, tc.provider, got, ok, tc.want, tc.ok)
+			t.Errorf("HerdrSessionStatus(%q, %q) = %q, %v; want %q, %v", tc.herdr, tc.provider, got, ok, tc.want, tc.ok)
 		}
 	}
 }
@@ -147,7 +147,7 @@ func TestFreshCodexInputAttentionOverridesHerdrAndReleasesOnResolution(t *testin
 			}
 			resolved := now.Add(time.Second)
 			s.SetAgentGraph(codexGraph(t, agentgraph.RuntimeActive, agentgraph.AttentionNone, resolved, time.Hour), resolved)
-			want, _ := HerdrLegacyStatus(herdrStatus, StatusWorking)
+			want, _ := HerdrSessionStatus(herdrStatus, StatusWorking)
 			if s.Codex.Status != want {
 				t.Fatalf("herdr authority did not resume: got=%s want=%s", s.Codex.Status, want)
 			}

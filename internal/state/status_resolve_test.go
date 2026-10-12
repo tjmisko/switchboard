@@ -36,7 +36,7 @@ func statusGraph(t *testing.T, provider agentgraph.ProviderKind, rootID string, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if graph.Summary.Status != status {
+	if string(graph.Summary.Status) != status {
 		t.Fatalf("graph for %q reduced to %q", status, graph.Summary.Status)
 	}
 	return graph
@@ -212,7 +212,7 @@ func TestLandAgentGraphShouldStayDelegatingWhenTheRolloutIdleCorrectionLandsOver
 	if s.Codex.Status != StatusDelegating {
 		t.Fatalf("idle root with a working child published %q, want delegating", s.Codex.Status)
 	}
-	if s.AgentGraph.Summary.Status != s.Codex.Status {
+	if string(s.AgentGraph.Summary.Status) != s.Codex.Status {
 		t.Fatalf("graph summary %q disagrees with published %q", s.AgentGraph.Summary.Status, s.Codex.Status)
 	}
 }

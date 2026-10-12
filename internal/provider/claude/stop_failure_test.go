@@ -24,7 +24,7 @@ func TestStopFailureShouldEndTheRootTurnWhenNoStopFollows(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		assertSummary(t, obs, now.Add(elapsed), agentgraph.LegacyIdle, agentgraph.AttentionNone)
+		assertSummary(t, obs, now.Add(elapsed), agentgraph.StatusIdle, agentgraph.AttentionNone)
 	}
 }
 
@@ -37,5 +37,5 @@ func TestStopFailureFromASubagentShouldNotEndTheRootTurn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertSummary(t, obs, now.Add(2*time.Second), agentgraph.LegacyWorking, agentgraph.AttentionNone)
+	assertSummary(t, obs, now.Add(2*time.Second), agentgraph.StatusWorking, agentgraph.AttentionNone)
 }

@@ -276,7 +276,7 @@ func (o Observation) Clone() Observation {
 type Summary struct {
 	Runtime        RuntimeState
 	Attention      AttentionState
-	LegacyStatus   string
+	Status         Status
 	LiveChildren   int
 	WaitingNodes   int
 	ApprovalNodes  int
@@ -285,9 +285,16 @@ type Summary struct {
 	Since          time.Time
 }
 
+// Status is the session status: the one value a root's graph reduces to, and
+// the one every renderer colours and the history log records. It answers what,
+// if anything, the session needs from you. StatusUnknown is the empty value, so
+// a zero Summary reads as unknown.
+type Status string
+
 const (
-	LegacyWorking    = "working"
-	LegacyIdle       = "idle"
-	LegacyPermission = "permission"
-	LegacyDelegating = "delegating"
+	StatusUnknown    Status = ""
+	StatusWorking    Status = "working"
+	StatusIdle       Status = "idle"
+	StatusPermission Status = "permission"
+	StatusDelegating Status = "delegating"
 )

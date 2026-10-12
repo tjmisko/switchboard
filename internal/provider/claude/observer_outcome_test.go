@@ -122,7 +122,7 @@ func TestObserveShouldDelayOnlyInferredIdleWhenAStopIsExplicit(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		assertSummary(t, obs, inferred, agentgraph.LegacyWorking, agentgraph.AttentionNone)
+		assertSummary(t, obs, inferred, agentgraph.StatusWorking, agentgraph.AttentionNone)
 	}
 
 	stopAt := now.Add(transcriptStopQuietWindow - time.Millisecond)
@@ -132,7 +132,7 @@ func TestObserveShouldDelayOnlyInferredIdleWhenAStopIsExplicit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertSummary(t, obs, next, agentgraph.LegacyIdle, agentgraph.AttentionNone)
+	assertSummary(t, obs, next, agentgraph.StatusIdle, agentgraph.AttentionNone)
 }
 
 func TestObserveShouldRestartInferredIdleConfirmationWhenActivityInterruptsTheQuietWindow(t *testing.T) {
@@ -143,7 +143,7 @@ func TestObserveShouldRestartInferredIdleConfirmationWhenActivityInterruptsTheQu
 		t.Helper()
 		appendClaudeLine(t, root.Transcript, fmt.Sprintf(`{"type":"system","subtype":"stop_hook_summary","preventedContinuation":false,"timestamp":%q}`, at.Format(time.RFC3339Nano)))
 	}
-	observe := func(at time.Time, want string) {
+	observe := func(at time.Time, want agentgraph.Status) {
 		t.Helper()
 		obs, err := o.Observe(context.Background(), root, at)
 		if err != nil {
@@ -152,13 +152,13 @@ func TestObserveShouldRestartInferredIdleConfirmationWhenActivityInterruptsTheQu
 		assertSummary(t, obs, at, want, agentgraph.AttentionNone)
 	}
 	appendStop(now.Add(time.Second))
-	observe(now.Add(30*time.Second), agentgraph.LegacyWorking)
+	observe(now.Add(30*time.Second), agentgraph.StatusWorking)
 	resumed := now.Add(45 * time.Second)
 	o.ApplyHook(HookSignal{Root: root, Event: "PreToolUse", At: resumed})
 	appendStop(resumed.Add(time.Second))
 	// The first stop's quiet window has elapsed, but the intervening activity
 	// makes the newer inferred stop wait through its own confirmation window.
-	observe(now.Add(transcriptStopQuietWindow), agentgraph.LegacyWorking)
-	observe(resumed.Add(transcriptStopQuietWindow-time.Millisecond), agentgraph.LegacyWorking)
-	observe(resumed.Add(transcriptStopQuietWindow), agentgraph.LegacyIdle)
+	observe(now.Add(transcriptStopQuietWindow), agentgraph.StatusWorking)
+	observe(resumed.Add(transcriptStopQuietWindow-time.Millisecond), agentgraph.StatusWorking)
+	observe(resumed.Add(transcriptStopQuietWindow), agentgraph.StatusIdle)
 }

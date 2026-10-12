@@ -237,10 +237,11 @@ until herdr answers after a restart. Edges herdr decides are recorded in history
 
 ### `claude` / `codex` / `pi` (`AgentInfo`) — claude stable, codex and pi additive
 
-The legacy per-agent enrichment block. A session populates at most one, under
-the key matching its `agent`. Both share one shape (`AgentInfo`). Hooks can
-populate it, and `SetAgentGraph` also projects the graph root id and reduced
-legacy status into it so old consumers keep working. Renderers read whichever
+The per-agent enrichment block, and where the session status is published. A
+session populates at most one, under the key matching its `agent`. Both share
+one shape (`AgentInfo`). Hooks can populate it, and `SetAgentGraph` also
+projects the graph root id and the session status into it, so consumers that
+predate `agent_graph` keep working. Renderers read whichever
 is present.
 
 The `pi` block holds Pi's session id, its session file as `transcript`,
@@ -254,7 +255,7 @@ no live authority, and its `status_since` is re-earned.
 | `session_id` | string | omitted when empty | Provider root id (Claude session id, Codex thread id, or Pi session id), supplied by exact provider evidence and/or hooks. It may change when a live root process starts a new provider session; consumers key navigation on the enclosing `Session.pid`, not this field alone. |
 | `transcript` | string | omitted when empty | Path to the session transcript when known: Claude Code's project `.jsonl`, Codex's `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, or Pi's `~/.pi/agent/sessions/--<path>--/<ts>_<uuid>.jsonl`. |
 | `status_since` | RFC 3339 timestamp \| absent | optional | When `status` last transitioned to its current value — the wire projection of the daemon's in-memory `StatusSince`, stamped onto the snapshot. Renderers compute the hover duration (`idle · 3m`, `permission · 45s`) as `now - status_since`. **Omitted** (never `null`/zero) until the first status edge stamps it; absent on a block that only carries `session_id`/`transcript`. Additive (Phase: usage-history); consumers tolerate its absence. Formatted identically to `started_at`. |
-| `status` | string | always (when block present) | Legacy root-chip activity. One of: `working`, `idle`, `permission`, `delegating`, `limited`; `""` means no fresh authoritative reduction. `limited` is publication-only: it overlays whatever the provider decided while `usage_limit` is active, renders grey like unknown, and is never an attention target. `delegating` is an idle root with live descendant work and renders the **same green as `working`**. `permission` folds both approval and user-input waits; use `agent_graph.summary`/nodes when that distinction matters. Consumers must tolerate unknown future strings. |
+| `status` | string | always (when block present) | The session status: what, if anything, the session needs from you. One of: `working`, `idle`, `permission`, `delegating`, `limited`; `""` means no fresh authoritative reduction. `limited` is publication-only: it overlays whatever the provider decided while `usage_limit` is active, renders grey like unknown, and is never an attention target. `delegating` is an idle root with live descendant work and renders the **same green as `working`**. `permission` folds both approval and user-input waits; use `agent_graph.summary`/nodes when that distinction matters. Consumers must tolerate unknown future strings. |
 | `in_flight_subagents` | number | omitted when 0 | How many subagent `Task`s the main thread has launched but not yet collected, recomputed each reconcile tick from the transcript tail. It is the signal behind a `delegating` chip; renderers show it as "N agents" in the tooltip, and `switchboard-ctl list --json` exposes it so a green chip's true state (genuinely working vs delegating) is visible. Claude-only. |
 | `pending_writers` | array of string | omitted when empty | Which **writers** are currently blocked on a permission prompt. A session is not one thread but 1 + N concurrent writers — the main thread plus each in-flight subagent — that share a pid and a chip, write to different files, and can each block independently. Each element is a bare subagent `agent_id` (the `<id>` stem of `<session>/subagents/agent-<id>.jsonl`), or the literal **`"main"`** for the main thread. **Sorted ascending**, so a renderer can diff two snapshots directly. A non-empty array means the chip is `permission`; a renderer may name the blocked teammate from it. Claude-only. Additive; consumers tolerate its absence. |
 | `pending_prompts` | array of object | omitted when empty | One entry per **open prompt**, where `pending_writers` carries one per blocked *writer* — a single writer can be blocked on several parallel calls at once. Each object is `{"writer","tool","input_hash","call_id","attention","since"}`: `writer` in the same spelling `pending_writers` uses (`"main"` for the main thread), `tool` the gated tool name, `input_hash` a hash of that call's `tool_input` (never the input itself), optional `call_id` the opaque exact identity after the latch confirms it, `attention` the wait's kind (`"approval"` or `"user_input"`, matching `agent_graph`'s vocabulary), and `since` the RFC 3339 instant that prompt opened. **Grouped by writer in `pending_writers`' ascending order, oldest-first within a writer.** Every `writer` here also appears in `pending_writers`; a writer may appear there with no record (see below). Claude-only. Additive; consumers tolerate its absence, and `pending_writers` remains the ownership contract. |
@@ -284,7 +285,7 @@ edges after 7 days. The event mapping is:
 
 For Codex, `PermissionRequest` with tool `AskUserQuestion` becomes structured
 attention `user_input`; other permission requests become `approval`. Either
-reduces to legacy `permission`. `request_user_input` is correlated only by its
+reduces to the `permission` session status. `request_user_input` is correlated only by its
 opaque `tool_use_id`; question and answer content are not persisted. A fresh
 app-server graph outranks ordinary hook fallback, but cannot clear this
 independently owned standard-CLI latch. Rollout files alone still cannot recover
@@ -495,20 +496,20 @@ intentional in the wire-only design.
 |-------|-----------|----------------|---------|
 | `runtime` | string | yes | Root runtime: `unknown`, `not_loaded`, `idle`, `active`, or `system_error`. Becomes `unknown` when the observation is not fresh or invalid, measured by the producing daemon against its in-memory horizon. A local daemon may therefore grey the summary less than five seconds before a consumer reaches the published ceiling. |
 | `attention` | string | yes | Folded wait reason: `none`, `approval`, or `user_input`. If both wait kinds exist, `approval` wins only in this compact field; the two counts below preserve both. |
-| `status` | string | yes | Legacy root-chip value: `working`, `idle`, `permission`, `delegating`, `limited` (see `usage_limit`), or `""` when no fresh rule produces a confident status. |
+| `status` | string | yes | The session status: `working`, `idle`, `permission`, `delegating`, `limited` (see `usage_limit`), or `""` when no fresh rule produces a confident status. |
 | `live_children` | integer | yes | Descendants with positive liveness: pending/running lifecycle, active/idle runtime, or actionable approval/user-input attention. Terminal lifecycle always excludes a child. `runtime=unknown|not_loaded` plus `lifecycle=unknown` is visible topology but contributes zero. |
 | `paused_children` | integer | omitted when zero | Publication-only. While `usage_limit` is active, the children `live_children` would count are reported here instead and `live_children` reads 0: the cap is the account's, so subagents stop with their root. `in_flight_subagents` likewise reads 0. |
 | `waiting_nodes` | integer | yes | Live root/descendant nodes waiting for either approval or user input. Equals `approval_nodes + user_input_nodes`. |
 | `approval_nodes` | integer | yes | Live nodes whose attention is `approval`. |
 | `user_input_nodes` | integer | yes | Live nodes whose attention is `user_input`. |
 | `error_nodes` | integer | yes | Nodes with runtime `system_error` or lifecycle `errored`; unlike live/wait counts this includes retained terminal evidence. |
-| `since` | RFC 3339 timestamp | omitted when unknown | When this complete derived tuple last changed. Count-only changes move it even when `status` stays the same. The legacy `AgentInfo.status_since` moves only when legacy `status` changes. |
+| `since` | RFC 3339 timestamp | omitted when unknown | When this complete derived tuple last changed. Count-only changes move it even when `status` stays the same. `AgentInfo.status_since` moves only when the session `status` changes. |
 
 The reducer is source-neutral. Given a fresh valid graph it applies, in order:
 
 1. any live approval/user-input wait → `permission`;
 2. active root → `working`;
-3. root `system_error` → empty/unknown legacy status (error remains explicit);
+3. root `system_error` → empty/unknown session status (error remains explicit);
 4. any live descendant active/pending/running → `delegating`;
 5. idle root → `idle`;
 6. otherwise empty/unknown.
@@ -556,7 +557,7 @@ value as no actionable reason unless a newer contract says otherwise; it must
 not crash or silently turn a future value red. The current daemon canonicalizes
 empty/unrecognized provider values to `unknown`/`none` before emitting state.
 
-### Ordering, authority, and legacy projection
+### Ordering, authority, and the agent-block projection
 
 The daemon validates each graph and emits nodes in deterministic root-first DFS
 preorder. Siblings sort lexicographically by `nickname`, then `role`, then `id`.
@@ -569,12 +570,12 @@ complete observations, a previously known omitted node transitions to
 `not_found`. Provider adapters may retain a bounded terminal cohort for current
 display, so `nodes` is not an unbounded archive.
 
-Applying a graph updates only these legacy compatibility values:
+Applying a graph updates only these agent-block values:
 
 - the matching `claude.session_id` or `codex.session_id` becomes `root_id`;
 - its `status` becomes `summary.status`, unless herdr is the session's status
   authority (see `herdr` above);
-- its `status_since` moves when that legacy status changes.
+- its `status_since` moves when that status changes.
 
 For a Pi session the graph is Pi's own one-node graph (its hooks', its
 session file's, or a restored one) or herdr's, and it updates only the `pi`
@@ -611,7 +612,7 @@ switchable, but its status is unknown.
 }
 ```
 
-**Codex tree.** The waiting child makes the legacy root summary red while
+**Codex tree.** The waiting child makes the root's session status red while
 preserving `user_input` as the exact reason.
 
 ```json

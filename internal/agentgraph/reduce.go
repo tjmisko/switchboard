@@ -2,7 +2,7 @@ package agentgraph
 
 import "time"
 
-// Reduce derives a structured and legacy summary as a pure function of an
+// Reduce derives the structured summary and session status as a pure function of an
 // observation, the prior summary, and a caller-supplied clock value. Source is
 // deliberately ignored: a fresh restored-last-known observation reduces the
 // same way as any other source until its FreshUntil deadline.
@@ -50,17 +50,17 @@ func Reduce(observation Observation, prior Summary, now time.Time) Summary {
 
 	switch {
 	case next.WaitingNodes > 0:
-		next.LegacyStatus = LegacyPermission
+		next.Status = StatusPermission
 	case root.Runtime == RuntimeActive:
-		next.LegacyStatus = LegacyWorking
+		next.Status = StatusWorking
 	case root.Runtime == RuntimeSystemError:
 		// V1 preserves the explicit error axis without borrowing the attention
 		// color for a condition that does not require user permission.
-		next.LegacyStatus = ""
+		next.Status = StatusUnknown
 	case workingDescendant:
-		next.LegacyStatus = LegacyDelegating
+		next.Status = StatusDelegating
 	case root.Runtime == RuntimeIdle:
-		next.LegacyStatus = LegacyIdle
+		next.Status = StatusIdle
 	}
 
 	return stampSince(next, prior, now)
@@ -96,7 +96,7 @@ func stampSince(next, prior Summary, now time.Time) Summary {
 func sameDerivedState(left, right Summary) bool {
 	return left.Runtime == right.Runtime &&
 		left.Attention == right.Attention &&
-		left.LegacyStatus == right.LegacyStatus &&
+		left.Status == right.Status &&
 		left.LiveChildren == right.LiveChildren &&
 		left.WaitingNodes == right.WaitingNodes &&
 		left.ApprovalNodes == right.ApprovalNodes &&

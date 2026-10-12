@@ -28,7 +28,7 @@ func usageLimitServer(t *testing.T, agent string) (*Server, *state.Store, *[]Req
 
 func publishedStatus(store *state.Store) (string, *state.UsageLimit) {
 	sess := store.PublishedSnapshot().Sessions[0]
-	return sess.AgentGraph.Summary.Status, sess.UsageLimit
+	return string(sess.AgentGraph.Summary.Status), sess.UsageLimit
 }
 
 func TestHookShouldPublishLimitedWhenTheCtlEdgeReportsAUsageLimit(t *testing.T) {

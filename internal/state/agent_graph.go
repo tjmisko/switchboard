@@ -65,13 +65,13 @@ func (g AgentGraph) MarshalJSON() ([]byte, error) {
 }
 
 // AgentGraphSummary is the state-owned wire form of agentgraph.Summary. Status
-// is the legacy working|idle|permission|delegating value; an empty status means
+// is the session status, working|idle|permission|delegating; an empty status means
 // no fresh authoritative summary. The approval/user-input counts retain the
 // distinction that the compact Attention field necessarily folds.
 type AgentGraphSummary struct {
 	Runtime        agentgraph.RuntimeState   `json:"runtime"`
 	Attention      agentgraph.AttentionState `json:"attention"`
-	Status         string                    `json:"status"`
+	Status         agentgraph.Status         `json:"status"`
 	LiveChildren   int                       `json:"live_children"`
 	WaitingNodes   int                       `json:"waiting_nodes"`
 	ApprovalNodes  int                       `json:"approval_nodes"`
@@ -183,7 +183,7 @@ func (s *Session) SetAgentGraph(graph *AgentGraph, now time.Time) {
 // ones, and re-resolves the published status at now (see resolveStatus). Root
 // ID and status are the only legacy enrichment fields it changes: Claude
 // in-flight/workflow/pending-writer data remains owned by the Claude adapter.
-// Legacy StatusSince moves only when the legacy status changes. It returns
+// StatusSince moves only when the session status changes. It returns
 // why the graph was not kept, "" when it was (LandingRefusal).
 //
 // A session that is neither Claude nor Codex only attaches the graph: Pi lands
@@ -232,7 +232,7 @@ func (g *AgentGraph) domainSummary() agentgraph.Summary {
 	return agentgraph.Summary{
 		Runtime:        g.Summary.Runtime,
 		Attention:      g.Summary.Attention,
-		LegacyStatus:   g.Summary.Status,
+		Status:         g.Summary.Status,
 		LiveChildren:   g.Summary.LiveChildren,
 		WaitingNodes:   g.Summary.WaitingNodes,
 		ApprovalNodes:  g.Summary.ApprovalNodes,
@@ -246,7 +246,7 @@ func projectSummary(summary agentgraph.Summary) AgentGraphSummary {
 	return AgentGraphSummary{
 		Runtime:        summary.Runtime,
 		Attention:      summary.Attention,
-		Status:         summary.LegacyStatus,
+		Status:         summary.Status,
 		LiveChildren:   summary.LiveChildren,
 		WaitingNodes:   summary.WaitingNodes,
 		ApprovalNodes:  summary.ApprovalNodes,
@@ -374,7 +374,7 @@ func hydrateAgentGraph(sess *Session, now time.Time) {
 		return
 	}
 	info.SessionID = projection.RootID
-	info.Status = projection.Summary.Status
+	info.Status = string(projection.Summary.Status)
 	// Preserve the pre-graph hydration contract: status_since is re-earned by
 	// daemon reconciliation, never trusted across a restart.
 	info.StatusSince = time.Time{}

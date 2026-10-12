@@ -12,7 +12,7 @@ import (
 type ShadowCase struct {
 	Name         string
 	Hooks        []HookSignal
-	LegacyStatus string
+	LegacyStatus agentgraph.Status
 	LiveChildren int
 	WaitingNodes int
 }
@@ -22,8 +22,8 @@ type ShadowCase struct {
 type ShadowComparison struct {
 	Match        bool
 	Rule         string
-	LegacyStatus string
-	GraphStatus  string
+	LegacyStatus agentgraph.Status
+	GraphStatus  agentgraph.Status
 	LiveChildren int
 	WaitingNodes int
 }
@@ -31,12 +31,12 @@ type ShadowComparison struct {
 // CanonicalShadowCases returns detached compatibility-oracle fixtures.
 func CanonicalShadowCases() []ShadowCase {
 	cases := []ShadowCase{
-		{Name: "root_idle", Hooks: []HookSignal{{Event: "SessionStart"}}, LegacyStatus: agentgraph.LegacyIdle},
-		{Name: "root_working", Hooks: []HookSignal{{Event: "SessionStart"}, {Event: "UserPromptSubmit"}}, LegacyStatus: agentgraph.LegacyWorking},
-		{Name: "main_approval", Hooks: []HookSignal{{Event: "SessionStart"}, {Event: "PermissionRequest", ToolName: "Bash"}}, LegacyStatus: agentgraph.LegacyPermission, WaitingNodes: 1},
-		{Name: "child_question", Hooks: []HookSignal{{Event: "SessionStart"}, {Event: "PermissionRequest", AgentID: "child", ToolName: "AskUserQuestion"}}, LegacyStatus: agentgraph.LegacyPermission, LiveChildren: 1, WaitingNodes: 1},
-		{Name: "simultaneous_writers", Hooks: []HookSignal{{Event: "SessionStart"}, {Event: "PermissionRequest", ToolName: "Edit"}, {Event: "PermissionRequest", AgentID: "child", ToolName: "Bash"}}, LegacyStatus: agentgraph.LegacyPermission, LiveChildren: 1, WaitingNodes: 2},
-		{Name: "approved_resume", Hooks: []HookSignal{{Event: "SessionStart"}, {Event: "PermissionRequest", ToolName: "Bash"}, {Event: "PostToolUse", ToolName: "Bash"}}, LegacyStatus: agentgraph.LegacyWorking},
+		{Name: "root_idle", Hooks: []HookSignal{{Event: "SessionStart"}}, LegacyStatus: agentgraph.StatusIdle},
+		{Name: "root_working", Hooks: []HookSignal{{Event: "SessionStart"}, {Event: "UserPromptSubmit"}}, LegacyStatus: agentgraph.StatusWorking},
+		{Name: "main_approval", Hooks: []HookSignal{{Event: "SessionStart"}, {Event: "PermissionRequest", ToolName: "Bash"}}, LegacyStatus: agentgraph.StatusPermission, WaitingNodes: 1},
+		{Name: "child_question", Hooks: []HookSignal{{Event: "SessionStart"}, {Event: "PermissionRequest", AgentID: "child", ToolName: "AskUserQuestion"}}, LegacyStatus: agentgraph.StatusPermission, LiveChildren: 1, WaitingNodes: 1},
+		{Name: "simultaneous_writers", Hooks: []HookSignal{{Event: "SessionStart"}, {Event: "PermissionRequest", ToolName: "Edit"}, {Event: "PermissionRequest", AgentID: "child", ToolName: "Bash"}}, LegacyStatus: agentgraph.StatusPermission, LiveChildren: 1, WaitingNodes: 2},
+		{Name: "approved_resume", Hooks: []HookSignal{{Event: "SessionStart"}, {Event: "PermissionRequest", ToolName: "Bash"}, {Event: "PostToolUse", ToolName: "Bash"}}, LegacyStatus: agentgraph.StatusWorking},
 	}
 	out := make([]ShadowCase, len(cases))
 	for i, fixture := range cases {
@@ -48,11 +48,11 @@ func CanonicalShadowCases() []ShadowCase {
 
 // CompareShadow compares the neutral reducer with the simultaneously-produced
 // legacy status. It never includes prompts, tools, paths, or descriptions.
-func CompareShadow(legacyStatus string, observation agentgraph.Observation, prior agentgraph.Summary, now time.Time) ShadowComparison {
+func CompareShadow(legacyStatus agentgraph.Status, observation agentgraph.Observation, prior agentgraph.Summary, now time.Time) ShadowComparison {
 	summary := agentgraph.Reduce(observation, prior, now)
 	comparison := ShadowComparison{
-		Match:        legacyStatus == summary.LegacyStatus,
-		LegacyStatus: legacyStatus, GraphStatus: summary.LegacyStatus,
+		Match:        legacyStatus == summary.Status,
+		LegacyStatus: legacyStatus, GraphStatus: summary.Status,
 		LiveChildren: summary.LiveChildren, WaitingNodes: summary.WaitingNodes,
 		Rule: "claude_shadow_match",
 	}
