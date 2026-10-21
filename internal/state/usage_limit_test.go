@@ -222,40 +222,17 @@ func TestRecordUsageLimitShouldRefuseEvidenceTheSessionHasAlreadyOutrun(t *testi
 	}
 }
 
-func TestProjectPublishedShouldNeverHideALivePermissionBehindALimit(t *testing.T) {
+// An active cap always wins: a limited session cannot be acting, so a red
+// beside it is stale. A capped turn fires no Stop precisely so its approval
+// latch outlives the modal, and the app-server re-stamps that latch on restart.
+func TestProjectPublishedShouldOverlayLimitedOverAPermissionWhenActive(t *testing.T) {
 	sess := limitedSession(timePtr(limitT0.Add(time.Hour)))
 	sess.Claude.Status = StatusPermission
+	sess.AgentGraph.Summary.Attention = agentgraph.AttentionApproval
 	sess.AgentGraph.Summary.Status = StatusPermission
 	got := ProjectPublished(Snapshot{Sessions: []Session{*sess}}, limitT0).Sessions[0]
-	if got.Claude.Status != StatusPermission || got.AgentGraph.Summary.Status != StatusPermission {
-		t.Fatalf("published %q/%q, want the red to win", got.Claude.Status, got.AgentGraph.Summary.Status)
-	}
-}
-
-// A capped turn fires no Stop, so a hook latch it leaves open is stale. The
-// cap the latch predates demotes it to limited; a latch at least as new as the
-// cap is still a decision the user can act on.
-func TestProjectPublishedShouldDemoteAStaleHookLatchBehindAnActiveLimit(t *testing.T) {
-	sess := limitedSession(timePtr(limitT0.Add(time.Hour)))
-	sess.Claude.Status = StatusPermission
-	sess.AgentGraph.Summary.Attention = agentgraph.AttentionApproval
-	sess.AgentGraph.Summary.Status = StatusPermission
-	sess.AgentGraph.Summary.Since = limitT0.Add(-time.Minute)
-	got := ProjectPublished(Snapshot{Sessions: []Session{*sess}}, limitT0.Add(time.Minute)).Sessions[0]
-	if got.AgentGraph.Summary.Status != StatusLimited {
-		t.Fatalf("published %q, want the stale latch demoted to limited", got.AgentGraph.Summary.Status)
-	}
-}
-
-func TestProjectPublishedShouldKeepAHookLatchTheLimitDoesNotPostdate(t *testing.T) {
-	sess := limitedSession(timePtr(limitT0.Add(time.Hour)))
-	sess.Claude.Status = StatusPermission
-	sess.AgentGraph.Summary.Attention = agentgraph.AttentionApproval
-	sess.AgentGraph.Summary.Status = StatusPermission
-	sess.AgentGraph.Summary.Since = limitT0.Add(time.Second)
-	got := ProjectPublished(Snapshot{Sessions: []Session{*sess}}, limitT0.Add(time.Minute)).Sessions[0]
-	if got.AgentGraph.Summary.Status != StatusPermission {
-		t.Fatalf("published %q, want the newer red to win", got.AgentGraph.Summary.Status)
+	if got.Claude.Status != StatusLimited || got.AgentGraph.Summary.Status != StatusLimited {
+		t.Fatalf("published %q/%q, want the cap to win", got.Claude.Status, got.AgentGraph.Summary.Status)
 	}
 }
 

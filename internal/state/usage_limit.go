@@ -1,10 +1,6 @@
 package state
 
-import (
-	"time"
-
-	"github.com/tjmisko/switchboard/internal/agentgraph"
-)
+import "time"
 
 // StatusLimited is the published status of a session whose provider account has
 // hit its usage limit. It is never written by hook or reconciler logic: the
@@ -128,31 +124,14 @@ func projectUsageLimit(sess *Session, now time.Time) {
 // usageLimitOverlays reports whether publication reads limited over the
 // session's status at now. It is the one rule both ProjectPublished and
 // ExplainStatus apply.
+//
+// An active cap always wins. A limited session cannot be acting, so any red
+// beside it is stale — and a real PermissionRequest, PreToolUse, PostToolUse or
+// UserPromptSubmit would have cleared the record first (rpc.usageLimitActivity).
+// In particular the app-server's persisted waitingOnApproval flag survives a
+// capped turn and is re-stamped on restart, so it must not hide the grey.
 func usageLimitOverlays(sess *Session, now time.Time) bool {
-	if !sess.UsageLimit.ActiveAt(now) {
-		return false
-	}
-	if !publishedPermission(sess) {
-		return true
-	}
-	// A capped turn ends without the hook that would clear a pending approval
-	// or question (Codex fires no Stop), so a root hook latch the cap strictly
-	// postdates is the stale request, not a live decision: let the cap win. A
-	// terminal reading, a red at least as new as the cap, or an unknown onset
-	// is a decision the user can still act on and hides the grey.
-	if sess.AgentGraph == nil {
-		return false
-	}
-	summary := sess.AgentGraph.Summary
-	hookLatch := summary.Attention == agentgraph.AttentionApproval || summary.Attention == agentgraph.AttentionUserInput
-	return hookLatch && !summary.Since.IsZero() && sess.UsageLimit.ObservedAt.After(summary.Since)
-}
-
-func publishedPermission(sess *Session) bool {
-	if info := sess.Enrichment(); info != nil {
-		return info.Status == StatusPermission
-	}
-	return sess.AgentGraph != nil && sess.AgentGraph.Summary.Status == StatusPermission
+	return sess.UsageLimit.ActiveAt(now)
 }
 
 // hydrateUsageLimit undoes the projection on a session read back from

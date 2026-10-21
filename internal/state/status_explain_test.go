@@ -279,14 +279,17 @@ func TestExplainStatusShouldReportLimitedWithTheUnderlyingDecisionBeneathItWhenA
 	}
 }
 
-func TestExplainStatusShouldNotOverlayLimitedWhenTheStatusIsPermission(t *testing.T) {
+func TestExplainStatusShouldOverlayLimitedOverAPermissionWhenActive(t *testing.T) {
 	s := &Session{PID: 11, StartedAt: herdrT0, Agent: AgentKindClaude, Claude: &AgentInfo{}}
 	s.SetAgentGraph(claudeGraph(t, agentgraph.RuntimeIdle, herdrT0, time.Hour), herdrT0)
 	s.SetHerdr(reading(HerdrBlocked, true, herdrT0), herdrT0)
 	s.RecordUsageLimit(UsageLimit{ObservedAt: herdrT0, Source: UsageLimitSourceClaudeHook})
 	d := s.ExplainStatus(herdrT0.Add(time.Minute))
-	if d.Status != StatusPermission || d.Underlying != nil || d.Reason != statusexplain.ReasonTerminalAuthority {
-		t.Fatalf("decision = %+v underlying = %+v, want herdr's permission and no overlay", d.Choice, d.Underlying)
+	if d.Status != StatusLimited || d.Reason != statusexplain.ReasonUsageLimitOverlay {
+		t.Fatalf("decision = %+v, want the cap to overlay limited", d.Choice)
+	}
+	if d.Underlying == nil || d.Underlying.Status != StatusPermission {
+		t.Fatalf("underlying = %+v, want herdr's permission beneath the cap", d.Underlying)
 	}
 }
 

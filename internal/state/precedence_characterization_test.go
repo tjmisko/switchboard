@@ -169,9 +169,9 @@ func TestPrecedencePiShouldPreferHookThenHerdrThenSessionFileWhenEachIsAvailable
 	}
 }
 
-// Rule usage_limit_overlay: publication reads limited over every status but
-// permission, until the limit lapses.
-func TestPrecedenceUsageLimitShouldOverlayEveryStatusButPermissionWhenActive(t *testing.T) {
+// Rule usage_limit_overlay: publication reads limited over every status,
+// including permission, until the limit lapses.
+func TestPrecedenceUsageLimitShouldOverlayEveryStatusWhenActive(t *testing.T) {
 	resets := herdrT0.Add(time.Hour)
 	for _, tc := range []struct {
 		status string
@@ -181,7 +181,7 @@ func TestPrecedenceUsageLimitShouldOverlayEveryStatusButPermissionWhenActive(t *
 		{StatusIdle, StatusLimited},
 		{StatusDelegating, StatusLimited},
 		{"", StatusLimited},
-		{StatusPermission, StatusPermission},
+		{StatusPermission, StatusLimited},
 	} {
 		s := Session{PID: 44, StartedAt: herdrT0, Agent: AgentKindClaude, Claude: &AgentInfo{Status: tc.status},
 			UsageLimit: &UsageLimit{ObservedAt: herdrT0, ResetsAt: &resets}}
