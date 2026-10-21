@@ -1,6 +1,10 @@
 package state
 
-import "time"
+import (
+	"time"
+
+	"github.com/tjmisko/switchboard/internal/agentgraph"
+)
 
 // StatusLimited is the published status of a session whose provider account has
 // hit its usage limit. It is never written by hook or reconciler logic: the
@@ -125,10 +129,23 @@ func projectUsageLimit(sess *Session, now time.Time) {
 // session's status at now. It is the one rule both ProjectPublished and
 // ExplainStatus apply.
 func usageLimitOverlays(sess *Session, now time.Time) bool {
-	// A live red is a decision the user can act on, and a capped turn raises
-	// none, so a permission status means the limit no longer holds: the clear
-	// that should have said so was lost. Never hide it behind grey.
-	return sess.UsageLimit.ActiveAt(now) && !publishedPermission(sess)
+	if !sess.UsageLimit.ActiveAt(now) {
+		return false
+	}
+	if !publishedPermission(sess) {
+		return true
+	}
+	// A capped turn ends without the hook that would clear a pending approval
+	// or question (Codex fires no Stop), so a root hook latch the cap strictly
+	// postdates is the stale request, not a live decision: let the cap win. A
+	// terminal reading, a red at least as new as the cap, or an unknown onset
+	// is a decision the user can still act on and hides the grey.
+	if sess.AgentGraph == nil {
+		return false
+	}
+	summary := sess.AgentGraph.Summary
+	hookLatch := summary.Attention == agentgraph.AttentionApproval || summary.Attention == agentgraph.AttentionUserInput
+	return hookLatch && !summary.Since.IsZero() && sess.UsageLimit.ObservedAt.After(summary.Since)
 }
 
 func publishedPermission(sess *Session) bool {

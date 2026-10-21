@@ -723,10 +723,26 @@ func (o *Observer) snapshot(client *rpcClient, rootID string) (*graphState, erro
 		cursor = *result.NextCursor
 	}
 	state := newGraphState(rootResult.Thread, descendants, o.config.RecentTerminalLimit)
+	state.observeTurnUsageLimit(rootResult.Thread.Turns)
+	state.observeTurnUsageLimit(turnResult.Data)
 	if _, err := state.observation(o.config.Now(), o.config.Freshness); err != nil {
 		return nil, newSnapshotDiagnosticError(DiagnosticSnapshotGraphInvalid, err)
 	}
 	return state, nil
+}
+
+// TurnUsageLimit is the newest usage-limit turn error the app-server has loaded
+// for rootID, read from the same thread turns the graph is built from. It is
+// the alongside path to the rollout scan: the rollout is the durable witness,
+// this is the same fact from the loaded thread and needs no file.
+func (o *Observer) TurnUsageLimit(key provider.RootKey, rootID string) (time.Time, *time.Time, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	record := o.roots[key]
+	if record == nil || record.threadID != rootID || record.graph == nil || record.graph.usageLimitAt.IsZero() {
+		return time.Time{}, nil, false
+	}
+	return record.graph.usageLimitAt, record.graph.usageLimitResetsAt, true
 }
 
 func (o *Observer) installSnapshot(generation uint64, key provider.RootKey, threadID string, state *graphState, estimate *ThreadUsageEstimate, usageRead bool, usageErr error) {

@@ -65,6 +65,32 @@ func (s RolloutState) clone() RolloutState {
 	return s
 }
 
+// observeTurnUsageLimit records the newest usage-limit turn error in turns.
+// It reads the app-server's persisted turn error, the same fact the rollout
+// writes, so a cap is seen even when the rollout is not bound or is still
+// being written.
+func (s *graphState) observeTurnUsageLimit(turns []rpcTurn) {
+	for _, turn := range turns {
+		if !turn.Error.usageLimit() {
+			continue
+		}
+		var at time.Time
+		switch {
+		case turn.CompletedAt != 0:
+			at = time.Unix(turn.CompletedAt, 0)
+		case turn.StartedAt != 0:
+			at = time.Unix(turn.StartedAt, 0)
+		default:
+			continue
+		}
+		if !at.After(s.usageLimitAt) {
+			continue
+		}
+		s.usageLimitAt = at
+		s.usageLimitResetsAt = usagelimit.CodexResetFromMessage(turn.Error.Message, at)
+	}
+}
+
 func readRolloutState(path string) (RolloutState, error) {
 	const tailBytes = 256 * 1024
 	unknown := RolloutState{Runtime: agentgraph.RuntimeUnknown}

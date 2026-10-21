@@ -18,6 +18,14 @@ type codexRolloutPathSource interface {
 	RolloutPaths(provider.RootKey, string) map[string]string
 }
 
+// codexTurnUsageLimitSource is the app-server's own view of a thread's newest
+// usage-limit turn error. It is read alongside the rollout tails: the rollout
+// is the durable witness, the app-server read is the same fact from the loaded
+// thread and needs no file.
+type codexTurnUsageLimitSource interface {
+	TurnUsageLimit(provider.RootKey, string) (time.Time, *time.Time, bool)
+}
+
 // codexLimitScan is one root's usage-limit scan state: when it last ran. Each
 // rollout's tail verdict is cached by its file identity in ReadRolloutState
 // (internal/tailcache), so an unchanged rollout is stat'ed, not re-read.
@@ -61,40 +69,47 @@ func (c *agentCoordinator) scanCodexUsageLimit(ref provider.RootRef, now time.Ti
 		}
 	}
 	delete(childPaths, rootPath)
-	if rootPath == "" && len(childPaths) == 0 {
-		return
-	}
 
-	c.codexLimitMu.Lock()
-	if c.codexLimitScans == nil {
-		c.codexLimitScans = make(map[provider.RootKey]*codexLimitScan)
-	}
-	scan := c.codexLimitScans[ref.Key()]
-	if scan == nil || scan.rootID != rootID {
-		scan = &codexLimitScan{rootID: rootID}
-		c.codexLimitScans[ref.Key()] = scan
-	}
-	if !scan.scannedAt.IsZero() && now.Sub(scan.scannedAt) < codexUsageLimitScanInterval {
-		c.codexLimitMu.Unlock()
-		return
-	}
-	scan.scannedAt = now
-	c.codexLimitMu.Unlock()
-
-	// The reads run outside every coordinator lock; the claim on scannedAt
-	// above is what keeps two ticks from scanning the same root at once.
-	root := readCodexRolloutState(rootPath)
+	// The app-server's own turn error is the alongside path: the same fact the
+	// rollout records, read from the loaded thread, so a cap is seen even when
+	// no rollout path is bound yet.
 	var newest *codexLimitEvidence
-	if root.UsageLimit != nil {
-		newest = &codexLimitEvidence{at: root.At, limit: root.UsageLimit}
-	}
-	for path := range childPaths {
-		child := readCodexRolloutState(path)
-		if child.UsageLimit == nil || !child.At.After(root.At) {
-			continue
+	if source, ok := c.codex.(codexTurnUsageLimitSource); ok {
+		if at, resetsAt, ok := source.TurnUsageLimit(ref.Key(), rootID); ok {
+			newest = &codexLimitEvidence{at: at, limit: &codexprovider.RolloutUsageLimit{ResetsAt: resetsAt}}
 		}
-		if newest == nil || child.At.After(newest.at) {
-			newest = &codexLimitEvidence{at: child.At, limit: child.UsageLimit}
+	}
+	if rootPath != "" || len(childPaths) > 0 {
+		c.codexLimitMu.Lock()
+		if c.codexLimitScans == nil {
+			c.codexLimitScans = make(map[provider.RootKey]*codexLimitScan)
+		}
+		scan := c.codexLimitScans[ref.Key()]
+		if scan == nil || scan.rootID != rootID {
+			scan = &codexLimitScan{rootID: rootID}
+			c.codexLimitScans[ref.Key()] = scan
+		}
+		if !scan.scannedAt.IsZero() && now.Sub(scan.scannedAt) < codexUsageLimitScanInterval {
+			c.codexLimitMu.Unlock()
+			return
+		}
+		scan.scannedAt = now
+		c.codexLimitMu.Unlock()
+
+		// The reads run outside every coordinator lock; the claim on scannedAt
+		// above is what keeps two ticks from scanning the same root at once.
+		root := readCodexRolloutState(rootPath)
+		if root.UsageLimit != nil && (newest == nil || root.At.After(newest.at)) {
+			newest = &codexLimitEvidence{at: root.At, limit: root.UsageLimit}
+		}
+		for path := range childPaths {
+			child := readCodexRolloutState(path)
+			if child.UsageLimit == nil || !child.At.After(root.At) {
+				continue
+			}
+			if newest == nil || child.At.After(newest.at) {
+				newest = &codexLimitEvidence{at: child.At, limit: child.UsageLimit}
+			}
 		}
 	}
 

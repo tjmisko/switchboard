@@ -54,11 +54,28 @@ type rpcStatus struct {
 }
 
 type rpcTurn struct {
-	ID          string    `json:"id"`
-	Status      string    `json:"status"`
-	Items       []rpcItem `json:"items"`
-	StartedAt   int64     `json:"startedAt"`
-	CompletedAt int64     `json:"completedAt"`
+	ID          string        `json:"id"`
+	Status      string        `json:"status"`
+	Items       []rpcItem     `json:"items"`
+	StartedAt   int64         `json:"startedAt"`
+	CompletedAt int64         `json:"completedAt"`
+	Error       *rpcTurnError `json:"error"`
+}
+
+// rpcTurnError is the app-server's typed turn failure. CodexErrorInfo is a bare
+// string for unit variants ("usageLimitExceeded") and an object for variants
+// with data, so it stays raw until the code is known to be one we read.
+type rpcTurnError struct {
+	Message        string          `json:"message"`
+	CodexErrorInfo json.RawMessage `json:"codexErrorInfo"`
+}
+
+func (e *rpcTurnError) usageLimit() bool {
+	if e == nil {
+		return false
+	}
+	var code string
+	return json.Unmarshal(e.CodexErrorInfo, &code) == nil && code == "usageLimitExceeded"
 }
 
 type rpcItem struct {
@@ -149,6 +166,12 @@ type graphState struct {
 	rootTurnID  string
 	nodes       map[string]*nodeState
 	unknownEnum bool
+	// usageLimitAt/usageLimitResetsAt are the newest app-server turn error
+	// that ended on the provider's usage limit. The rollout scan is the
+	// durable witness; this is the same fact read from the loaded thread and
+	// is what the daemon consults when no rollout path is bound.
+	usageLimitAt       time.Time
+	usageLimitResetsAt *time.Time
 }
 
 func newGraphState(root rpcThread, descendants []rpcThread, terminalLimit int) *graphState {

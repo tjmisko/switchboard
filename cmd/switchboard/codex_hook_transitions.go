@@ -53,6 +53,14 @@ type codexPendingApproval struct {
 	sessionID                                      string
 	timer                                          *time.Timer
 	done                                           sync.Once
+
+	// titleBlockedObserved records that the pane title showed the
+	// action-required preview while this gate was open. Only then does the
+	// title's return to the spinner/idle title mean the modal closed; without
+	// it, a title that never showed blocked (the action item disabled, a
+	// headless client) would read as "answered" the moment the gate opened.
+	// See observeCodexTitleEdge.
+	titleBlockedObserved bool
 }
 
 func (p *codexPendingApproval) finish(wg *sync.WaitGroup) { p.done.Do(wg.Done) }
@@ -1172,6 +1180,7 @@ func (c *agentCoordinator) startCodexApprovalTimerLocked(state *codexHookRootSta
 				toolName: pending.toolName, inputHash: pending.inputHash, episode: pending.episode,
 				startedAt: pending.startedAt, redPublishedAt: pending.redPublishedAt,
 				ref: pending.ref, sessionID: pending.sessionID,
+				titleBlockedObserved: pending.titleBlockedObserved,
 			}
 			current.approvals[key] = deferred
 			c.startCodexApprovalTimerLocked(current, key, deferred)
@@ -1442,6 +1451,82 @@ func codexApprovalRedPublishedLocked(state *codexHookRootState) bool {
 		}
 	}
 	return false
+}
+
+// codexTitleRequiresAction reports whether a Codex pane title is the
+// "Action Required" preview Codex paints while a permission or question modal
+// owns the pane. The prefix is ACTION_REQUIRED_PREVIEW_PREFIX in Codex's
+// bottom_pane/action_required_title.rs; the strings are copied here rather than
+// imported because Switchboard never links the TUI. Keep them versioned like
+// herdr's screen manifest: a title the human cannot read as blocked must never
+// be the only thing standing between a live modal and a green chip.
+func codexTitleRequiresAction(title string) bool {
+	t := strings.ToLower(strings.TrimSpace(title))
+	return strings.Contains(t, "action required") || strings.Contains(t, "waiting for approval")
+}
+
+// observeCodexTitleEdge retires an open approval when the pane title shows the
+// modal has closed. It is the local-TUI answer edge the hook stream cannot see:
+// a PermissionRequest fires when the modal OPENS, and Codex fires no second
+// pre-hook when the human answers. The title flips to the action-required
+// preview while the modal is up and back to the spinner/idle title when it
+// closes, so a title sampled after the gate opened that no longer requires
+// action means the human answered — presumed continuation, before the approved
+// tool's PostToolUse can arrive. See
+// docs/codex-approval-clear-latency-2026-10-21-augmented.md.
+//
+// It only retires a gate that has SEEN the blocked title. The title flips a
+// draw-tick after the hook opens the gate, so an early sample could otherwise
+// read as "answered" in the gap between the hook and the first redraw. A gate
+// whose title never showed blocked — the action item disabled, a headless or
+// remote client whose title Switchboard cannot read — is left to the existing
+// edges and keeps its bounded grace.
+//
+// It clears EVERY open gate on the root, not one request. The title is blocked
+// while ANY request is pending and clears only when the last one does, so the
+// edge cannot name which request was answered. That is deliberate: the read
+// model wants "is this pane blocked", and the title's own semantics already
+// answer only that question. A sibling gate whose modal is still up would keep
+// the title blocked and so would not be retired here.
+//
+// Called from the observe tick, not from the hook reducer: a title change is a
+// polled observation with no event to carry it. It takes the store snapshot
+// BEFORE codexHookMu, matching the timer path's lock order; the store lock is
+// never taken while codexHookMu is held.
+func (c *agentCoordinator) observeCodexTitleEdge(key provider.RootKey, now time.Time) {
+	sess, ok := sessionForKey(c.store.Snapshot(), key)
+	if !ok || sess.Wezterm == nil {
+		return
+	}
+	title := strings.TrimSpace(sess.Wezterm.Title)
+	if title == "" {
+		return // no title is no signal, never an answer
+	}
+	requires := codexTitleRequiresAction(title)
+	var resolved []*codexPendingApproval
+	c.codexHookMu.Lock()
+	state := c.codexHookRoots[key]
+	if state != nil {
+		if requires {
+			for _, pending := range state.approvals {
+				pending.titleBlockedObserved = true
+			}
+		} else {
+			for approvalKey, pending := range state.approvals {
+				if !pending.titleBlockedObserved {
+					continue
+				}
+				c.stopCodexApprovalLocked(pending)
+				delete(state.approvals, approvalKey)
+				resolved = append(resolved, pending)
+			}
+		}
+	}
+	c.codexHookMu.Unlock()
+	for _, pending := range resolved {
+		logCodexHookWait("resolved", pending, "title_answer_edge", now)
+		c.recordDiagnostic(agentgraph.ProviderCodex, "hook_approval_resolved_by_title", now)
+	}
 }
 
 func codexObservationRootAttention(observation agentgraph.Observation) agentgraph.AttentionState {

@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/tjmisko/switchboard/internal/agentgraph"
 )
 
 var limitT0 = time.Date(2026, 10, 5, 19, 28, 5, 0, time.UTC)
@@ -227,6 +229,33 @@ func TestProjectPublishedShouldNeverHideALivePermissionBehindALimit(t *testing.T
 	got := ProjectPublished(Snapshot{Sessions: []Session{*sess}}, limitT0).Sessions[0]
 	if got.Claude.Status != StatusPermission || got.AgentGraph.Summary.Status != StatusPermission {
 		t.Fatalf("published %q/%q, want the red to win", got.Claude.Status, got.AgentGraph.Summary.Status)
+	}
+}
+
+// A capped turn fires no Stop, so a hook latch it leaves open is stale. The
+// cap the latch predates demotes it to limited; a latch at least as new as the
+// cap is still a decision the user can act on.
+func TestProjectPublishedShouldDemoteAStaleHookLatchBehindAnActiveLimit(t *testing.T) {
+	sess := limitedSession(timePtr(limitT0.Add(time.Hour)))
+	sess.Claude.Status = StatusPermission
+	sess.AgentGraph.Summary.Attention = agentgraph.AttentionApproval
+	sess.AgentGraph.Summary.Status = StatusPermission
+	sess.AgentGraph.Summary.Since = limitT0.Add(-time.Minute)
+	got := ProjectPublished(Snapshot{Sessions: []Session{*sess}}, limitT0.Add(time.Minute)).Sessions[0]
+	if got.AgentGraph.Summary.Status != StatusLimited {
+		t.Fatalf("published %q, want the stale latch demoted to limited", got.AgentGraph.Summary.Status)
+	}
+}
+
+func TestProjectPublishedShouldKeepAHookLatchTheLimitDoesNotPostdate(t *testing.T) {
+	sess := limitedSession(timePtr(limitT0.Add(time.Hour)))
+	sess.Claude.Status = StatusPermission
+	sess.AgentGraph.Summary.Attention = agentgraph.AttentionApproval
+	sess.AgentGraph.Summary.Status = StatusPermission
+	sess.AgentGraph.Summary.Since = limitT0.Add(time.Second)
+	got := ProjectPublished(Snapshot{Sessions: []Session{*sess}}, limitT0.Add(time.Minute)).Sessions[0]
+	if got.AgentGraph.Summary.Status != StatusPermission {
+		t.Fatalf("published %q, want the newer red to win", got.AgentGraph.Summary.Status)
 	}
 }
 

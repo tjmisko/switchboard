@@ -11,6 +11,31 @@ import (
 	"github.com/tjmisko/switchboard/internal/agentgraph"
 )
 
+func TestObserveTurnUsageLimitShouldReadTheAppServerTurnError(t *testing.T) {
+	var s graphState
+	s.observeTurnUsageLimit([]rpcTurn{{
+		CompletedAt: 1792620487,
+		Error: &rpcTurnError{
+			Message:        "You've hit your usage limit. Upgrade to Pro ... try again at 6:23 PM.",
+			CodexErrorInfo: []byte(`"usageLimitExceeded"`),
+		},
+	}})
+	if s.usageLimitAt.IsZero() || s.usageLimitResetsAt == nil {
+		t.Fatalf("usage limit not recorded: at=%v resets=%v", s.usageLimitAt, s.usageLimitResetsAt)
+	}
+	if got := s.usageLimitAt.UTC(); got.Unix() != 1792620487 {
+		t.Fatalf("usage limit at = %v, want the turn's completedAt", got)
+	}
+	// A later non-limit failure must not replace the cap.
+	s.observeTurnUsageLimit([]rpcTurn{{
+		CompletedAt: 1792620500,
+		Error:       &rpcTurnError{Message: "something else", CodexErrorInfo: []byte(`"internalServerError"`)},
+	}})
+	if got := s.usageLimitAt.UTC(); got.Unix() != 1792620487 {
+		t.Fatalf("a non-limit turn replaced the cap: %v", got)
+	}
+}
+
 func TestRolloutRuntimeRequiresExplicitLatestLifecycle(t *testing.T) {
 	base := time.Date(2026, 9, 30, 22, 0, 0, 0, time.UTC)
 	marker := func(kind string, seconds int) string {

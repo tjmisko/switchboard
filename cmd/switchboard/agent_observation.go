@@ -419,6 +419,7 @@ func (c *agentCoordinator) observe(ctx context.Context, ref provider.RootRef) {
 // cannot express that against a wall clock it does not control.
 func (c *agentCoordinator) observeAt(ctx context.Context, ref provider.RootRef, now time.Time) {
 	if ref.Provider == agentgraph.ProviderCodex {
+		c.observeCodexTitleEdge(ref.Key(), now)
 		c.scanCodexUsageLimit(ref, now)
 		c.pollCodexStoppedRoot(ref, now)
 	}

@@ -565,6 +565,60 @@ func codexApprovalWriters(t *testing.T, coordinator *agentCoordinator, store *st
 	return writers
 }
 
+func setCodexTestTitle(store *state.Store, pid int, title string, at time.Time) {
+	store.Apply(func(m map[int]*state.Session) {
+		sess := m[pid]
+		if sess == nil {
+			return
+		}
+		if sess.Wezterm == nil {
+			sess.Wezterm = &state.WeztermInfo{}
+		}
+		sess.Wezterm.Title = title
+		sess.Wezterm.TitleAt = at
+	})
+}
+
+func TestCodexApprovalTitleEdgeRetiresAnsweredGate(t *testing.T) {
+	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
+	base := time.Now()
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PermissionRequest", SessionID: "thread-1", TurnID: "turn-1",
+		ToolUseID: "exec-1", ToolName: "exec_command", ObservedAt: base,
+	})
+	if got := codexApprovalWriters(t, coordinator, store); len(got) != 1 {
+		t.Fatalf("approval gate did not open: %v", got)
+	}
+	ref, _ := providerRootRef(store.Snapshot().Sessions[0])
+
+	setCodexTestTitle(store, 8123, "[ ! ] Action Required | codex", base.Add(time.Millisecond))
+	coordinator.observeCodexTitleEdge(ref.Key(), base.Add(time.Millisecond))
+	if got := codexApprovalWriters(t, coordinator, store); len(got) != 1 {
+		t.Fatalf("a title that never showed blocked retired the gate: %v", got)
+	}
+
+	setCodexTestTitle(store, 8123, "⠋ codex", base.Add(2*time.Millisecond))
+	coordinator.observeCodexTitleEdge(ref.Key(), base.Add(2*time.Millisecond))
+	if got := codexApprovalWriters(t, coordinator, store); len(got) != 0 {
+		t.Fatalf("answered gate survived the title edge: %v", got)
+	}
+}
+
+func TestCodexApprovalTitleEdgeNeedsBlockedObservation(t *testing.T) {
+	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
+	base := time.Now()
+	sendCodexHook(coordinator, store, rpc.Request{
+		Event: "PermissionRequest", SessionID: "thread-1", TurnID: "turn-1",
+		ToolUseID: "exec-1", ToolName: "exec_command", ObservedAt: base,
+	})
+	ref, _ := providerRootRef(store.Snapshot().Sessions[0])
+	setCodexTestTitle(store, 8123, "⠋ codex", base.Add(time.Millisecond))
+	coordinator.observeCodexTitleEdge(ref.Key(), base.Add(time.Millisecond))
+	if got := codexApprovalWriters(t, coordinator, store); len(got) != 1 {
+		t.Fatalf("title edge retired a gate whose title never showed blocked: %v", got)
+	}
+}
+
 func TestCodexQuestionShouldClearWhenItsOwnPostToolUseIDMatches(t *testing.T) {
 	coordinator, store := newStandardCodexHookTestCoordinator(t, "thread-1")
 	base := time.Now()
