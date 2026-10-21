@@ -10,6 +10,7 @@ import (
 
 	"github.com/tjmisko/switchboard/internal/agentgraph"
 	"github.com/tjmisko/switchboard/internal/provider"
+	codexprovider "github.com/tjmisko/switchboard/internal/provider/codex"
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/state"
 	"github.com/tjmisko/switchboard/internal/tailcache"
@@ -72,6 +73,73 @@ func requireNotLimited(t *testing.T, store *state.Store) {
 	if published := store.PublishedSnapshot().Sessions[0]; published.UsageLimit != nil {
 		t.Fatalf("usage_limit = %+v, want none", published.UsageLimit)
 	}
+}
+
+func requireLimitedSource(t *testing.T, store *state.Store, source string) {
+	t.Helper()
+	published := store.PublishedSnapshot().Sessions[0]
+	if published.UsageLimit == nil || published.UsageLimit.Source != source {
+		t.Fatalf("usage_limit = %+v, want source %q", published.UsageLimit, source)
+	}
+}
+
+// rolloutCappedMessageOnly is a capped turn end with no rate-limit telemetry,
+// so its reset can only come from the message.
+func rolloutCappedMessageOnly(at time.Time, message string) string {
+	return fmt.Sprintf("{\"timestamp\":%q,\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"error\":{\"message\":%q,\"codex_error_info\":\"usage_limit_exceeded\"}}}\n",
+		at.Format(time.RFC3339Nano), message)
+}
+
+func TestWitnessBetterShouldPreferResetQualityThenTheRolloutSource(t *testing.T) {
+	epochRollout := &codexLimitEvidence{source: state.UsageLimitSourceCodexRollout, limit: &codexprovider.RolloutUsageLimit{ResetFromEpoch: true}}
+	messageRollout := &codexLimitEvidence{source: state.UsageLimitSourceCodexRollout, limit: &codexprovider.RolloutUsageLimit{}}
+	messageAppServer := &codexLimitEvidence{source: state.UsageLimitSourceCodexAppServer, limit: &codexprovider.RolloutUsageLimit{}}
+	if !witnessBetter(epochRollout, messageAppServer) || witnessBetter(messageAppServer, epochRollout) {
+		t.Fatal("an epoch rollout should beat a message-only app-server witness")
+	}
+	if !witnessBetter(messageRollout, messageAppServer) || witnessBetter(messageAppServer, messageRollout) {
+		t.Fatal("the rollout should win the message-only tie")
+	}
+}
+
+func TestCodexUsageLimitScanShouldRecordTheAppServerSourceWhenOnlyTheTurnErrorCarriesTheCap(t *testing.T) {
+	now := time.Now()
+	resetsAt := now.Add(2 * time.Hour).Truncate(time.Second)
+	store := state.New("")
+	ref := seedCoordinatorSession(store, 4081, now.Add(-2*time.Hour), state.AgentKindCodex, "root", "/codex")
+	fake := newFakeCodexCoordinatorObserver()
+	fake.turnLimits = map[string]fakeTurnLimit{"root": {at: now.Add(-time.Minute).Truncate(time.Second), resetsAt: &resetsAt}}
+	fake.observations[ref.Key()] = testCodexObservation(ref, "root", now, agentgraph.RuntimeNotLoaded, agentgraph.AttentionNone)
+	c := newAgentCoordinator(store, nil, nil, fake)
+	c.refreshTrackedRoots()
+	defer c.Close()
+
+	c.observeAt(context.Background(), codexRootRef(t, store), now)
+	c.observeAt(context.Background(), codexRootRef(t, store), now.Add(codexUsageLimitScanInterval))
+
+	requireLimitedSource(t, store, state.UsageLimitSourceCodexAppServer)
+}
+
+func TestCodexUsageLimitScanShouldRecordTheRolloutSourceWhenBothWitnessesCarryTheCap(t *testing.T) {
+	now := time.Now()
+	resetsAt := now.Add(2 * time.Hour).Truncate(time.Second)
+	store := state.New("")
+	ref := seedCoordinatorSession(store, 4082, now.Add(-2*time.Hour), state.AgentKindCodex, "root", "/codex")
+	fake := newFakeCodexCoordinatorObserver()
+	dir := t.TempDir()
+	fake.threadPaths = map[string]string{
+		"root": writeRollout(t, dir, "root.jsonl", rolloutCappedMessageOnly(now, "You've hit your usage limit. try again at 11:15 PM.")),
+	}
+	fake.turnLimits = map[string]fakeTurnLimit{"root": {at: now.Truncate(time.Second), resetsAt: &resetsAt}}
+	fake.observations[ref.Key()] = testCodexObservation(ref, "root", now, agentgraph.RuntimeNotLoaded, agentgraph.AttentionNone)
+	c := newAgentCoordinator(store, nil, nil, fake)
+	c.refreshTrackedRoots()
+	defer c.Close()
+
+	c.observeAt(context.Background(), codexRootRef(t, store), now)
+	c.observeAt(context.Background(), codexRootRef(t, store), now.Add(codexUsageLimitScanInterval))
+
+	requireLimitedSource(t, store, state.UsageLimitSourceCodexRollout)
 }
 
 func TestCodexUsageLimitScanShouldLimitTheSessionWhenASubagentIsCappedWhileTheRootWaits(t *testing.T) {

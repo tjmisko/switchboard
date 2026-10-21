@@ -83,7 +83,7 @@ func (c *agentCoordinator) pollCodexStoppedRoot(ref provider.RootRef, now time.T
 // recordCodexUsageLimit records a usage-limit turn end, the root's or a
 // subagent's, on the session still bound to rootID. Session.RecordUsageLimit
 // refuses it if a newer activity hook has already arrived.
-func (c *agentCoordinator) recordCodexUsageLimit(ref provider.RootRef, rootID string, at time.Time, limit *codexprovider.RolloutUsageLimit) {
+func (c *agentCoordinator) recordCodexUsageLimit(ref provider.RootRef, rootID string, at time.Time, limit *codexprovider.RolloutUsageLimit, source string) {
 	sess, ok := sessionForKey(c.store.Snapshot(), ref.Key())
 	if !ok || sess.AgentGraph == nil || sess.AgentGraph.RootID != rootID {
 		return
@@ -98,8 +98,8 @@ func (c *agentCoordinator) recordCodexUsageLimit(ref provider.RootRef, rootID st
 		if live == nil || live.AgentGraph == nil || live.AgentGraph.RootID != rootID {
 			return
 		}
-		if live.RecordUsageLimit(state.UsageLimit{ObservedAt: at, ResetsAt: limit.ResetsAt, Source: state.UsageLimitSourceCodexRollout}) {
-			log.Printf("usage-limit: pid=%d agent=codex resets_at=%s", sess.PID, formatUsageLimitReset(limit.ResetsAt))
+		if live.RecordUsageLimit(state.UsageLimit{ObservedAt: at, ResetsAt: limit.ResetsAt, Source: source, ResetFromEpoch: limit.ResetFromEpoch}) {
+			log.Printf("usage-limit: pid=%d agent=codex source=%s resets_at=%s", sess.PID, source, formatUsageLimitReset(limit.ResetsAt))
 		}
 	})
 }

@@ -23,6 +23,9 @@ type RolloutState struct {
 // neither the rate-limit telemetry nor the message named a reset.
 type RolloutUsageLimit struct {
 	ResetsAt *time.Time
+	// ResetFromEpoch reports that ResetsAt came from the rate-limit telemetry
+	// epoch rather than the error message.
+	ResetFromEpoch bool
 }
 
 // ReadRolloutRuntime reads explicit lifecycle markers from an already-bound
@@ -131,7 +134,8 @@ func readRolloutState(path string) (RolloutState, error) {
 		}
 		var turnError rolloutTurnError
 		if json.Unmarshal(event.Payload.Error, &turnError) == nil && turnError.usageLimit() {
-			state.UsageLimit = &RolloutUsageLimit{ResetsAt: limits.resetFor(turnError.Message, event.Timestamp)}
+			resetsAt, fromEpoch := limits.resetFor(turnError.Message, event.Timestamp)
+			state.UsageLimit = &RolloutUsageLimit{ResetsAt: resetsAt, ResetFromEpoch: fromEpoch}
 		}
 	}
 	return state, nil
@@ -195,17 +199,17 @@ func (l *rolloutRateLimits) observe(snapshot *rolloutRateLimit) {
 // the second. When both exist and agree within two minutes the epoch wins;
 // when they disagree the telemetry is from a different window, so the message
 // wins.
-func (l *rolloutRateLimits) resetFor(message string, at time.Time) *time.Time {
+func (l *rolloutRateLimits) resetFor(message string, at time.Time) (*time.Time, bool) {
 	stated := usagelimit.CodexResetFromMessage(message, at)
 	if l.nearest == nil {
-		return stated
+		return stated, false
 	}
 	epoch := time.Unix(l.nearest.ResetsAt, 0)
 	if !epoch.After(at) {
-		return stated
+		return stated, false
 	}
 	if stated != nil && (stated.Sub(epoch) > 2*time.Minute || epoch.Sub(*stated) > 2*time.Minute) {
-		return stated
+		return stated, false
 	}
-	return &epoch
+	return &epoch, true
 }

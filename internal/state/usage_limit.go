@@ -15,9 +15,10 @@ const usageLimitUnknownResetHold = 7 * 24 * time.Hour
 
 // Usage-limit evidence sources, recorded on UsageLimit.Source.
 const (
-	UsageLimitSourceClaudeHook   = "claude_stop_failure"
-	UsageLimitSourceCodexRollout = "codex_rollout"
-	UsageLimitSourcePiHook       = "pi_hook"
+	UsageLimitSourceClaudeHook     = "claude_stop_failure"
+	UsageLimitSourceCodexRollout   = "codex_rollout"
+	UsageLimitSourceCodexAppServer = "codex_app_server"
+	UsageLimitSourcePiHook         = "pi_hook"
 )
 
 // UsageLimit is the evidence that a session's turn ended on its provider's usage
@@ -29,6 +30,9 @@ type UsageLimit struct {
 	ObservedAt time.Time  `json:"observed_at"`
 	ResetsAt   *time.Time `json:"resets_at,omitempty"`
 	Source     string     `json:"source,omitempty"`
+	// ResetFromEpoch reports that ResetsAt came from the provider's rate-limit
+	// epoch rather than a reset parsed from the error message.
+	ResetFromEpoch bool `json:"reset_from_epoch,omitempty"`
 }
 
 // ActiveAt reports whether the limit still blocks the session at now. A limit

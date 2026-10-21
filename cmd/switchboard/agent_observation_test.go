@@ -34,6 +34,12 @@ type fakeCodexCoordinatorObserver struct {
 	closes       int
 	observes     int
 	threadPaths  map[string]string // RolloutPaths answer for every bound root
+	turnLimits   map[string]fakeTurnLimit
+}
+
+type fakeTurnLimit struct {
+	at       time.Time
+	resetsAt *time.Time
 }
 
 type fakeRolloutBinding struct {
@@ -101,6 +107,16 @@ func (f *fakeCodexCoordinatorObserver) RolloutPaths(key provider.RootKey, thread
 		return nil
 	}
 	return maps.Clone(f.threadPaths)
+}
+
+func (f *fakeCodexCoordinatorObserver) TurnUsageLimit(key provider.RootKey, rootID string) (time.Time, *time.Time, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.bindings[key] != rootID {
+		return time.Time{}, nil, false
+	}
+	limit, ok := f.turnLimits[rootID]
+	return limit.at, limit.resetsAt, ok
 }
 
 func (f *fakeCodexCoordinatorObserver) binding(key provider.RootKey) string {

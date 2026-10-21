@@ -279,6 +279,39 @@ func TestExplainStatusShouldReportLimitedWithTheUnderlyingDecisionBeneathItWhenA
 	}
 }
 
+func TestExplainStatusShouldReportTheCodexWitnessProvenanceAndResetQuality(t *testing.T) {
+	for _, tt := range []struct {
+		source    string
+		fromEpoch bool
+	}{
+		{UsageLimitSourceCodexRollout, true},
+		{UsageLimitSourceCodexAppServer, false},
+	} {
+		t.Run(tt.source, func(t *testing.T) {
+			s := &Session{PID: 13, StartedAt: herdrT0, Agent: AgentKindCodex, Codex: &AgentInfo{}}
+			s.SetAgentGraph(codexGraph(t, agentgraph.RuntimeIdle, agentgraph.AttentionNone, herdrT0, time.Hour), herdrT0)
+			resets := herdrT0.Add(3 * time.Hour)
+			s.RecordUsageLimit(UsageLimit{ObservedAt: herdrT0, ResetsAt: &resets, Source: tt.source, ResetFromEpoch: tt.fromEpoch})
+			at := herdrT0.Add(time.Minute)
+			d := s.ExplainStatus(at)
+			if d.Status != StatusLimited || d.Reason != statusexplain.ReasonUsageLimitOverlay || d.Source != tt.source {
+				t.Fatalf("decision = %+v, want limited with source %s", d.Choice, tt.source)
+			}
+			if s.UsageLimit.ResetFromEpoch != tt.fromEpoch {
+				t.Fatalf("reset quality = %v, want %v", s.UsageLimit.ResetFromEpoch, tt.fromEpoch)
+			}
+			cp := *s
+			codex := *s.Codex
+			cp.Codex = &codex
+			cp.UsageLimit = cloneUsageLimit(s.UsageLimit)
+			published := ProjectPublished(Snapshot{Sessions: []Session{cp}}, at)
+			if published.Sessions[0].UsageLimit.ResetFromEpoch != tt.fromEpoch {
+				t.Fatalf("published reset quality = %v, want %v", published.Sessions[0].UsageLimit.ResetFromEpoch, tt.fromEpoch)
+			}
+		})
+	}
+}
+
 func TestExplainStatusShouldOverlayLimitedOverAPermissionWhenActive(t *testing.T) {
 	s := &Session{PID: 11, StartedAt: herdrT0, Agent: AgentKindClaude, Claude: &AgentInfo{}}
 	s.SetAgentGraph(claudeGraph(t, agentgraph.RuntimeIdle, herdrT0, time.Hour), herdrT0)

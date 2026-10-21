@@ -36,6 +36,48 @@ func TestObserveTurnUsageLimitShouldReadTheAppServerTurnError(t *testing.T) {
 	}
 }
 
+func TestReadRolloutStateShouldPreferTheRateLimitEpochForTheReset(t *testing.T) {
+	at := time.Date(2026, 9, 30, 22, 0, 0, 0, time.UTC)
+	epoch := at.Add(3 * time.Hour)
+	rows := fmt.Sprintf(
+		"{\"timestamp\":%q,\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"rate_limits\":{\"limit_id\":\"codex\",\"primary\":{\"used_percent\":100,\"resets_at\":%d}}}}\n"+
+			"{\"timestamp\":%q,\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"error\":{\"message\":\"You’ve hit your usage limit.\",\"codex_error_info\":\"usage_limit_exceeded\"}}}\n",
+		at.Add(-time.Second).Format(time.RFC3339Nano), epoch.Unix(),
+		at.Format(time.RFC3339Nano))
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	if err := os.WriteFile(path, []byte(rows), 0600); err != nil {
+		t.Fatal(err)
+	}
+	state, err := ReadRolloutState(path)
+	if err != nil || state.UsageLimit == nil {
+		t.Fatalf("usage limit = %+v err=%v, want the cap", state.UsageLimit, err)
+	}
+	if !state.UsageLimit.ResetFromEpoch {
+		t.Fatalf("reset_from_epoch = false, want the telemetry epoch")
+	}
+	if state.UsageLimit.ResetsAt == nil || !state.UsageLimit.ResetsAt.Equal(epoch) {
+		t.Fatalf("resets_at = %v, want %v", state.UsageLimit.ResetsAt, epoch)
+	}
+}
+
+func TestReadRolloutStateShouldMarkAMessageResetAsNotFromEpoch(t *testing.T) {
+	at := time.Date(2026, 9, 30, 22, 0, 0, 0, time.UTC)
+	rows := fmt.Sprintf(
+		"{\"timestamp\":%q,\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"error\":{\"message\":\"You’ve hit your usage limit. try again at 11:15 PM.\",\"codex_error_info\":\"usage_limit_exceeded\"}}}\n",
+		at.Format(time.RFC3339Nano))
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	if err := os.WriteFile(path, []byte(rows), 0600); err != nil {
+		t.Fatal(err)
+	}
+	state, err := ReadRolloutState(path)
+	if err != nil || state.UsageLimit == nil {
+		t.Fatalf("usage limit = %+v err=%v, want the cap", state.UsageLimit, err)
+	}
+	if state.UsageLimit.ResetFromEpoch {
+		t.Fatalf("reset_from_epoch = true, want a message reset")
+	}
+}
+
 func TestRolloutRuntimeRequiresExplicitLatestLifecycle(t *testing.T) {
 	base := time.Date(2026, 9, 30, 22, 0, 0, 0, time.UTC)
 	marker := func(kind string, seconds int) string {

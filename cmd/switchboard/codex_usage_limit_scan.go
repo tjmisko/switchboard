@@ -5,6 +5,7 @@ import (
 
 	"github.com/tjmisko/switchboard/internal/provider"
 	codexprovider "github.com/tjmisko/switchboard/internal/provider/codex"
+	"github.com/tjmisko/switchboard/internal/state"
 )
 
 // codexUsageLimitScanInterval throttles the scan per root. Observe runs on
@@ -35,8 +36,42 @@ type codexLimitScan struct {
 }
 
 type codexLimitEvidence struct {
-	at    time.Time
-	limit *codexprovider.RolloutUsageLimit
+	at     time.Time
+	limit  *codexprovider.RolloutUsageLimit
+	source string
+}
+
+// witnessBetter reports whether candidate a should replace the current best b.
+// Reset quality decides first: an exact rate-limit epoch beats a reset parsed
+// from the error message. For equal quality the declared source order decides,
+// then recency within one source.
+func witnessBetter(a, b *codexLimitEvidence) bool {
+	if b == nil {
+		return true
+	}
+	if a.limit.ResetFromEpoch != b.limit.ResetFromEpoch {
+		return a.limit.ResetFromEpoch
+	}
+	if a.source != b.source {
+		return codexUsageLimitSourceRank(a.source) < codexUsageLimitSourceRank(b.source)
+	}
+	return a.at.After(b.at)
+}
+
+// codexUsageLimitSourceRank orders two witnesses of equal reset quality. The
+// rollout is the durable witness this scan is built on, so it wins the tie: an
+// app_server source then means the durable witness was unavailable.
+func codexUsageLimitSourceRank(source string) int {
+	if source == state.UsageLimitSourceCodexAppServer {
+		return 1
+	}
+	return 0
+}
+
+// rolloutLimitEvidence wraps a rollout cap so the scan can compare it against
+// the app-server's witness.
+func rolloutLimitEvidence(at time.Time, limit *codexprovider.RolloutUsageLimit) *codexLimitEvidence {
+	return &codexLimitEvidence{at: at, limit: limit, source: state.UsageLimitSourceCodexRollout}
 }
 
 // scanCodexUsageLimit looks for a usage-limit turn end in the root's rollout
@@ -74,9 +109,18 @@ func (c *agentCoordinator) scanCodexUsageLimit(ref provider.RootRef, now time.Ti
 	// rollout records, read from the loaded thread, so a cap is seen even when
 	// no rollout path is bound yet.
 	var newest *codexLimitEvidence
+	consider := func(e *codexLimitEvidence) {
+		if witnessBetter(e, newest) {
+			newest = e
+		}
+	}
 	if source, ok := c.codex.(codexTurnUsageLimitSource); ok {
 		if at, resetsAt, ok := source.TurnUsageLimit(ref.Key(), rootID); ok {
-			newest = &codexLimitEvidence{at: at, limit: &codexprovider.RolloutUsageLimit{ResetsAt: resetsAt}}
+			consider(&codexLimitEvidence{
+				at:     at,
+				limit:  &codexprovider.RolloutUsageLimit{ResetsAt: resetsAt},
+				source: state.UsageLimitSourceCodexAppServer,
+			})
 		}
 	}
 	if rootPath != "" || len(childPaths) > 0 {
@@ -99,24 +143,22 @@ func (c *agentCoordinator) scanCodexUsageLimit(ref provider.RootRef, now time.Ti
 		// The reads run outside every coordinator lock; the claim on scannedAt
 		// above is what keeps two ticks from scanning the same root at once.
 		root := readCodexRolloutState(rootPath)
-		if root.UsageLimit != nil && (newest == nil || root.At.After(newest.at)) {
-			newest = &codexLimitEvidence{at: root.At, limit: root.UsageLimit}
+		if root.UsageLimit != nil {
+			consider(rolloutLimitEvidence(root.At, root.UsageLimit))
 		}
 		for path := range childPaths {
 			child := readCodexRolloutState(path)
 			if child.UsageLimit == nil || !child.At.After(root.At) {
 				continue
 			}
-			if newest == nil || child.At.After(newest.at) {
-				newest = &codexLimitEvidence{at: child.At, limit: child.UsageLimit}
-			}
+			consider(rolloutLimitEvidence(child.At, child.UsageLimit))
 		}
 	}
 
 	if newest == nil || !newest.at.After(hookAt) {
 		return
 	}
-	c.recordCodexUsageLimit(ref, rootID, newest.at, newest.limit)
+	c.recordCodexUsageLimit(ref, rootID, newest.at, newest.limit, newest.source)
 }
 
 // codexHookRolloutPaths returns the rollouts hooks have named for rootID and
