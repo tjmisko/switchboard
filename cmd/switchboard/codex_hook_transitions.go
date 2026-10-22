@@ -1556,15 +1556,40 @@ func (c *agentCoordinator) retireCodexLatchesFromTurnEnd(ref provider.RootRef, n
 		c.codexHookMu.Unlock()
 		return
 	}
-	before := len(state.pending) + len(state.approvals)
-	stop := rpc.Request{Event: "Stop", TurnID: turnID}
-	reduceCodexPendingInput(state, stop)
-	c.reduceCodexPendingApprovalLocked(state, ref, rootID, stop, now)
-	retired := len(state.pending)+len(state.approvals) < before
+	retired := c.releaseCodexLatchesLocked(state, ref, rootID, turnID, now)
 	c.codexHookMu.Unlock()
 	if retired {
 		c.recordDiagnostic(agentgraph.ProviderCodex, "hook_latch_retired_turn_end", now)
 	}
+}
+
+// releaseCodexLatchesLocked runs the Stop sweep for turnID, "" for every latch
+// this root holds, and reports whether it retired anything. c.codexHookMu must
+// be held.
+func (c *agentCoordinator) releaseCodexLatchesLocked(state *codexHookRootState, ref provider.RootRef, rootID, turnID string, now time.Time) bool {
+	before := len(state.pending) + len(state.approvals)
+	stop := rpc.Request{Event: "Stop", TurnID: turnID}
+	reduceCodexPendingInput(state, stop)
+	c.reduceCodexPendingApprovalLocked(state, ref, rootID, stop, now)
+	return len(state.pending)+len(state.approvals) < before
+}
+
+// clearCodexOnUsageLimit is the cap's turn end. A session whose account is
+// capped cannot be blocked on a human, so the root's latches and any red it
+// still carries are stale. It sweeps the latches and lands the rollout-tail
+// idle correction, which outranks a restored last-known red. The cap is
+// account-wide, so it releases every latch this root holds, not one turn's.
+func (c *agentCoordinator) clearCodexOnUsageLimit(ref provider.RootRef, rootID string, at, now time.Time) {
+	if _, ok := sessionForKey(c.store.Snapshot(), ref.Key()); !ok {
+		return
+	}
+	c.codexHookMu.Lock()
+	state := c.codexHookRoots[ref.Key()]
+	if state != nil && state.sessionID == rootID {
+		c.releaseCodexLatchesLocked(state, ref, rootID, "", now)
+	}
+	c.codexHookMu.Unlock()
+	c.landCodexCapTurnEnd(ref, rootID, at, now)
 }
 
 func codexObservationRootAttention(observation agentgraph.Observation) agentgraph.AttentionState {

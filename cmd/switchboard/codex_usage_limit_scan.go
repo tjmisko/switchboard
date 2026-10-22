@@ -46,6 +46,9 @@ type codexLimitEvidence struct {
 	at     time.Time
 	limit  *codexprovider.RolloutUsageLimit
 	source string
+	// rootTurnEnd marks evidence that the root's own turn ended. A subagent's
+	// cap leaves the root waiting, so only a root turn end releases it.
+	rootTurnEnd bool
 }
 
 // witnessBetter reports whether candidate a should replace the current best b.
@@ -77,8 +80,8 @@ func codexUsageLimitSourceRank(source string) int {
 
 // rolloutLimitEvidence wraps a rollout cap so the scan can compare it against
 // the app-server's witness.
-func rolloutLimitEvidence(at time.Time, limit *codexprovider.RolloutUsageLimit) *codexLimitEvidence {
-	return &codexLimitEvidence{at: at, limit: limit, source: state.UsageLimitSourceCodexRollout}
+func rolloutLimitEvidence(at time.Time, limit *codexprovider.RolloutUsageLimit, rootTurnEnd bool) *codexLimitEvidence {
+	return &codexLimitEvidence{at: at, limit: limit, source: state.UsageLimitSourceCodexRollout, rootTurnEnd: rootTurnEnd}
 }
 
 // scanCodexUsageLimit looks for a usage-limit turn end in the root's rollout
@@ -124,9 +127,10 @@ func (c *agentCoordinator) scanCodexUsageLimit(ref provider.RootRef, now time.Ti
 	if source, ok := c.codex.(codexTurnUsageLimitSource); ok {
 		if at, resetsAt, ok := source.TurnUsageLimit(ref.Key(), rootID); ok {
 			consider(&codexLimitEvidence{
-				at:     at,
-				limit:  &codexprovider.RolloutUsageLimit{ResetsAt: resetsAt},
-				source: state.UsageLimitSourceCodexAppServer,
+				at:          at,
+				limit:       &codexprovider.RolloutUsageLimit{ResetsAt: resetsAt},
+				source:      state.UsageLimitSourceCodexAppServer,
+				rootTurnEnd: true,
 			})
 		}
 	}
@@ -151,14 +155,14 @@ func (c *agentCoordinator) scanCodexUsageLimit(ref provider.RootRef, now time.Ti
 		// above is what keeps two ticks from scanning the same root at once.
 		root := readCodexRolloutState(rootPath)
 		if root.UsageLimit != nil {
-			consider(rolloutLimitEvidence(root.At, root.UsageLimit))
+			consider(rolloutLimitEvidence(root.At, root.UsageLimit, true))
 		}
 		for path := range childPaths {
 			child := readCodexRolloutState(path)
 			if child.UsageLimit == nil || !child.At.After(root.At) {
 				continue
 			}
-			consider(rolloutLimitEvidence(child.At, child.UsageLimit))
+			consider(rolloutLimitEvidence(child.At, child.UsageLimit, false))
 		}
 	}
 
@@ -166,6 +170,12 @@ func (c *agentCoordinator) scanCodexUsageLimit(ref provider.RootRef, now time.Ti
 		return
 	}
 	c.recordCodexUsageLimit(ref, rootID, newest.at, newest.limit, newest.source)
+	if newest.rootTurnEnd {
+		// The cap proves the root's turn ended, so anything it still holds red
+		// is stale: release the latches and retire the red now, not only from
+		// the published overlay.
+		c.clearCodexOnUsageLimit(ref, rootID, newest.at, now)
+	}
 }
 
 // codexHookRolloutPaths returns the rollouts hooks have named for rootID and

@@ -80,6 +80,34 @@ func (c *agentCoordinator) pollCodexStoppedRoot(ref provider.RootRef, now time.T
 	c.applyObservationAs(ref, generation, observation, claudeprovider.Compatibility{}, now, "", state.GraphTranscriptTail)
 }
 
+// landCodexCapTurnEnd lands the rollout-tail idle correction a usage cap proves:
+// the capped turn ended, so any permission the root still carries is stale. It
+// is the correction pollCodexStoppedRoot lands, but the cap authorizes it where
+// that read refuses to clear a red, and it needs no hook-bound transcript.
+func (c *agentCoordinator) landCodexCapTurnEnd(ref provider.RootRef, rootID string, at, now time.Time) {
+	sess, ok := sessionForKey(c.store.Snapshot(), ref.Key())
+	if !ok || sess.AgentGraph == nil || sess.AgentGraph.RootID != rootID {
+		return
+	}
+	observation := observationFromState(agentgraph.ProviderCodex, sess.AgentGraph)
+	touched := false
+	for i := range observation.Nodes {
+		node := &observation.Nodes[i]
+		if node.ID != rootID {
+			continue
+		}
+		node.Runtime, node.Attention, node.UpdatedAt = agentgraph.RuntimeIdle, agentgraph.AttentionNone, at
+		touched = true
+	}
+	if !touched {
+		return
+	}
+	observation.Source = agentgraph.SourceCodexRollout
+	observation.ObservedAt, observation.FreshUntil = now, now.Add(codexTranscriptQuietWindow)
+	generation := c.begin(ref.Key())
+	c.applyObservationAs(ref, generation, observation, claudeprovider.Compatibility{}, now, "", state.GraphTranscriptTail)
+}
+
 // recordCodexUsageLimit records a usage-limit turn end, the root's or a
 // subagent's, on the session still bound to rootID. Session.RecordUsageLimit
 // refuses it if a newer activity hook has already arrived.
