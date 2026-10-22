@@ -372,6 +372,108 @@ func applyFixture(t *testing.T, observer *Observer, name string, limit int) {
 	}
 }
 
+func TestTerminalRootTurnShouldNotProjectAPersistedWaitingFlag(t *testing.T) {
+	state := newGraphState(rpcThread{
+		ID:     "root",
+		Status: rpcStatus{Type: "idle", ActiveFlags: []string{"waitingOnApproval"}},
+		Turns:  []rpcTurn{{ID: "turn-1", Status: "completed", CompletedAt: 1700000000}},
+	}, nil, 32)
+	observation, err := state.observation(fixtureNow, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNode(t, observation, "root", "", "", "", agentgraph.RuntimeIdle, agentgraph.AttentionNone, agentgraph.LifecycleUnknown)
+}
+
+func TestRootTurnEndShouldTrackOnlyTheCurrentTerminalTurn(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		turns []rpcTurn
+		want  string
+	}{
+		{"completed newest", []rpcTurn{{ID: "t1", Status: "completed", CompletedAt: 1}}, "t1"},
+		{"interrupted newest", []rpcTurn{{ID: "t1", Status: "interrupted", CompletedAt: 1}}, "t1"},
+		{"failed newest", []rpcTurn{{ID: "t1", Status: "failed", CompletedAt: 1}}, "t1"},
+		{"live newest", []rpcTurn{{ID: "t1", Status: "completed", CompletedAt: 1}, {ID: "t2", Status: "inProgress"}}, ""},
+		{"no status", []rpcTurn{{ID: "t1"}}, ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			state := newGraphState(rpcThread{ID: "root", Status: rpcStatus{Type: "idle"}, Turns: tt.turns}, nil, 32)
+			if state.rootTurnEndID != tt.want {
+				t.Fatalf("rootTurnEndID = %q, want %q", state.rootTurnEndID, tt.want)
+			}
+		})
+	}
+}
+
+func TestTurnEndShouldReportOnlyALoadedTerminalRootTurn(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		runtime    agentgraph.RuntimeState
+		turnStatus string
+		want       bool
+	}{
+		{"loaded completed", agentgraph.RuntimeIdle, "completed", true},
+		{"loaded interrupted", agentgraph.RuntimeIdle, "interrupted", true},
+		{"notLoaded completed", agentgraph.RuntimeNotLoaded, "completed", false},
+		{"unknown completed", agentgraph.RuntimeUnknown, "completed", false},
+		{"loaded inProgress", agentgraph.RuntimeActive, "inProgress", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			graph := newGraphState(rpcThread{
+				ID: "root", Status: rpcStatus{Type: string(tt.runtime)},
+				Turns: []rpcTurn{{ID: "t1", Status: tt.turnStatus, CompletedAt: 1}},
+			}, nil, 32)
+			observer := &Observer{roots: map[provider.RootKey]*rootRecord{}}
+			key := provider.RootKey{PID: 1}
+			observer.roots[key] = &rootRecord{threadID: "root", graph: graph}
+			if _, _, got := observer.TurnEnd(key, "root"); got != tt.want {
+				t.Fatalf("TurnEnd = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTerminalRootTurnShouldNotPreserveABlockingInputRequest(t *testing.T) {
+	prior := newGraphState(rpcThread{ID: "root", Status: rpcStatus{Type: "active"}}, nil, 32)
+	root := prior.nodes["root"]
+	root.ensureWaitMaps()
+	root.wait.requests["req-1"] = requestEvidence{
+		reason: agentgraph.AttentionUserInput, owner: requestHuman, kind: "userInput",
+		turnID: "turn-1", startedAt: fixtureNow,
+	}
+	prior.deriveAll()
+	if !prior.hasHumanAttention() {
+		t.Fatal("prior graph did not hold the input request")
+	}
+
+	snapshot := newGraphState(rpcThread{
+		ID: "root", Status: rpcStatus{Type: "idle"},
+		Turns: []rpcTurn{{ID: "turn-1", Status: "completed", CompletedAt: 1700000000}},
+	}, nil, 32)
+	snapshot.preserveInputAttention(prior)
+	if snapshot.hasHumanAttention() {
+		t.Fatal("terminal turn preserved a blocking input request")
+	}
+}
+
+func TestLiveRootTurnShouldPreserveABlockingInputRequest(t *testing.T) {
+	prior := newGraphState(rpcThread{ID: "root", Status: rpcStatus{Type: "active"}}, nil, 32)
+	root := prior.nodes["root"]
+	root.ensureWaitMaps()
+	root.wait.requests["req-1"] = requestEvidence{
+		reason: agentgraph.AttentionUserInput, owner: requestHuman, kind: "userInput",
+		turnID: "turn-1", startedAt: fixtureNow,
+	}
+	prior.deriveAll()
+
+	snapshot := newGraphState(rpcThread{ID: "root", Status: rpcStatus{Type: "active"}}, nil, 32)
+	snapshot.preserveInputAttention(prior)
+	if !snapshot.hasHumanAttention() {
+		t.Fatal("a live turn dropped a nonblocking input request")
+	}
+}
+
 func assertNode(t *testing.T, observation agentgraph.Observation, id, parent, nickname, role string, runtime agentgraph.RuntimeState, attention agentgraph.AttentionState, lifecycle agentgraph.LifecycleState) {
 	t.Helper()
 	node := findNode(observation, id)

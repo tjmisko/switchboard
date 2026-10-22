@@ -27,6 +27,13 @@ type codexTurnUsageLimitSource interface {
 	TurnUsageLimit(provider.RootKey, string) (time.Time, *time.Time, bool)
 }
 
+// codexTurnEndSource is the app-server's view of whether the root's own newest
+// turn is terminal. It is the release edge the hook stream omits for a capped,
+// interrupted or aborted turn.
+type codexTurnEndSource interface {
+	TurnEnd(provider.RootKey, string) (string, time.Time, bool)
+}
+
 // codexLimitScan is one root's usage-limit scan state: when it last ran. Each
 // rollout's tail verdict is cached by its file identity in ReadRolloutState
 // (internal/tailcache), so an unchanged rollout is stat'ed, not re-read.

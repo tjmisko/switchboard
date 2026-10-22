@@ -1529,6 +1529,44 @@ func (c *agentCoordinator) observeCodexTitleEdge(key provider.RootKey, now time.
 	}
 }
 
+// retireCodexLatchesFromTurnEnd retires the latches a finished app-server turn
+// opened. Codex fires no Stop hook for a capped, interrupted or aborted turn, so
+// the app-server's terminal turn stands in for it: the same writer-blind,
+// turn-scoped sweep the Stop edge runs, so a latch that names another turn
+// survives.
+//
+// The store snapshot is read before codexHookMu, never while it is held.
+func (c *agentCoordinator) retireCodexLatchesFromTurnEnd(ref provider.RootRef, now time.Time) {
+	source, ok := c.codex.(codexTurnEndSource)
+	if !ok {
+		return
+	}
+	sess, ok := sessionForKey(c.store.Snapshot(), ref.Key())
+	if !ok || sess.AgentGraph == nil || sess.AgentGraph.RootID == "" {
+		return
+	}
+	rootID := sess.AgentGraph.RootID
+	turnID, _, ok := source.TurnEnd(ref.Key(), rootID)
+	if !ok {
+		return
+	}
+	c.codexHookMu.Lock()
+	state := c.codexHookRoots[ref.Key()]
+	if state == nil || state.sessionID != rootID {
+		c.codexHookMu.Unlock()
+		return
+	}
+	before := len(state.pending) + len(state.approvals)
+	stop := rpc.Request{Event: "Stop", TurnID: turnID}
+	reduceCodexPendingInput(state, stop)
+	c.reduceCodexPendingApprovalLocked(state, ref, rootID, stop, now)
+	retired := len(state.pending)+len(state.approvals) < before
+	c.codexHookMu.Unlock()
+	if retired {
+		c.recordDiagnostic(agentgraph.ProviderCodex, "hook_latch_retired_turn_end", now)
+	}
+}
+
 func codexObservationRootAttention(observation agentgraph.Observation) agentgraph.AttentionState {
 	for _, node := range observation.Nodes {
 		if node.ID == observation.RootID {

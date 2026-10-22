@@ -166,6 +166,11 @@ type graphState struct {
 	rootTurnID  string
 	nodes       map[string]*nodeState
 	unknownEnum bool
+	// rootTurnEndID/rootTurnEndAt name the root's own newest turn when the
+	// app-server reports it terminal. A finished turn owns no live modal, so a
+	// waiting flag the snapshot still carries is that turn's persisted remnant.
+	rootTurnEndID string
+	rootTurnEndAt time.Time
 	// usageLimitAt/usageLimitResetsAt are the newest app-server turn error
 	// that ended on the provider's usage limit. The rollout scan is the
 	// durable witness; this is the same fact read from the loaded thread and
@@ -186,6 +191,12 @@ func newGraphState(root rpcThread, descendants []rpcThread, terminalLimit int) *
 			state.applyCollaboration(turn.ID, item)
 		}
 	}
+	state.observeTurnEnd(root.Turns)
+	if state.rootTurnEndID != "" && state.rootTurnEndID == state.rootTurnID {
+		// The waiting flag persisted across the turn's end: clear it, or a
+		// notLoaded root reads as a live approval it no longer has.
+		state.clearThreadWait(root.ID)
+	}
 	for _, thread := range descendants {
 		for _, turn := range thread.Turns {
 			for _, item := range turn.Items {
@@ -197,9 +208,55 @@ func newGraphState(root rpcThread, descendants []rpcThread, terminalLimit int) *
 	return state
 }
 
+// turnTerminal reports whether a turn status ends the turn. Codex's TurnStatus
+// is completed, interrupted, failed or inProgress.
+func turnTerminal(status string) bool {
+	switch status {
+	case "completed", "interrupted", "failed":
+		return true
+	default:
+		return false
+	}
+}
+
+// observeTurnEnd records the root's own newest turn when the snapshot reports
+// it terminal. It only looks at the turn the snapshot names current, so an
+// older terminal turn under a newer live one is not a release edge.
+func (s *graphState) observeTurnEnd(turns []rpcTurn) {
+	for _, turn := range turns {
+		if turn.ID != s.rootTurnID || !turnTerminal(turn.Status) {
+			continue
+		}
+		at := unixSeconds(turn.CompletedAt)
+		if at.IsZero() {
+			at = unixSeconds(turn.StartedAt)
+		}
+		s.rootTurnEndID, s.rootTurnEndAt = turn.ID, at
+	}
+}
+
+// observeTurnCompleted records a terminal root turn from a turn/completed
+// notification. eventAt is the notification's arrival, used when the turn
+// carries no completion time.
+func (s *graphState) observeTurnCompleted(turn rpcTurn, eventAt time.Time) {
+	if turn.ID == "" {
+		return
+	}
+	s.rootTurnID = turn.ID
+	if !turnTerminal(turn.Status) {
+		return
+	}
+	at := unixSeconds(turn.CompletedAt)
+	if at.IsZero() {
+		at = eventAt
+	}
+	s.rootTurnEndID, s.rootTurnEndAt = turn.ID, at
+}
+
 func (s *graphState) clone() *graphState {
 	out := &graphState{
 		rootID: s.rootID, rootTurnID: s.rootTurnID,
+		rootTurnEndID: s.rootTurnEndID, rootTurnEndAt: s.rootTurnEndAt,
 		nodes:       make(map[string]*nodeState, len(s.nodes)),
 		unknownEnum: s.unknownEnum,
 	}
@@ -475,10 +532,16 @@ func (s *graphState) preserveInputAttention(previous *graphState) {
 	if previous == nil || previous.rootID != s.rootID {
 		return
 	}
+	terminal := s.rootTurnEndID != "" && s.rootTurnEndID == s.rootTurnID
 	for id, node := range s.nodes {
 		if prior := previous.nodes[id]; prior != nil {
 			node.asyncInputItems = cloneSet(prior.asyncInputItems)
 			node.seenInputItems = cloneSet(prior.seenInputItems)
+			if terminal && id == s.rootID {
+				// A blocking request cannot outlive its turn. Async questions
+				// above do, by design.
+				continue
+			}
 			// thread/read has no pending-input list. A same-connection snapshot
 			// cannot prove that a nonblocking request was answered.
 			for requestID, request := range prior.inputRequests() {

@@ -470,6 +470,12 @@ func (c *agentCoordinator) observeAt(ctx context.Context, ref provider.RootRef, 
 			return
 		}
 	}
+	if ref.Provider == agentgraph.ProviderCodex && agentgraph.OutcomeOf(observation, err) == agentgraph.OutcomeUsable {
+		// A terminal app-server turn is the Stop the hook stream omits for a
+		// capped, interrupted or aborted turn. Retire the latches it opened
+		// before the overlays re-assert them onto this observation.
+		c.retireCodexLatchesFromTurnEnd(ref, now)
+	}
 	compat, rule := claudeprovider.Compatibility{}, ""
 	if ref.Provider == agentgraph.ProviderClaude {
 		compat = c.claude.Projection(ref.Key())

@@ -731,6 +731,27 @@ func (o *Observer) snapshot(client *rpcClient, rootID string) (*graphState, erro
 	return state, nil
 }
 
+// TurnEnd is the root's own newest turn when the app-server reports it
+// terminal. Codex fires no Stop hook for a capped, interrupted or aborted turn,
+// so this is the release edge for the latches that turn opened. A notLoaded or
+// unknown root is not a live level and reports none.
+func (o *Observer) TurnEnd(key provider.RootKey, rootID string) (string, time.Time, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	record := o.roots[key]
+	if record == nil || record.threadID != rootID || record.graph == nil {
+		return "", time.Time{}, false
+	}
+	graph := record.graph
+	if graph.rootTurnEndID == "" || graph.rootTurnEndID != graph.rootTurnID {
+		return "", time.Time{}, false
+	}
+	if node := graph.nodes[rootID]; node == nil || node.baseRuntime == agentgraph.RuntimeNotLoaded || node.baseRuntime == agentgraph.RuntimeUnknown {
+		return "", time.Time{}, false
+	}
+	return graph.rootTurnEndID, graph.rootTurnEndAt, true
+}
+
 // TurnUsageLimit is the newest usage-limit turn error the app-server has loaded
 // for rootID, read from the same thread turns the graph is built from. It is
 // the alongside path to the rollout scan: the rollout is the durable witness,
@@ -1169,6 +1190,9 @@ func (o *Observer) applyNotificationLocked(notification rpcNotification) ([]prov
 				touches = true
 			}
 		case "turn/completed":
+			if params.ThreadID == state.rootID {
+				state.observeTurnCompleted(params.Turn, eventAt)
+			}
 			if state.nodes[params.ThreadID] != nil {
 				record.usageRefreshDue = true
 				touches = true
