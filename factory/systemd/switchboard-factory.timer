@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily switchboard factory sweep
+
+[Timer]
+OnCalendar=*-*-* 10:00
+# Run at the next boot or login when the machine was off at 10:00. One catch-up
+# run covers any number of missed days: the sweep is keyed by version, not date.
+Persistent=true
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=Switchboard factory — sweep claude/codex/pi for upstream changes
+Documentation=file://%h/Projects/switchboard/factory/README.md
+# A failed fetch (offline at boot, a GitHub 504) exits non-zero and is retried
+# below; the sweep is idempotent, so the retry only redoes what is missing.
+StartLimitIntervalSec=1d
+StartLimitBurst=4
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/Projects/switchboard/factory/run sweep
+Restart=on-failure
+RestartSec=30min
+Nice=10
