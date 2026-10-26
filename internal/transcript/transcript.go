@@ -153,7 +153,12 @@ type entry struct {
 	Subtype               string `json:"subtype"`
 	QueueTranscriptOnly   bool   `json:"queueTranscriptOnly"`
 	PreventedContinuation bool   `json:"preventedContinuation"`
-	Timestamp             string `json:"timestamp"`
+	// IsMeta marks a user entry Claude Code injected itself rather than one the
+	// user typed: a slash command's returned context (limpid's /read), the
+	// reminder /rename leaves, a loaded skill body. classify reads it as no agent
+	// turn (see classify).
+	IsMeta    bool   `json:"isMeta"`
+	Timestamp string `json:"timestamp"`
 	// UUID identifies the transcript row. Current assistant rows also carry the
 	// provider message id below; UUID is a content-free fallback for older rows.
 	UUID    string `json:"uuid"`
@@ -1338,8 +1343,18 @@ func AnchorSince(path string, now, prev time.Time, intoWorking bool, maxBytes in
 // counting as activity: its blocks are tool_result, not text, so neither special
 // case matches — that is the real "agent is mid-turn" signal the resume self-heal
 // relies on.
+//
+// An `isMeta` user entry is never activity. Current Claude Code no longer writes
+// a slash command as a tagged user entry: it writes a `system`/`local_command`
+// record (ignored above) and, when the command returns context, a user entry
+// flagged isMeta whose text carries NO tag. limpid's /read found it: its "The
+// user opened limpid page …" note slipped past localCommandPrefixes, read as
+// activity, and the idle→working self-heal turned an idle session green with no
+// Stop to bring it back. isMeta is the harness's own marker for text it injected
+// — never a typed prompt, never model output — so dropping it loses no resume
+// signal: a real turn fires UserPromptSubmit and writes assistant entries.
 func classify(e entry) Signal {
-	if e.QueueTranscriptOnly {
+	if e.QueueTranscriptOnly || e.IsMeta {
 		return SignalNone
 	}
 	switch e.Message.Role {

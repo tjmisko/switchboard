@@ -376,6 +376,10 @@ remains the event that opens red; a missing or ambiguous join falls back to the
 transcript latch. See the implementation and rollout record in
 [docs/pretooluse-hook-plan.md](docs/pretooluse-hook-plan.md).
 
+If you add your own slash commands, plugins or tools to Claude Code, see
+[custom commands and tools](docs/custom-tools.md) for how they can show the
+wrong color and how to avoid it.
+
 `SubagentStart`/`SubagentStop` are **optional** — they make subagent-fanout
 detection real-time by triggering an immediate re-scan instead of waiting for the
 next reconcile tick. Fanouts are still detected without them (the daemon scans
