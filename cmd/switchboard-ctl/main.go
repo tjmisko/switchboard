@@ -696,6 +696,7 @@ const (
 type piHookPayload struct {
 	OpenDialogs         *int     `json:"open_dialogs"`
 	Busy                bool     `json:"busy"`
+	Aborted             bool     `json:"aborted"`
 	PreviousSessionFile string   `json:"previous_session_file"`
 	SessionName         string   `json:"session_name"`
 	MessageID           string   `json:"message_id"`
@@ -722,6 +723,8 @@ func carryPiLifecycle(req *rpc.Request, body []byte, event string) {
 		req.Busy = payload.Busy
 		req.PreviousSessionFile = boundedHookPath(payload.PreviousSessionFile)
 		req.SessionName = truncatePrompt(payload.SessionName, maxPiSessionName)
+	case "Stop":
+		req.Aborted = payload.Aborted
 	case "SessionName":
 		// Pi's /name mid-session (session_info_changed); empty when cleared.
 		req.SessionName = truncatePrompt(payload.SessionName, maxPiSessionName)

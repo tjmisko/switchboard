@@ -163,6 +163,26 @@ func TestPiHookShouldCarryEachFieldOnlyOnItsOwnEventWhenAPayloadHasThemAll(t *te
 	}
 }
 
+func TestPiHookShouldCarryAbortedOnlyOnStopWhenTheExtensionSendsIt(t *testing.T) {
+	body := []byte(`{"aborted":true}`)
+	if req := parseHookPayloadAt(body, "Stop", state.AgentKindPi, hookAt); !req.Aborted {
+		t.Fatalf("Stop aborted = false, want true")
+	}
+	for _, event := range []string{"StopFailure", "UserPromptSubmit", "SessionStart", "PermissionResolved"} {
+		if req := parseHookPayloadAt(body, event, state.AgentKindPi, hookAt); req.Aborted {
+			t.Errorf("%s carried aborted", event)
+		}
+	}
+	for _, agent := range []string{state.AgentKindClaude, state.AgentKindCodex} {
+		if req := parseHookPayloadAt(body, "Stop", agent, hookAt); req.Aborted {
+			t.Errorf("%s Stop carried Pi's aborted", agent)
+		}
+	}
+	if req := parseHookPayloadAt([]byte(`{"session_id":"pi-1","aborted":"yes"}`), "Stop", state.AgentKindPi, hookAt); req.Aborted || req.SessionID != "pi-1" {
+		t.Errorf("malformed aborted = %v session=%q, want false and the session kept", req.Aborted, req.SessionID)
+	}
+}
+
 func TestPiFieldsShouldNotReachTheWireWhenClaudeOrCodexSendThem(t *testing.T) {
 	body := []byte(`{"open_dialogs":1,"busy":true,"session_name":"n","model":"m","input_tokens":1}`)
 	for _, agent := range []string{state.AgentKindClaude, state.AgentKindCodex} {
