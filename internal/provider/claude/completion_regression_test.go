@@ -81,6 +81,26 @@ func TestTranscriptStopPollingRequiresQuietHooksAndTerminalEvidence(t *testing.T
 	}
 }
 
+// limpid's /read fires no hook; Claude Code records it as a local_command system
+// entry plus an untagged isMeta user entry holding the returned context. The
+// session is idle while the user reads, so the chip must stay orange.
+func TestSlashCommandContextAfterStopStaysIdle(t *testing.T) {
+	o, root, now := newTestObserver(t)
+	defer o.Close()
+	o.ApplyHook(HookSignal{Root: root, Event: "UserPromptSubmit", At: now})
+	appendClaudeLine(t, root.Transcript, fmt.Sprintf(`{"type":"assistant","timestamp":%q,"message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"Done"}]}}`, now.Add(time.Second).Format(time.RFC3339Nano)))
+	o.ApplyHook(HookSignal{Root: root, Event: "Stop", At: now.Add(time.Second + 10*time.Millisecond)})
+	appendClaudeLine(t, root.Transcript, fmt.Sprintf(`{"type":"system","subtype":"local_command","timestamp":%q,"content":"<command-name>/read</command-name>"}`, now.Add(2*time.Minute).Format(time.RFC3339Nano)))
+	appendClaudeLine(t, root.Transcript, fmt.Sprintf(`{"type":"user","isMeta":true,"timestamp":%q,"message":{"role":"user","content":"The user opened limpid page /tmp/claude-x.html."}}`, now.Add(2*time.Minute).Format(time.RFC3339Nano)))
+	for _, elapsed := range []time.Duration{2*time.Minute + time.Second, 10 * time.Minute} {
+		obs, err := o.Observe(context.Background(), root, now.Add(elapsed))
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertSummary(t, obs, now.Add(elapsed), agentgraph.LegacyIdle, agentgraph.AttentionNone)
+	}
+}
+
 func TestPollingHealsRestoredFalseGreenWithNewerStatusAnchor(t *testing.T) {
 	o, root, now := newTestObserver(t)
 	defer o.Close()

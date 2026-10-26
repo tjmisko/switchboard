@@ -48,6 +48,19 @@ func bashStdout(ts, s string) string {
 	return userStringContent(ts, "<bash-stdout>"+s+"</bash-stdout>")
 }
 
+// localCommandRecord is the `system`/`local_command` entry current Claude Code
+// writes for a slash command, in place of the older tagged user entry.
+func localCommandRecord(ts, name string) string {
+	return fmt.Sprintf(`{"type":"system","subtype":"local_command","timestamp":%q,"content":"<command-name>/%s</command-name>"}`, ts, name)
+}
+
+// metaUser is a user entry Claude Code injected itself (isMeta): a slash
+// command's returned context, the reminder /rename leaves. Its text carries no
+// local-command tag, so only the flag tells it apart from a typed prompt.
+func metaUser(ts, s string) string {
+	return fmt.Sprintf(`{"type":"user","isMeta":true,"timestamp":%q,"message":{"role":"user","content":%q}}`, ts, s)
+}
+
 // systemLine is a timestamped system entry with no message.role — ancillary, so
 // it must not count as conversational activity.
 func systemLine(ts string) string {
@@ -231,6 +244,58 @@ func TestNewestSignal(t *testing.T) {
 			},
 			wantKind: SignalActivity,
 			wantTS:   "2026-06-01T21:39:05Z",
+		},
+		{
+			// The regression: limpid's /read returns context, which Claude Code
+			// writes as an untagged isMeta user entry after the Stop. It started no
+			// turn, so it must not promote an idle chip to green.
+			name: "should not treat a slash command's returned context as activity",
+			lines: []string{
+				assistantText("2026-10-26T16:05:20Z"),
+				localCommandRecord("2026-10-26T16:07:59Z", "read"),
+				metaUser("2026-10-26T16:07:59Z", "The user opened limpid page /tmp/claude-x.html. Answers and comments arrive complete."),
+			},
+			wantKind: SignalActivity,
+			wantTS:   "2026-10-26T16:05:20Z",
+		},
+		{
+			name: "should not treat the reminder /rename leaves as activity",
+			lines: []string{
+				assistantText("2026-10-26T16:05:20Z"),
+				localCommandRecord("2026-10-26T16:06:00Z", "rename"),
+				metaUser("2026-10-26T16:06:00Z", "<system-reminder>\nThe user named this session \"x\".\n</system-reminder>"),
+			},
+			wantKind: SignalActivity,
+			wantTS:   "2026-10-26T16:05:20Z",
+		},
+		{
+			name: "should report none when the tail holds only a slash command and its meta context",
+			lines: []string{
+				localCommandRecord("2026-10-26T16:07:59Z", "read"),
+				metaUser("2026-10-26T16:07:59Z", "The user opened limpid page /tmp/claude-x.html."),
+			},
+			wantKind: SignalNone,
+			wantTS:   "",
+		},
+		{
+			// The guard against over-reach: the same text typed by the user (no
+			// isMeta) is a real prompt and still reads as activity.
+			name:     "should still treat an untagged non-meta user prompt as activity",
+			lines:    []string{assistantText("2026-10-26T16:05:20Z"), userStringContent("2026-10-26T16:09:54Z", "The user opened limpid page")},
+			wantKind: SignalActivity,
+			wantTS:   "2026-10-26T16:09:54Z",
+		},
+		{
+			name:     "should report activity when the agent answers after a meta entry",
+			lines:    []string{metaUser("2026-10-26T16:07:59Z", "context"), assistantText("2026-10-26T16:08:10Z")},
+			wantKind: SignalActivity,
+			wantTS:   "2026-10-26T16:08:10Z",
+		},
+		{
+			name:     "should still report an interrupt that follows a meta entry",
+			lines:    []string{metaUser("2026-10-26T16:07:59Z", "context"), interruptLine("2026-10-26T16:08:10Z")},
+			wantKind: SignalInterrupt,
+			wantTS:   "2026-10-26T16:08:10Z",
 		},
 		{
 			name:     "should tolerate blank and malformed lines",
