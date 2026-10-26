@@ -1,0 +1,183 @@
+# The upstream surfaces switchboard depends on, and where to watch them.
+#
+# factory/run reads this file to:
+#   - flag fingerprint changes (each surface's `fingerprint` regexes),
+#   - pre-flag changelog bullets (`keywords`, case-insensitive substrings),
+#   - give the classifier the context it needs to call a change a threat.
+#
+# risk:
+#   status    drift silently changes what a session shows (working / waiting /
+#             idle / limited / done). Nothing errors; the bar is just wrong.
+#   identity  drift loses or misattributes a session (discovery, binding,
+#             naming, subagent parentage).
+#   cost      usage / pricing / billing numbers drift.
+#
+# None of these is a stable upstream contract. The Codex app-server schema is
+# generated but marked [experimental].
+
+# ---------------------------------------------------------------- claude ----
+
+[tools.claude]
+changelog = { kind = "markdown-h2", url = "https://raw.githubusercontent.com/anthropics/claude-code/main/CHANGELOG.md" }
+docs = [
+  "https://code.claude.com/docs/en/hooks.md",
+  "https://code.claude.com/docs/llms.txt",
+]
+keywords = ["hook", "transcript", "jsonl", "subagent", "agent team", "teammate", "workflow", "permission prompt", "elicitation", "stop", "compact", "usage limit", "rate limit", "session id", "resume", "statusline", "status line", "notification"]
+
+[[tools.claude.surface]]
+name = "hook events"
+risk = "status"
+reads = ["~/.claude/settings.json -> switchboard-ctl", "internal/provider/claude/observer.go"]
+fingerprint = ['^hook_event\s']
+note = "21 of 33 binary events registered (2026-10-26). A renamed or removed event is a silent status loss."
+
+[[tools.claude.surface]]
+name = "hook payload base fields (session_id, transcript_path, agent_id, agent_type, prompt_id, permission_mode)"
+risk = "identity"
+reads = ["docs/claude-code-hook-schema.md"]
+note = "agent_id is the only subagent discriminator. Not fingerprinted; re-verify by hand (doc last verified on 2.1.222)."
+
+[[tools.claude.surface]]
+name = "StopFailure error + last_assistant_message text"
+risk = "status"
+reads = ["internal/usagelimit"]
+note = "Free-text regexes for the `limited` status; the most brittle thing we parse."
+
+[[tools.claude.surface]]
+name = "transcript JSONL (type, subtype, isMeta, stop_reason, toolUseResult, tool_use/tool_result blocks)"
+risk = "status"
+reads = ["internal/transcript/transcript.go"]
+note = "Witness when hooks are silent. #119 (isMeta) is an example of drift here."
+
+[[tools.claude.surface]]
+name = "subagent transcripts <session>/subagents/agent-*.jsonl"
+risk = "identity"
+reads = ["internal/transcript/subagents.go"]
+
+[[tools.claude.surface]]
+name = "workflow runs <session>/subagents/workflows/wf_<id>/journal.jsonl, agent-*.meta.json, workflows/scripts/*.js"
+risk = "status"
+reads = ["internal/transcript/workflows.go"]
+note = "Workflows fire no hooks; this undocumented layout is the only signal."
+
+[[tools.claude.surface]]
+name = "assistant message usage fields"
+risk = "cost"
+reads = ["internal/transcript/usage.go", "internal/pricing"]
+
+[[tools.claude.surface]]
+name = "process shape: comm == claude, exe resolves to .../claude"
+risk = "identity"
+reads = ["internal/discovery/discovery.go"]
+fingerprint = ['^cli_flag --(resume|continue|agent|session-id|print)\b']
+
+# ----------------------------------------------------------------- codex ----
+
+[tools.codex]
+changelog = { kind = "github-releases", url = "https://api.github.com/repos/openai/codex/releases", tag_prefix = "rust-v" }
+docs = [
+  "https://developers.openai.com/codex/changelog",
+  "https://raw.githubusercontent.com/openai/codex/main/codex-rs/app-server/README.md",
+  "https://developers.openai.com/codex/hooks",
+]
+keywords = ["app-server", "app server", "thread", "turn", "approval", "request_user_input", "requestuserinput", "question", "hook", "rollout", "session", "status", "guardian", "auto-review", "auto review", "subagent", "sub-agent", "multi-agent", "steer", "interrupt", "usage limit", "rate limit", "daemon", "proxy"]
+
+[[tools.codex.surface]]
+name = "app-server thread/turn/item notifications"
+risk = "status"
+reads = ["internal/provider/codex/observer.go", "internal/provider/codex/protocol.go"]
+fingerprint = ['^method \w+ (thread|turn)/', '^method \w+ item/(started|completed)$']
+
+[[tools.codex.surface]]
+name = "ThreadStatus variants and ThreadActiveFlag (waitingOnApproval, ...)"
+risk = "status"
+reads = ["internal/provider/codex/observer.go"]
+fingerprint = ['^(def|field|enum) (ThreadStatus|ThreadActiveFlag|TurnStatus|Turn|Thread|ThreadItem)\b']
+note = "Codex's own status enum; any new variant or flag needs a mapping."
+
+[[tools.codex.surface]]
+name = "approval and question server requests, serverRequest/resolved"
+risk = "status"
+reads = ["internal/provider/codex/observer.go"]
+fingerprint = [
+  '^method \w+ item/(tool/requestUserInput|commandExecution/requestApproval|fileChange/requestApproval|permissions/requestApproval)$',
+  '^method \w+ (applyPatchApproval|execCommandApproval|serverRequest/resolved)$',
+  '^(def|field|enum) \w*(Approval|RequestUserInput|ServerRequestResolved)\w*\b',
+]
+note = "requestUserInput is the mid-turn question path."
+
+[[tools.codex.surface]]
+name = "auto-approval review (guardian)"
+risk = "status"
+reads = ["internal/provider/codex/observer.go", "docs/codex-auto-review-attention.md"]
+fingerprint = ['^method \w+ item/autoApprovalReview/', '^(def|field|enum) Guardian\w*\b', '^feature \S*guardian\S*\s']
+
+[[tools.codex.surface]]
+name = "client requests (thread/list, read, turns/list, start, resume; turn/start, steer, interrupt; account/read, usage/read)"
+risk = "identity"
+reads = ["internal/provider/codex/client.go", "internal/provider/codex/proxy.go"]
+fingerprint = ['^method ClientRequest (thread|turn|account)/']
+
+[[tools.codex.surface]]
+name = "account usage and rate limits"
+risk = "cost"
+reads = ["internal/provider/codex/client.go"]
+fingerprint = ['^method \w+ account/', '^(def|field|enum) (TokenUsage|RateLimit\w*|\w*UsageLimit\w*)\b']
+
+[[tools.codex.surface]]
+name = "shared app-server daemon and proxy"
+risk = "identity"
+reads = ["internal/provider/codex/proxy.go", "internal/provider/codex/binding.go"]
+fingerprint = ['^app_server_command\s', '^feature \S*app_server\S*\s']
+
+[[tools.codex.surface]]
+name = "rollout JSONL ~/.codex/sessions/** (session_meta, turn_context, event_msg token_count, model_reroute)"
+risk = "status"
+reads = ["internal/provider/codex/rollout.go", "internal/provider/codex/runtime_rollout.go"]
+note = "Not fingerprinted. Usage-limit text is scanned here too."
+
+[[tools.codex.surface]]
+name = "~/.codex/hooks.json events"
+risk = "status"
+reads = ["cmd/switchboard/codex_hook_transitions.go"]
+fingerprint = ['^feature \S*hook\S*\s']
+
+[[tools.codex.surface]]
+name = "process shape: comm == codex, argv[0] basename, app-server subcommand excluded"
+risk = "identity"
+reads = ["internal/discovery/discovery.go"]
+
+# -------------------------------------------------------------------- pi ----
+
+[tools.pi]
+changelog = { kind = "markdown-h2", url = "https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/CHANGELOG.md" }
+docs = ["https://github.com/earendil-works/pi/tree/main/packages/coding-agent/docs"]
+keywords = ["extension", "event", "session", "session file", "jsonl", "rpc", "ui prompt", "prompt", "agent_", "settle", "tool_execution", "subagent", "usage", "process title"]
+
+[[tools.pi.surface]]
+name = "extension events"
+risk = "status"
+reads = ["integrations/pi/switchboard.ts"]
+fingerprint = [
+  '^extension_event (agent_settled|agent_start|before_provider_headers|message_end|provider_stream_event|session_info_changed|session_shutdown|session_start|tool_execution_end|tool_execution_start|ui_prompt_end|ui_prompt_start)$',
+  '^extension_event agent_',
+]
+note = "12 of 41 events used (1.0.4). ui_prompt_* is the waiting signal."
+
+[[tools.pi.surface]]
+name = "extension API types and docs"
+risk = "status"
+reads = ["dist/core/extensions/types.d.ts", "docs/extensions.md"]
+fingerprint = ['^doc_sha (extensions|message-types)\.md', '^doc_sha types\.d\.ts']
+
+[[tools.pi.surface]]
+name = "session files ~/.pi/agent/sessions/--<path>--/<ts>_<uuid>.jsonl (type session, message)"
+risk = "status"
+reads = ["internal/provider/pi/session_file.go"]
+fingerprint = ['^doc_sha (session-format|sessions)\.md']
+
+[[tools.pi.surface]]
+name = "process shape: comm == pi, node exe, argv overwritten to pi"
+risk = "identity"
+reads = ["internal/discovery/discovery.go"]
