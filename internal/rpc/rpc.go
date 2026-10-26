@@ -161,6 +161,9 @@ type Request struct {
 	OpenDialogs *int `json:"open_dialogs,omitempty"`
 	// Busy is SessionStart's !ctx.isIdle(): a reload landed mid-run.
 	Busy bool `json:"busy,omitempty"`
+	// Aborted is Stop's cancelled run: the user interrupted it (Escape)
+	// rather than letting it finish. The status is idle either way.
+	Aborted bool `json:"aborted,omitempty"`
 	// PreviousSessionFile is SessionStart's previousSessionFile on /new,
 	// /resume and /fork, which pairs a rotated session with its predecessor.
 	PreviousSessionFile string `json:"previous_session_file,omitempty"`

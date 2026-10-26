@@ -22,7 +22,7 @@
 //   ui_prompt_start, herdr:blocked      → PermissionRequest {open_dialogs}
 //   ui_prompt_end, herdr:blocked off    → PermissionResolved {open_dialogs}
 //   message_end (assistant)             → Usage {token counts, cost_total, provider, model, message_id}
-//   agent_settled                       → Stop, or StopFailure {error_message} after an error stop
+//   agent_settled                       → Stop {aborted}, or StopFailure {error_message} after an error stop
 //
 // open_dialogs is the number of dialogs open now (the ui_prompt span plus
 // herdr's blocked counter), not an edge, so a lost or reordered hook
@@ -95,6 +95,19 @@ export function selectedUpstreamFromChunk(chunk: any): { responseId: string; ups
   const upstream = raw.toLowerCase().trim().replace(/\s+/g, "-");
   if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(upstream)) return undefined;
   return { responseId, upstream };
+}
+
+// settledHook decides what agent_settled reports. An error stop stays a
+// StopFailure even when the user then cancelled a retry, because the ctl
+// classifies usage limits from its error text. Otherwise the run was cancelled
+// when Pi says so (agent_settled.aborted, Pi 1.1.0+) or, on older Pi, when the
+// last assistant message stopped as aborted.
+export function settledHook(
+  event: any,
+  last: { stopReason?: string } | undefined,
+): { hook: "Stop" | "StopFailure"; aborted: boolean } {
+  if (last?.stopReason === "error") return { hook: "StopFailure", aborted: false };
+  return { hook: "Stop", aborted: event?.aborted === true || last?.stopReason === "aborted" };
 }
 
 export default function (pi) {
@@ -232,13 +245,15 @@ export default function (pi) {
 
   // agent_end can still be followed by an automatic retry or compaction;
   // agent_settled is the point where Pi will not continue on its own.
-  pi.on("agent_settled", (_event, ctx) => {
+  pi.on("agent_settled", (event, ctx) => {
     if (!interactive || ctx?.isIdle?.() === false) return;
-    const failed = lastAssistant?.stopReason === "error";
+    const settled = settledHook(event, lastAssistant);
     const errorMessage = String(lastAssistant?.errorMessage ?? "").slice(0, maxErrorMessage);
     lastAssistant = undefined;
-    if (!failed) {
-      send("Stop", sessionFields(ctx));
+    if (settled.hook === "Stop") {
+      const payload: Record<string, unknown> = sessionFields(ctx);
+      if (settled.aborted) payload.aborted = true;
+      send("Stop", payload);
       return;
     }
     const payload: Record<string, unknown> = sessionFields(ctx);

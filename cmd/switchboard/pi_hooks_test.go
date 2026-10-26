@@ -361,6 +361,26 @@ func TestPiReducerShouldRecordEveryEdgeAsATransitionWithAPiRule(t *testing.T) {
 	}
 }
 
+func TestPiReducerShouldRecordACancelledRunWhenStopIsAborted(t *testing.T) {
+	h := newPiHarness(t)
+	h.hook("SessionStart", 0)
+	h.hook("UserPromptSubmit", time.Second)
+	h.hook("Stop", 2*time.Second, func(req *rpc.Request) { req.Aborted = true })
+	h.wantStatus("cancelled run", state.StatusIdle)
+	h.hook("UserPromptSubmit", 3*time.Second)
+	h.hook("Stop", 4*time.Second)
+	var rules []string
+	for _, event := range h.events() {
+		if event.Type == history.EventTransition && event.To == state.StatusIdle && event.From == state.StatusWorking {
+			rules = append(rules, event.Rule)
+		}
+	}
+	want := []string{statustune.RulePiRunCancelled, statustune.RulePiRunSettled}
+	if len(rules) != len(want) || rules[0] != want[0] || rules[1] != want[1] {
+		t.Fatalf("working→idle rules = %v, want %v (the cancel must not stick to the next run)", rules, want)
+	}
+}
+
 func TestPiReducerShouldIgnoreAHookWhenTheSessionIsNotPi(t *testing.T) {
 	h := newPiHarness(t)
 	h.store.Apply(func(sessions map[int]*state.Session) { sessions[piTestPID].Agent = state.AgentKindClaude })

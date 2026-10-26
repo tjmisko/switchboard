@@ -106,6 +106,9 @@ func reducePiHook(root *piHookRoot, req rpc.Request, rebinding bool) string {
 		if req.Event == "StopFailure" {
 			return statustune.RulePiRunFailed
 		}
+		if req.Aborted {
+			return statustune.RulePiRunCancelled
+		}
 		return statustune.RulePiRunSettled
 	}
 	return ""
