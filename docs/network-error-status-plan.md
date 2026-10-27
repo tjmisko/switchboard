@@ -1,6 +1,17 @@
 # Network-error status (`error`) — plan
 
-Status: planned on `main` (2026-10-26). Nothing implemented yet.
+Status: implemented on `main` (2026-10-27: 5303395, 44b4131, 1507848, 7578b4e).
+Not yet deployed.
+
+As built, the plan changed in three ways:
+
+- The classifier is a new package, `internal/turnfailure`.
+  `internal/usagelimit` was not renamed, so the Codex usage-limit witness code
+  stayed untouched.
+- `ClearUsageLimit` became `ClearTurnRecords`. It clears both records.
+- A landed provider graph whose root is active again, with a turn newer than
+  the failure, also clears the record (`clearTurnFailureOnRootTurn`). See
+  "Open verification" 1.
 
 ## Problem
 
@@ -160,7 +171,10 @@ park.
 
 ## Open verification
 
-1. **Does a goal-mode check-in fire `UserPromptSubmit`?** If it does, the
+1. **Still unknown** (2026-10-27): the transcript does not record hook firings,
+   and hookcap has no task-notification capture. Both possible answers are now
+   handled, because the root-turn graph edge clears the record either way.
+   **Does a goal-mode check-in fire `UserPromptSubmit`?** If it does, the
    retry loop reads green and the next give-up parks red again, which is what
    the owner wants. If it does not, the record would hold through the retry.
    In that case, also clear on a provider-graph `working` edge whose turn
