@@ -150,6 +150,11 @@ type Request struct {
 	UsageLimit         bool       `json:"usage_limit,omitempty"`
 	UsageLimitResetsAt *time.Time `json:"usage_limit_resets_at,omitempty"`
 
+	// TurnFailure is the ctl edge's verdict that this turn ended on an error
+	// only a human can unblock: "unreachable" (network) or "auth". Message
+	// text never crosses RPC.
+	TurnFailure string `json:"turn_failure,omitempty"`
+
 	// Pi extension lifecycle metadata (integrations/pi/switchboard.ts), set
 	// only on pi-hook requests. None of it is provider content: a count, a
 	// flag, a path, the user-set session name, and usage figures.

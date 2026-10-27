@@ -23,6 +23,7 @@ import (
 	"github.com/tjmisko/switchboard/internal/rpc"
 	"github.com/tjmisko/switchboard/internal/sessionview"
 	"github.com/tjmisko/switchboard/internal/state"
+	"github.com/tjmisko/switchboard/internal/turnfailure"
 	"github.com/tjmisko/switchboard/internal/usagelimit"
 )
 
@@ -811,6 +812,7 @@ func classifyUsageLimit(req *rpc.Request, payload hookPayload, agent string, at 
 		verdict, limited = usagelimit.FromPiError(payload.ErrorMessage, at)
 	}
 	if !limited {
+		classifyTurnFailure(req, payload, agent)
 		return
 	}
 	req.UsageLimit = true
@@ -818,6 +820,27 @@ func classifyUsageLimit(req *rpc.Request, payload hookPayload, agent string, at 
 		resetsAt := verdict.ResetsAt.UTC()
 		req.UsageLimitResetsAt = &resetsAt
 	}
+}
+
+// classifyTurnFailure runs for a failed turn that is not a usage limit and
+// forwards only the verdict, never the error text.
+func classifyTurnFailure(req *rpc.Request, payload hookPayload, agent string) {
+	var kind turnfailure.Kind
+	var failed bool
+	switch agent {
+	case state.AgentKindClaude:
+		var errorType string
+		if json.Unmarshal(payload.Error, &errorType) != nil {
+			return
+		}
+		kind, failed = turnfailure.FromClaude(errorType, payload.LastAssistantMessage)
+	case state.AgentKindPi:
+		kind, failed = turnfailure.FromPi(payload.ErrorMessage)
+	}
+	if !failed {
+		return
+	}
+	req.TurnFailure = string(kind)
 }
 func truncatePrompt(prompt string, limit int) string {
 	prompt = strings.TrimSpace(prompt)
