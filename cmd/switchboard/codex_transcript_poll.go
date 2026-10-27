@@ -132,6 +132,30 @@ func (c *agentCoordinator) recordCodexUsageLimit(ref provider.RootRef, rootID st
 	})
 }
 
+// recordCodexTurnFailure stores a turn that ended on a network or auth error.
+// RecordTurnFailure refuses evidence older than the session's newest activity,
+// so a failure the user has since re-prompted past is not parked again.
+func (c *agentCoordinator) recordCodexTurnFailure(ref provider.RootRef, rootID string, failure state.TurnFailure) {
+	sess, ok := sessionForKey(c.store.Snapshot(), ref.Key())
+	if !ok || sess.AgentGraph == nil || sess.AgentGraph.RootID != rootID {
+		return
+	}
+	// The scan re-reads the same evidence until the rollout moves; only new
+	// evidence is worth a store write and a log line.
+	if sess.TurnFailure != nil && sess.TurnFailure.ObservedAt.Equal(failure.ObservedAt) {
+		return
+	}
+	c.store.Apply(func(sessions map[int]*state.Session) {
+		live := sessions[sess.PID]
+		if live == nil || live.AgentGraph == nil || live.AgentGraph.RootID != rootID {
+			return
+		}
+		if live.RecordTurnFailure(failure) {
+			log.Printf("turn-failure: pid=%d agent=codex kind=%s source=%s", sess.PID, failure.Kind, failure.Source)
+		}
+	})
+}
+
 func formatUsageLimitReset(resetsAt *time.Time) string {
 	if resetsAt == nil {
 		return "unknown"

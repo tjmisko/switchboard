@@ -8,6 +8,7 @@ import (
 	"github.com/tjmisko/switchboard/internal/agentgraph"
 	"github.com/tjmisko/switchboard/internal/tailcache"
 	"github.com/tjmisko/switchboard/internal/tailread"
+	"github.com/tjmisko/switchboard/internal/turnfailure"
 	"github.com/tjmisko/switchboard/internal/usagelimit"
 )
 
@@ -17,6 +18,10 @@ type RolloutState struct {
 	Runtime    agentgraph.RuntimeState
 	At         time.Time
 	UsageLimit *RolloutUsageLimit
+	// TurnFailure is the turnfailure.Kind when that boundary is a turn a network
+	// or auth error ended; empty otherwise. Never set together with UsageLimit.
+	// A string, so the cached value copies without aliasing.
+	TurnFailure string
 }
 
 // RolloutUsageLimit is a usage_limit_exceeded turn end. ResetsAt is nil when
@@ -94,6 +99,36 @@ func (s *graphState) observeTurnUsageLimit(turns []rpcTurn) {
 	}
 }
 
+// observeTurnFailure records the newest network or auth turn error in turns,
+// the same fact the rollout's terminal row carries. A failure is current only
+// while it is the newest turn: a later turn, successful or not yet finished,
+// means the user moved on, so the failure is dropped.
+func (s *graphState) observeTurnFailure(turns []rpcTurn) {
+	var newest, failedAt time.Time
+	var failedKind string
+	for _, turn := range turns {
+		at := turn.endedOrStartedAt()
+		if at.IsZero() {
+			continue
+		}
+		if at.After(newest) {
+			newest = at
+		}
+		kind, ok := turn.Error.turnFailure()
+		if !ok || turn.CompletedAt == 0 || !at.After(failedAt) {
+			continue
+		}
+		failedAt, failedKind = at, string(kind)
+	}
+	if failedKind == "" || failedAt.Before(newest) {
+		return
+	}
+	if !failedAt.After(s.turnFailureAt) {
+		return
+	}
+	s.turnFailureAt, s.turnFailureKind = failedAt, failedKind
+}
+
 func readRolloutState(path string) (RolloutState, error) {
 	const tailBytes = 256 * 1024
 	unknown := RolloutState{Runtime: agentgraph.RuntimeUnknown}
@@ -133,9 +168,16 @@ func readRolloutState(path string) (RolloutState, error) {
 			continue
 		}
 		var turnError rolloutTurnError
-		if json.Unmarshal(event.Payload.Error, &turnError) == nil && turnError.usageLimit() {
+		if json.Unmarshal(event.Payload.Error, &turnError) != nil {
+			continue
+		}
+		if turnError.usageLimit() {
 			resetsAt, fromEpoch := limits.resetFor(turnError.Message, event.Timestamp)
 			state.UsageLimit = &RolloutUsageLimit{ResetsAt: resetsAt, ResetFromEpoch: fromEpoch}
+			continue
+		}
+		if kind, ok := turnfailure.FromCodex(turnError.CodexErrorInfo, turnError.Message); ok {
+			state.TurnFailure = string(kind)
 		}
 	}
 	return state, nil

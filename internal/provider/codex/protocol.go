@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/tjmisko/switchboard/internal/agentgraph"
+	"github.com/tjmisko/switchboard/internal/turnfailure"
 )
 
 type initializeResult struct {
@@ -76,6 +77,26 @@ func (e *rpcTurnError) usageLimit() bool {
 	}
 	var code string
 	return json.Unmarshal(e.CodexErrorInfo, &code) == nil && code == "usageLimitExceeded"
+}
+
+// turnFailure classifies the turn error as a network or auth failure. The
+// app-server spells the code in camelCase; turnfailure folds it.
+func (e *rpcTurnError) turnFailure() (turnfailure.Kind, bool) {
+	if e == nil || e.usageLimit() {
+		return "", false
+	}
+	return turnfailure.FromCodex(e.CodexErrorInfo, e.Message)
+}
+
+// endedOrStartedAt is when the turn finished, or began if it has not.
+func (t rpcTurn) endedOrStartedAt() time.Time {
+	switch {
+	case t.CompletedAt != 0:
+		return time.Unix(t.CompletedAt, 0)
+	case t.StartedAt != 0:
+		return time.Unix(t.StartedAt, 0)
+	}
+	return time.Time{}
 }
 
 type rpcItem struct {
@@ -177,6 +198,10 @@ type graphState struct {
 	// is what the daemon consults when no rollout path is bound.
 	usageLimitAt       time.Time
 	usageLimitResetsAt *time.Time
+	// turnFailureAt/turnFailureKind are the newest app-server turn error that
+	// ended on a network or auth failure and is still the newest turn.
+	turnFailureAt   time.Time
+	turnFailureKind string
 }
 
 func newGraphState(root rpcThread, descendants []rpcThread, terminalLimit int) *graphState {

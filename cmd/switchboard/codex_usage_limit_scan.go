@@ -27,6 +27,12 @@ type codexTurnUsageLimitSource interface {
 	TurnUsageLimit(provider.RootKey, string) (time.Time, *time.Time, bool)
 }
 
+// codexTurnFailureSource is the app-server's view of the root's newest turn
+// when it ended on a network or auth error (turnfailure.Kind as a string).
+type codexTurnFailureSource interface {
+	TurnFailure(provider.RootKey, string) (time.Time, string, bool)
+}
+
 // codexTurnEndSource is the app-server's view of whether the root's own newest
 // turn is terminal. It is the release edge the hook stream omits for a capped,
 // interrupted or aborted turn.
@@ -124,6 +130,19 @@ func (c *agentCoordinator) scanCodexUsageLimit(ref provider.RootRef, now time.Ti
 			newest = e
 		}
 	}
+	// A network or auth failure is parked evidence like a cap. Only the root's own
+	// turn end counts: a subagent's failure does not say the root is stuck.
+	var failure *state.TurnFailure
+	considerFailure := func(at time.Time, kind, source string) {
+		if failure == nil || at.After(failure.ObservedAt) {
+			failure = &state.TurnFailure{ObservedAt: at, Kind: kind, Source: source}
+		}
+	}
+	if source, ok := c.codex.(codexTurnFailureSource); ok {
+		if at, kind, ok := source.TurnFailure(ref.Key(), rootID); ok {
+			considerFailure(at, kind, state.TurnFailureSourceCodexAppServer)
+		}
+	}
 	if source, ok := c.codex.(codexTurnUsageLimitSource); ok {
 		if at, resetsAt, ok := source.TurnUsageLimit(ref.Key(), rootID); ok {
 			consider(&codexLimitEvidence{
@@ -157,6 +176,9 @@ func (c *agentCoordinator) scanCodexUsageLimit(ref provider.RootRef, now time.Ti
 		if root.UsageLimit != nil {
 			consider(rolloutLimitEvidence(root.At, root.UsageLimit, true))
 		}
+		if root.TurnFailure != "" {
+			considerFailure(root.At, root.TurnFailure, state.TurnFailureSourceCodexRollout)
+		}
 		for path := range childPaths {
 			child := readCodexRolloutState(path)
 			if child.UsageLimit == nil || !child.At.After(root.At) {
@@ -166,6 +188,9 @@ func (c *agentCoordinator) scanCodexUsageLimit(ref provider.RootRef, now time.Ti
 		}
 	}
 
+	if failure != nil && failure.ObservedAt.After(hookAt) {
+		c.recordCodexTurnFailure(ref, rootID, *failure)
+	}
 	if newest == nil || !newest.at.After(hookAt) {
 		return
 	}

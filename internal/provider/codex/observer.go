@@ -725,6 +725,9 @@ func (o *Observer) snapshot(client *rpcClient, rootID string) (*graphState, erro
 	state := newGraphState(rootResult.Thread, descendants, o.config.RecentTerminalLimit)
 	state.observeTurnUsageLimit(rootResult.Thread.Turns)
 	state.observeTurnUsageLimit(turnResult.Data)
+	// Both lists are the one thread's turns; judging "newest turn" over their
+	// union keeps a failure in one from outliving a success in the other.
+	state.observeTurnFailure(append(append([]rpcTurn(nil), rootResult.Thread.Turns...), turnResult.Data...))
 	if _, err := state.observation(o.config.Now(), o.config.Freshness); err != nil {
 		return nil, newSnapshotDiagnosticError(DiagnosticSnapshotGraphInvalid, err)
 	}
@@ -764,6 +767,19 @@ func (o *Observer) TurnUsageLimit(key provider.RootKey, rootID string) (time.Tim
 		return time.Time{}, nil, false
 	}
 	return record.graph.usageLimitAt, record.graph.usageLimitResetsAt, true
+}
+
+// TurnFailure is the newest network or auth turn error the app-server has
+// loaded for rootID that is still the root's newest turn, with its
+// turnfailure.Kind. It mirrors TurnUsageLimit.
+func (o *Observer) TurnFailure(key provider.RootKey, rootID string) (time.Time, string, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	record := o.roots[key]
+	if record == nil || record.threadID != rootID || record.graph == nil || record.graph.turnFailureAt.IsZero() {
+		return time.Time{}, "", false
+	}
+	return record.graph.turnFailureAt, record.graph.turnFailureKind, true
 }
 
 func (o *Observer) installSnapshot(generation uint64, key provider.RootKey, threadID string, state *graphState, estimate *ThreadUsageEstimate, usageRead bool, usageErr error) {

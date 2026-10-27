@@ -94,12 +94,14 @@ func FromPi(message string) (Kind, bool) {
 
 // FromCodex classifies a Codex task_complete error. errorInfo is the raw
 // codex_error_info: a JSON string tag or a single-key object keyed by the tag.
+// Tags are accepted in snake_case (rollout) or camelCase (app-server).
 // message is error.message, consulted only when the tag is "other" or absent.
 func FromCodex(errorInfo json.RawMessage, message string) (Kind, bool) {
 	tag, ok := codexTag(errorInfo)
 	if !ok {
 		return "", false
 	}
+	tag = snakeCase(tag)
 	if codexUnreachableTags[tag] {
 		return Unreachable, true
 	}
@@ -116,6 +118,22 @@ func FromCodex(errorInfo json.RawMessage, message string) (Kind, bool) {
 		return Auth, true
 	}
 	return "", false
+}
+
+// snakeCase folds the app-server's camelCase codes ("httpConnectionFailed")
+// onto the rollout's snake_case tags so one table serves both.
+func snakeCase(tag string) string {
+	var out strings.Builder
+	for i, r := range tag {
+		if r >= 'A' && r <= 'Z' {
+			if i > 0 {
+				out.WriteByte('_')
+			}
+			r += 'a' - 'A'
+		}
+		out.WriteRune(r)
+	}
+	return out.String()
 }
 
 // codexTag extracts the tag; ok is false for malformed JSON. A missing or null
