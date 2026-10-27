@@ -1,6 +1,10 @@
 package state
 
-import "time"
+import (
+	"time"
+
+	"github.com/tjmisko/switchboard/internal/agentgraph"
+)
 
 // StatusError is the published status of a session whose last turn failed to
 // reach or authenticate with its provider. Like StatusLimited it is never
@@ -49,6 +53,49 @@ func (s *Session) RecordTurnFailure(f TurnFailure) bool {
 		s.UsageLimit = nil
 	}
 	return true
+}
+
+// clearTurnFailureOnRootTurn drops the failure when the provider graph shows
+// the root agent itself active in a turn newer than the failure. Claude Code
+// goal mode re-runs a failed turn on its own through a queued
+// <task-notification> prompt that may fire no prompt hook, so ClearTurnRecords
+// never runs; the retry window should read green, and red returns only if the
+// provider gives up again.
+//
+// Only the root counts: subagents also retry against a dead network, so an
+// active child alone proves nothing. The root's turn time is its UpdatedAt (the
+// moment its runtime last changed), falling back to the graph's ObservedAt when
+// unset. Only the failure is dropped, never a usage limit. The activity
+// watermark advances to the turn time so a late, older StopFailure cannot
+// repaint red.
+func (s *Session) clearTurnFailureOnRootTurn(graph *AgentGraph) {
+	if s.TurnFailure == nil || graph == nil {
+		return
+	}
+	failedAt := s.TurnFailure.ObservedAt
+	if !graph.ObservedAt.After(failedAt) {
+		return
+	}
+	for _, node := range graph.Nodes {
+		if node.ID != graph.RootID {
+			continue
+		}
+		if node.Runtime != agentgraph.RuntimeActive {
+			return
+		}
+		turnAt := node.UpdatedAt
+		if turnAt.IsZero() {
+			turnAt = graph.ObservedAt
+		}
+		if !turnAt.After(failedAt) {
+			return
+		}
+		s.TurnFailure = nil
+		if turnAt.After(s.turnActivityAt) {
+			s.turnActivityAt = turnAt
+		}
+		return
+	}
 }
 
 func projectTurnFailure(sess *Session, now time.Time) {

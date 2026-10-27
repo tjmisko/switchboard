@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tjmisko/switchboard/internal/agentgraph"
 	"github.com/tjmisko/switchboard/internal/statusexplain"
 )
 
@@ -123,5 +124,47 @@ func TestExplainStatusShouldNameTheTurnFailureOverlayWhenPublishedError(t *testi
 	}
 	if !d.Choice.FreshUntil.IsZero() || !d.Choice.ObservedAt.Equal(limitT0) {
 		t.Fatalf("choice times = %v/%v", d.Choice.ObservedAt, d.Choice.FreshUntil)
+	}
+}
+
+func landAfterFailure(t *testing.T, status string, at time.Time) *Session {
+	t.Helper()
+	s := claudeSession()
+	s.TurnFailure = &TurnFailure{ObservedAt: limitT0, Kind: TurnFailureUnreachable, Source: TurnFailureSourceClaudeHook}
+	s.LandAgentGraph(claudeStatusGraph(t, agentgraph.SourceClaudeTranscript, status, at, time.Minute), GraphLanding{Kind: GraphSnapshot}, at)
+	return s
+}
+
+func TestLandAgentGraphShouldClearTheFailureWhenTheRootGoesActiveAfterIt(t *testing.T) {
+	s := landAfterFailure(t, StatusWorking, limitT0.Add(time.Second))
+	if s.TurnFailure != nil {
+		t.Fatal("failure survived the root's new turn")
+	}
+	if !s.turnActivityAt.Equal(limitT0.Add(time.Second)) {
+		t.Fatalf("watermark = %v, want the root turn time", s.turnActivityAt)
+	}
+	if s.RecordTurnFailure(TurnFailure{ObservedAt: limitT0, Kind: TurnFailureUnreachable}) {
+		t.Fatal("a late older failure repainted red")
+	}
+}
+
+func TestLandAgentGraphShouldKeepTheFailureWhenOnlyAChildIsActive(t *testing.T) {
+	s := landAfterFailure(t, StatusDelegating, limitT0.Add(time.Second))
+	if s.TurnFailure == nil {
+		t.Fatal("an active child cleared the failure")
+	}
+}
+
+func TestLandAgentGraphShouldKeepTheFailureWhenTheActiveGraphPredatesIt(t *testing.T) {
+	s := landAfterFailure(t, StatusWorking, limitT0.Add(-time.Second))
+	if s.TurnFailure == nil {
+		t.Fatal("a graph older than the failure cleared it")
+	}
+}
+
+func TestLandAgentGraphShouldKeepTheFailureWhenTheRootIsIdle(t *testing.T) {
+	s := landAfterFailure(t, StatusIdle, limitT0.Add(time.Second))
+	if s.TurnFailure == nil {
+		t.Fatal("an idle root cleared the failure")
 	}
 }

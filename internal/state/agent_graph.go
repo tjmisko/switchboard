@@ -217,6 +217,7 @@ func (s *Session) LandAgentGraph(graph *AgentGraph, landing GraphLanding, now ti
 	if reason := s.LandingRefusal(graph.RootID, graph.ObservedAt, landing.Kind); reason != "" {
 		return reason
 	}
+	s.clearTurnFailureOnRootTurn(graph)
 	info := s.AgentBlock(kind)
 	info.SessionID = graph.RootID
 	s.landEvidence(graph, landing, now)
