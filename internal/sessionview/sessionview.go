@@ -40,6 +40,9 @@ func Prepare(snapshot state.Snapshot, limit int) []Item {
 		if status == state.StatusLimited {
 			classes = append(classes, "limited")
 		}
+		if status == state.StatusError {
+			classes = append(classes, "error")
+		}
 		if session.Focused {
 			classes = append(classes, "focused")
 		}
@@ -77,7 +80,8 @@ func Status(session state.Session) string {
 	return "unknown"
 }
 
-// ColorClass maps delegating onto working and limited onto unknown, retaining
+// ColorClass maps delegating onto working, error onto permission's red, and
+// limited onto unknown, retaining
 // each as a secondary class in Prepare. Delegating keeps the green/no-attention
 // rule; limited paints grey in every stylesheet that already greys unknown.
 func ColorClass(status string) string {
@@ -86,8 +90,24 @@ func ColorClass(status string) string {
 		return state.StatusWorking
 	case state.StatusLimited:
 		return "unknown"
+	case state.StatusError:
+		return state.StatusPermission
 	}
 	return status
+}
+
+// FailureDetail spells out an error session's status for a tooltip.
+func FailureDetail(session state.Session) string {
+	if session.TurnFailure == nil {
+		return "turn failed"
+	}
+	switch session.TurnFailure.Kind {
+	case state.TurnFailureUnreachable:
+		return "can't reach API"
+	case state.TurnFailureAuth:
+		return "auth failed"
+	}
+	return "turn failed"
 }
 
 // LimitDetail spells out a limited session's status for a tooltip: "usage

@@ -116,7 +116,7 @@ func TestCodexTranscriptPollShouldNotLimitWhenActivityOutranTheRead(t *testing.T
 	// the quiet-window read did.
 	store.Apply(func(sessions map[int]*state.Session) {
 		for _, sess := range sessions {
-			sess.ClearUsageLimit(now.Add(2 * time.Second))
+			sess.ClearTurnRecords(now.Add(2 * time.Second))
 		}
 	})
 	c.observeAt(context.Background(), ref, now.Add(95*time.Second))

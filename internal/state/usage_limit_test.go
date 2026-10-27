@@ -90,15 +90,15 @@ func TestRecordUsageLimitShouldNotAliasTheCallersResetTime(t *testing.T) {
 	}
 }
 
-func TestClearUsageLimitShouldKeepTheRecordWhenActivityPredatesTheLimit(t *testing.T) {
+func TestClearTurnRecordsShouldKeepTheRecordWhenActivityPredatesTheLimit(t *testing.T) {
 	sess := limitedSession(nil)
-	if sess.ClearUsageLimit(limitT0.Add(-time.Millisecond)) || sess.UsageLimit == nil {
+	if sess.ClearTurnRecords(limitT0.Add(-time.Millisecond)) || sess.UsageLimit == nil {
 		t.Fatal("activity from before the limit cleared it")
 	}
-	if !sess.ClearUsageLimit(limitT0.Add(time.Second)) || sess.UsageLimit != nil {
+	if !sess.ClearTurnRecords(limitT0.Add(time.Second)) || sess.UsageLimit != nil {
 		t.Fatal("activity after the limit did not clear it")
 	}
-	if sess.ClearUsageLimit(limitT0.Add(time.Hour)) {
+	if sess.ClearTurnRecords(limitT0.Add(time.Hour)) {
 		t.Fatal("clearing an absent record reported a change")
 	}
 }
@@ -213,7 +213,7 @@ func TestLoadShouldDropALimitThatLapsedWhileTheDaemonWasDown(t *testing.T) {
 
 func TestRecordUsageLimitShouldRefuseEvidenceTheSessionHasAlreadyOutrun(t *testing.T) {
 	var sess Session
-	sess.ClearUsageLimit(limitT0.Add(time.Second)) // the next prompt, with no record to clear
+	sess.ClearTurnRecords(limitT0.Add(time.Second)) // the next prompt, with no record to clear
 	if sess.RecordUsageLimit(UsageLimit{ObservedAt: limitT0}) || sess.UsageLimit != nil {
 		t.Fatal("a limit read after newer activity greyed the session")
 	}

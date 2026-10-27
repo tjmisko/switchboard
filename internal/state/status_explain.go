@@ -65,6 +65,15 @@ func (s Session) ExplainStatus(now time.Time) statusexplain.Decision {
 			FreshUntil: s.UsageLimit.deadline(), DecidedAt: now,
 		}
 	}
+	if turnFailureOverlays(&s, now) {
+		underlying := d.Choice
+		d.Underlying = &underlying
+		d.Choice = statusexplain.Choice{
+			Status: StatusError, Source: s.TurnFailure.Source, EvidenceKind: statusexplain.EvidenceTurnFailure,
+			Reason: statusexplain.ReasonTurnFailureOverlay, ObservedAt: s.TurnFailure.ObservedAt,
+			DecidedAt: now,
+		}
+	}
 	return d
 }
 

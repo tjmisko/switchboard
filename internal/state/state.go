@@ -55,13 +55,17 @@ type Session struct {
 	// usage limit. Publication reads its status as limited while the record is
 	// active (ProjectPublished); omitted otherwise.
 	UsageLimit *UsageLimit `json:"usage_limit,omitempty"`
-	// usageLimitActivityAt is the newest activity ClearUsageLimit has seen, so
+	// TurnFailure is set while the session's last turn failed to reach or
+	// authenticate with its provider. Publication reads its status as error
+	// (ProjectPublished); omitted otherwise.
+	TurnFailure *TurnFailure `json:"turn_failure,omitempty"`
+	// turnActivityAt is the newest activity ClearTurnRecords has seen, so
 	// RecordUsageLimit can refuse evidence that the session has already outrun.
 	// In-memory only; a restart forgets it, which costs at most one stale read.
-	usageLimitActivityAt time.Time
+	turnActivityAt time.Time
 	// statusDecision is the status resolver's last decision for the session
 	// (#96): the status it published, the evidence that decided, and every
-	// candidate that lost and why. In-memory only, like usageLimitActivityAt.
+	// candidate that lost and why. In-memory only, like turnActivityAt.
 	// ExplainStatus reads it, and the next resolution weighs it as its prior
 	// (open attention holds through its own deadline).
 	statusDecision statusexplain.Decision
@@ -1125,6 +1129,7 @@ func (s *Store) snapshotLocked() Snapshot {
 		cp.DisplayName = cloneDisplayName(sess.DisplayName)
 		cp.Herdr = cloneHerdr(sess.Herdr)
 		cp.UsageLimit = cloneUsageLimit(sess.UsageLimit)
+		cp.TurnFailure = cloneTurnFailure(sess.TurnFailure)
 		sessions = append(sessions, cp)
 	}
 	// Sort into chip order, which carries a PID tie-break for determinism: equal
@@ -1488,6 +1493,7 @@ func (s *Store) Load() error {
 		hydratePendingWriters(sess.Codex)
 		hydratePiBlock(sess.Pi)
 		hydrateUsageLimit(&sess, hydratedAt)
+		hydrateTurnFailure(&sess)
 		hydrateAgentGraph(&sess, hydratedAt)
 		s.sessions[sess.PID] = &sess
 	}

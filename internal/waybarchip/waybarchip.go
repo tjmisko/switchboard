@@ -487,6 +487,9 @@ func TooltipMarkup(cfg projectname.Config, cache *sblabel.NameCache, s state.Ses
 	if status == state.StatusLimited {
 		statusText = sessionview.LimitDetail(s, now)
 	}
+	if status == state.StatusError {
+		statusText = sessionview.FailureDetail(s)
+	}
 	// How long the session has held this status. Skipped while suspended — the
 	// status (and its clock) is stale until resume.
 	if !s.Suspended {

@@ -24,7 +24,7 @@ const (
 // UsageLimit is the evidence that a session's turn ended on its provider's usage
 // limit. It is orthogonal to the status FSM: hooks and the provider graph keep
 // deciding the underlying status, and only publication reads limited over it.
-// Any new activity from the session drops the record (ClearUsageLimit), and
+// Any new activity from the session drops the record (ClearTurnRecords), and
 // so does reaching ResetsAt.
 type UsageLimit struct {
 	ObservedAt time.Time  `json:"observed_at"`
@@ -61,28 +61,35 @@ func (s *Session) RecordUsageLimit(limit UsageLimit) bool {
 	if s.UsageLimit != nil && limit.ObservedAt.Before(s.UsageLimit.ObservedAt) {
 		return false
 	}
-	if limit.ObservedAt.Before(s.usageLimitActivityAt) {
+	if limit.ObservedAt.Before(s.turnActivityAt) {
 		return false
 	}
 	s.UsageLimit = cloneUsageLimit(&limit)
+	// Newer evidence wins: a limit supersedes the failure it follows.
+	if s.TurnFailure != nil && !s.TurnFailure.ObservedAt.After(limit.ObservedAt) {
+		s.TurnFailure = nil
+	}
 	return true
 }
 
-// ClearUsageLimit notes activity observed at `at` and drops the record when the
-// activity postdates its evidence. Activity from before the limit (a reordered
-// or delayed hook) cannot clear it. It reports whether a record was dropped.
-func (s *Session) ClearUsageLimit(at time.Time) bool {
-	if at.After(s.usageLimitActivityAt) {
-		s.usageLimitActivityAt = at
+// ClearTurnRecords notes activity observed at `at` and drops the usage-limit
+// and turn-failure records the activity postdates. Activity from before a
+// record (a reordered or delayed hook) cannot clear it. It reports whether
+// anything was dropped.
+func (s *Session) ClearTurnRecords(at time.Time) bool {
+	if at.After(s.turnActivityAt) {
+		s.turnActivityAt = at
 	}
-	if s.UsageLimit == nil {
-		return false
+	dropped := false
+	if s.UsageLimit != nil && (at.IsZero() || !at.Before(s.UsageLimit.ObservedAt)) {
+		s.UsageLimit = nil
+		dropped = true
 	}
-	if !at.IsZero() && at.Before(s.UsageLimit.ObservedAt) {
-		return false
+	if s.TurnFailure != nil && (at.IsZero() || !at.Before(s.TurnFailure.ObservedAt)) {
+		s.TurnFailure = nil
+		dropped = true
 	}
-	s.UsageLimit = nil
-	return true
+	return dropped
 }
 
 // ProjectPublished returns a detached snapshot as consumers see it: every session
@@ -92,6 +99,7 @@ func (s *Session) ClearUsageLimit(at time.Time) bool {
 func ProjectPublished(snap Snapshot, now time.Time) Snapshot {
 	for i := range snap.Sessions {
 		projectUsageLimit(&snap.Sessions[i], now)
+		projectTurnFailure(&snap.Sessions[i], now)
 	}
 	return snap
 }

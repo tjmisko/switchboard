@@ -38,6 +38,8 @@ const (
 	ReasonPiHookAuthority     Reason = "pi_hook_authority"
 	// Publication reads limited over the decision beneath it.
 	ReasonUsageLimitOverlay Reason = "usage_limit_overlay"
+	// Publication reads error over the decision beneath it.
+	ReasonTurnFailureOverlay Reason = "turn_failure_overlay"
 
 	// No exact provider session is bound to the root, so nothing observes it.
 	ReasonBindingMissing Reason = "binding_missing"
@@ -87,7 +89,7 @@ const (
 var knownReasons = map[Reason]bool{
 	ReasonGraphAuthority: true, ReasonHookOwned: true, ReasonHerdrOverride: true,
 	ReasonHerdrYieldAttention: true, ReasonHerdrOnly: true, ReasonHerdrFallback: true,
-	ReasonPiHookAuthority: true, ReasonUsageLimitOverlay: true, ReasonBindingMissing: true,
+	ReasonPiHookAuthority: true, ReasonUsageLimitOverlay: true, ReasonTurnFailureOverlay: true, ReasonBindingMissing: true,
 	ReasonObservationPending: true, ReasonObservationExpired: true,
 	ReasonCoverageUnsupported: true, ReasonObservationReset: true, ReasonUnrecorded: true, ReasonSourceOutranked: true,
 	ReasonStaleVsFresh: true, ReasonOlderThanCurrent: true,
@@ -120,13 +122,15 @@ const (
 	EvidenceRestored EvidenceKind = "restored"
 	// Usage-limit evidence, which only publication reads.
 	EvidenceUsageLimit EvidenceKind = "usage_limit"
+	// Turn-failure evidence, which only publication reads.
+	EvidenceTurnFailure EvidenceKind = "turn_failure"
 	// No evidence at all.
 	EvidenceNone EvidenceKind = "none"
 )
 
 var knownEvidence = map[EvidenceKind]bool{
 	EvidenceProviderSnapshot: true, EvidenceHook: true, EvidenceTerminal: true,
-	EvidenceRestored: true, EvidenceUsageLimit: true, EvidenceNone: true,
+	EvidenceRestored: true, EvidenceUsageLimit: true, EvidenceTurnFailure: true, EvidenceNone: true,
 	EvidenceHookEdge: true, EvidenceTranscript: true,
 }
 

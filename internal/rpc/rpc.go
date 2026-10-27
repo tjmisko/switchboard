@@ -1143,7 +1143,7 @@ func (s *Server) handleHook(req Request) {
 // matched only by its unique live directory clears the same session the
 // rollout read recorded on. Zero resolves by process ancestry (legacy path).
 func (s *Server) applyUsageLimitHook(req Request, pid int) {
-	if !req.UsageLimit && !usageLimitActivity(req.Event) {
+	if !req.UsageLimit && req.TurnFailure == "" && !usageLimitActivity(req.Event) {
 		return
 	}
 	at := req.ObservedAt
@@ -1158,8 +1158,14 @@ func (s *Server) applyUsageLimitHook(req Request, pid int) {
 		if sess == nil {
 			return
 		}
+		if req.TurnFailure != "" {
+			if sess.RecordTurnFailure(state.TurnFailure{ObservedAt: at, Kind: req.TurnFailure, Source: turnFailureSource(req.Agent)}) {
+				log.Printf("turn-failure: pid=%d agent=%s kind=%s", pid, req.Agent, req.TurnFailure)
+			}
+			return
+		}
 		if !req.UsageLimit {
-			if sess.ClearUsageLimit(at) {
+			if sess.ClearTurnRecords(at) {
 				log.Printf("usage-limit: pid=%d cleared by %s", pid, req.Event)
 			}
 			return
@@ -1188,6 +1194,16 @@ func usageLimitSource(agent string) string {
 		return state.UsageLimitSourcePiHook
 	}
 	return state.UsageLimitSourceClaudeHook
+}
+
+func turnFailureSource(agent string) string {
+	switch agent {
+	case state.AgentKindCodex:
+		return state.TurnFailureSourceCodexRollout
+	case state.AgentKindPi:
+		return state.TurnFailureSourcePiHook
+	}
+	return state.TurnFailureSourceClaudeHook
 }
 
 func formatResetsAt(resetsAt *time.Time) string {
