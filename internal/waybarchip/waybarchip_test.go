@@ -155,8 +155,8 @@ func TestRenderSlotCodexExplicitNameReplacesShortID(t *testing.T) {
 		},
 	}
 	out := renderSlot(state.Snapshot{Sessions: []state.Session{s}}, 0, testAvail, testMetrics, &nameConfig{}, &sblabel.NameCache{})
-	if out.Text != "<b>sb</b> Plan Faster Abstract Extraction" {
-		t.Fatalf("renamed Codex chip = %q, want <b>sb</b> Plan Faster Abstract Extraction", out.Text)
+	if out.Text != "<b>sb</b><span size='90%' rise='512'> Plan Faster Abstract Extraction</span>" {
+		t.Fatalf("renamed Codex chip = %q, want <b>sb</b><span size='90%%' rise='512'> Plan Faster Abstract Extraction</span>", out.Text)
 	}
 }
 
@@ -250,12 +250,12 @@ func TestRenderSlotFitIgnoresWhetherSessionsAreRemote(t *testing.T) {
 // pangoPlain reverses pangoEscape so hover assertions read as the card renders,
 // not as the markup that carries it.
 func pangoPlain(s string) string {
-	return strings.NewReplacer("<b>", "", "</b>", "", "&lt;", "<", "&gt;", ">", "&amp;", "&").Replace(s)
+	return strings.NewReplacer("<span size='90%' rise='512'>", "", "</span>", "", "<b>", "", "</b>", "", "&lt;", "<", "&gt;", ">", "&amp;", "&").Replace(s)
 }
 
 func TestDisplayMarkupEscapesAfterFitting(t *testing.T) {
 	name := sblabel.Display{Project: "中国<&>地理", Task: "Fix Names"}
-	if got, want := displayMarkup(name, name.String()), "<b>中国&lt;&amp;&gt;地理</b> Fix Names"; got != want {
+	if got, want := displayMarkup(name, name.String()), "<b>中国&lt;&amp;&gt;地理</b><span size='90%' rise='512'> Fix Names</span>"; got != want {
 		t.Errorf("markup = %q, want %q", got, want)
 	}
 	// Truncation through a multibyte project name must leave both the UTF-8
@@ -961,8 +961,8 @@ func TestRenderSlotShouldShowARenamedSessionOnTheNextSnapshot(t *testing.T) {
 
 	names := &nameConfig{}
 	labels := &sblabel.NameCache{}
-	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels); got.Text != "<b>proj</b> Aaa" {
-		t.Fatalf("chip text = %q, want <b>proj</b> Aaa", got.Text)
+	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels); got.Text != "<b>proj</b><span size='90%' rise='512'> Aaa</span>" {
+		t.Fatalf("chip text = %q, want <b>proj</b><span size='90%%' rise='512'> Aaa</span>", got.Text)
 	}
 
 	// The rename, with a forced later mtime so the test does not depend on the
@@ -975,8 +975,8 @@ func TestRenderSlotShouldShowARenamedSessionOnTheNextSnapshot(t *testing.T) {
 	}
 
 	got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels)
-	if got.Text != "<b>proj</b> Bbb" {
-		t.Errorf("chip text = %q, want <b>proj</b> Bbb — the rename did not reach the chip", got.Text)
+	if got.Text != "<b>proj</b><span size='90%' rise='512'> Bbb</span>" {
+		t.Errorf("chip text = %q, want <b>proj</b><span size='90%%' rise='512'> Bbb</span> — the rename did not reach the chip", got.Text)
 	}
 	if !strings.Contains(got.Tooltip, "Bbb") {
 		t.Errorf("tooltip kept the stale name: %q", got.Tooltip)
@@ -997,11 +997,11 @@ func TestRenderSlotShouldNameEachSessionFromItsOwnFile(t *testing.T) {
 	names := &nameConfig{}
 	labels := &sblabel.NameCache{}
 	for pass := range 2 {
-		if got := renderSlot(snap, 0, testAvail, testMetrics, names, labels); got.Text != "<b>proj</b> First" {
-			t.Errorf("pass %d: slot 0 text = %q, want <b>proj</b> First", pass, got.Text)
+		if got := renderSlot(snap, 0, testAvail, testMetrics, names, labels); got.Text != "<b>proj</b><span size='90%' rise='512'> First</span>" {
+			t.Errorf("pass %d: slot 0 text = %q, want <b>proj</b><span size='90%%' rise='512'> First</span>", pass, got.Text)
 		}
-		if got := renderSlot(snap, 1, testAvail, testMetrics, names, labels); got.Text != "<b>proj</b> Second" {
-			t.Errorf("pass %d: slot 1 text = %q, want <b>proj</b> Second", pass, got.Text)
+		if got := renderSlot(snap, 1, testAvail, testMetrics, names, labels); got.Text != "<b>proj</b><span size='90%' rise='512'> Second</span>" {
+			t.Errorf("pass %d: slot 1 text = %q, want <b>proj</b><span size='90%%' rise='512'> Second</span>", pass, got.Text)
 		}
 	}
 }

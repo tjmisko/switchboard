@@ -372,7 +372,13 @@ func displayMarkup(name sblabel.Display, fitted string) string {
 	if n > len(runes) {
 		n = len(runes)
 	}
-	return "<b>" + pangoEscape(string(runes[:n])) + "</b>" + pangoEscape(string(runes[n:]))
+	project := "<b>" + pangoEscape(string(runes[:n])) + "</b>"
+	if n == len(runes) {
+		return project
+	}
+	// Keep the project at the bar's font size. At the standard 13px size,
+	// raising the 90% task by half a point centers its smaller line box.
+	return project + "<span size='90%' rise='512'>" + pangoEscape(string(runes[n:])) + "</span>"
 }
 
 // nextWaybarRefresh returns the earliest coarse-duration boundary visible in

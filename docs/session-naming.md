@@ -4,7 +4,9 @@ Every provider uses the same visible convention:
 
 **Project or alias** Task Title With Spaces
 
-The project is bold; the task uses title case, spaces instead of dashed
+The project is bold at the normal bar size. Task text uses 90% size with a
+half-point upward offset to keep it vertically centered beside the project.
+The task uses title case, spaces instead of dashed
 separators, and at most five words. An unnamed session shows only its project.
 The directory's spelling, case, and Unicode characters are preserved unless a
 project alias is configured.
