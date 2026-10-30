@@ -239,13 +239,14 @@ func ProjectBase(dir string) string {
 	return filepath.Base(ProjectRoot(dir))
 }
 
-// sanitize lowercases s and collapses runs of non-[a-z0-9] into single hyphens,
-// trimming leading/trailing hyphens. It is the fallback abbreviation.
+// sanitize lowercases s and preserves Unicode letters, numbers, and combining
+// marks, collapsing other runs into single hyphens and trimming edge hyphens.
+// It is the fallback abbreviation.
 func sanitize(s string) string {
 	var b strings.Builder
 	prevHyphen := false
 	for _, r := range strings.ToLower(s) {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) || unicode.IsMark(r) {
 			b.WriteRune(r)
 			prevHyphen = false
 			continue

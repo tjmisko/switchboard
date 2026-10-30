@@ -44,6 +44,25 @@ func writeSessionFile(t *testing.T, pid int, name string) {
 	writeSessionName(t, sessionHome(t), pid, name)
 }
 
+func TestChipPreservesUnicodeProjectPrefix(t *testing.T) {
+	writeSessionFile(t, 4242, "map-update")
+	s := state.Session{PID: 4242, CWD: "/projects/中国地理"}
+	cfg := projectname.DefaultConfig()
+	const want = "中国地理-map-update"
+	if got := Chip(cfg, s); got != want {
+		t.Errorf("Chip = %q, want %q", got, want)
+	}
+	var cache NameCache
+	if got := cache.Chip(cfg, s); got != want {
+		t.Errorf("cached Chip = %q, want %q", got, want)
+	}
+	s.Remote = true
+	s.ResolvedName = "map-update"
+	if got := Chip(cfg, s); got != want {
+		t.Errorf("remote Chip = %q, want %q", got, want)
+	}
+}
+
 func TestRawName_prefersClaudeSessionName(t *testing.T) {
 	writeSessionFile(t, 4242, "from-claude")
 	s := state.Session{

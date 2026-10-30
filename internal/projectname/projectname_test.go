@@ -23,6 +23,9 @@ func TestPrefix_appendsCanonicalWhenUnprefixed(t *testing.T) {
 		{"arachne adds arachne", "Arachne", "assess", "arachne-assess"},
 		{"sspi adds sspi", "sspi-data-webapp", "cleanup", "sspi-cleanup"},
 		{"fallback sanitizes basename", "My_Cool.Repo", "notes", "my-cool-repo-notes"},
+		{"Chinese basename", "中国地理", "notes", "中国地理-notes"},
+		{"mixed scripts and separators", "中国_Géographie.１２", "notes", "中国-géographie-１２-notes"},
+		{"combining marks", "Cafe\u0301", "notes", "cafe\u0301-notes"},
 		{"preserves input case", "switchboard", "Foo", "sb-Foo"},
 	}
 	for _, c := range cases {
@@ -31,6 +34,37 @@ func TestPrefix_appendsCanonicalWhenUnprefixed(t *testing.T) {
 				t.Errorf("Prefix(%q) under %q = %q, want %q", c.input, c.base, got, c.want)
 			}
 		})
+	}
+}
+
+func TestUnicodeProjectDirectory(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "中国地理")
+	if err := os.MkdirAll(filepath.Join(root, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	nested := filepath.Join(root, "资料")
+	if err := os.Mkdir(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultConfig()
+	if got := CanonicalForDir(cfg, nested); got != "中国地理" {
+		t.Errorf("CanonicalForDir = %q", got)
+	}
+	if got := FullForDir(cfg, nested); got != "中国地理" {
+		t.Errorf("FullForDir = %q", got)
+	}
+	if got := ResolveForDir(cfg, nested, "中国地理-notes"); got != "中国地理-notes" {
+		t.Errorf("ResolveForDir duplicated prefix: %q", got)
+	}
+	if got := TaskForDir(cfg, nested, "中国地理-notes"); got != "notes" {
+		t.Errorf("TaskForDir = %q", got)
+	}
+	path := filepath.Join(t.TempDir(), "projects.json")
+	if err := setAbbrevIn(path, root, "中国_地理"); err != nil {
+		t.Fatal(err)
+	}
+	if got := ResolveForDir(loadFrom(path), nested, "notes"); got != "中国-地理-notes" {
+		t.Errorf("saved Unicode abbreviation = %q", got)
 	}
 }
 
