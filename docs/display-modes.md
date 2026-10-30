@@ -14,7 +14,7 @@ empty navigable list makes next/previous a valid no-op.
 
 | Mode | Surface | Session appearance |
 | --- | --- | --- |
-| `chips` (default) | Independent bottom Waybar | Small-caps project/alias, same-size title-cased task (five words max), tooltips and navigation |
+| `chips` (default) | Independent bottom Waybar | Bold project/alias and same-size title-cased task at 90% scale (five words max), tooltips and navigation |
 | `circles` | Right end of the existing top Waybar | One compact GTK circle per session, no visible text |
 
 The circle view has no fixed slot limit. Both views share working/idle/permission

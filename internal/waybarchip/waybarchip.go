@@ -367,16 +367,15 @@ func displayMarkup(name sblabel.Display, fitted string) string {
 	runes := []rune(fitted)
 	n := utf8.RuneCountInString(name.Project)
 	if n == 0 {
-		return pangoEscape(fitted)
+		return "<span size='90%'>" + pangoEscape(fitted) + "</span>"
 	}
 	if n > len(runes) {
 		n = len(runes)
 	}
-	// Lowercase the project input so Pango gives mixed-case names a uniform
-	// small-caps treatment, as in the hover heading. Both runs inherit the same
-	// font size and baseline; no rise or size overrides affect the line box.
-	project := "<span variant='smallcaps'>" + pangoEscape(strings.ToLower(string(runes[:n]))) + "</span>"
-	return project + pangoEscape(string(runes[n:]))
+	// Scale the whole label together so project and task share one size and
+	// baseline. Preserve the project's spelling and distinguish it with bold.
+	project := "<b>" + pangoEscape(string(runes[:n])) + "</b>"
+	return "<span size='90%'>" + project + pangoEscape(string(runes[n:])) + "</span>"
 }
 
 // nextWaybarRefresh returns the earliest coarse-duration boundary visible in

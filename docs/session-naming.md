@@ -2,12 +2,10 @@
 
 Every provider uses the same visible convention:
 
-Project or alias (small caps) · Task Title With Spaces
+**Project or alias** Task Title With Spaces
 
-The project uses small caps. Project and task inherit the same font size and
-baseline, without per-run size or vertical offsets. The renderer lowercases
-the project input so mixed-case names receive a uniform small-caps treatment;
-the underlying project name remains unchanged.
+The project is bold. Project and task share one font size, set to 90% of the
+normal bar text size, and a common baseline without vertical offsets.
 The task uses title case, spaces instead of dashed
 separators, and at most five words. An unnamed session shows only its project.
 The directory's spelling, case, and Unicode characters are preserved unless a
@@ -15,10 +13,10 @@ project alias is configured.
 
 | Directory / alias | Native task name | Bottom chip |
 | --- | --- | --- |
-| `中国地理` | `map-update` | 中国地理 Map Update |
-| `MyProject` | none | MYPROJECT |
-| Switchboard alias `sb` | `sb-fix-project-name-detection-in-all-providers` | SB Fix Project Name Detection In |
-| Arachne alias `ar` | `Refactor auth module` | AR Refactor Auth Module |
+| `中国地理` | `map-update` | **中国地理** Map Update |
+| `MyProject` | none | **MyProject** |
+| Switchboard alias `sb` | `sb-fix-project-name-detection-in-all-providers` | **sb** Fix Project Name Detection In |
+| Arachne alias `ar` | `Refactor auth module` | **ar** Refactor Auth Module |
 
 ## Integration map
 
@@ -43,7 +41,7 @@ records remain unchanged.
 
 The bottom-bar broker and standalone `switchboard-waybar` share
 `internal/waybarchip.Renderer`. It fits plain display text against the bar width,
-then escapes user text and applies Pango small caps only to the project portion.
+then escapes user text, bolds the project, and scales the whole label to 90%.
 The display publisher, picker, and Polybar use the same plain display label;
 Waybar's hover card also uses the shared normalized task. Compact circles keep
 their existing geometry and shared hover card.
@@ -146,9 +144,9 @@ normalization never mutates either provider's native value.
 
 ## Styling guidance and activation
 
-- Keep project and task separate until rendering. Use small caps for the
-  project or alias, at the same font size and baseline as the task. Preserve
-  the source spelling; title-case and cap only the task.
+- Keep project and task separate until rendering. Bold the project or alias,
+  preserving its spelling. Scale both parts together to 90%, sharing one size
+  and baseline; title-case and cap only the task.
 - Strip a known project prefix before counting task words. Accept both the
   legacy dashed prefix and readable words; do not introduce provider names or
   glyphs as tasks.
