@@ -44,3 +44,10 @@ func TestUnnamedPiUsesOnlyProject(t *testing.T) {
 		t.Errorf("Pi legacy name borrowed provider chrome: %q", got)
 	}
 }
+
+func TestDisplayNameWithoutMetadataStaysVisible(t *testing.T) {
+	s := state.Session{PID: 4242, Agent: state.AgentKindCodex}
+	if got := DisplayName(projectname.DefaultConfig(), s).String(); got != "pid 4242" {
+		t.Errorf("metadata-free session = %q", got)
+	}
+}

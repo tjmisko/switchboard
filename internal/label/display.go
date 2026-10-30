@@ -1,6 +1,7 @@
 package label
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/tjmisko/switchboard/internal/panetitle"
@@ -40,7 +41,13 @@ func displayName(cfg projectname.Config, s state.Session, claudeName func(int) s
 			rule = cfg.RuleForDir(s.CWD)
 		}
 	}
-	return Display{Project: rule.DisplayName(), Task: rule.TaskTitle(displaySource(s, claudeName))}
+	name := Display{Project: rule.DisplayName(), Task: rule.TaskTitle(displaySource(s, claudeName))}
+	if name.String() == "" {
+		// Discovery can publish a session before its cwd or task is known.
+		// Keep that session visible until project metadata arrives.
+		name.Project = fmt.Sprintf("pid %d", s.PID)
+	}
+	return name
 }
 
 // displaySource selects the unshortened task name. Provider decoration, cwd
