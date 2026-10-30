@@ -2,10 +2,12 @@
 
 Every provider uses the same visible convention:
 
-**Project or alias** Task Title With Spaces
+Project or alias (small caps) · Task Title With Spaces
 
-The project is bold at the normal bar size. Task text uses 90% size with a
-half-point upward offset to keep it vertically centered beside the project.
+The project uses small caps. Project and task inherit the same font size and
+baseline, without per-run size or vertical offsets. The renderer lowercases
+the project input so mixed-case names receive a uniform small-caps treatment;
+the underlying project name remains unchanged.
 The task uses title case, spaces instead of dashed
 separators, and at most five words. An unnamed session shows only its project.
 The directory's spelling, case, and Unicode characters are preserved unless a
@@ -13,10 +15,10 @@ project alias is configured.
 
 | Directory / alias | Native task name | Bottom chip |
 | --- | --- | --- |
-| `中国地理` | `map-update` | **中国地理** Map Update |
-| `MyProject` | none | **MyProject** |
-| Switchboard alias `sb` | `sb-fix-project-name-detection-in-all-providers` | **sb** Fix Project Name Detection In |
-| Arachne alias `ar` | `Refactor auth module` | **ar** Refactor Auth Module |
+| `中国地理` | `map-update` | 中国地理 Map Update |
+| `MyProject` | none | MYPROJECT |
+| Switchboard alias `sb` | `sb-fix-project-name-detection-in-all-providers` | SB Fix Project Name Detection In |
+| Arachne alias `ar` | `Refactor auth module` | AR Refactor Auth Module |
 
 ## Integration map
 
@@ -41,7 +43,7 @@ records remain unchanged.
 
 The bottom-bar broker and standalone `switchboard-waybar` share
 `internal/waybarchip.Renderer`. It fits plain display text against the bar width,
-then escapes user text and applies Pango `<b>` only to the project portion.
+then escapes user text and applies Pango small caps only to the project portion.
 The display publisher, picker, and Polybar use the same plain display label;
 Waybar's hover card also uses the shared normalized task. Compact circles keep
 their existing geometry and shared hover card.
@@ -144,8 +146,9 @@ normalization never mutates either provider's native value.
 
 ## Styling guidance and activation
 
-- Keep project and task separate until rendering. Bold only the project or
-  alias, preserving its configured spelling; title-case and cap only the task.
+- Keep project and task separate until rendering. Use small caps for the
+  project or alias, at the same font size and baseline as the task. Preserve
+  the source spelling; title-case and cap only the task.
 - Strip a known project prefix before counting task words. Accept both the
   legacy dashed prefix and readable words; do not introduce provider names or
   glyphs as tasks.
@@ -153,6 +156,10 @@ normalization never mutates either provider's native value.
   Unicode and escape all user-controlled markup characters.
 - Keep status colors, focus borders, remote borders, and navigation independent
   of naming. Tooltips retain full project/path context and coarse clocks.
+- Keep bottom-chip glow and color changes immediate, with CSS `transition:
+  none`. [Waybar reapplies custom-module classes on updates](https://github.com/Alexays/Waybar/blob/0.15.0/src/modules/custom.cpp#L183-L194);
+  an animated focus highlight can flash again on a tooltip-only refresh.
+  Static status and focus styling remains visible without those animations.
 - Reuse the shared resolver and formatter in integrations instead of copying
   per-provider naming rules into shell or TypeScript.
 

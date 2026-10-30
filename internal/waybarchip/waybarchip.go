@@ -372,13 +372,11 @@ func displayMarkup(name sblabel.Display, fitted string) string {
 	if n > len(runes) {
 		n = len(runes)
 	}
-	project := "<b>" + pangoEscape(string(runes[:n])) + "</b>"
-	if n == len(runes) {
-		return project
-	}
-	// Keep the project at the bar's font size. At the standard 13px size,
-	// raising the 90% task by half a point centers its smaller line box.
-	return project + "<span size='90%' rise='512'>" + pangoEscape(string(runes[n:])) + "</span>"
+	// Lowercase the project input so Pango gives mixed-case names a uniform
+	// small-caps treatment, as in the hover heading. Both runs inherit the same
+	// font size and baseline; no rise or size overrides affect the line box.
+	project := "<span variant='smallcaps'>" + pangoEscape(strings.ToLower(string(runes[:n]))) + "</span>"
+	return project + pangoEscape(string(runes[n:]))
 }
 
 // nextWaybarRefresh returns the earliest coarse-duration boundary visible in
