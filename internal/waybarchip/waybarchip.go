@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tjmisko/switchboard/internal/barlayout"
 	"github.com/tjmisko/switchboard/internal/buildinfo"
@@ -84,7 +85,7 @@ func (r *Renderer) RenderSlotsAt(snap state.Snapshot, slots int, now time.Time) 
 	cfg := r.names.config()
 	labels := make([]string, len(snap.Sessions))
 	for i := range snap.Sessions {
-		labels[i] = r.labels.Chip(cfg, snap.Sessions[i])
+		labels[i] = r.labels.DisplayName(cfg, snap.Sessions[i]).String()
 	}
 	labels = barlayout.Fit(labels, r.availPx, r.metrics)
 	chips := sessionview.Prepare(snap, slots)
@@ -340,7 +341,7 @@ func renderSlotAt(snap state.Snapshot, slot int, availPx float64, metrics barlay
 	cfg := names.config()
 	labels := make([]string, len(snap.Sessions))
 	for i := range snap.Sessions {
-		labels[i] = cache.Chip(cfg, snap.Sessions[i])
+		labels[i] = cache.DisplayName(cfg, snap.Sessions[i]).String()
 	}
 	labels = barlayout.Fit(labels, availPx, metrics)
 	return renderPreparedSlot(sessionview.Prepare(snap, slot+1), slot, labels, cfg, cache, now)
@@ -353,11 +354,25 @@ func renderPreparedSlot(chips []sessionview.Item, slot int, labels []string, cfg
 	chip := chips[slot]
 	s := chip.Session
 	return waybarOutput{
-		Text:    labels[slot],
+		Text:    displayMarkup(cache.DisplayName(cfg, s), labels[slot]),
 		Tooltip: TooltipMarkup(cfg, cache, s, now),
 		Class:   chip.Classes,
 		Alt:     sessionview.ColorClass(chip.Status),
 	}
+}
+
+// displayMarkup applies Pango only after fitting plain text, so tags and
+// escaped entities never consume the width budget or get truncated.
+func displayMarkup(name sblabel.Display, fitted string) string {
+	runes := []rune(fitted)
+	n := utf8.RuneCountInString(name.Project)
+	if n == 0 {
+		return pangoEscape(fitted)
+	}
+	if n > len(runes) {
+		n = len(runes)
+	}
+	return "<b>" + pangoEscape(string(runes[:n])) + "</b>" + pangoEscape(string(runes[n:]))
 }
 
 // nextWaybarRefresh returns the earliest coarse-duration boundary visible in
@@ -400,7 +415,7 @@ func renderAggregate(snap state.Snapshot, names *nameConfig, cache *sblabel.Name
 		if s.Focused {
 			mark = "*"
 		}
-		parts = append(parts, mark+cache.Chip(cfg, s))
+		parts = append(parts, mark+displayMarkup(cache.DisplayName(cfg, s), cache.DisplayName(cfg, s).String()))
 	}
 	return waybarOutput{
 		Text:  strings.Join(parts, "  "),
@@ -438,18 +453,17 @@ func sessionStatus(s state.Session) string {
 // dismiss any open hover; a field that ticks per second makes the card
 // unhoverable. See durfmt.Coarse for the measurement that motivated it.
 func TooltipMarkup(cfg projectname.Config, cache *sblabel.NameCache, s state.Session, now time.Time) string {
-	var full, task string
+	var full string
 	if s.Remote {
 		base := strings.TrimSpace(s.CWD)
 		if base != "" {
 			base = filepath.Base(filepath.Clean(base))
 		}
 		full = projectname.FullForBase(cfg, base)
-		task = cfg.RuleForBase(base).StripKnownPrefix(cache.RawName(s))
 	} else {
 		full = projectname.FullForDir(cfg, s.CWD)
-		task = projectname.TaskForDir(cfg, s.CWD, cache.RawName(s))
 	}
+	task := cache.DisplayName(cfg, s).Task
 	status := sessionStatus(s)
 
 	statusText := status

@@ -131,7 +131,7 @@ func TestRenderSlotCodexNameDoesNotMoveWithTerminalSpinner(t *testing.T) {
 		got = append(got, renderSlot(state.Snapshot{Sessions: []state.Session{s}}, 0, testAvail, testMetrics, names, labels))
 	}
 	for i, out := range got {
-		if out.Text != "sb-01" {
+		if out.Text != "<b>sb</b>" {
 			t.Errorf("frame %d chip text = %q, want compact stable id", i, out.Text)
 		}
 		if !slices.Contains(out.Class, state.StatusWorking) {
@@ -155,8 +155,8 @@ func TestRenderSlotCodexExplicitNameReplacesShortID(t *testing.T) {
 		},
 	}
 	out := renderSlot(state.Snapshot{Sessions: []state.Session{s}}, 0, testAvail, testMetrics, &nameConfig{}, &sblabel.NameCache{})
-	if out.Text != "sb-plan-faster-abstract" {
-		t.Fatalf("renamed Codex chip = %q, want sb-plan-faster-abstract", out.Text)
+	if out.Text != "<b>sb</b> Plan Faster Abstract Extraction" {
+		t.Fatalf("renamed Codex chip = %q, want <b>sb</b> Plan Faster Abstract Extraction", out.Text)
 	}
 }
 
@@ -237,7 +237,7 @@ func TestRenderSlotFitIgnoresWhetherSessionsAreRemote(t *testing.T) {
 		// Guard against the comparison going vacuous: if a metrics change ever
 		// left this row roomy enough to render in full, both sides would match
 		// trivially and stop testing the budget at all.
-		if !strings.HasSuffix(local.Text, "…") {
+		if !strings.HasSuffix(pangoPlain(local.Text), "…") {
 			t.Fatalf("slot %d rendered %q unabbreviated; widen the row or lengthen the labels", slot, local.Text)
 		}
 		if len([]rune(local.Text)) != len([]rune(remote.Text)) {
@@ -250,7 +250,19 @@ func TestRenderSlotFitIgnoresWhetherSessionsAreRemote(t *testing.T) {
 // pangoPlain reverses pangoEscape so hover assertions read as the card renders,
 // not as the markup that carries it.
 func pangoPlain(s string) string {
-	return strings.NewReplacer("&lt;", "<", "&gt;", ">", "&amp;", "&").Replace(s)
+	return strings.NewReplacer("<b>", "", "</b>", "", "&lt;", "<", "&gt;", ">", "&amp;", "&").Replace(s)
+}
+
+func TestDisplayMarkupEscapesAfterFitting(t *testing.T) {
+	name := sblabel.Display{Project: "中国<&>地理", Task: "Fix Names"}
+	if got, want := displayMarkup(name, name.String()), "<b>中国&lt;&amp;&gt;地理</b> Fix Names"; got != want {
+		t.Errorf("markup = %q, want %q", got, want)
+	}
+	// Truncation through a multibyte project name must leave both the UTF-8
+	// and markup intact. An ellipsis within the project stays bold.
+	if got, want := displayMarkup(name, "中国<…"), "<b>中国&lt;…</b>"; got != want {
+		t.Errorf("truncated markup = %q, want %q", got, want)
+	}
 }
 
 func TestRemoteTooltipDoesNotResolveCWDOnLocalFilesystem(t *testing.T) {
@@ -628,12 +640,12 @@ func TestRenderSlotAbbreviatesWhenCrowded(t *testing.T) {
 	}}
 	unit := barlayout.Metrics{CharPx: 1, ChipFixedPx: 0}
 
-	if full := renderSlot(snap, 0, 100000, unit, &nameConfig{}, &sblabel.NameCache{}); strings.HasSuffix(full.Text, "…") {
+	if full := renderSlot(snap, 0, 100000, unit, &nameConfig{}, &sblabel.NameCache{}); strings.HasSuffix(pangoPlain(full.Text), "…") {
 		t.Errorf("a wide bar should not abbreviate: %q", full.Text)
 	}
 
 	narrow := renderSlot(snap, 0, 10, unit, &nameConfig{}, &sblabel.NameCache{})
-	if !strings.HasSuffix(narrow.Text, "…") {
+	if !strings.HasSuffix(pangoPlain(narrow.Text), "…") {
 		t.Errorf("a crowded bar should abbreviate with an ellipsis: %q", narrow.Text)
 	}
 	if !strings.Contains(narrow.Tooltip, "aaaaaaaa") {
@@ -851,8 +863,8 @@ func TestNameConfigShouldReloadWhenConfigFileChanges(t *testing.T) {
 
 	names := &nameConfig{}
 	labels := &sblabel.NameCache{}
-	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels); got.Text != "aaa-proj" {
-		t.Fatalf("chip text = %q, want aaa-proj", got.Text)
+	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels); got.Text != "<b>aaa</b>" {
+		t.Fatalf("chip text = %q, want <b>aaa</b>", got.Text)
 	}
 
 	// Rewrite as the rename hook would, forcing a later mtime so the test does
@@ -864,8 +876,8 @@ func TestNameConfigShouldReloadWhenConfigFileChanges(t *testing.T) {
 	}
 
 	got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels)
-	if got.Text != "zzz-proj" {
-		t.Errorf("chip text = %q, want zzz-proj — the rewritten config was not picked up", got.Text)
+	if got.Text != "<b>zzz</b>" {
+		t.Errorf("chip text = %q, want <b>zzz</b> — the rewritten config was not picked up", got.Text)
 	}
 	// The hover names the project in full, so a changed ABBREVIATION must not
 	// show up there — that is the chip's job, asserted above.
@@ -889,8 +901,8 @@ func TestNameConfigShouldServeCachedConfigWhenFileStampUnchanged(t *testing.T) {
 
 	names := &nameConfig{}
 	labels := &sblabel.NameCache{}
-	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels); got.Text != "aaa-proj" {
-		t.Fatalf("chip text = %q, want aaa-proj", got.Text)
+	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels); got.Text != "<b>aaa</b>" {
+		t.Fatalf("chip text = %q, want <b>aaa</b>", got.Text)
 	}
 
 	writeAbbrev(t, cfgPath, root, "bbb") // same length, so size is unchanged too
@@ -898,8 +910,8 @@ func TestNameConfigShouldServeCachedConfigWhenFileStampUnchanged(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels); got.Text != "aaa-proj" {
-		t.Errorf("chip text = %q, want the cached aaa-proj — the config was re-read despite an unchanged stamp", got.Text)
+	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels); got.Text != "<b>aaa</b>" {
+		t.Errorf("chip text = %q, want the cached <b>aaa</b> — the config was re-read despite an unchanged stamp", got.Text)
 	}
 }
 
@@ -911,13 +923,13 @@ func TestNameConfigShouldPickUpAConfigFileCreatedAfterFirstRender(t *testing.T) 
 
 	names := &nameConfig{}
 	labels := &sblabel.NameCache{}
-	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels); got.Text != "proj" {
+	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels); got.Text != "<b>proj</b>" {
 		t.Fatalf("chip text = %q, want the unprefixed proj (no user config)", got.Text)
 	}
 
 	writeAbbrev(t, cfgPath, root, "zzz")
-	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels); got.Text != "zzz-proj" {
-		t.Errorf("chip text = %q, want zzz-proj — a newly created config was not picked up", got.Text)
+	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels); got.Text != "<b>zzz</b>" {
+		t.Errorf("chip text = %q, want <b>zzz</b> — a newly created config was not picked up", got.Text)
 	}
 }
 
@@ -949,8 +961,8 @@ func TestRenderSlotShouldShowARenamedSessionOnTheNextSnapshot(t *testing.T) {
 
 	names := &nameConfig{}
 	labels := &sblabel.NameCache{}
-	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels); got.Text != "proj-aaa" {
-		t.Fatalf("chip text = %q, want proj-aaa", got.Text)
+	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels); got.Text != "<b>proj</b> Aaa" {
+		t.Fatalf("chip text = %q, want <b>proj</b> Aaa", got.Text)
 	}
 
 	// The rename, with a forced later mtime so the test does not depend on the
@@ -963,10 +975,10 @@ func TestRenderSlotShouldShowARenamedSessionOnTheNextSnapshot(t *testing.T) {
 	}
 
 	got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels)
-	if got.Text != "proj-bbb" {
-		t.Errorf("chip text = %q, want proj-bbb — the rename did not reach the chip", got.Text)
+	if got.Text != "<b>proj</b> Bbb" {
+		t.Errorf("chip text = %q, want <b>proj</b> Bbb — the rename did not reach the chip", got.Text)
 	}
-	if !strings.Contains(got.Tooltip, "bbb") {
+	if !strings.Contains(got.Tooltip, "Bbb") {
 		t.Errorf("tooltip kept the stale name: %q", got.Tooltip)
 	}
 }
@@ -985,11 +997,11 @@ func TestRenderSlotShouldNameEachSessionFromItsOwnFile(t *testing.T) {
 	names := &nameConfig{}
 	labels := &sblabel.NameCache{}
 	for pass := range 2 {
-		if got := renderSlot(snap, 0, testAvail, testMetrics, names, labels); got.Text != "proj-first" {
-			t.Errorf("pass %d: slot 0 text = %q, want proj-first", pass, got.Text)
+		if got := renderSlot(snap, 0, testAvail, testMetrics, names, labels); got.Text != "<b>proj</b> First" {
+			t.Errorf("pass %d: slot 0 text = %q, want <b>proj</b> First", pass, got.Text)
 		}
-		if got := renderSlot(snap, 1, testAvail, testMetrics, names, labels); got.Text != "proj-second" {
-			t.Errorf("pass %d: slot 1 text = %q, want proj-second", pass, got.Text)
+		if got := renderSlot(snap, 1, testAvail, testMetrics, names, labels); got.Text != "<b>proj</b> Second" {
+			t.Errorf("pass %d: slot 1 text = %q, want <b>proj</b> Second", pass, got.Text)
 		}
 	}
 }
@@ -1337,8 +1349,8 @@ func TestNameConfigShouldPickUpARenameWrittenBySetAbbrev(t *testing.T) {
 
 	names := &nameConfig{}
 	labels := &sblabel.NameCache{}
-	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels); got.Text != "aaa-proj" {
-		t.Fatalf("chip text = %q, want aaa-proj", got.Text)
+	if got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels); got.Text != "<b>aaa</b>" {
+		t.Fatalf("chip text = %q, want <b>aaa</b>", got.Text)
 	}
 
 	// The middle-click rename, as the bar performs it.
@@ -1346,8 +1358,8 @@ func TestNameConfigShouldPickUpARenameWrittenBySetAbbrev(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := renderSlot(snapshotIn(root), 0, testAvail, testMetrics, names, labels)
-	if got.Text != "zzz-proj" {
-		t.Errorf("chip text = %q, want zzz-proj — the middle-click rename did not reach the chip", got.Text)
+	if got.Text != "<b>zzz</b>" {
+		t.Errorf("chip text = %q, want <b>zzz</b> — the middle-click rename did not reach the chip", got.Text)
 	}
 	if !strings.Contains(got.Tooltip, "<span variant='smallcaps'>proj</span>") ||
 		strings.Contains(got.Tooltip, "zzz") {

@@ -14,7 +14,7 @@ empty navigable list makes next/previous a valid no-op.
 
 | Mode | Surface | Session appearance |
 | --- | --- | --- |
-| `chips` (default) | Independent bottom Waybar | Existing named chips, tooltips and navigation |
+| `chips` (default) | Independent bottom Waybar | Bold project/alias, title-cased task (five words max), tooltips and navigation |
 | `circles` | Right end of the existing top Waybar | One compact GTK circle per session, no visible text |
 
 The circle view has no fixed slot limit. Both views share working/idle/permission
@@ -27,6 +27,8 @@ status, task, coarse durations, workspace, PID, and agent summary. Unchanged
 cards are retained when another session updates; clocks refresh at their next
 visible boundary even when no new session snapshot arrives.
 Scroll uses the existing previous/next commands; right-click opens the picker.
+See [session naming](session-naming.md) for shared project-directory settings,
+provider name sources, legacy dashed labels, and the display styling contract.
 The current named-chip example retains its ten configured slots; the ordered
 session data and navigation are never truncated to those slots.
 

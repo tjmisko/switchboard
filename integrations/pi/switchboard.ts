@@ -75,6 +75,9 @@ function sessionFields(ctx: any): Record<string, unknown> {
 }
 
 function sessionName(ctx: any): string | undefined {
+  // Forward the native value verbatim. The shared Switchboard renderer owns
+  // project resolution and five-word title casing for every provider; neither
+  // "pi" nor the terminal's "π - directory" decoration is a task name.
   try {
     const name = ctx?.sessionManager?.getSessionName?.();
     if (typeof name === "string" && name) return name;

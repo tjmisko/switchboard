@@ -92,7 +92,7 @@ Every Waybar chip has a hover card:
 ```
 ARACHNE  ~/Projects/Arachne
 goosebook   ● working · 53m
-react-canvas-refactor
+React Canvas Refactor
 up 2h20m · started 14:49 · ws 4 · pid 20805
 33 agents · 3 live · 2h24m done
 ```

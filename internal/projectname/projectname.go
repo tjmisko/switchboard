@@ -13,6 +13,8 @@
 // (matched by git-root basename). An unknown project falls back to its
 // sanitized basename, so new repos get a sensible abbreviation with no prompt.
 //
+// Config.ProjectRoot adds configurable project parents before Git discovery.
+// DisplayName/TaskTitle provide readable text separately from dashed labels.
 // The string logic (ruleForRoot/Prefix/StripKnownPrefix/sanitize) is pure and
 // exhaustively unit-tested; only ProjectRoot, ConfigPath, Load, SetAbbrev and
 // SetFull touch the filesystem.
@@ -36,6 +38,7 @@ import (
 // using the terse Canonical. Full is optional — callers fall back to the
 // Canonical or a title-cased basename when it is unset.
 type ProjectRule struct {
+	Display    string   `json:"display,omitempty"`
 	MatchPaths []string `json:"match_paths,omitempty"`
 	Match      []string `json:"match,omitempty"`
 	Canonical  string   `json:"canonical"`
@@ -44,15 +47,17 @@ type ProjectRule struct {
 }
 
 // Config is an ordered rule list; the first matching rule wins. User rules are
-// layered ahead of the defaults (see Merged), so a path override beats a
-// basename default.
+// layered ahead of the defaults, so a path override beats a basename default.
+// ProjectDirs lists project parent directories; nil uses the defaults and an
+// empty slice disables parent matching.
 type Config struct {
-	Rules []ProjectRule `json:"rules"`
+	Rules       []ProjectRule `json:"rules"`
+	ProjectDirs []string      `json:"project_dirs"`
 }
 
 // DefaultConfig returns the built-in seed rules, matched by basename.
 func DefaultConfig() Config {
-	return Config{Rules: []ProjectRule{
+	return Config{ProjectDirs: []string{"~/Projects", "~/Tools"}, Rules: []ProjectRule{
 		{Match: []string{"arachne"}, Canonical: "arachne", Full: "Arachne", Aliases: []string{"arachne"}},
 		{Match: []string{"sspi-data-webapp"}, Canonical: "sspi", Full: "SSPI Data Webapp", Aliases: []string{"sspi", "sspi-data", "sspi-data-webapp"}},
 		{Match: []string{"switchboard"}, Canonical: "sb", Full: "Switchboard", Aliases: []string{"switchboard", "switch", "sb"}},
@@ -88,7 +93,7 @@ func (c Config) RuleForBase(base string) ProjectRule {
 		}
 	}
 	canon := sanitize(base)
-	return ProjectRule{Match: []string{lowerBase}, Canonical: canon, Aliases: []string{canon}}
+	return ProjectRule{Match: []string{lowerBase}, Canonical: canon, Display: base, Aliases: []string{canon}}
 }
 
 // alreadyPrefixed reports whether name already carries one of the rule's
@@ -142,18 +147,18 @@ func (r ProjectRule) StripKnownPrefix(name string) string {
 
 // ResolveForDir returns name prefixed for the project housing dir.
 func ResolveForDir(cfg Config, dir, name string) string {
-	return cfg.ruleForRoot(ProjectRoot(dir), ProjectBase(dir)).Prefix(name)
+	return cfg.RuleForDir(dir).Prefix(name)
 }
 
 // TaskForDir returns name with any project-alias prefix stripped, for the
 // tooltip's task line.
 func TaskForDir(cfg Config, dir, name string) string {
-	return cfg.ruleForRoot(ProjectRoot(dir), ProjectBase(dir)).StripKnownPrefix(name)
+	return cfg.RuleForDir(dir).StripKnownPrefix(name)
 }
 
 // CanonicalForDir returns the abbreviation that would be prepended for dir.
 func CanonicalForDir(cfg Config, dir string) string {
-	return cfg.ruleForRoot(ProjectRoot(dir), ProjectBase(dir)).Canonical
+	return cfg.RuleForDir(dir).Canonical
 }
 
 // FullForDir returns the pretty, human-readable display name for the project
@@ -162,8 +167,8 @@ func CanonicalForDir(cfg Config, dir string) string {
 // title-cased project basename ("my-cool-repo" -> "My Cool Repo"), falling back
 // to the Canonical when even that is empty.
 func FullForDir(cfg Config, dir string) string {
-	base := ProjectBase(dir)
-	r := cfg.ruleForRoot(ProjectRoot(dir), base)
+	base := filepath.Base(cfg.ProjectRoot(dir))
+	r := cfg.RuleForDir(dir)
 	if r.Full != "" {
 		return r.Full
 	}
@@ -280,7 +285,8 @@ func titleize(s string) string {
 // fileConfig is the on-disk shape of the user config: abbreviations keyed by
 // absolute git-root path.
 type fileConfig struct {
-	Projects map[string]fileEntry `json:"projects"`
+	Projects    map[string]fileEntry `json:"projects"`
+	ProjectDirs []string             `json:"project_dirs"`
 }
 
 type fileEntry struct {
@@ -311,8 +317,10 @@ func loadFrom(path string) Config {
 	if data, err := os.ReadFile(path); err == nil {
 		var fc fileConfig
 		if json.Unmarshal(data, &fc) == nil {
+			cfg.ProjectDirs = fc.ProjectDirs
 			for root, e := range fc.Projects {
 				canon, aliases, full := e.Canonical, e.Aliases, e.Full
+				display := ""
 				if canon == "" {
 					// Only a Full (pretty name) was set — no abbrev override. Inherit
 					// the canonical/aliases (and any default Full) the basename would
@@ -320,6 +328,7 @@ func loadFrom(path string) Config {
 					base := filepath.Base(filepath.Clean(root))
 					dr := defaults.ruleForRoot(root, base)
 					canon = dr.Canonical
+					display = dr.Display
 					if len(aliases) == 0 {
 						aliases = dr.Aliases
 					}
@@ -333,6 +342,7 @@ func loadFrom(path string) Config {
 				cfg.Rules = append(cfg.Rules, ProjectRule{
 					MatchPaths: []string{root},
 					Canonical:  canon,
+					Display:    display,
 					Full:       full,
 					Aliases:    aliases,
 				})

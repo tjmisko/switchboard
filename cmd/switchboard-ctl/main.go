@@ -424,7 +424,7 @@ func cmdStatus(c *rpc.Client) {
 
 // cmdPick emits one tab-separated line per session, ordered as the snapshot.
 // Format: EXACT-TOKEN \t LABEL \t WORKSPACE \t CWD
-// LABEL is the project-prefixed, de-duplicated session name (see
+// LABEL is the readable project and title-cased task (see
 // internal/label). Intended to be piped into fzf with `--with-nth=2..` so the
 // user sees the label but the PID stays in the selected line for the focus call.
 func cmdPick(c *rpc.Client) {
@@ -436,7 +436,7 @@ func cmdPick(c *rpc.Client) {
 		if !sessionNavigable(s) {
 			continue
 		}
-		label := sblabel.Chip(cfg, s)
+		label := sblabel.DisplayName(cfg, s).String()
 		if s.Remote {
 			label = s.Hostname + ":" + label
 		}
@@ -971,13 +971,14 @@ func firstNonEmpty(vals ...string) string {
 // Subcommands:
 //
 //	resolve  --cwd <dir> --name <name>   print the prefixed, de-duplicated name
+//	display  --cwd <dir> --name <name>   print the readable project/task label
 //	abbrev   --cwd <dir>                 print the project's canonical abbrev
 //	full     --cwd <dir>                 print the project's pretty display name
 //	set      <dir> <abbrev>              persist an abbrev for the dir's git root
 //	set-full --cwd <dir> --name <full>   persist a pretty display name for it
 func cmdName(args []string) {
 	if len(args) == 0 {
-		fail("name requires a subcommand: resolve|abbrev|full|set|set-full")
+		fail("name requires a subcommand: resolve|display|abbrev|full|set|set-full")
 	}
 	switch args[0] {
 	case "resolve":
@@ -986,6 +987,13 @@ func cmdName(args []string) {
 		name := fs.String("name", "", "desired session name to prefix")
 		_ = fs.Parse(args[1:])
 		fmt.Println(projectname.ResolveForDir(projectname.Load(), dirOrCwd(*cwd), *name))
+	case "display":
+		fs := flag.NewFlagSet("name display", flag.ExitOnError)
+		cwd := fs.String("cwd", "", "project directory (default: current)")
+		name := fs.String("name", "", "task name")
+		_ = fs.Parse(args[1:])
+		rule := projectname.Load().RuleForDir(dirOrCwd(*cwd))
+		fmt.Println(strings.TrimSpace(rule.DisplayName() + " " + rule.TaskTitle(*name)))
 	case "abbrev":
 		fs := flag.NewFlagSet("name abbrev", flag.ExitOnError)
 		cwd := fs.String("cwd", "", "project directory (default: current)")
@@ -1001,7 +1009,7 @@ func cmdName(args []string) {
 		if len(rest) < 2 {
 			fail("usage: name set <dir> <abbrev>")
 		}
-		root := projectname.ProjectRoot(rest[0])
+		root := projectname.Load().ProjectRoot(rest[0])
 		if err := projectname.SetAbbrev(root, rest[1]); err != nil {
 			fail("name set: %v", err)
 		}
@@ -1014,13 +1022,13 @@ func cmdName(args []string) {
 		if strings.TrimSpace(*name) == "" {
 			fail("usage: name set-full --cwd <dir> --name <full>")
 		}
-		root := projectname.ProjectRoot(dirOrCwd(*cwd))
+		root := projectname.Load().ProjectRoot(dirOrCwd(*cwd))
 		if err := projectname.SetFull(root, *name); err != nil {
 			fail("name set-full: %v", err)
 		}
 		fmt.Printf("%s -> %s\n", root, projectname.FullForDir(projectname.Load(), root))
 	default:
-		fail("unknown name subcommand %q (resolve|abbrev|full|set|set-full)", args[0])
+		fail("unknown name subcommand %q (resolve|display|abbrev|full|set|set-full)", args[0])
 	}
 }
 

@@ -162,7 +162,7 @@ func (p *presentationPublisher) publish(snap state.Snapshot, mode display.Mode, 
 		p.namesStamp = stamp
 		p.namesLoaded = true
 	}
-	frame := display.Build(snap, mode, connected, visible, func(s state.Session) string { return p.labels.Chip(p.names, s) })
+	frame := display.Build(snap, mode, connected, visible, func(s state.Session) string { return p.labels.DisplayName(p.names, s).String() })
 	for i, session := range snap.Sessions {
 		frame.Sessions[i].TooltipMarkup = waybarchip.TooltipMarkup(p.names, &p.labels, session, now)
 	}

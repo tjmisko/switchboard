@@ -1,179 +1,161 @@
-# Session naming & project prefixes
+# Session names, project directories, and display styling
 
-switchboard gives both Claude and Codex roots a stable task name, prefixes it
-with a short **project abbreviation** derived from the session's directory —
-`arachne-…`, `sspi-…`, `sb-…` — and de-duplicates so you never get
-`arachne-arachne-…`.
+Every provider uses the same visible convention:
 
-Codex terminal titles are never used as Codex chip labels. An unnamed Codex
-thread can put its UUID in the title, and its configurable activity item paints
-animated spinner frames there. Feeding that title into the bar made both details
-visible and made the chip's identity move. Switchboard instead uses stable
-app-server thread metadata.
+**Project or alias** Task Title With Spaces
 
-## The two-layer model
+The project is bold; the task uses title case, spaces instead of dashed
+separators, and at most five words. An unnamed session shows only its project.
+The directory's spelling, case, and Unicode characters are preserved unless a
+project alias is configured.
 
-A Claude session has two independent "names":
+| Directory / alias | Native task name | Bottom chip |
+| --- | --- | --- |
+| `中国地理` | `map-update` | **中国地理** Map Update |
+| `MyProject` | none | **MyProject** |
+| Switchboard alias `sb` | `sb-fix-project-name-detection-in-all-providers` | **sb** Fix Project Name Detection In |
+| Arachne alias `ar` | `Refactor auth module` | **ar** Refactor Auth Module |
 
-1. **Claude's own name** — what shows in Claude's input-box border and the
-   `/resume` picker. It is set by `/name <text>` (an alias for `/rename`) or by
-   `claude -n <text>` at launch, and stored as `custom-title` / `name` records
-   under `~/.claude/`. **Only Claude can change the live value** — external file
-   writes do not move it (verified empirically; see below).
+## Integration map
 
-2. **switchboard's label** — the bottom-bar chip text and hover. switchboard
-   computes this at **display time** from the session's cwd, so it is always
-   project-prefixed regardless of what you `/name` the session.
+| Provider | Authoritative task input | Transport / implementation | Visible fallback |
+| --- | --- | --- | --- |
+| Claude | `/name` or `/rename`, including `claude -n` | `~/.claude/sessions/<pid>.json`, read by `internal/label` | Normalized terminal title, then project alone |
+| Codex | Conversation-bound Switchboard `display_name`, then native app-server root name | `internal/provider/codex`, daemon naming hooks and read-only observer | Project alone; terminal titles never supply task text |
+| Pi | Native `/name` for the current Pi session | `integrations/pi/switchboard.ts` forwards `session_start` / `session_info_changed` → `switchboard-ctl pi-hook` → native `display_name` | Project alone; never Claude files or Pi terminal chrome |
 
-Because layer 2 re-derives the prefix every render and de-duplicates, **`/name`
-never fights the scheme**:
+Previously, `internal/projectname` supplied a dashed project prefix and
+`internal/label.RawName` shortened Codex tasks to three words and Pi tasks to
+four. Claude names were largely verbatim. Pi without a native name could reach
+Claude's terminal fallback and display `π - directory` as a task. Project
+discovery already walked Git roots and supported aliases, but had no
+configurable project parent directories.
 
-| you type          | chip shows           |
-| ----------------- | -------------------- |
-| `/name foo`       | `arachne-foo`        |
-| `/name arachne-foo` | `arachne-foo` (no double) |
-| `/name arachne`   | `arachne`            |
+Now `internal/label.DisplayName` selects unshortened native task text and
+`internal/projectname.ProjectRule.TaskTitle` normalizes it once, after removing
+the project prefix. This avoids consuming the task's five-word budget with a
+prefix or applying provider-specific limits first. Source names and persisted
+records remain unchanged.
 
-The launcher wrapper (layer 1) is a bonus: it prefixes `claude -n` at startup so
-Claude's *own* border is also project-scoped from the first frame. If you
-`/name` afterward, Claude's border follows your text; switchboard's chip stays
-prefixed either way.
+The bottom-bar broker and standalone `switchboard-waybar` share
+`internal/waybarchip.Renderer`. It fits plain display text against the bar width,
+then escapes user text and applies Pango `<b>` only to the project portion.
+The display publisher, picker, and Polybar use the same plain display label;
+Waybar's hover card also uses the shared normalized task. Compact circles keep
+their existing geometry and shared hover card.
 
-### Why not auto-prefix Claude's live name?
+## Project resolution and configuration
 
-A throwaway-session experiment (v2.1.190) showed the live displayed name comes
-solely from Claude's in-memory state. Appending `custom-title` to the transcript
-**and** editing `~/.claude/sessions/<pid>.json` `name`, then driving a turn, left
-the live border unchanged (the on-disk values persisted but were not read back
-into the running UI). So there is no supported or unsupported way to
-auto-prefix a *running* session's own name — hence the display-time approach.
-
-## Codex names
-
-Ordinary `codex` sessions receive a Switchboard-owned display label after
-their first usable completed turn. `UserPromptSubmit` retains a bounded prompt
-candidate for the exact process lifetime and conversation; the matching later
-`Stop` supplies the bounded final assistant message. Empty or interrupted
-completions are discarded, and the next completed turn gets another chance.
-
-The naming turn receives only the cwd basename, prompt, and final response. Both
-content fields are limited to 1,000 Unicode characters and remain ephemeral.
-The selected model must return a lowercase 2–5-word kebab-case title no longer
-than 40 characters. Switchboard retries once, then chooses a deterministic
-fallback. The model defaults to `gpt-5.6-luna` and is configurable with
-`-codex-autoname-model`.
-
-Only this record is persisted:
+Settings live in `$XDG_CONFIG_HOME/switchboard/projects.json`, defaulting to
+`~/.config/switchboard/projects.json`:
 
 ```json
 {
-  "value": "context-aware-session-names",
-  "origin": "generated",
-  "conversation_id": "<codex-thread-id>",
-  "native_baseline": "session-naming"
+  "project_dirs": ["~/Projects", "~/Tools"],
+  "projects": {
+    "/home/you/Projects/Arachne": {
+      "canonical": "ar",
+      "aliases": ["ar", "arachne"],
+      "full": "Arachne"
+    }
+  }
 }
 ```
 
-No prompt, assistant response, pending attempt, or turn ID enters
-`state.json`, history, diagnostics, or logs. The record is valid only for its
-bound conversation. A daemon restart preserves a valid record for the same
-live conversation but never reconstructs discarded naming context.
+`project_dirs` lists parent directories, not individual projects. Its default
+is `~/Projects` and `~/Tools`. Absolute paths and a leading `~/` are supported;
+other relative paths are ignored. An explicit empty array disables parent
+matching. Existing project files without this field inherit the defaults.
+Changing an alias preserves this setting.
 
-Codex label precedence is:
+Resolution is shared by Claude, Codex, Pi, the display, and CLI naming commands:
 
-1. a valid Switchboard `display_name`;
-2. the current native app-server root name;
-3. the first two characters of the exact thread ID;
-4. the cwd basename;
-5. `pid N`.
+1. Inside a configured parent, use its immediate child as the project. For
+   example, `~/Tools/MyTool/src/parser` belongs to `MyTool`, even without Git.
+   A nested Git checkout or worktree stays grouped under that project. If
+   parents overlap, the most specific parent wins.
+2. Else use the nearest ancestor with a `.git` directory or file.
+3. Else use the current directory itself.
+4. Apply a path-specific alias first, then a built-in basename rule. Otherwise
+   display the project directory name verbatim.
 
-Whichever value wins is normalized at the display boundary to a lowercase,
-at-most-three-word kebab slug. The persisted display record and Codex's native
-name remain untouched. Project prefixing happens after normalization. For
-example, a native `Plan faster abstract extraction` in Lysilogy renders as
-`lysilogy-plan-faster-abstract`.
+Built-in aliases remain `arachne`, `sspi-data-webapp → sspi`,
+`switchboard → sb`, and `switchboard-dashboard → sb-dash`. A `full` entry
+controls the expanded project title in the hover card; it does not replace the
+chip's alias. Unknown project names need no configuration.
 
-Switchboard never mutates Codex's native name. When the read-only observer sees
-an authoritative native name, that value becomes the display record's baseline.
-A later authoritative value that differs clears the generated record, so
-`/rename` takes precedence. Partial hook graphs and unavailable observations
-cannot manufacture a rename. With the observer disabled, generation still
-works; rename precedence is simply delayed until authoritative metadata becomes
-available.
-
-Codex terminal titles are not naming inputs. Their spinner, model, branch, and
-full UUID therefore cannot leak into a chip label.
-
-## Pi names
-
-Pi's own `/name` is forwarded by its extension (`session_info_changed`, and
-`session_start` for the name a resumed session already has) and stored as a
-native display record bound to the Pi session id:
-
-```json
-{
-  "value": "Refactor auth module",
-  "origin": "native",
-  "conversation_id": "<pi-session-id>"
-}
-```
-
-The stored value is Pi's name verbatim. Normalization happens only at the
-display boundary: `internal/label` folds it to a lowercase kebab slug of at
-most **four** words (Codex caps at three), after which the usual project prefix
-is applied — so `Refactor auth module` in Switchboard renders as
-`sb-refactor-auth-module`. A name that normalizes to nothing (only separators)
-falls through to the ordinary cwd/pid chain, exactly like an unnamed session.
-
-Pi's name record is bound to one Pi session: a `/new` or `/resume` that changes
-the session id drops it, and a rename addressed to a session the root is no
-longer bound to is ignored. Like a Codex rename, a Pi rename carries no status
-evidence and never renews the hook lease.
-
-## Components
-
-- **`internal/projectname`** — the pure resolver: prefix + dedup (longest-alias,
-  hyphen-boundary), git-root detection, and a writable user config layered over
-  built-in defaults.
-- **`switchboard-ctl name`** — `resolve --cwd --name`,
-  `abbrev --cwd` (current abbreviation), `set <dir> <abbrev>` (persist).
-- **`internal/label`** — sources Claude names from
-  `~/.claude/sessions/<pid>.json` (with its existing terminal-title fallback)
-  and Codex names from a conversation-bound `display_name` or the app-server
-  root node, then applies the compact-ID fallback and project prefix. Shared by
-  the Waybar chips and `switchboard-ctl pick`/`list`.
-- **`internal/provider/codex`** — generates validated display labels in an
-  isolated ephemeral turn and observes native names through a read-only graph.
-- **Claude startup wrapper** — `~/.config/scripts/claude-name-wrapper.sh`.
-- **hover rename** — middle-click a chip → `~/.config/scripts/claude-abbrev-edit`.
-
-## Abbreviations & new projects
-
-Abbreviations live in `~/.config/switchboard/projects.json`, keyed by absolute
-git-root path, layered ahead of the built-in defaults (matched by basename):
-
-```json
-{ "projects": { "/home/you/Projects/Arachne": { "canonical": "ar", "aliases": ["ar"] } } }
-```
-
-Built-in defaults: `arachne`; `sspi-data-webapp → sspi` (aliases
-`sspi`/`sspi-data`/`sspi-data-webapp`); `switchboard → sb` (aliases
-`switchboard`/`switch`/`sb`).
-
-**A project you have never named just works**: its abbreviation falls back to the
-sanitized git-root basename (`~/Resume → resume`), shown immediately with no
-prompt. Rename it whenever you like:
-
-- middle-click its chip and type a new abbreviation (rofi), or
-- `switchboard-ctl name set <dir> <abbrev>`.
-
-The bar re-renders on the next daemon snapshot (~1s).
-
-## Activation
+Remote paths are never walked on the local filesystem or matched against local
+path overrides. The current remote fallback is lexical basename resolution;
+local project parent settings do not infer another machine's home directory.
 
 ```sh
-go install ./...                              # rebuild switchboard-ctl + switchboard-waybar
-echo 'source ~/.config/scripts/claude-name-wrapper.sh' >> ~/.bashrc   # optional layer-1 wrapper
-# restart the bottom bar so waybar picks up the new claude.jsonc bindings
-switchboard-ctl bottombar stop && switchboard-ctl bottombar reconcile
+switchboard-ctl name display --cwd ~/Projects/Arachne --name refactor-auth-module
+# arachne Refactor Auth Module
+switchboard-ctl name set ~/Projects/Arachne ar
+switchboard-ctl name set-full --cwd ~/Projects/Arachne --name Arachne
 ```
+
+Middle-clicking a chip opens the shared project alias editor. Its historical
+script name, `~/.config/scripts/claude-abbrev-edit`, is retained for existing
+bindings, but the alias applies to all providers in the project. Its source
+lives in `linux-config/common/.config/scripts`, deployed through stow. Remote
+aliases are edited on their source host. Renderer configuration reloads on the
+next snapshot after the file's stamp changes.
+
+## Dashed labels and identity
+
+`switchboard-ctl name resolve --cwd <dir> --name <task>` still returns the
+legacy project-prefixed label, such as `sb-fix-project-names`. `name abbrev`
+returns its canonical project prefix. Unicode letters, numbers, and combining
+marks survive sanitization. `internal/label.Chip` / `RawName` retain the
+historical dashed-label APIs, including their compact provider fallbacks.
+
+The optional Claude startup wrapper still uses `name resolve` to scope a
+`claude -n` name. It does not own Switchboard's display styling. Pi and Codex do
+not need launcher wrappers for project names.
+
+A dashed label is not a unique session ID. Navigation and click targets remain
+bound to the host, PID, and process start time. Changing display text, aliases,
+or casing does not change those selectors. `display.json`'s `label` is plain
+readable text; its `key` is the stable session identity. Pango belongs only in
+markup fields and Waybar's module text, never in an identity or stored name.
+
+## Native names and generation
+
+Switchboard does not rewrite providers' live names. Claude owns its in-memory
+name; external writes to its transcript or session file do not change its live
+border. The startup wrapper can only affect launch-time `-n` values.
+
+Codex's first usable completed turn can generate a Switchboard-owned name.
+The naming call receives the cwd basename plus bounded prompt and final
+response excerpts (1,000 Unicode characters each). Its output remains a 2–5
+word kebab-case value capped at 40 characters, validated with one retry and a
+deterministic fallback. Only the conversation-bound display record persists;
+prompt/response excerpts and pending attempts do not enter state or history.
+The naming model is configurable with `-codex-autoname-model`.
+
+An authoritative Codex native rename clears the generated record when it
+differs from the recorded baseline. Pi forwards its native name verbatim and
+binds it to its Pi session ID. `/new` or `/resume` invalidates stale records;
+renaming carries no status evidence and does not renew a hook lease. Display
+normalization never mutates either provider's native value.
+
+## Styling guidance and activation
+
+- Keep project and task separate until rendering. Bold only the project or
+  alias, preserving its configured spelling; title-case and cap only the task.
+- Strip a known project prefix before counting task words. Accept both the
+  legacy dashed prefix and readable words; do not introduce provider names or
+  glyphs as tasks.
+- Fit and truncate plain text before escaping and adding markup. Preserve
+  Unicode and escape all user-controlled markup characters.
+- Keep status colors, focus borders, remote borders, and navigation independent
+  of naming. Tooltips retain full project/path context and coarse clocks.
+- Reuse the shared resolver and formatter in integrations instead of copying
+  per-provider naming rules into shell or TypeScript.
+
+Deploy a managed installation with `scripts/deploy`; it installs the matching
+daemon, control client, and renderer and verifies the running revision. Do not
+use `go install` to update an installation managed through `current`. Pi's
+extension should remain linked to `integrations/pi/switchboard.ts`; stow owns
+the shell scripts in `linux-config`.

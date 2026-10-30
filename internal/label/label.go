@@ -29,25 +29,25 @@ import (
 	"github.com/tjmisko/switchboard/internal/transcript"
 )
 
-// RawName picks the human name for a session before project prefixing. Codex
+// RawName picks the legacy name for a session before project prefixing. Codex
 // uses a conversation-matching Switchboard display name, then an authoritative
 // native graph name, then the first two characters of its stable thread ID. The
-// selected Codex value is normalized for display to a lowercase kebab slug with
+// selected Codex value is normalized to a lowercase kebab slug with
 // at most three words; the native and persisted source values remain untouched.
 // It deliberately never uses the Codex terminal title, whose configurable
 // branch/model fields and activity spinner do not belong in a session label.
 // Claude prefers its authoritative ~/.claude/sessions/<pid>.json name, then a
 // spinner-stripped terminal title. Pi prefers its own /name, carried as a
-// native display name bound to the Pi session, then follows Claude's chain.
-// Pi's /name is normalized at this display boundary to a lowercase kebab slug
-// with at most four words, so the chip reads `<project>-<task-words>` without
-// mutating the name Pi itself holds. Every provider falls back to cwd and
-// finally pid.
+// native display name bound to the Pi session, then falls back to cwd.
+// Pi's /name becomes a lowercase kebab slug with at most four words without
+// mutating the native value. Every provider falls back to cwd and finally pid.
+// DisplayName uses the unshortened source for the shared readable convention.
 func RawName(s state.Session) string {
 	return rawName(s, claudeSessionName)
 }
 
-// Chip returns the project-prefixed, de-duplicated label for a session's chip.
+// Chip returns the legacy project-prefixed, de-duplicated dashed label.
+// Visible surfaces use DisplayName instead.
 func Chip(cfg projectname.Config, s state.Session) string {
 	if s.Remote {
 		return cfg.RuleForBase(remoteProjectBase(s.CWD)).Prefix(RawName(s))
@@ -78,6 +78,9 @@ func rawName(s state.Session, claudeName func(pid int) string) string {
 		if name := codexRawName(s); name != "" {
 			return name
 		}
+	} else if s.Agent == state.AgentKindPi {
+		// Pi's terminal title contains provider chrome, not a task name.
+		// Fall through to cwd rather than consulting Claude's naming sources.
 	} else if s.Remote {
 		// A remote PID is not a process namespace on this machine. Use only
 		// names already carried by the snapshot; in particular, never read the

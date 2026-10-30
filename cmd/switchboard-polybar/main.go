@@ -128,7 +128,7 @@ func (r *liveRenderer) render(snap state.Snapshot) string {
 	cfg := r.names.config()
 	labels := make([]string, limit)
 	for i := range limit {
-		labels[i] = r.labels.Chip(cfg, snap.Sessions[i])
+		labels[i] = r.labels.DisplayName(cfg, snap.Sessions[i]).String()
 	}
 	return renderSnapshot(snap, labels, r.options)
 }
